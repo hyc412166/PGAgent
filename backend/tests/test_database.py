@@ -51,6 +51,10 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
         "approvals",
         "memories",
         "model_connections",
+        "skills",
+        "agent_tools",
+        "agent_skills",
+        "session_skills",
         "team_tasks",
         "agent_messages",
         "usage_records",
@@ -107,7 +111,7 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     session_columns = {column["name"] for column in inspector.get_columns("sessions")}
     assert "is_default" in agent_columns
     assert {
-        "model_connection_id", "model_id", "thinking_level", "context_tokens", "last_compacted_at"
+        "model_connection_id", "model_id", "thinking_level", "permission_mode", "context_tokens", "last_compacted_at"
     }.issubset(session_columns)
     with database.SessionLocal() as db:
         assert db.get(database.Workspace, "legacy-workspace") is not None
@@ -381,6 +385,148 @@ def test_session_model_connection_must_exist_and_be_enabled(client: TestClient) 
     assert client.patch(
         f"/api/sessions/{session_id}", json={"model_connection_id": disabled_id}
     ).status_code == 409
+
+
+def test_agent_model_connection_must_exist_and_be_enabled(client: TestClient) -> None:
+    with database.SessionLocal() as db:
+        enabled = ModelConnection(
+            name="Enabled child-agent relay",
+            provider="openai_compatible",
+            base_url="https://example.invalid/v1",
+            secret_ref="test:enabled-child-agent-relay",
+        )
+        disabled = ModelConnection(
+            name="Disabled child-agent relay",
+            provider="openai_compatible",
+            base_url="https://example.invalid/v1",
+            secret_ref="test:disabled-child-agent-relay",
+            enabled=False,
+        )
+        db.add_all([enabled, disabled])
+        db.commit()
+        enabled_id = enabled.id
+        disabled_id = disabled.id
+
+    assert client.post(
+        "/api/agents", json={"name": "Missing connection", "model_connection_id": "missing-connection"}
+    ).status_code == 409
+    assert client.post(
+        "/api/agents", json={"name": "Disabled connection", "model_connection_id": disabled_id}
+    ).status_code == 409
+
+    created = client.post(
+        "/api/agents", json={"name": "Enabled connection", "model_connection_id": enabled_id}
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["model_connection_id"] == enabled_id
+
+    agent_id = client.post("/api/agents", json={"name": "Unbound child"}).json()["id"]
+    assert client.patch(
+        f"/api/agents/{agent_id}", json={"model_connection_id": "missing-connection"}
+    ).status_code == 409
+    assert client.patch(
+        f"/api/agents/{agent_id}", json={"model_connection_id": disabled_id}
+    ).status_code == 409
+    updated = client.patch(f"/api/agents/{agent_id}", json={"model_connection_id": enabled_id})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["model_connection_id"] == enabled_id
+
+
+def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(client: TestClient) -> None:
+    session = client.post("/api/sessions", json={}).json()
+    run = client.post("/api/runs", json={"session_id": session["id"]}).json()
+    with database.SessionLocal() as db:
+        db.add_all([
+            database.RunEvent(
+                run_id=run["id"],
+                event_type="runtime_snapshot",
+                payload={
+                    "messages": [{"role": "user", "content": "private message"}],
+                    "events": [{"arguments": {"api_key": "snapshot-secret"}}],
+                    "runtime_binding": {"secret_ref": "env:secret", "skill_instructions": "# SKILL.md"},
+                },
+            ),
+            database.RunEvent(
+                run_id=run["id"],
+                event_type="checkpoint",
+                payload={"messages": [{"content": "other private checkpoint"}]},
+            ),
+            database.RunEvent(
+                run_id=run["id"],
+                event_type="model_step_started",
+                step=1,
+                payload={"step": 1, "elapsed_ms": 10, "messages": [{"content": "private"}]},
+            ),
+            database.RunEvent(
+                run_id=run["id"],
+                event_type="tool_started",
+                payload={
+                    "tool_name": "read",
+                    "tool_call_id": "call-1",
+                    "elapsed_ms": 20,
+                    "thought_duration_ms": 10,
+                    "arguments": {
+                        "path": "safe.txt",
+                        "url": "https://username:password@example.test/docs?api_key=secret#fragment",
+                        "content": "private file body",
+                        "api_key": "tool-secret",
+                    },
+                    "secret_ref": "env:tool-secret",
+                },
+            ),
+            database.RunEvent(
+                run_id=run["id"],
+                event_type="tool_finished",
+                payload={
+                    "tool_name": "read",
+                    "tool_call_id": "call-1",
+                    "ok": True,
+                    "changed": False,
+                    "duration_ms": 5,
+                    "elapsed_ms": 25,
+                    "output": "private tool output",
+                    "messages": [{"content": "private"}],
+                },
+            ),
+            database.RunEvent(
+                run_id=run["id"],
+                event_type="run_completed",
+                payload={"elapsed_ms": 30, "has_output": True, "output": "private assistant output"},
+            ),
+        ])
+        db.commit()
+
+    response = client.get(f"/api/runs/{run['id']}/events")
+    assert response.status_code == 200, response.text
+    events = response.json()
+    assert {event["event_type"] for event in events} == {
+        "model_step_started", "tool_started", "tool_finished", "run_completed",
+    }
+    events_by_type = {event["event_type"]: event for event in events}
+    assert events_by_type["tool_started"]["payload"] == {
+        "elapsed_ms": 20,
+        "thought_duration_ms": 10,
+        "tool_name": "read",
+        "tool_call_id": "call-1",
+        "arguments": {
+            "path": "safe.txt",
+            "url": "https://example.test/docs",
+        },
+    }
+    assert events_by_type["tool_finished"]["payload"] == {
+        "duration_ms": 5,
+        "elapsed_ms": 25,
+        "changed": False,
+        "ok": True,
+        "tool_name": "read",
+        "tool_call_id": "call-1",
+    }
+    serialized = str(events)
+    for private_value in (
+        "private message", "snapshot-secret", "env:secret", "# SKILL.md",
+        "private file body", "tool-secret", "private tool output", "private assistant output",
+    ):
+        assert private_value not in serialized
 
 
 @pytest.mark.parametrize("run_status", ["received", "awaiting_approval"])

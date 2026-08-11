@@ -32,6 +32,8 @@ export interface AgentProfile {
   is_default?: boolean
   status?: string
   tools?: string[]
+  tool_ids?: string[]
+  skill_ids?: string[]
   created_at?: string
 }
 
@@ -43,12 +45,67 @@ export interface Session {
   model_connection_id?: string
   model_id?: string
   thinking_level?: ThinkingLevel
+  skill_ids?: string[]
+  permission_mode?: PermissionMode
   status?: string
   created_at?: string
   updated_at?: string
 }
 
 export type ThinkingLevel = 'off' | 'auto' | 'low' | 'medium' | 'high' | 'xhigh'
+export type PermissionMode = 'ask' | 'smart' | 'full'
+
+export interface ToolCatalogItem {
+  id: string
+  name: string
+  label?: string
+  description?: string
+  category?: string
+  risk_level?: string
+  enabled?: boolean
+  is_builtin?: boolean
+  availability?: string
+  requires_approval?: boolean
+}
+
+export interface SkillCatalogItem {
+  id: string
+  slug?: string
+  name: string
+  description?: string
+  source?: string
+  source_url?: string
+  root_path?: string
+  version?: string
+  enabled?: boolean
+  installed_at?: string
+}
+
+export interface SkillMarketplaceItem {
+  id: string
+  slug?: string
+  name: string
+  source?: string
+  source_url?: string
+  market_url?: string
+  installs?: number
+}
+
+export interface SkillMarketplaceSearch {
+  provider?: string
+  available?: boolean
+  message?: string
+  items?: SkillMarketplaceItem[]
+}
+
+export interface SkillInstallPreview {
+  installed: boolean
+  source_url: string
+  candidates?: string[]
+  files?: Array<{ path: string; size: number }>
+  skill?: SkillCatalogItem
+  message?: string
+}
 
 export interface SessionContext {
   used_tokens: number
@@ -91,6 +148,7 @@ export interface Message {
   tool_name?: string
   tool_call_id?: string
   status?: string
+  metadata?: ApiRecord
 }
 
 export interface RunEvent {

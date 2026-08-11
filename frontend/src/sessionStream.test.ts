@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { appendAssistantDelta, isCurrentSessionRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, visibleSessionItems } from './sessionStream'
+import { appendAssistantDelta, isCurrentSessionRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, visibleSessionItems } from './sessionStream'
 
 describe('会话 SSE 事件', () => {
   it('解析生命周期与文本增量', () => {
@@ -11,7 +11,9 @@ describe('会话 SSE 事件', () => {
 
   it('识别工具、审批与终态', () => {
     expect(runStreamPhase({ type: 'tool_started', tool_name: 'read_file' })).toBe('正在调用 read_file…')
+    expect(runStreamPhase({ type: 'tool_call', tool_name: 'webfetch' })).toBe('正在调用 webfetch…')
     expect(runStreamPhase({ type: 'approval_requested' })).toBe('等待你的审批')
+    expect(runStreamPhase({ type: 'delegated_child_awaiting_approval' })).toBe('子 Agent 正等待你的审批')
     expect(isTerminalRunStreamEvent({ type: 'run_completed' })).toBe(true)
     expect(isTerminalRunStreamEvent({ type: 'model_step_started' })).toBe(false)
     expect(isTerminalRunStreamEvent({ type: 'integration_failed' })).toBe(true)
@@ -48,5 +50,9 @@ describe('会话 SSE 事件', () => {
     expect(shouldMarkApprovalResuming('terminal', 'run-1', 'run-1')).toBe(false)
     expect(shouldMarkApprovalResuming('idle', '', 'run-1')).toBe(false)
     expect(shouldMarkApprovalResuming('awaiting_approval', 'run-2', 'run-1')).toBe(false)
+  })
+  it('refreshes the session after a rejected child approval', () => {
+    expect(shouldRefreshConversationAfterApprovalDecision('reject')).toBe(true)
+    expect(shouldRefreshConversationAfterApprovalDecision('approve')).toBe(false)
   })
 })

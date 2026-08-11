@@ -9,11 +9,15 @@ describe('临时草稿原子启动', () => {
       model_connection_id: null,
       model_id: null,
       thinking_level: 'auto',
+      skill_ids: [],
+      permission_mode: 'smart',
     })).toEqual({
       idempotency_key: key,
       title: '分析 当前项目',
       content: '分析   当前项目',
       thinking_level: 'auto',
+      skill_ids: [],
+      permission_mode: 'smart',
     })
   })
 
@@ -22,6 +26,8 @@ describe('临时草稿原子启动', () => {
       model_connection_id: 'connection-1',
       model_id: 'model-1',
       thinking_level: 'high',
+      skill_ids: ['skill-1', 'skill-1', 'skill-2'],
+      permission_mode: 'ask',
     })).toEqual({
       idempotency_key: 'draft-1',
       title: '执行任务',
@@ -30,6 +36,8 @@ describe('临时草稿原子启动', () => {
       model_connection_id: 'connection-1',
       model_id: 'model-1',
       thinking_level: 'high',
+      skill_ids: ['skill-1', 'skill-2'],
+      permission_mode: 'ask',
     })
   })
 })

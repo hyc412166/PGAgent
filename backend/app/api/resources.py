@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -57,6 +58,7 @@ from app.schemas import (
     WorkspaceRead,
     WorkspaceUpdate,
 )
+from app.services.skill_service import replace_agent_capabilities, replace_session_skills
 
 
 router = APIRouter(prefix="/api", tags=["resources"])
@@ -65,6 +67,45 @@ _ACTIVE_SESSION_RUN_STATUSES = frozenset(
     {"received", "preparing_context", "planning", "acting", "observing", "running", "awaiting_approval"}
 )
 _SESSION_RUNTIME_SETTING_FIELDS = frozenset({"model_connection_id", "model_id", "thinking_level"})
+_PUBLIC_RUN_EVENT_TYPES = frozenset({
+    "approval_rejected",
+    "approval_requested",
+    "completed",
+    "context_prepared",
+    "context_resumed",
+    "failed",
+    "integration_failed",
+    "model_failed",
+    "model_step_started",
+    "run_completed",
+    "run_interrupted",
+    "run_stopped",
+    "stopped",
+    "tool_call",
+    "tool_finished",
+    "tool_result",
+    "tool_started",
+    "user_question_requested",
+})
+_TOOL_START_EVENT_TYPES = frozenset({"tool_call", "tool_started"})
+_TOOL_FINISH_EVENT_TYPES = frozenset({"tool_finished", "tool_result"})
+_TERMINAL_EVENT_TYPES = frozenset({
+    "completed", "failed", "integration_failed", "model_failed", "run_completed", "run_stopped", "stopped"
+})
+_PUBLIC_EVENT_NUMBER_FIELDS = frozenset({
+    "duration_ms",
+    "elapsed_ms",
+    "estimated_tokens",
+    "omitted_messages",
+    "output_chars",
+    "question_chars",
+    "remaining_call_count",
+    "step",
+    "thought_duration_ms",
+})
+_PUBLIC_EVENT_BOOLEAN_FIELDS = frozenset({
+    "changed", "has_output", "ok", "pending_approval", "requires_next_message", "terminal",
+})
 
 
 def _require(db: Session, model: type[T], object_id: str, label: str) -> T:
@@ -96,6 +137,132 @@ def _require_enabled_model_connection(db: Session, connection_id: str | None) ->
         raise HTTPException(status_code=409, detail="Selected model connection does not exist")
     if not connection.enabled:
         raise HTTPException(status_code=409, detail="Selected model connection is disabled")
+
+
+def _public_event_text(value: Any, *, limit: int = 160) -> str | None:
+    """Return a bounded display label, never arbitrary event payload content."""
+
+    if not isinstance(value, str):
+        return None
+    return " ".join(value.replace("\x00", "").split())[:limit] or None
+
+
+def _public_event_url(value: Any) -> str | None:
+    """Keep a URL target useful to the timeline without query/fragment secrets."""
+
+    text = _public_event_text(value, limit=2_048)
+    if text is None:
+        return None
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return None
+    host = parsed.hostname
+    if parsed.scheme not in {"http", "https"} or not host:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))[:300]
+
+
+def _public_tool_argument_summary(value: Any) -> dict[str, str]:
+    """Expose only a display target from a tool's already-scrubbed summary.
+
+    Runtime events are normally written with ``safe_tool_argument_summary``.
+    The HTTP read boundary still cannot trust every historical or manually
+    created row, so it deliberately accepts no arbitrary argument keys.
+    """
+
+    if not isinstance(value, dict):
+        return {}
+    public: dict[str, str] = {}
+    for key in ("path", "file_path", "target"):
+        text = _public_event_text(value.get(key), limit=300)
+        if text is not None:
+            public[key] = text
+    url = _public_event_url(value.get("url"))
+    if url is not None:
+        public["url"] = url
+    return public
+
+
+def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
+    """Project a persisted event into the minimal timeline-safe contract.
+
+    A RunEvent is also used as the private runtime checkpoint store.  Never
+    expose an unfiltered payload here: it can contain model messages, original
+    arguments/results, credential references, or loaded Skill source text.
+    """
+
+    source = payload if isinstance(payload, dict) else {}
+    public: dict[str, Any] = {}
+    for key in _PUBLIC_EVENT_NUMBER_FIELDS:
+        value = source.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            public[key] = value
+    for key in _PUBLIC_EVENT_BOOLEAN_FIELDS:
+        value = source.get(key)
+        if isinstance(value, bool):
+            public[key] = value
+
+    if event_type in _TOOL_START_EVENT_TYPES | _TOOL_FINISH_EVENT_TYPES | {"user_question_requested"}:
+        for key in ("tool_name", "tool_call_id"):
+            text = _public_event_text(source.get(key), limit=160)
+            if text is not None:
+                public[key] = text
+        arguments = _public_tool_argument_summary(source.get("arguments"))
+        if arguments:
+            public["arguments"] = arguments
+
+    if event_type == "approval_requested":
+        request = source.get("request")
+        if isinstance(request, dict):
+            request_public: dict[str, Any] = {}
+            tool_name = _public_event_text(request.get("tool_name"), limit=160)
+            if tool_name is not None:
+                request_public["tool_name"] = tool_name
+            arguments = _public_tool_argument_summary(request.get("arguments"))
+            if arguments:
+                request_public["arguments"] = arguments
+            count = request.get("remaining_call_count")
+            if isinstance(count, (int, float)) and not isinstance(count, bool):
+                request_public["remaining_call_count"] = count
+            if request_public:
+                public["request"] = request_public
+
+    # Controlled status labels are useful for diagnostics, while free-form
+    # error/reason/output text is intentionally kept out of this endpoint.
+    if event_type in _TERMINAL_EVENT_TYPES | {"run_interrupted", "approval_rejected"}:
+        for key in ("code", "error_type"):
+            text = _public_event_text(source.get(key), limit=160)
+            if text is not None:
+                public[key] = text
+    return public
+
+
+def _public_run_event(event: RunEvent) -> RunEventRead | None:
+    """Return one safe timeline event, omitting private snapshots/checkpoints."""
+
+    event_type = str(event.event_type or "").strip().casefold()
+    # Snapshots (including future checkpoint event names) remain in SQLite for
+    # recovery only.  Their full payload is never a front-end API response.
+    if "checkpoint" in event_type or event_type.endswith("_snapshot"):
+        return None
+    if event_type not in _PUBLIC_RUN_EVENT_TYPES:
+        return None
+    return RunEventRead(
+        id=event.id,
+        run_id=event.run_id,
+        event_type=event_type,
+        step=event.step,
+        payload=_public_run_event_payload(event_type, event.payload),
+        created_at=event.created_at,
+    )
 
 
 def _normalized_workspace_root(root_path: str) -> str:
@@ -209,8 +376,25 @@ def list_agents(db: Session = Depends(get_db)) -> list[Agent]:
 
 @router.post("/agents", response_model=AgentRead, status_code=status.HTTP_201_CREATED)
 def create_agent(payload: AgentCreate, db: Session = Depends(get_db)) -> Agent:
-    item = Agent(**payload.model_dump())
+    data = payload.model_dump()
+    tool_ids = data.pop("tool_ids", [])
+    skill_ids = data.pop("skill_ids", [])
+    _require_enabled_model_connection(db, data.get("model_connection_id"))
+    item = Agent(**data)
     db.add(item)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Related resource does not exist") from exc
+    replace_agent_capabilities(
+        db,
+        item,
+        tool_ids=tool_ids,
+        skill_ids=skill_ids,
+        replace_tools=True,
+        replace_skills=True,
+    )
     _commit(db)
     db.refresh(item)
     return item
@@ -231,7 +415,16 @@ def update_agent(agent_id: str, payload: AgentUpdate, db: Session = Depends(get_
             status_code=409,
             detail="The PGAgent coordinator is managed by the system and cannot be modified",
         )
-    _apply(item, payload)
+    tool_ids = updates.pop("tool_ids", None)
+    skill_ids = updates.pop("skill_ids", None)
+    if "model_connection_id" in updates:
+        _require_enabled_model_connection(db, updates["model_connection_id"])
+    for key, value in updates.items():
+        setattr(item, key, value)
+    if "tool_ids" in payload.model_fields_set:
+        replace_agent_capabilities(db, item, tool_ids=tool_ids, replace_tools=True)
+    if "skill_ids" in payload.model_fields_set:
+        replace_agent_capabilities(db, item, skill_ids=skill_ids, replace_skills=True)
     _commit(db)
     db.refresh(item)
     return item
@@ -267,6 +460,7 @@ def list_sessions(
 @router.post("/sessions", response_model=SessionRead, status_code=status.HTTP_201_CREATED)
 def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> ChatSession:
     data = payload.model_dump()
+    skill_ids = data.pop("skill_ids", [])
     data["workspace_id"] = data.get("workspace_id") or DEFAULT_WORKSPACE_ID
     # Keep the field in the public schema for old clients, but all
     # conversations are coordinated by the built-in PGAgent master.
@@ -278,6 +472,8 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> Cha
     _require_enabled_model_connection(db, data.get("model_connection_id"))
     item = ChatSession(**data)
     db.add(item)
+    db.flush()
+    replace_session_skills(db, item, skill_ids)
     _commit(db)
     db.refresh(item)
     return item
@@ -294,6 +490,8 @@ def update_session(
 ) -> ChatSession:
     item = _require(db, ChatSession, session_id, "Session")
     updates = payload.model_dump(exclude_unset=True)
+    skill_ids_supplied = "skill_ids" in updates
+    skill_ids = updates.pop("skill_ids", None)
     if "model_connection_id" in updates:
         _require_enabled_model_connection(db, updates["model_connection_id"])
     runtime_settings_changed = any(
@@ -311,7 +509,10 @@ def update_session(
                 status_code=409,
                 detail="Model and thinking settings cannot change while the session has an active or awaiting run",
             )
-    _apply(item, payload)
+    for key, value in updates.items():
+        setattr(item, key, value)
+    if skill_ids_supplied:
+        replace_session_skills(db, item, skill_ids)
     # Accept stale clients that still send agent_id, without letting a child
     # Agent replace the session's fixed coordinator.
     item.agent_id = DEFAULT_AGENT_ID
@@ -404,11 +605,12 @@ def update_run(run_id: str, payload: RunUpdate, db: Session = Depends(get_db)) -
 
 
 @router.get("/runs/{run_id}/events", response_model=list[RunEventRead])
-def list_run_events(run_id: str, db: Session = Depends(get_db)) -> list[RunEvent]:
+def list_run_events(run_id: str, db: Session = Depends(get_db)) -> list[RunEventRead]:
     _require(db, Run, run_id, "Run")
-    return list(
+    events = list(
         db.scalars(select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.created_at.asc()))
     )
+    return [public for event in events if (public := _public_run_event(event)) is not None]
 
 
 @router.post(
