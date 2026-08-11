@@ -294,7 +294,7 @@ def test_compaction_never_splits_messages_with_the_same_timestamp(
         assert session.last_compacted_at is None
 
 
-def test_runtime_uses_enabled_fallback_connection_and_inherits_session_auto(
+def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settings(
     seeded_run: tuple[str, str],
 ) -> None:
     run_id, session_id = seeded_run
@@ -323,7 +323,9 @@ def test_runtime_uses_enabled_fallback_connection_and_inherits_session_auto(
     _runtime, context = RunCoordinator._resolve_runtime(run_id)
     assert context["model_connection_id"] == connection_id
     assert context["provider"].model_id == "fallback-model"
-    assert context["provider"].thinking_level == "high"
+    # Conversations run through the fixed PGAgent coordinator. A user-created
+    # child profile can no longer override its model/thinking configuration.
+    assert context["provider"].thinking_level == "low"
     assert context["agent_instructions"] == ""
 
     binding = dict(context["runtime_binding"])

@@ -13,7 +13,12 @@ from app import database
 from app.database import (
     Base,
     DEFAULT_AGENT_ID,
+    DEFAULT_AGENT_DESCRIPTION,
+    DEFAULT_AGENT_NAME,
+    DEFAULT_AGENT_SYSTEM_PROMPT,
     DEFAULT_WORKSPACE_ID,
+    DEFAULT_WORKSPACE_DESCRIPTION,
+    DEFAULT_WORKSPACE_NAME,
     ModelConnection,
     configure_database,
     init_db,
@@ -41,6 +46,7 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
         "sessions",
         "chat_messages",
         "runs",
+        "draft_launches",
         "run_events",
         "approvals",
         "memories",
@@ -194,6 +200,35 @@ def test_core_resource_crud_and_dashboard(client: TestClient, tmp_path: Path) ->
     assert dashboard["pending_approvals"] == 1
 
 
+def test_workspace_directory_only_is_named_and_deduplicated(
+    client: TestClient, tmp_path: Path
+) -> None:
+    root = tmp_path / "selected-project"
+    root.mkdir()
+
+    created = client.post("/api/workspaces", json={"root_path": str(root)})
+    assert created.status_code == 201, created.text
+    workspace = created.json()
+    assert workspace["name"] == "selected-project"
+    assert workspace["description"] == ""
+    assert Path(workspace["root_path"]).resolve() == root.resolve()
+
+    duplicate = client.post(
+        "/api/workspaces",
+        json={"root_path": str(root.parent / "." / root.name)},
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["id"] == workspace["id"]
+    assert len(client.get("/api/workspaces").json()) == 2
+
+
+def test_workspace_filesystem_root_uses_project_fallback_name(client: TestClient, tmp_path: Path) -> None:
+    root = Path(tmp_path.anchor)
+    created = client.post("/api/workspaces", json={"root_path": str(root)})
+    assert created.status_code == 201, created.text
+    assert created.json()["name"] == "项目"
+
+
 def test_defaults_are_seeded_protected_and_used_for_new_sessions(client: TestClient) -> None:
     workspaces = client.get("/api/workspaces").json()
     agents = client.get("/api/agents").json()
@@ -203,29 +238,40 @@ def test_defaults_are_seeded_protected_and_used_for_new_sessions(client: TestCli
         database.PROJECT_ROOT / "data" / "workspaces" / "default"
     ).resolve()
     assert default_agent["is_default"] is True
-    assert default_agent["system_prompt"] == ""
+    assert default_workspace["name"] == DEFAULT_WORKSPACE_NAME
+    assert default_workspace["description"] == DEFAULT_WORKSPACE_DESCRIPTION
+    assert default_agent["name"] == DEFAULT_AGENT_NAME
+    assert default_agent["description"] == DEFAULT_AGENT_DESCRIPTION
+    assert default_agent["system_prompt"] == DEFAULT_AGENT_SYSTEM_PROMPT
     assert default_agent["mode"] == "auto"
     assert client.delete(f"/api/workspaces/{DEFAULT_WORKSPACE_ID}").status_code == 409
     assert client.delete(f"/api/agents/{DEFAULT_AGENT_ID}").status_code == 409
-    rejected = client.patch(
-        f"/api/agents/{DEFAULT_AGENT_ID}", json={"system_prompt": "override default behavior"}
-    )
-    assert rejected.status_code == 409
-    allowed = client.patch(
-        f"/api/agents/{DEFAULT_AGENT_ID}", json={"description": "Updated description"}
-    )
-    assert allowed.status_code == 200
-    assert allowed.json()["system_prompt"] == ""
+    for payload in (
+        {"system_prompt": "override default behavior"},
+        {"description": "Updated description"},
+        {"name": "Renamed master"},
+        {"enabled": False},
+    ):
+        rejected = client.patch(f"/api/agents/{DEFAULT_AGENT_ID}", json=payload)
+        assert rejected.status_code == 409, rejected.text
 
     with database.SessionLocal() as db:
         default_agent_row = db.get(database.Agent, DEFAULT_AGENT_ID)
         assert default_agent_row is not None
+        default_agent_row.name = "legacy renamed coordinator"
+        default_agent_row.description = "legacy description"
         default_agent_row.system_prompt = "legacy override"
+        default_agent_row.workspace_id = None
+        default_agent_row.enabled = False
         db.commit()
     init_db()
     repaired_default = client.get(f"/api/agents/{DEFAULT_AGENT_ID}")
     assert repaired_default.status_code == 200
-    assert repaired_default.json()["system_prompt"] == ""
+    assert repaired_default.json()["name"] == DEFAULT_AGENT_NAME
+    assert repaired_default.json()["description"] == DEFAULT_AGENT_DESCRIPTION
+    assert repaired_default.json()["system_prompt"] == DEFAULT_AGENT_SYSTEM_PROMPT
+    assert repaired_default.json()["workspace_id"] == DEFAULT_WORKSPACE_ID
+    assert repaired_default.json()["enabled"] is True
 
     created = client.post("/api/sessions", json={})
     assert created.status_code == 201, created.text
@@ -235,6 +281,51 @@ def test_defaults_are_seeded_protected_and_used_for_new_sessions(client: TestCli
     assert body["thinking_level"] == "auto"
     assert body["context_tokens"] == 0
     assert body["last_compacted_at"] is None
+
+
+def test_sessions_always_use_the_fixed_coordinator(client: TestClient) -> None:
+    child = client.post("/api/agents", json={"name": "Specialist child"}).json()
+
+    created = client.post(
+        "/api/sessions",
+        json={"title": "Use a child", "agent_id": child["id"]},
+    )
+    assert created.status_code == 201, created.text
+    session = created.json()
+    assert session["agent_id"] == DEFAULT_AGENT_ID
+
+    patched = client.patch(f"/api/sessions/{session['id']}", json={"agent_id": child["id"]})
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["agent_id"] == DEFAULT_AGENT_ID
+
+    run = client.post(
+        "/api/runs",
+        json={"session_id": session["id"], "agent_id": child["id"]},
+    )
+    assert run.status_code == 201, run.text
+    assert run.json()["agent_id"] == DEFAULT_AGENT_ID
+
+
+def test_seed_migrates_legacy_session_binding_without_losing_messages(client: TestClient) -> None:
+    with database.SessionLocal() as db:
+        child = database.Agent(name="Legacy child")
+        db.add(child)
+        db.flush()
+        session = database.Session(title="Legacy conversation", agent_id=child.id)
+        db.add(session)
+        db.flush()
+        db.add(database.ChatMessage(session_id=session.id, role="user", content="keep this message"))
+        db.commit()
+        session_id = session.id
+
+    init_db()
+
+    with database.SessionLocal() as db:
+        session = db.get(database.Session, session_id)
+        assert session is not None
+        assert session.agent_id == DEFAULT_AGENT_ID
+        messages = db.query(database.ChatMessage).filter_by(session_id=session_id).all()
+        assert [message.content for message in messages] == ["keep this message"]
 
 
 def test_session_model_overrides_can_be_patched(client: TestClient) -> None:
