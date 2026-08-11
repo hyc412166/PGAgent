@@ -1,10 +1,12 @@
 import { draftSessionTitle } from './sessionNavigation'
-import type { ThinkingLevel } from './types'
+import type { PermissionMode, ThinkingLevel } from './types'
 
 export interface DraftLaunchSettings {
   model_connection_id: string | null
   model_id: string | null
   thinking_level: ThinkingLevel
+  skill_ids: string[]
+  permission_mode: PermissionMode
 }
 
 export interface DraftLaunchPayload {
@@ -15,6 +17,8 @@ export interface DraftLaunchPayload {
   model_connection_id?: string
   model_id?: string
   thinking_level: ThinkingLevel
+  skill_ids: string[]
+  permission_mode: PermissionMode
 }
 
 export function createDraftIdempotencyKey(randomId?: () => string): string {
@@ -40,5 +44,7 @@ export function buildDraftLaunchPayload(
     ...(settings.model_connection_id ? { model_connection_id: settings.model_connection_id } : {}),
     ...(settings.model_id ? { model_id: settings.model_id } : {}),
     thinking_level: settings.thinking_level,
+    skill_ids: [...new Set(settings.skill_ids)],
+    permission_mode: settings.permission_mode,
   }
 }

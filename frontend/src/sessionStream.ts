@@ -33,10 +33,17 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'model_step_started':
     case 'model_retry': return '思考中…'
     case 'assistant_delta': return '正在回复…'
-    case 'tool_started': return event.tool_name ? `正在调用 ${event.tool_name}…` : '正在调用工具…'
-    case 'tool_finished': return '正在读取工具结果…'
+    case 'tool_started':
+    case 'tool_call': return event.tool_name ? `正在调用 ${event.tool_name}…` : '正在调用工具…'
+    case 'tool_finished':
+    case 'tool_result': return '正在读取工具结果…'
     case 'approval_requested': return '等待你的审批'
     case 'approval_granted': return '审批已通过，继续处理…'
+    case 'delegated_child_awaiting_approval': return '子 Agent 正等待你的审批'
+    case 'delegated_child_completed': return '子 Agent 已返回结果'
+    case 'delegated_child_continuation_started': return '主 Agent 正在汇总子 Agent 结果…'
+    case 'delegated_child_stopped':
+    case 'delegated_child_failed': return '子 Agent 未完成'
     case 'run_completed':
     case 'completed': return '已完成'
     case 'run_stopped':
@@ -103,4 +110,10 @@ export function isCurrentSessionRun(
 
 export function shouldMarkApprovalResuming(status: string, liveRunId: string, approvalRunId: string): boolean {
   return status === 'awaiting_approval' && Boolean(approvalRunId) && liveRunId === approvalRunId
+}
+
+export function shouldRefreshConversationAfterApprovalDecision(decision: 'approve' | 'reject'): boolean {
+  // A rejected delegated child writes its terminal result directly into the
+  // current session.  Approval/runs alone are insufficient to render it.
+  return decision === 'reject'
 }

@@ -46,6 +46,7 @@ from app.services.run_service import (
     coordinator,
 )
 from app.services.run_stream import TERMINAL_EVENT_TYPES, run_stream_broker
+from app.services.skill_service import replace_session_skills, validate_skill_ids
 
 
 router = APIRouter(prefix="/api", tags=["runtime"])
@@ -112,6 +113,8 @@ def _draft_request_fingerprint(payload: DraftLaunchRequest, normalized_root: str
         "model_connection_id": payload.model_connection_id,
         "model_id": payload.model_id,
         "thinking_level": payload.thinking_level,
+        "permission_mode": payload.permission_mode,
+        "skill_ids": sorted({skill_id.strip() for skill_id in payload.skill_ids}),
     }
     encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -207,6 +210,9 @@ async def launch_draft(
                 raise HTTPException(status_code=409, detail="Selected model connection does not exist")
             if not connection.enabled:
                 raise HTTPException(status_code=409, detail="Selected model connection is disabled")
+        # Validate before any workspace/session/message/run row is staged so
+        # an invalid or disabled Skill leaves an unsent draft fully ephemeral.
+        skill_ids = validate_skill_ids(db, payload.skill_ids)
 
         if normalized_root is None:
             workspace = db.get(Workspace, DEFAULT_WORKSPACE_ID)
@@ -231,10 +237,12 @@ async def launch_draft(
             model_connection_id=payload.model_connection_id,
             model_id=payload.model_id,
             thinking_level=payload.thinking_level,
+            permission_mode=payload.permission_mode,
             status="active",
         )
         db.add(chat_session)
         db.flush()
+        replace_session_skills(db, chat_session, skill_ids)
         message = ChatMessage(
             session_id=chat_session.id,
             role="user",
@@ -440,6 +448,7 @@ async def decide_and_resume(
     original_approval_reason = approval.reason
     decided_at = datetime.now(timezone.utc)
     approval_status = "approved" if payload.decision == "approve" else "rejected"
+    parent_bridge_event: dict[str, object] | None = None
     approval_update = db.execute(
         update(Approval)
         .where(Approval.id == approval.id, Approval.status == "pending")
@@ -465,6 +474,19 @@ async def decide_and_resume(
     if run_update.rowcount != 1:
         db.rollback()
         raise HTTPException(status_code=409, detail="运行状态已变更，未执行审批决定")
+    if payload.decision == "reject":
+        # A delegated child is linked to the parent session for approval
+        # visibility.  Rejection must settle the child task in this same
+        # transaction; otherwise the task board would remain falsely active.
+        db.refresh(run)
+        parent_bridge_event = coordinator.reconcile_delegated_child_terminal(
+            db,
+            run,
+            status="stopped",
+            stop_reason="approval_rejected",
+            error=payload.reason or "Child approval was rejected",
+            error_code="approval_rejected",
+        )
     db.commit()
     approval = db.get(Approval, approval_id)
     if approval is None:
@@ -489,4 +511,7 @@ async def decide_and_resume(
             "code": "approval_rejected",
             "reason": payload.reason or "approval rejected",
         })
+        if parent_bridge_event is not None and parent_bridge_event.get("parent_run_id"):
+            run_stream_broker.publish(str(parent_bridge_event["parent_run_id"]), parent_bridge_event)
+        coordinator.launch_parent_continuation_if_queued(parent_bridge_event)
     return approval

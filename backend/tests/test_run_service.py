@@ -324,9 +324,11 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
     assert context["model_connection_id"] == connection_id
     assert context["provider"].model_id == "fallback-model"
     # Conversations run through the fixed PGAgent coordinator. A user-created
-    # child profile can no longer override its model/thinking configuration.
+    # child profile can no longer override its model/thinking configuration;
+    # it is only surfaced as safe capability metadata for the task tool.
     assert context["provider"].thinking_level == "low"
-    assert context["agent_instructions"] == ""
+    assert agent.id in context["agent_instructions"]
+    assert "Builder" in context["agent_instructions"]
 
     binding = dict(context["runtime_binding"])
     with database.SessionLocal() as db:

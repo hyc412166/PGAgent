@@ -11,6 +11,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Sequence
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .context import ContextManager
@@ -31,6 +32,84 @@ USAGE_COUNTER_KEYS = (
     "cache_read_tokens",
     "total_tokens",
 )
+
+
+_SECRET_ARGUMENT_MARKERS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "token",
+    "secret",
+    "password",
+    "cookie",
+    "content",
+    "old_string",
+    "new_string",
+)
+
+
+def safe_tool_argument_summary(tool_name: str, arguments: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Build timeline-safe tool metadata without persisting private payloads.
+
+    Tool arguments often contain an entire file body, command source code, or
+    a URL query with a credential.  Timeline/SSE events intentionally receive
+    only a short structural summary so the UI can show activity without
+    turning the event log into a second secret store.
+    """
+
+    source = dict(arguments or {})
+    summary: dict[str, Any] = {}
+    for raw_key, value in source.items():
+        key = str(raw_key)
+        lowered = key.casefold()
+        if any(marker in lowered for marker in _SECRET_ARGUMENT_MARKERS):
+            summary[key] = "[redacted]"
+            continue
+        if key == "command":
+            if isinstance(value, list) and value:
+                summary[key] = {"executable": str(value[0])[:120], "argument_count": max(0, len(value) - 1)}
+            elif isinstance(value, str):
+                summary[key] = {"provided": True, "chars": len(value)}
+            else:
+                summary[key] = {"provided": bool(value)}
+            continue
+        if key == "url" and isinstance(value, str):
+            try:
+                parsed = urlsplit(value)
+                summary[key] = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"[:300]
+            except ValueError:
+                summary[key] = {"provided": True, "chars": len(value)}
+            continue
+        if key == "todos" and isinstance(value, list):
+            summary[key] = {"count": len(value)}
+            continue
+        if isinstance(value, str):
+            # ``query`` and regular expressions can also contain private data;
+            # activity needs the fact and size, not their literal text.
+            summary[key] = {"chars": len(value)} if key in {"query", "pattern", "question", "task"} else value[:300]
+        elif isinstance(value, (int, float, bool)) or value is None:
+            summary[key] = value
+        elif isinstance(value, (list, tuple, set)):
+            summary[key] = {"count": len(value)}
+        elif isinstance(value, Mapping):
+            summary[key] = {"keys": sorted(str(item) for item in value)[:20]}
+        else:
+            summary[key] = {"type": type(value).__name__}
+    # ``tool_name`` is emitted as a top-level event field by the caller; keep
+    # this helper limited to the non-sensitive argument summary.
+    return {"arguments": summary}
+
+
+def safe_approval_request_summary(pending: Mapping[str, Any]) -> dict[str, Any]:
+    """Redact an approval event while the durable Approval keeps its exact call."""
+
+    tool_name = str(pending.get("tool_name") or "unknown")
+    return {
+        "id": str(pending.get("id") or ""),
+        "tool_name": tool_name,
+        **safe_tool_argument_summary(tool_name, pending.get("arguments") if isinstance(pending.get("arguments"), Mapping) else {}),
+        "remaining_call_count": len(pending.get("remaining_calls") or []),
+    }
 
 
 def empty_usage(
@@ -378,6 +457,9 @@ class AgentRuntime:
             instructions = context.get("agent_instructions")
             auto_rule = "根据任务复杂度自行决定是否先在内部规划；简单任务可直接执行。"
             instructions = f"{instructions}\n{auto_rule}" if instructions else auto_rule
+            skill_catalog = self.tool_registry.skill_catalog_prompt
+            if skill_catalog:
+                instructions = f"{instructions}\n{skill_catalog}"
             bundle = self.context_manager.build(
                 system_prompt=context["system_prompt"],
                 agent_instructions=instructions,
@@ -412,7 +494,14 @@ class AgentRuntime:
                 stopped["events"] = await self._publish(stopped, "run_stopped", code=step_decision.code, reason=step_decision.reason)
                 return stopped
 
-            events = await self._publish(state, "model_step_started", step=guard.steps)
+            thought_started_at = self.clock()
+            events = await self._publish(
+                state,
+                "model_step_started",
+                step=guard.steps,
+                elapsed_ms=round((thought_started_at - active_started_at) * 1000),
+                monotonic_ms=round(thought_started_at * 1000),
+            )
             state = {**state, "events": events}
 
             trimmed_messages, omitted = self.context_manager.trim_runtime_messages(state.get("messages", []))
@@ -431,7 +520,7 @@ class AgentRuntime:
                     attempt=attempt,
                     delay_seconds=round(delay, 3),
                     error_kind=kind.value,
-                    error=str(error),
+                    error_type=type(error).__name__,
                 )
 
             try:
@@ -513,7 +602,12 @@ class AgentRuntime:
                 return stopped
             except Exception as exc:
                 failed = {**state, "status": "failed", "error": str(exc)}
-                failed["events"] = await self._publish(failed, "model_failed", error=str(exc))
+                failed["events"] = await self._publish(
+                    failed,
+                    "model_failed",
+                    error_type=type(exc).__name__,
+                    elapsed_ms=round((self.clock() - active_started_at) * 1000),
+                )
                 return failed
 
             state = {**state, "usage": merge_usage(state.get("usage"), turn.usage)}
@@ -543,8 +637,11 @@ class AgentRuntime:
                 completed["events"] = await self._publish(
                     completed,
                     "run_completed",
-                    output=turn.content,
                     usage=completed["usage"],
+                    has_output=bool(turn.content),
+                    output_chars=len(turn.content),
+                    elapsed_ms=round((self.clock() - active_started_at) * 1000),
+                    thought_duration_ms=round((self.clock() - thought_started_at) * 1000),
                 )
                 return completed
 
@@ -568,10 +665,38 @@ class AgentRuntime:
                     stopped["events"] = await self._publish(stopped, "run_stopped", code=call_decision.code, reason=call_decision.reason)
                     return stopped
 
+                tool_started_at = self.clock()
+                state["events"] = await self._publish(
+                    {**state, "messages": messages},
+                    "tool_started",
+                    tool_name=call.name,
+                    tool_call_id=call.id,
+                    **safe_tool_argument_summary(call.name, call.arguments),
+                    elapsed_ms=round((tool_started_at - active_started_at) * 1000),
+                    thought_duration_ms=round((tool_started_at - thought_started_at) * 1000),
+                )
+
                 # Approval is never inferred from a model-controlled call id. The
                 # only grant path is resume_after_approval's persisted exact call.
-                result = self.tool_registry.execute(call.name, call.arguments, approved=False)
+                result = await self.tool_registry.execute_async(
+                    call.name,
+                    call.arguments,
+                    approved=False,
+                    call_id=call.id,
+                )
                 if result.approval_required:
+                    state["events"] = await self._publish(
+                        {**state, "messages": messages},
+                        "tool_finished",
+                        tool_name=call.name,
+                        tool_call_id=call.id,
+                        ok=False,
+                        changed=False,
+                        error_code=result.error_code,
+                        pending_approval=True,
+                        duration_ms=round((self.clock() - tool_started_at) * 1000),
+                        elapsed_ms=round((self.clock() - active_started_at) * 1000),
+                    )
                     if result.approval_request is not None:
                         result.approval_request.id = call.id
                     pending = result.approval_request.to_dict() if result.approval_request else {
@@ -591,7 +716,11 @@ class AgentRuntime:
                         "messages": messages,
                         "pending_approval": pending,
                     }
-                    waiting["events"] = await self._publish(waiting, "approval_requested", request=pending)
+                    waiting["events"] = await self._publish(
+                        waiting,
+                        "approval_requested",
+                        request=safe_approval_request_summary(pending),
+                    )
                     time_decision = self._run_time_decision(active_elapsed_base, active_started_at)
                     if time_decision.stop:
                         stopped = self._stop_state(waiting, time_decision)
@@ -630,7 +759,56 @@ class AgentRuntime:
                     ok=result.ok,
                     changed=result.changed,
                     error_code=result.error_code,
+                    duration_ms=round((self.clock() - tool_started_at) * 1000),
+                    elapsed_ms=round((self.clock() - active_started_at) * 1000),
                 )
+                if result.metadata.get("delegated_child_awaiting_approval"):
+                    child_run_id = str(result.metadata.get("child_run_id") or "")
+                    task_id = str(result.metadata.get("task_id") or "")
+                    reason = "A delegated child run is awaiting user approval."
+                    stopped = {
+                        **state,
+                        "status": "stopped",
+                        "messages": messages,
+                        "stop_reason": "delegated_child_awaiting_approval",
+                        "error": reason,
+                    }
+                    stopped["events"] = await self._publish(
+                        stopped,
+                        "run_stopped",
+                        code="delegated_child_awaiting_approval",
+                        reason=reason,
+                        child_run_id=child_run_id,
+                        task_id=task_id,
+                        elapsed_ms=round((self.clock() - active_started_at) * 1000),
+                    )
+                    return stopped
+                if result.metadata.get("needs_user_input"):
+                    question = str(result.metadata.get("question") or result.content).strip()
+                    asking = {**state, "messages": messages, "events": state.get("events", [])}
+                    asking["events"] = await self._publish(
+                        asking,
+                        "user_question_requested",
+                        tool_name=call.name,
+                        tool_call_id=call.id,
+                        question_chars=len(question),
+                        requires_next_message=True,
+                        elapsed_ms=round((self.clock() - active_started_at) * 1000),
+                    )
+                    completed = {
+                        **asking,
+                        "status": "completed",
+                        "output": f"我需要先确认：{question}",
+                    }
+                    completed["events"] = await self._publish(
+                        completed,
+                        "run_completed",
+                        usage=completed.get("usage", empty_usage()),
+                        has_output=bool(completed["output"]),
+                        output_chars=len(str(completed["output"])),
+                        elapsed_ms=round((self.clock() - active_started_at) * 1000),
+                    )
+                    return completed
                 time_decision = self._run_time_decision(active_elapsed_base, active_started_at)
                 if time_decision.stop:
                     stopped = self._stop_state({**state, "messages": messages}, time_decision)
@@ -725,6 +903,9 @@ class AgentRuntime:
         if not call_id or not tool_name:
             raise ValueError("审批请求缺少 id 或 tool_name")
 
+        def elapsed_ms() -> int:
+            return round((active_elapsed_base + max(0.0, self.clock() - active_started_at)) * 1000)
+
         restored = LoopGuard(
             max_steps=self.config.max_steps,
             max_calls=self.config.max_tool_calls,
@@ -765,12 +946,33 @@ class AgentRuntime:
         timed_out = await timeout_outcome(list(prior.events), list(prior.messages))
         if timed_out is not None:
             return timed_out
-        events = await self._publish(resume_state, "approval_granted", request_id=call_id, tool_name=tool_name)
+        events = await self._publish(
+            resume_state,
+            "approval_granted",
+            request_id=call_id,
+            tool_name=tool_name,
+            elapsed_ms=elapsed_ms(),
+        )
         resume_state["events"] = events
         timed_out = await timeout_outcome(events, list(prior.messages))
         if timed_out is not None:
             return timed_out
-        result = self.tool_registry.execute(tool_name, arguments, approved=True)
+        tool_started_at = self.clock()
+        events = await self._publish(
+            {"events": events},
+            "tool_started",
+            tool_name=tool_name,
+            tool_call_id=call_id,
+            resumed_after_approval=True,
+            **safe_tool_argument_summary(tool_name, arguments),
+            elapsed_ms=elapsed_ms(),
+        )
+        result = await self.tool_registry.execute_async(
+            tool_name,
+            arguments,
+            approved=True,
+            call_id=call_id,
+        )
         messages = [*prior.messages, {
             "role": "tool",
             "tool_call_id": call_id,
@@ -778,14 +980,43 @@ class AgentRuntime:
             "content": json.dumps(result.to_dict(), ensure_ascii=False),
         }]
         events = await self._publish(
-            resume_state,
+            {"events": events},
             "tool_finished",
             tool_name=tool_name,
             tool_call_id=call_id,
             ok=result.ok,
             changed=result.changed,
             error_code=result.error_code,
+            duration_ms=round((self.clock() - tool_started_at) * 1000),
+            elapsed_ms=elapsed_ms(),
         )
+        if result.metadata.get("delegated_child_awaiting_approval"):
+            child_run_id = str(result.metadata.get("child_run_id") or "")
+            task_id = str(result.metadata.get("task_id") or "")
+            reason = "A delegated child run is awaiting user approval."
+            events = await self._publish(
+                {"events": events},
+                "run_stopped",
+                code="delegated_child_awaiting_approval",
+                reason=reason,
+                child_run_id=child_run_id,
+                task_id=task_id,
+                elapsed_ms=elapsed_ms(),
+            )
+            return RunOutcome(
+                status="stopped",
+                output=None,
+                messages=messages,
+                events=events,
+                steps=restored.steps,
+                tool_calls=restored.calls,
+                mode=prior.mode,
+                stop_reason="delegated_child_awaiting_approval",
+                error=reason,
+                guard_snapshot=restored.snapshot(),
+                usage=normalize_usage(prior.usage),
+                active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
+            )
         timed_out = await timeout_outcome(events, messages)
         if timed_out is not None:
             return timed_out
@@ -833,8 +1064,34 @@ class AgentRuntime:
                     active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
                 )
 
-            remaining_result = self.tool_registry.execute(call.name, call.arguments, approved=False)
+            tool_started_at = self.clock()
+            events = await self._publish(
+                {"events": events},
+                "tool_started",
+                tool_name=call.name,
+                tool_call_id=call.id,
+                **safe_tool_argument_summary(call.name, call.arguments),
+                elapsed_ms=elapsed_ms(),
+            )
+            remaining_result = await self.tool_registry.execute_async(
+                call.name,
+                call.arguments,
+                approved=False,
+                call_id=call.id,
+            )
             if remaining_result.approval_required:
+                events = await self._publish(
+                    {"events": events},
+                    "tool_finished",
+                    tool_name=call.name,
+                    tool_call_id=call.id,
+                    ok=False,
+                    changed=False,
+                    error_code=remaining_result.error_code,
+                    pending_approval=True,
+                    duration_ms=round((self.clock() - tool_started_at) * 1000),
+                    elapsed_ms=elapsed_ms(),
+                )
                 if remaining_result.approval_request is not None:
                     remaining_result.approval_request.id = call.id
                     next_pending = remaining_result.approval_request.to_dict()
@@ -847,7 +1104,11 @@ class AgentRuntime:
                 next_pending["batch_made_progress"] = made_progress
                 next_pending["seen_observations"] = seen[-observation_limit:]
                 state = {"events": events}
-                events = await self._publish(state, "approval_requested", request=next_pending)
+                events = await self._publish(
+                    state,
+                    "approval_requested",
+                    request=safe_approval_request_summary(next_pending),
+                )
                 timed_out = await timeout_outcome(events, messages)
                 if timed_out is not None:
                     return timed_out
@@ -886,7 +1147,68 @@ class AgentRuntime:
                 ok=remaining_result.ok,
                 changed=remaining_result.changed,
                 error_code=remaining_result.error_code,
+                duration_ms=round((self.clock() - tool_started_at) * 1000),
+                elapsed_ms=elapsed_ms(),
             )
+            if remaining_result.metadata.get("delegated_child_awaiting_approval"):
+                child_run_id = str(remaining_result.metadata.get("child_run_id") or "")
+                task_id = str(remaining_result.metadata.get("task_id") or "")
+                reason = "A delegated child run is awaiting user approval."
+                events = await self._publish(
+                    {"events": events},
+                    "run_stopped",
+                    code="delegated_child_awaiting_approval",
+                    reason=reason,
+                    child_run_id=child_run_id,
+                    task_id=task_id,
+                    elapsed_ms=elapsed_ms(),
+                )
+                return RunOutcome(
+                    status="stopped",
+                    output=None,
+                    messages=messages,
+                    events=events,
+                    steps=restored.steps,
+                    tool_calls=restored.calls,
+                    mode=prior.mode,
+                    stop_reason="delegated_child_awaiting_approval",
+                    error=reason,
+                    guard_snapshot=restored.snapshot(),
+                    usage=normalize_usage(prior.usage),
+                    active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
+                )
+            if remaining_result.metadata.get("needs_user_input"):
+                question = str(remaining_result.metadata.get("question") or remaining_result.content).strip()
+                events = await self._publish(
+                    {"events": events},
+                    "user_question_requested",
+                    tool_name=call.name,
+                    tool_call_id=call.id,
+                    question_chars=len(question),
+                    requires_next_message=True,
+                    elapsed_ms=elapsed_ms(),
+                )
+                output = f"我需要先确认：{question}"
+                events = await self._publish(
+                    {"events": events},
+                    "run_completed",
+                    usage=normalize_usage(prior.usage),
+                    has_output=bool(output),
+                    output_chars=len(output),
+                    elapsed_ms=elapsed_ms(),
+                )
+                return RunOutcome(
+                    status="completed",
+                    output=output,
+                    messages=messages,
+                    events=events,
+                    steps=restored.steps,
+                    tool_calls=restored.calls,
+                    mode=prior.mode,
+                    guard_snapshot=restored.snapshot(),
+                    usage=normalize_usage(prior.usage),
+                    active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
+                )
             timed_out = await timeout_outcome(events, messages)
             if timed_out is not None:
                 return timed_out
@@ -923,5 +1245,186 @@ class AgentRuntime:
             guard_snapshot=restored.snapshot(),
             prior_usage=prior.usage,
             prior_seen_observations=seen,
+            prior_active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
+        )
+
+    @staticmethod
+    def _delegated_task_call_from_messages(
+        messages: Sequence[Mapping[str, Any]],
+    ) -> tuple[int, str, dict[str, Any]]:
+        """Locate the exact parent ``task`` call that paused for a child.
+
+        A parent pause is persisted after its task tool returned the child's
+        ``awaiting_approval`` payload.  When that child is terminal, the
+        idempotent delegate can safely replace this *same* tool observation
+        with the stored terminal payload.  Looking up both the tool result and
+        the preceding assistant call prevents inventing arguments or replaying
+        a different task from a later model turn.
+        """
+
+        for tool_index in range(len(messages) - 1, -1, -1):
+            tool_message = messages[tool_index]
+            if tool_message.get("role") != "tool" or tool_message.get("name") != "task":
+                continue
+            call_id = str(tool_message.get("tool_call_id") or "").strip()
+            if not call_id:
+                continue
+            for assistant_index in range(tool_index - 1, -1, -1):
+                assistant_message = messages[assistant_index]
+                if assistant_message.get("role") != "assistant":
+                    continue
+                for raw_call in assistant_message.get("tool_calls") or []:
+                    if not isinstance(raw_call, Mapping):
+                        continue
+                    function = raw_call.get("function")
+                    if not isinstance(function, Mapping):
+                        continue
+                    if str(raw_call.get("id") or "") != call_id or function.get("name") != "task":
+                        continue
+                    raw_arguments = function.get("arguments") or {}
+                    if isinstance(raw_arguments, str):
+                        try:
+                            raw_arguments = json.loads(raw_arguments)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError("delegated task arguments are not valid JSON") from exc
+                    if not isinstance(raw_arguments, Mapping):
+                        raise ValueError("delegated task arguments must be an object")
+                    return tool_index, call_id, dict(raw_arguments)
+            raise ValueError("delegated task call has no matching assistant tool call")
+        raise ValueError("delegated child pause has no task tool result")
+
+    async def resume_after_delegated_child(
+        self,
+        prior: RunOutcome,
+        *,
+        thread_id: str | None = None,
+    ) -> RunOutcome:
+        """Continue a parent after a delegated child reaches a terminal state.
+
+        This is deliberately separate from :meth:`resume_after_approval`:
+        the parent was not awaiting a user decision.  It reuses only the
+        persisted idempotency key for the original ``task`` tool call, then
+        lets the real parent model inspect that terminal child payload and
+        decide whether to finish or take another safe step.
+        """
+
+        if (
+            prior.status != "stopped"
+            or prior.stop_reason != "delegated_child_awaiting_approval"
+        ):
+            raise ValueError("only a parent stopped for a delegated child can continue")
+        if self.config.max_run_seconds is not None and self.config.max_run_seconds < 0:
+            raise ValueError("max_run_seconds must be non-negative")
+        if self.config.observation_history_limit < 1:
+            raise ValueError("observation_history_limit must be positive")
+
+        tool_index, call_id, arguments = self._delegated_task_call_from_messages(prior.messages)
+        active_started_at = self.clock()
+        active_elapsed_base = max(0.0, float(prior.active_elapsed_seconds or 0.0))
+        restored = LoopGuard(
+            max_steps=self.config.max_steps,
+            max_calls=self.config.max_tool_calls,
+            identical_limit=self.config.identical_call_limit,
+            no_progress_limit=self.config.no_progress_limit,
+        )
+        restored.restore(prior.guard_snapshot)
+
+        def elapsed_ms() -> int:
+            return round((active_elapsed_base + max(0.0, self.clock() - active_started_at)) * 1000)
+
+        time_decision = self._run_time_decision(active_elapsed_base, active_started_at)
+        if time_decision.stop:
+            events = await self._publish(
+                {"events": list(prior.events)},
+                "run_stopped",
+                code=time_decision.code,
+                reason=time_decision.reason,
+            )
+            return RunOutcome(
+                status="stopped",
+                output=None,
+                messages=list(prior.messages),
+                events=events,
+                steps=restored.steps,
+                tool_calls=restored.calls,
+                mode=prior.mode,
+                stop_reason=time_decision.code,
+                error=time_decision.reason,
+                guard_snapshot=restored.snapshot(),
+                usage=normalize_usage(prior.usage),
+                active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
+            )
+
+        events = await self._publish(
+            {"events": list(prior.events)},
+            "delegated_child_continuation_started",
+            tool_name="task",
+            tool_call_id=call_id,
+            elapsed_ms=elapsed_ms(),
+        )
+        tool_started_at = self.clock()
+        # ``approved=True`` is safe here: it does not start new work.  The
+        # exact parent task was already approval-gated before the child was
+        # dispatched, and the delegate now returns its persisted terminal row
+        # by that same call id.
+        result = await self.tool_registry.execute_async(
+            "task",
+            arguments,
+            approved=True,
+            call_id=call_id,
+        )
+        events = await self._publish(
+            {"events": events},
+            "tool_finished",
+            tool_name="task",
+            tool_call_id=call_id,
+            ok=result.ok,
+            changed=result.changed,
+            error_code=result.error_code,
+            resumed_after_delegated_child=True,
+            duration_ms=round((self.clock() - tool_started_at) * 1000),
+            elapsed_ms=elapsed_ms(),
+        )
+        messages = [dict(message) for message in prior.messages]
+        messages[tool_index] = {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": "task",
+            "content": json.dumps(result.to_dict(), ensure_ascii=False),
+        }
+        if result.metadata.get("delegated_child_awaiting_approval"):
+            reason = "The delegated child is still awaiting user approval."
+            events = await self._publish(
+                {"events": events},
+                "run_stopped",
+                code="delegated_child_awaiting_approval",
+                reason=reason,
+                child_run_id=str(result.metadata.get("child_run_id") or ""),
+                task_id=str(result.metadata.get("task_id") or ""),
+                elapsed_ms=elapsed_ms(),
+            )
+            return RunOutcome(
+                status="stopped",
+                output=None,
+                messages=messages,
+                events=events,
+                steps=restored.steps,
+                tool_calls=restored.calls,
+                mode=prior.mode,
+                stop_reason="delegated_child_awaiting_approval",
+                error=reason,
+                guard_snapshot=restored.snapshot(),
+                usage=normalize_usage(prior.usage),
+                active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
+            )
+        return await self.run(
+            system_prompt="",
+            recent_messages=[],
+            mode=prior.mode,
+            thread_id=thread_id,
+            prepared_messages=messages,
+            prior_events=events,
+            guard_snapshot=restored.snapshot(),
+            prior_usage=prior.usage,
             prior_active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
         )

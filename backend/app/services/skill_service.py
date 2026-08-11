@@ -1,0 +1,633 @@
+"""Safe persistence and transport helpers for PGAgent Skills and capabilities.
+
+This module deliberately never imports or executes a file from an installed
+Skill.  A Skill is configuration and copied source material until a later
+runtime integration explicitly supports it.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import tempfile
+import uuid
+import zipfile
+from io import BytesIO
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any
+from urllib.parse import quote, urlparse
+
+import httpx
+from fastapi import HTTPException, status
+from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
+
+from app.capabilities import BUILTIN_TOOL_BY_ID, BUILTIN_TOOL_CATALOG
+from app.config import settings
+from app.database import Agent, AgentSkill, AgentTool, Session as ChatSession, SessionSkill, Skill
+
+
+MAX_SKILL_FILES = 200
+MAX_SKILL_FILE_BYTES = 2 * 1024 * 1024
+MAX_SKILL_TOTAL_BYTES = 10 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 20 * 1024 * 1024
+MAX_ARCHIVE_FILES = 5_000
+MAX_ARCHIVE_EXPANDED_BYTES = 50 * 1024 * 1024
+SKILLS_SH_BASE_URL = "https://skills.sh"
+GITHUB_ALLOWED_HOSTS = frozenset({"github.com", "api.github.com", "codeload.github.com"})
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+_SAFE_GITHUB_PART_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+@dataclass(frozen=True, slots=True)
+class SkillManifest:
+    slug: str
+    name: str
+    description: str
+    version: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SkillPreview:
+    source_url: str
+    candidates: tuple[str, ...]
+    files: tuple[tuple[str, int], ...]
+    selected_root: Path | None
+
+
+def tool_catalog_payload() -> list[dict[str, Any]]:
+    """Return the static tool catalog in the public API shape."""
+
+    return [
+        {
+            "id": item.id,
+            "name": item.name,
+            "label": item.label,
+            "description": item.description,
+            "category": item.category,
+            "risk_level": item.risk_level,
+            "enabled": item.enabled,
+            "is_builtin": True,
+            "availability": item.availability,
+            "runtime_tool_id": item.runtime_tool_id,
+            "requires_approval": item.requires_approval,
+        }
+        for item in BUILTIN_TOOL_CATALOG
+    ]
+
+
+def _normalized_ids(values: Iterable[str] | None, *, label: str) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        normalized = str(value).strip()
+        if not normalized:
+            raise HTTPException(status_code=422, detail=f"{label} must not contain blank values")
+        if normalized not in seen:
+            result.append(normalized)
+            seen.add(normalized)
+    return result
+
+
+def validate_tool_ids(tool_ids: Iterable[str] | None) -> list[str]:
+    normalized = _normalized_ids(tool_ids, label="tool_ids")
+    unknown = [tool_id for tool_id in normalized if tool_id not in BUILTIN_TOOL_BY_ID]
+    if unknown:
+        raise HTTPException(status_code=422, detail={"unknown_tool_ids": unknown})
+    return normalized
+
+
+def validate_skill_ids(db: Session, skill_ids: Iterable[str] | None) -> list[str]:
+    normalized = _normalized_ids(skill_ids, label="skill_ids")
+    if not normalized:
+        return []
+    rows = list(db.scalars(select(Skill).where(Skill.id.in_(normalized))))
+    by_id = {row.id: row for row in rows}
+    missing = [skill_id for skill_id in normalized if skill_id not in by_id]
+    if missing:
+        raise HTTPException(status_code=422, detail={"unknown_skill_ids": missing})
+    disabled = [skill_id for skill_id in normalized if not by_id[skill_id].enabled]
+    if disabled:
+        raise HTTPException(status_code=409, detail={"disabled_skill_ids": disabled})
+    return normalized
+
+
+def replace_agent_capabilities(
+    db: Session,
+    agent: Agent,
+    *,
+    tool_ids: Iterable[str] | None = None,
+    skill_ids: Iterable[str] | None = None,
+    replace_tools: bool = False,
+    replace_skills: bool = False,
+) -> None:
+    """Replace explicit relations only when the matching field was supplied."""
+
+    if replace_tools:
+        normalized_tools = validate_tool_ids(tool_ids)
+        db.execute(delete(AgentTool).where(AgentTool.agent_id == agent.id))
+        db.add_all(AgentTool(agent_id=agent.id, tool_id=tool_id) for tool_id in normalized_tools)
+    if replace_skills:
+        normalized_skills = validate_skill_ids(db, skill_ids)
+        db.execute(delete(AgentSkill).where(AgentSkill.agent_id == agent.id))
+        db.add_all(AgentSkill(agent_id=agent.id, skill_id=skill_id) for skill_id in normalized_skills)
+
+
+def replace_session_skills(
+    db: Session,
+    chat_session: ChatSession,
+    skill_ids: Iterable[str] | None,
+) -> None:
+    normalized_skills = validate_skill_ids(db, skill_ids)
+    db.execute(delete(SessionSkill).where(SessionSkill.session_id == chat_session.id))
+    db.add_all(SessionSkill(session_id=chat_session.id, skill_id=skill_id) for skill_id in normalized_skills)
+
+
+def _skills_root() -> Path:
+    return settings.data_dir / "skills"
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _safe_slug(value: str) -> str:
+    slug = _SLUG_RE.sub("-", value.strip().lower()).strip("-")
+    slug = slug[:100].strip("-")
+    if not slug:
+        raise HTTPException(status_code=422, detail="Skill name cannot produce a safe slug")
+    return slug
+
+
+def _strip_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1].strip()
+    return value
+
+
+def parse_skill_manifest(skill_file: Path, *, fallback_name: str) -> SkillManifest:
+    """Extract conservative metadata without evaluating YAML or markdown code."""
+
+    try:
+        text = skill_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail="SKILL.md must be UTF-8 text") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail=f"Cannot read SKILL.md: {exc}") from exc
+
+    lines = text.splitlines()
+    frontmatter: dict[str, str] = {}
+    body_start = 0
+    if lines and lines[0].strip() == "---":
+        closing = next((index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"), None)
+        if closing is None:
+            raise HTTPException(status_code=422, detail="SKILL.md frontmatter is not closed")
+        for line in lines[1:closing]:
+            key, separator, value = line.partition(":")
+            if separator and key.strip().lower() in {"name", "description", "version"}:
+                frontmatter[key.strip().lower()] = _strip_quotes(value)
+        body_start = closing + 1
+
+    heading = next((line[2:].strip() for line in lines[body_start:] if line.startswith("# ") and line[2:].strip()), "")
+    description = frontmatter.get("description", "").strip()
+    if not description:
+        description = next(
+            (
+                line.strip()
+                for line in lines[body_start:]
+                if line.strip() and not line.lstrip().startswith("#") and not line.lstrip().startswith("```")
+            ),
+            "",
+        )
+    name = frontmatter.get("name", "").strip() or heading or fallback_name
+    return SkillManifest(
+        slug=_safe_slug(frontmatter.get("name", "") or fallback_name),
+        name=name[:160],
+        description=description[:10_000],
+        version=(frontmatter.get("version") or "").strip()[:80] or None,
+    )
+
+
+def _collect_safe_files(source_root: Path) -> list[tuple[Path, Path, int]]:
+    source_root = source_root.resolve(strict=True)
+    if not source_root.is_dir():
+        raise HTTPException(status_code=422, detail="Skill source must be a directory")
+    if (source_root / "SKILL.md").is_symlink() or not (source_root / "SKILL.md").is_file():
+        raise HTTPException(status_code=422, detail="Skill source must contain a regular SKILL.md file")
+
+    files: list[tuple[Path, Path, int]] = []
+    total = 0
+    for candidate in sorted(source_root.rglob("*")):
+        relative = candidate.relative_to(source_root)
+        if ".git" in relative.parts:
+            continue
+        if candidate.is_symlink() or not _is_within(candidate.resolve(), source_root):
+            raise HTTPException(status_code=422, detail=f"Skill source contains an unsafe link: {relative.as_posix()}")
+        if candidate.is_dir():
+            continue
+        if not candidate.is_file():
+            raise HTTPException(status_code=422, detail=f"Skill source contains an unsupported entry: {relative.as_posix()}")
+        size = candidate.stat().st_size
+        if size > MAX_SKILL_FILE_BYTES:
+            raise HTTPException(status_code=413, detail=f"Skill file is too large: {relative.as_posix()}")
+        total += size
+        if total > MAX_SKILL_TOTAL_BYTES:
+            raise HTTPException(status_code=413, detail="Skill package is too large")
+        files.append((candidate, relative, size))
+        if len(files) > MAX_SKILL_FILES:
+            raise HTTPException(status_code=413, detail="Skill package has too many files")
+    return files
+
+
+def _copy_skill_directory(source_root: Path, destination_root: Path) -> list[tuple[Path, Path, int]]:
+    files = _collect_safe_files(source_root)
+    destination_root.mkdir(parents=True, exist_ok=False)
+    for source, relative, _size in files:
+        destination = destination_root / relative
+        if not _is_within(destination.resolve(strict=False), destination_root.resolve()):
+            raise HTTPException(status_code=422, detail="Skill contains an unsafe destination path")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    return files
+
+
+def install_local_skill(
+    db: Session,
+    source_path: str | Path,
+    *,
+    source: str = "local",
+    source_url: str | None = None,
+    preferred_slug: str | None = None,
+) -> Skill:
+    """Copy one verified local Skill package into PGAgent-managed storage."""
+
+    raw_source = Path(source_path).expanduser()
+    try:
+        source_root = raw_source.resolve(strict=True)
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail=f"Skill source path is unavailable: {exc}") from exc
+    if not source_root.is_dir():
+        raise HTTPException(status_code=422, detail="Skill source must be a directory")
+    manifest = parse_skill_manifest(source_root / "SKILL.md", fallback_name=source_root.name)
+    slug = _safe_slug(preferred_slug) if preferred_slug else manifest.slug
+    existing = db.scalar(select(Skill).where(Skill.slug == slug))
+    if existing is not None:
+        raise HTTPException(status_code=409, detail=f"A Skill with slug '{slug}' is already installed")
+
+    managed_root = _skills_root().resolve()
+    managed_root.mkdir(parents=True, exist_ok=True)
+    destination = managed_root / slug
+    if destination.exists():
+        raise HTTPException(status_code=409, detail=f"Managed Skill directory '{slug}' already exists")
+    staging = managed_root / f".{slug}.{uuid.uuid4().hex}.staging"
+    try:
+        _copy_skill_directory(source_root, staging)
+        staging.replace(destination)
+        item = Skill(
+            slug=slug,
+            name=manifest.name,
+            description=manifest.description,
+            source=source,
+            source_url=source_url,
+            root_path=str(destination),
+            version=manifest.version,
+            enabled=True,
+        )
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+        return item
+    except HTTPException:
+        db.rollback()
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+    except Exception:
+        db.rollback()
+        if staging.exists():
+            shutil.rmtree(staging)
+        if destination.exists():
+            shutil.rmtree(destination)
+        raise
+
+
+def _market_token() -> str | None:
+    return (
+        os.getenv("SKILLS_SH_API_TOKEN")
+        or os.getenv("PGAGENT_SKILLS_SH_API_TOKEN")
+        or os.getenv("VERCEL_OIDC_TOKEN")
+    )
+
+
+def market_status() -> tuple[bool, str | None]:
+    if _market_token():
+        return True, None
+    return False, "配置 SKILLS_SH_API_TOKEN（skills.sh 所需的 Bearer/OIDC 令牌）后可搜索市场。"
+
+
+def _skills_sh_json(path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    token = _market_token()
+    if not token:
+        raise HTTPException(status_code=409, detail="skills.sh marketplace token is not configured")
+    try:
+        response = httpx.get(
+            f"{SKILLS_SH_BASE_URL}{path}",
+            params=params,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=10.0,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"skills.sh marketplace request failed: {exc}") from exc
+    if response.status_code == 401:
+        raise HTTPException(status_code=502, detail="skills.sh rejected the configured marketplace token")
+    if response.status_code == 429:
+        raise HTTPException(status_code=429, detail="skills.sh marketplace rate limit reached; retry later")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"skills.sh marketplace returned HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="skills.sh marketplace returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="skills.sh marketplace returned an invalid payload")
+    return payload
+
+
+def search_market(query: str, limit: int) -> tuple[bool, str | None, list[dict[str, Any]]]:
+    available, message = market_status()
+    if not available:
+        return False, message, []
+    payload = _skills_sh_json("/api/v1/skills/search", params={"q": query, "limit": limit})
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail="skills.sh marketplace response has no data list")
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+            continue
+        source_url = row.get("installUrl") if isinstance(row.get("installUrl"), str) else None
+        market_url = row.get("url") if isinstance(row.get("url"), str) else None
+        items.append(
+            {
+                "id": row["id"],
+                "slug": str(row.get("slug") or row["id"].rsplit("/", 1)[-1]),
+                "name": str(row.get("name") or row.get("slug") or row["id"]),
+                "source": str(row.get("source") or "skills.sh"),
+                "source_url": source_url,
+                "market_url": market_url,
+                "installs": int(row["installs"]) if isinstance(row.get("installs"), int) else None,
+            }
+        )
+    return True, None, items
+
+
+def _safe_relative_path(value: str) -> PurePosixPath:
+    path = PurePosixPath(value.replace("\\", "/"))
+    if (
+        not value
+        or "\x00" in value
+        or path.is_absolute()
+        or ".." in path.parts
+        or any(":" in part for part in path.parts)
+        or path == PurePosixPath(".")
+    ):
+        raise HTTPException(status_code=422, detail=f"Unsafe skill file path: {value}")
+    return path
+
+
+def _write_market_files(files: Sequence[dict[str, Any]], root: Path) -> None:
+    if len(files) > MAX_SKILL_FILES:
+        raise HTTPException(status_code=413, detail="Skill package has too many files")
+    total = 0
+    for row in files:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str) or not isinstance(row.get("contents"), str):
+            raise HTTPException(status_code=502, detail="skills.sh detail contains an invalid file entry")
+        relative = _safe_relative_path(row["path"])
+        contents = row["contents"].encode("utf-8")
+        if len(contents) > MAX_SKILL_FILE_BYTES:
+            raise HTTPException(status_code=413, detail=f"Skill file is too large: {relative.as_posix()}")
+        total += len(contents)
+        if total > MAX_SKILL_TOTAL_BYTES:
+            raise HTTPException(status_code=413, detail="Skill package is too large")
+        target = root.joinpath(*relative.parts)
+        if not _is_within(target.resolve(strict=False), root.resolve()):
+            raise HTTPException(status_code=422, detail="Skill contains an unsafe destination path")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(contents)
+
+
+def _validate_market_id(market_id: str) -> str:
+    normalized = market_id.strip().strip("/")
+    parts = normalized.split("/")
+    if len(parts) < 2 or any(not _SAFE_GITHUB_PART_RE.fullmatch(part) for part in parts):
+        raise HTTPException(status_code=422, detail="market_id must be a safe skills.sh identifier")
+    return normalized
+
+
+def preview_market_skill(market_id: str, *, confirm: bool, db: Session) -> tuple[SkillPreview, Skill | None]:
+    normalized = _validate_market_id(market_id)
+    payload = _skills_sh_json(f"/api/v1/skills/{quote(normalized, safe='/')}")
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise HTTPException(status_code=502, detail="skills.sh does not expose a file snapshot for this Skill")
+    preview_files: list[tuple[str, int]] = []
+    for row in files:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str) or not isinstance(row.get("contents"), str):
+            raise HTTPException(status_code=502, detail="skills.sh detail contains an invalid file entry")
+        relative = _safe_relative_path(row["path"])
+        preview_files.append((relative.as_posix(), len(row["contents"].encode("utf-8"))))
+    source_url = f"https://skills.sh/{normalized}"
+    preview = SkillPreview(source_url=source_url, candidates=(".",), files=tuple(preview_files), selected_root=None)
+    if not confirm:
+        return preview, None
+    with tempfile.TemporaryDirectory(prefix="pgagent-market-") as temp_dir:
+        source_root = Path(temp_dir)
+        _write_market_files(files, source_root)
+        installed = install_local_skill(
+            db,
+            source_root,
+            source="skills_sh",
+            source_url=source_url,
+            preferred_slug=str(payload.get("slug") or normalized.rsplit("/", 1)[-1]),
+        )
+    return preview, installed
+
+
+def _validate_github_url(url: str) -> tuple[str, list[str]]:
+    parsed = urlparse(url.strip())
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or host not in GITHUB_ALLOWED_HOSTS or parsed.username or parsed.password:
+        raise HTTPException(status_code=422, detail="Only public HTTPS GitHub repository or ZIP URLs are supported")
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts or any(part in {".", ".."} for part in parts):
+        raise HTTPException(status_code=422, detail="GitHub source URL has an unsafe path")
+    return host, parts
+
+
+def _github_default_archive_url(source_url: str) -> str:
+    host, parts = _validate_github_url(source_url)
+    if host != "github.com" or len(parts) != 2 or not all(_SAFE_GITHUB_PART_RE.fullmatch(part) for part in parts):
+        raise HTTPException(status_code=422, detail="Repository URL must be https://github.com/{owner}/{repo}")
+    owner, repo = parts
+    try:
+        response = httpx.get(
+            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}",
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=10.0,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub repository lookup failed: {exc}") from exc
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Public GitHub repository was not found")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"GitHub repository lookup returned HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="GitHub repository lookup returned invalid JSON") from exc
+    branch = payload.get("default_branch") if isinstance(payload, dict) else None
+    if not isinstance(branch, str) or not branch or not _SAFE_GITHUB_PART_RE.fullmatch(branch):
+        raise HTTPException(status_code=502, detail="GitHub repository has no safe default branch")
+    return f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/zipball/{quote(branch)}"
+
+
+def _archive_url_for_source(source_url: str) -> str:
+    host, parts = _validate_github_url(source_url)
+    if host == "github.com" and len(parts) == 2:
+        return _github_default_archive_url(source_url)
+    path = urlparse(source_url).path.lower()
+    is_codeload_zip = host == "codeload.github.com" and len(parts) >= 4 and parts[2] == "zip"
+    if not path.endswith(".zip") and not is_codeload_zip:
+        raise HTTPException(status_code=422, detail="GitHub archive URL must end in .zip")
+    return source_url
+
+
+def _download_github_archive(url: str) -> bytes:
+    _validate_github_url(url)
+    try:
+        with httpx.Client(timeout=20.0, follow_redirects=True, headers={"Accept": "application/zip"}) as client:
+            with client.stream("GET", url) as response:
+                history = [*response.history, response]
+                for hop in history:
+                    parsed = urlparse(str(hop.url))
+                    if parsed.scheme != "https" or (parsed.hostname or "").lower() not in GITHUB_ALLOWED_HOSTS:
+                        raise HTTPException(status_code=422, detail="GitHub archive redirected to an untrusted host")
+                if response.status_code == 404:
+                    raise HTTPException(status_code=404, detail="GitHub archive was not found")
+                if response.status_code >= 400:
+                    raise HTTPException(status_code=502, detail=f"GitHub archive returned HTTP {response.status_code}")
+                chunks: list[bytes] = []
+                size = 0
+                for chunk in response.iter_bytes():
+                    size += len(chunk)
+                    if size > MAX_ARCHIVE_BYTES:
+                        raise HTTPException(status_code=413, detail="GitHub archive is too large")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub archive download failed: {exc}") from exc
+
+
+def _extract_safe_zip(archive: bytes, root: Path) -> None:
+    try:
+        with zipfile.ZipFile(BytesIO(archive)) as bundle:
+            infos = [item for item in bundle.infolist() if not item.is_dir()]
+            if len(infos) > MAX_ARCHIVE_FILES:
+                raise HTTPException(status_code=413, detail="GitHub archive has too many files")
+            total = 0
+            for info in infos:
+                relative = _safe_relative_path(info.filename)
+                unix_mode = (info.external_attr >> 16) & 0o170000
+                if unix_mode == 0o120000:
+                    raise HTTPException(status_code=422, detail=f"GitHub archive contains a symlink: {relative.as_posix()}")
+                if info.file_size > MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise HTTPException(status_code=413, detail=f"GitHub archive file is too large: {relative.as_posix()}")
+                total += info.file_size
+                if total > MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise HTTPException(status_code=413, detail="GitHub archive expands beyond the safe inspection limit")
+                target = root.joinpath(*relative.parts)
+                if not _is_within(target.resolve(strict=False), root.resolve()):
+                    raise HTTPException(status_code=422, detail="GitHub archive contains an unsafe path")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.open(info, "r") as source, target.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+    except HTTPException:
+        raise
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=422, detail="GitHub source is not a valid ZIP archive") from exc
+
+
+def _find_skill_directories(root: Path) -> list[Path]:
+    return sorted(
+        {path.parent.resolve() for path in root.rglob("SKILL.md") if path.is_file() and not path.is_symlink()},
+        key=lambda path: path.as_posix(),
+    )
+
+
+def _relative_candidate(root: Path, candidate: Path) -> str:
+    return candidate.relative_to(root).as_posix() or "."
+
+
+def _select_skill_directory(root: Path, skill_path: str | None) -> tuple[list[Path], Path | None]:
+    candidates = _find_skill_directories(root)
+    if not candidates:
+        raise HTTPException(status_code=422, detail="GitHub archive contains no SKILL.md folder")
+    if skill_path:
+        relative = _safe_relative_path(skill_path)
+        selected = root.joinpath(*relative.parts).resolve()
+        if not _is_within(selected, root.resolve()) or selected not in candidates:
+            raise HTTPException(
+                status_code=422,
+                detail={"skill_path": "does not point to a SKILL.md folder", "candidates": [_relative_candidate(root, item) for item in candidates]},
+            )
+        return candidates, selected
+    if len(candidates) == 1:
+        return candidates, candidates[0]
+    return candidates, None
+
+
+def preview_github_skill(
+    source_url: str,
+    *,
+    skill_path: str | None,
+    confirm: bool,
+    db: Session,
+) -> tuple[SkillPreview, Skill | None]:
+    archive_url = _archive_url_for_source(source_url)
+    archive = _download_github_archive(archive_url)
+    with tempfile.TemporaryDirectory(prefix="pgagent-github-") as temp_dir:
+        extraction_root = Path(temp_dir)
+        _extract_safe_zip(archive, extraction_root)
+        candidates, selected = _select_skill_directory(extraction_root, skill_path)
+        preview = SkillPreview(
+            source_url=source_url,
+            candidates=tuple(_relative_candidate(extraction_root, candidate) for candidate in candidates),
+            files=tuple(
+                (relative.as_posix(), size)
+                for source, relative, size in _collect_safe_files(selected)
+            )
+            if selected is not None
+            else (),
+            selected_root=selected,
+        )
+        if not confirm:
+            return preview, None
+        if selected is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "Choose skill_path before installing", "candidates": list(preview.candidates)},
+            )
+        installed = install_local_skill(db, selected, source="github", source_url=source_url)
+        return preview, installed

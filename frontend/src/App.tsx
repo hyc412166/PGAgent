@@ -3,12 +3,14 @@ import {
   AlertCircle,
   ArrowRight,
   Bot,
+  BookOpen,
   Box,
   Check,
   CheckCircle2,
   ChevronRight,
   ChartNoAxesCombined,
   Database,
+  Download,
   FolderOpen,
   Folder,
   History,
@@ -23,27 +25,32 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Search,
   Send,
   Settings2,
   ShieldCheck,
   Sparkles,
   SquareTerminal,
   Trash2,
+  Upload,
   Users,
+  Wrench,
   Workflow,
   X,
   XCircle,
   type LucideIcon,
 } from 'lucide-react'
-import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { api, apiUrl, describeError } from './api'
+import { permissionLabel, permissionOptions, toggleSelectedId } from './capabilitySelection'
 import { modelSelectionPayload, resolveEffectiveThinking, shortModelLabel, thinkingLevelLabels } from './composerSettings'
 import { buildContextUsageView } from './contextUsage'
 import { buildDraftLaunchPayload, createDraftIdempotencyKey } from './draftLaunch'
 import { availableConnectionModels, resolveEffectiveModelSettings } from './modelSettings'
 import { buildSessionNavigation, folderName, isDefaultWorkspace, projectRootForSession } from './sessionNavigation'
-import { appendAssistantDelta, isCurrentSessionRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, visibleSessionItems, type RunStreamEvent } from './sessionStream'
+import { appendAssistantDelta, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldRefreshConversationAfterApprovalDecision, visibleSessionItems, type RunStreamEvent } from './sessionStream'
+import { emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline, type ThoughtTimelineState } from './thoughtTimeline'
 import type {
   AgentProfile,
   Approval,
@@ -52,6 +59,7 @@ import type {
   Health,
   Message,
   Run,
+  RunEvent,
   Session,
   SessionContext,
   TeamTask,
@@ -59,18 +67,28 @@ import type {
   UsageSummary,
   ModelUsage,
   FolderSelection,
+  PermissionMode,
+  SkillCatalogItem,
+  SkillInstallPreview,
+  SkillMarketplaceItem,
+  SkillMarketplaceSearch,
+  ToolCatalogItem,
   Workspace,
 } from './types'
 import './App.css'
 
 type LoadState<T> = { data: T; loading: boolean; error: string }
-type LiveRunState = { runId: string; phase: string; draft: string; status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'; error: string }
+type LiveRunState = { runId: string; phase: string; draft: string; status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'; error: string; thought: ThoughtTimelineState; thinkingStatus: string }
 type OwnedSessionMessages = { ownerSessionId: string; items: Message[] }
-type DraftSessionSettings = { model_connection_id: string | null; model_id: string | null; thinking_level: ThinkingLevel }
+type DraftSessionSettings = { model_connection_id: string | null; model_id: string | null; thinking_level: ThinkingLevel; skill_ids: string[]; permission_mode: PermissionMode }
 type DraftLaunchResponse = { session: Session; run: Run; workspace?: Workspace }
 
-const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'auto' }
+const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'auto', skill_ids: [], permission_mode: 'smart' }
 const emptyDraftContext: SessionContext = { used_tokens: 0, limit_tokens: 100_000, compact_threshold_tokens: 90_000, percent: 0 }
+
+function emptyLiveRun(): LiveRunState {
+  return { runId: '', phase: '', draft: '', status: 'idle', error: '', thought: emptyThoughtTimeline, thinkingStatus: '' }
+}
 
 const runStreamEventNames = [
   'run_state',
@@ -82,9 +100,16 @@ const runStreamEventNames = [
   'model_retry',
   'assistant_delta',
   'tool_started',
+  'tool_call',
   'tool_finished',
+  'tool_result',
   'approval_requested',
   'approval_granted',
+  'delegated_child_continuation_started',
+  'delegated_child_awaiting_approval',
+  'delegated_child_completed',
+  'delegated_child_stopped',
+  'delegated_child_failed',
   'run_completed',
   'run_stopped',
   'model_failed',
@@ -236,6 +261,38 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   return <label className="field"><span>{label}</span>{children}{hint && <small>{hint}</small>}</label>
 }
 
+function CapabilityMultiSelect({
+  label,
+  items,
+  selectedIds,
+  loading,
+  error,
+  onRetry,
+  onToggle,
+}: {
+  label: string
+  items: Array<{ id: string; name: string; description?: string; enabled?: boolean }>
+  selectedIds: string[]
+  loading: boolean
+  error: string
+  onRetry: () => void
+  onToggle: (id: string) => void
+}) {
+  return <section className="capability-select" aria-label={label}>
+    <header><strong>{label}</strong><span>已选择 {selectedIds.length}</span></header>
+    {error ? <div className="capability-inline-state error"><AlertCircle size={13} /><span>{error}</span><button type="button" onClick={onRetry}>重试</button></div>
+      : loading ? <div className="capability-inline-state"><LoaderCircle className="spin" size={13} />正在读取…</div>
+        : items.length ? <div className="capability-options">{items.map((item) => {
+          const selected = selectedIds.includes(item.id)
+          return <button key={item.id} type="button" className={selected ? 'selected' : ''} aria-pressed={selected} disabled={item.enabled === false} onClick={() => onToggle(item.id)}>
+            <span className="capability-check">{selected && <Check size={12} />}</span>
+            <span><strong>{item.name}</strong>{item.description && <small>{item.description}</small>}</span>
+          </button>
+        })}</div>
+          : <p className="capability-empty">目录中暂无可用项目。</p>}
+  </section>
+}
+
 function ContextUsageRing({ context }: { context: SessionContext }) {
   const view = buildContextUsageView(context)
   return (
@@ -279,6 +336,7 @@ function SlidePanel({ title, description, onClose, children }: { title: string; 
 const navigation = [
   { path: '/dashboard', label: '总览', icon: LayoutDashboard },
   { path: '/agents', label: 'Agent', icon: Bot },
+  { path: '/skills', label: '技能库', icon: BookOpen },
   { path: '/sessions', label: '会话', icon: MessageSquare },
   { path: '/runs', label: '运行记录', icon: History },
   { path: '/usage', label: '用量统计', icon: ChartNoAxesCombined },
@@ -308,13 +366,13 @@ function AppShell() {
         </div>
         <nav aria-label="主导航">
           <p className="nav-label">工作台</p>
-          {navigation.slice(0, 5).map(({ path, label, icon: Icon }) => (
+          {navigation.slice(0, 6).map(({ path, label, icon: Icon }) => (
             <NavLink key={path} to={path} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={collapsed ? label : undefined}>
               <Icon size={18} /><span>{label}</span>
             </NavLink>
           ))}
           <p className="nav-label nav-label-spaced">协作与系统</p>
-          {navigation.slice(5).map(({ path, label, icon: Icon }) => (
+          {navigation.slice(6).map(({ path, label, icon: Icon }) => (
             <NavLink key={path} to={path} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={collapsed ? label : undefined}>
               <Icon size={18} /><span>{label}</span>
             </NavLink>
@@ -332,6 +390,7 @@ function AppShell() {
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/workspaces" element={<Navigate to="/sessions" replace />} />
           <Route path="/agents" element={<AgentsPage />} />
+          <Route path="/skills" element={<SkillsPage />} />
           <Route path="/sessions" element={<SessionsPage />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/usage" element={<UsagePage />} />
@@ -417,8 +476,12 @@ function RunRow({ run, onClick }: { run: Run; onClick?: () => void }) {
 function AgentsPage() {
   const agents = useApiData<AgentProfile[]>([], () => api.list<AgentProfile>('/api/agents', ['agents']), [])
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
+  const tools = useApiData<ToolCatalogItem[]>([], () => api.list<ToolCatalogItem>('/api/tools', ['tools']), [])
+  const skills = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
   const [panelOpen, setPanelOpen] = useState(false)
   const [editing, setEditing] = useState<AgentProfile | null>(null)
+  const [selectedToolIds, setSelectedToolIds] = useState<string[]>([])
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([])
   const [saving, setSaving] = useState(false)
   const [deletingId, setDeletingId] = useState('')
   const [formError, setFormError] = useState('')
@@ -426,7 +489,11 @@ function AgentsPage() {
 
   function openAgentPanel(agent?: AgentProfile) {
     if (agent?.is_default) return
-    setEditing(agent ?? null); setFormError(''); setPanelOpen(true)
+    setEditing(agent ?? null)
+    setSelectedToolIds(agent?.tool_ids ?? [])
+    setSelectedSkillIds(agent?.skill_ids ?? [])
+    setFormError('')
+    setPanelOpen(true)
   }
 
   async function saveAgent(event: FormEvent<HTMLFormElement>) {
@@ -439,6 +506,8 @@ function AgentsPage() {
         model_connection_id: form.get('connection_id') || null,
         model_id: form.get('model') || null,
         thinking_level: form.get('thinking_level'),
+        tool_ids: selectedToolIds,
+        skill_ids: selectedSkillIds,
       }
       if (editing) await api.patch(`/api/agents/${editing.id}`, payload)
       else await api.post('/api/agents', payload)
@@ -463,20 +532,21 @@ function AgentsPage() {
             <article className="entity-card agent-card" key={agent.id}>
               <div className="agent-head"><div className="agent-avatar"><Bot size={22} /></div><div className="agent-card-actions"><StatusBadge status={agent.status || 'idle'} /><button className="icon-button" aria-label={`编辑 ${agent.name}`} title="编辑子 Agent" onClick={() => openAgentPanel(agent)}><Pencil size={15} /></button><button className="icon-button danger-icon" aria-label={`删除 ${agent.name}`} disabled={deletingId === agent.id} title="删除子 Agent" onClick={() => void deleteAgent(agent)}>{deletingId === agent.id ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}</button></div></div>
               <h2>{agent.name}</h2><p className="agent-role">{agent.role || '通用执行子 Agent'}</p><p>{agent.description || '暂无角色说明'}</p>
-              <div className="agent-meta"><span><Sparkles size={14} />{agent.model || agent.model_id || '继承默认模型'}</span><span><Workflow size={14} />委派能力待开放</span></div>
+              <div className="agent-meta"><span><Sparkles size={14} />{agent.model || agent.model_id || '继承默认模型'}</span><span><Wrench size={14} />{agent.tool_ids?.length ?? 0} 工具 · {agent.skill_ids?.length ?? 0} Skill</span></div>
               <footer><span>{formatDate(agent.created_at)}</span><span>{`思考：${agent.thinking_level || 'auto'}`}</span></footer>
             </article>
           ))}
         </section>
-      ) : <EmptyState icon={Bot} title="创建你的第一个子 Agent" description="定义专业角色、系统指令与模型偏好；主 Agent 的自动委派会在后续版本开放。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />}
-      {panelOpen && <SlidePanel title={editing ? '编辑子 Agent' : '创建子 Agent'} description="当前保存角色、系统指令与模型偏好；工具、Skill 和自动委派将在后续版本开放。" onClose={() => { setPanelOpen(false); setEditing(null) }}>
+      ) : <EmptyState icon={Bot} title="创建你的第一个子 Agent" description="定义专业角色、系统指令、模型与可用能力；主 Agent 会在复杂、专业或你明确要求时委派匹配的子 Agent。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />}
+      {panelOpen && <SlidePanel title={editing ? '编辑子 Agent' : '创建子 Agent'} description="配置角色、模型以及允许这个子 Agent 使用的工具和 Skill。主 Agent 会在需要时将任务委派给匹配的子 Agent。" onClose={() => { setPanelOpen(false); setEditing(null) }}>
         <form className="panel-form" onSubmit={saveAgent} key={editing?.id || 'new-agent'}>
           <Field label="名称"><input name="name" required placeholder="例如：代码协作者" autoFocus defaultValue={editing?.name || ''} /></Field>
           <Field label="简介"><input name="description" placeholder="简要描述擅长处理的任务" defaultValue={editing?.description || ''} /></Field>
           <Field label="系统指令"><textarea name="system_prompt" rows={6} placeholder="说明工作原则、输出风格和边界……" defaultValue={editing?.system_prompt || ''} /></Field>
           <div className="form-row"><Field label="模型连接"><select name="connection_id" defaultValue={editing?.model_connection_id || editing?.connection_id || ''}><option value="">使用默认连接</option>{connections.data.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="模型 ID"><input name="model" placeholder="例如：deepseek-chat" defaultValue={editing?.model_id || editing?.model || ''} /></Field></div>
           <Field label="思考强度"><select name="thinking_level" defaultValue={editing?.thinking_level || 'auto'}><option value="off">关闭</option><option value="auto">自动</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option></select></Field>
-          <div className="tool-summary"><strong>工具与 Skill</strong><small>当前版本暂不为子 Agent 单独配置工具或 Skill，也不会伪造自动委派；这些能力将在后续版本开放。</small></div>
+          <CapabilityMultiSelect label="工具" items={tools.data.map((item) => ({ ...item, name: item.label || item.name }))} selectedIds={selectedToolIds} loading={tools.loading} error={tools.error} onRetry={() => void tools.reload()} onToggle={(id) => setSelectedToolIds((current) => toggleSelectedId(current, id))} />
+          <CapabilityMultiSelect label="Skill" items={skills.data} selectedIds={selectedSkillIds} loading={skills.loading} error={skills.error} onRetry={() => void skills.reload()} onToggle={(id) => setSelectedSkillIds((current) => toggleSelectedId(current, id))} />
           {formError && <p className="form-error" role="alert">{formError}</p>}
           <div className="form-actions"><button type="button" className="button button-secondary" onClick={() => { setPanelOpen(false); setEditing(null) }}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}{editing ? '保存修改' : '创建'}</button></div>
         </form>
@@ -485,21 +555,130 @@ function AgentsPage() {
   )
 }
 
+function SkillsPage() {
+  const installed = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
+  const market = useApiData<SkillMarketplaceSearch>({}, () => api.get<SkillMarketplaceSearch>('/api/skills/market/status'), [])
+  const [query, setQuery] = useState('')
+  const [results, setResults] = useState<SkillMarketplaceItem[]>([])
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
+  const [marketMessage, setMarketMessage] = useState('')
+  const [importing, setImporting] = useState(false)
+  const [installingId, setInstallingId] = useState('')
+  const [previews, setPreviews] = useState<Record<string, SkillInstallPreview>>({})
+  const [actionError, setActionError] = useState('')
+
+  async function importLocalSkill() {
+    if (importing) return
+    setImporting(true); setActionError('')
+    try {
+      const selection = await api.post<FolderSelection>('/api/system/select-folder')
+      if (!selection.path) return
+      await api.post('/api/skills/import', { source_path: selection.path })
+      await installed.reload()
+    } catch (error) { setActionError(describeError(error)) } finally { setImporting(false) }
+  }
+
+  async function searchMarket(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const normalizedQuery = query.trim()
+    if (normalizedQuery.length < 2 || searching) return
+    setSearching(true); setSearchError(''); setMarketMessage('')
+    try {
+      const response = await api.post<SkillMarketplaceSearch>('/api/skills/market/search', { query: normalizedQuery, limit: 20 })
+      setResults(response.items ?? [])
+      setMarketMessage(response.message ?? '')
+    } catch (error) {
+      setResults([])
+      setSearchError(describeError(error))
+    } finally { setSearching(false) }
+  }
+
+  async function previewMarketSkill(item: SkillMarketplaceItem) {
+    if (installingId) return
+    setInstallingId(item.id); setActionError('')
+    try {
+      const preview = await api.post<SkillInstallPreview>('/api/skills/market/install', { market_id: item.id, confirm: false })
+      setPreviews((current) => ({ ...current, [item.id]: preview }))
+    } catch (error) { setActionError(describeError(error)) } finally { setInstallingId('') }
+  }
+
+  async function confirmMarketSkill(item: SkillMarketplaceItem) {
+    if (installingId || !previews[item.id]) return
+    setInstallingId(item.id); setActionError('')
+    try {
+      await api.post('/api/skills/market/install', { market_id: item.id, confirm: true })
+      setPreviews((current) => {
+        const next = { ...current }
+        delete next[item.id]
+        return next
+      })
+      await installed.reload()
+    } catch (error) { setActionError(describeError(error)) } finally { setInstallingId('') }
+  }
+
+  return <div className="page skills-page">
+    <PageHeader eyebrow="CAPABILITY LIBRARY" title="技能库" description="管理已安装的 Skill，或从本地文件夹与在线市场添加新能力。" action={<button className="button button-primary" disabled={importing} onClick={() => void importLocalSkill()}>{importing ? <LoaderCircle className="spin" size={15} /> : <Upload size={15} />}导入本地 Skill</button>} />
+    {actionError && <p className="form-error page-form-error" role="alert">{actionError}</p>}
+    <section className="skills-section">
+      <div className="skills-section-heading"><div><h2>已安装</h2><p>这里只显示后端实际返回的 Skill。</p></div><span>{installed.data.length}</span></div>
+      {installed.error ? <ErrorState message={installed.error} onRetry={installed.reload} /> : installed.loading ? <LoadingState /> : installed.data.length ? <div className="skill-card-grid">
+        {installed.data.map((skill) => <article className="skill-card" key={skill.id}>
+          <div className="skill-card-icon"><BookOpen size={18} /></div>
+          <div><h3>{skill.name}</h3><p>{skill.description || '暂无说明'}</p></div>
+          <dl><div><dt>版本</dt><dd>{skill.version || '未标注'}</dd></div><div><dt>来源</dt><dd title={skill.source_url || skill.source}>{skill.source || 'local'}</dd></div></dl>
+        </article>)}
+      </div> : <EmptyState icon={BookOpen} title="还没有安装 Skill" description="选择本地 Skill 文件夹导入，或在下方搜索在线市场。" />}
+    </section>
+    <section className="skills-section skill-market-section">
+      <div className="skills-section-heading"><div><h2>在线市场</h2><p>{market.data.provider ? `来源：${market.data.provider}` : '搜索可下载的 Skill。'}</p></div></div>
+      {market.error ? <ErrorState message={market.error} onRetry={market.reload} /> : market.loading ? <LoadingState label="正在检查市场服务" /> : market.data.available === false ? <ErrorState message={market.data.message || '在线市场当前不可用。'} onRetry={market.reload} /> : <>
+        <form className="skill-search" onSubmit={searchMarket}>
+          <Search size={16} /><input aria-label="搜索在线 Skill" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="输入至少 2 个字符搜索…" /><button className="button button-secondary" disabled={query.trim().length < 2 || searching}>{searching ? <LoaderCircle className="spin" size={14} /> : <Search size={14} />}搜索</button>
+        </form>
+        {searchError && <ErrorState message={searchError} onRetry={() => { const form = document.querySelector<HTMLFormElement>('.skill-search'); form?.requestSubmit() }} />}
+        {marketMessage && <p className="market-message">{marketMessage}</p>}
+        {!searching && !searchError && results.length ? <div className="market-results">{results.map((item) => {
+          const preview = previews[item.id]
+          return <article key={item.id} className={preview ? 'has-preview' : ''}>
+            <div><strong>{item.name}</strong><small>{item.slug || item.source || item.id}</small></div>
+            {typeof item.installs === 'number' && <span>{item.installs.toLocaleString()} 次安装</span>}
+            <button className="button button-secondary" disabled={!!installingId} onClick={() => void previewMarketSkill(item)}>{installingId === item.id && !preview ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}{preview ? '重新预览' : '下载'}</button>
+            {preview && <div className="skill-preview">
+              <p><strong>来源</strong><span title={preview.source_url}>{preview.source_url}</span></p>
+              <p><strong>候选目录</strong><span>{preview.candidates?.length ? preview.candidates.join('、') : '默认目录'}</span></p>
+              <p><strong>文件</strong><span>{preview.files?.length ?? 0} 个</span></p>
+              <button className="button button-primary" disabled={!!installingId} onClick={() => void confirmMarketSkill(item)}>{installingId === item.id ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}确认导入</button>
+            </div>}
+          </article>
+        })}</div> : !searching && !searchError && query.trim() && <p className="market-empty">提交搜索后，真实结果会显示在这里。</p>}
+      </>}
+    </section>
+  </div>
+}
+
 function SessionsPage() {
   const sessions = useApiData<Session[]>([], () => api.list<Session>('/api/sessions', ['sessions']), [])
   const agents = useApiData<AgentProfile[]>([], () => api.list<AgentProfile>('/api/agents', ['agents']), [])
   const workspaces = useApiData<Workspace[]>([], () => api.list<Workspace>('/api/workspaces', ['workspaces']), [])
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
+  const skills = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
   const [activeId, setActiveId] = useState('')
   const [composer, setComposer] = useState('')
   const [sending, setSending] = useState(false)
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false)
   const [settingsSubmenu, setSettingsSubmenu] = useState<'model' | 'thinking' | null>(null)
+  const [addMenuOpen, setAddMenuOpen] = useState(false)
+  const [skillSubmenuOpen, setSkillSubmenuOpen] = useState(false)
+  const [permissionMenuOpen, setPermissionMenuOpen] = useState(false)
+  const [capabilitySaving, setCapabilitySaving] = useState(false)
   const settingsMenuRef = useRef<HTMLDivElement>(null)
   const settingsTriggerRef = useRef<HTMLButtonElement>(null)
   const modelSubmenuRef = useRef<HTMLDivElement>(null)
   const thinkingSubmenuRef = useRef<HTMLDivElement>(null)
+  const addMenuRef = useRef<HTMLDivElement>(null)
+  const permissionMenuRef = useRef<HTMLDivElement>(null)
   const [decidingApproval, setDecidingApproval] = useState('')
   const [actionError, setActionError] = useState('')
   const [draftActive, setDraftActive] = useState(false)
@@ -509,7 +688,8 @@ function SessionsPage() {
   const [addingProject, setAddingProject] = useState(false)
   const [pickingDraftProject, setPickingDraftProject] = useState(false)
   const [projectError, setProjectError] = useState('')
-  const [liveRun, setLiveRun] = useState<LiveRunState>({ runId: '', phase: '', draft: '', status: 'idle', error: '' })
+  const [completedThoughtsByRun, setCompletedThoughtsByRun] = useState<Record<string, ThoughtTimelineState>>({})
+  const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRun)
   const eventSourceRef = useRef<EventSource | null>(null)
   const fallbackTimerRef = useRef<number | null>(null)
   const streamReconnectTimerRef = useRef<number | null>(null)
@@ -519,13 +699,13 @@ function SessionsPage() {
   const runStartMessageCountRef = useRef(0)
   const messagesRef = useRef<HTMLDivElement>(null)
   const activeIdRef = useRef('')
-  const activeRunIdRef = useRef('')
   const stickToBottomRef = useRef(true)
   const terminalSyncVersionRef = useRef(0)
   const pendingDraftRunRef = useRef<{ sessionId: string; runId: string } | null>(null)
   const draftIdempotencyKeyRef = useRef('')
   const draftVersionRef = useRef(0)
   const sendingRef = useRef(false)
+  const loadedThoughtRunIdsRef = useRef(new Set<string>())
   activeIdRef.current = activeId
   const liveRunRef = useRef(liveRun)
   liveRunRef.current = liveRun
@@ -556,7 +736,32 @@ function SessionsPage() {
   }, [settingsMenuOpen])
 
   useEffect(() => {
+    if (!addMenuOpen && !permissionMenuOpen) return
+    const closeOnPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node
+      if (addMenuOpen && !addMenuRef.current?.contains(target)) {
+        setAddMenuOpen(false)
+        setSkillSubmenuOpen(false)
+      }
+      if (permissionMenuOpen && !permissionMenuRef.current?.contains(target)) setPermissionMenuOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      setAddMenuOpen(false)
+      setSkillSubmenuOpen(false)
+      setPermissionMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOnPointerDown)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [addMenuOpen, permissionMenuOpen])
+
+  useEffect(() => {
     setSettingsMenuOpen(false); setSettingsSubmenu(null)
+    setAddMenuOpen(false); setSkillSubmenuOpen(false); setPermissionMenuOpen(false)
   }, [activeId])
 
   const messages = useApiData<OwnedSessionMessages>(
@@ -571,23 +776,68 @@ function SessionsPage() {
   const activeSession = sessions.data.find((item) => stringId(item.id) === activeId)
   const activeAgent = agents.data.find((item) => item.id === activeSession?.agent_id)
   const sessionRuns = runs.data.filter((item) => !item.session_id || item.session_id === activeId)
-  const activeRun = sessionRuns.find((item) => activeRunStatuses.has(item.status || '')) ?? sessionRuns[0]
+  const awaitingApprovalRunIds = sessionRuns
+    .filter((item) => item.status === 'awaiting_approval')
+    .map((item) => item.id)
+  const approvalRunIdsKey = awaitingApprovalRunIds.join(',')
+  // A child awaiting approval takes precedence over its parent so the card is
+  // actionable in this very conversation instead of hidden behind a parent
+  // run that has already stopped for the child.
+  const activeRun = sessionRuns.find((item) => item.status === 'awaiting_approval')
+    ?? sessionRuns.find((item) => activeRunStatuses.has(item.status || ''))
+    ?? sessionRuns[0]
   const activeRunId = activeRun?.id || ''
-  activeRunIdRef.current = activeRunId
   const visibleMessages = visibleSessionItems(messages.data.ownerSessionId, activeId, messages.data.items)
   const sessionNavigation = buildSessionNavigation(workspaces.data, sessions.data)
-  const approvals = useApiData<Approval[]>([], () => activeRunId ? api.list<Approval>(`/api/approvals?run_id=${encodeURIComponent(activeRunId)}&status=pending`, ['approvals']) : Promise.resolve([]), [activeRunId])
-  const visibleApprovals = approvals.data.filter((approval) => !approval.run_id || approval.run_id === activeRunId)
+  const approvals = useApiData<Approval[]>([], async () => {
+    const runIds = approvalRunIdsKey ? approvalRunIdsKey.split(',').filter(Boolean) : []
+    if (!runIds.length) return []
+    const groups = await Promise.all(runIds.map((runId) => api.list<Approval>(
+      `/api/approvals?run_id=${encodeURIComponent(runId)}&status=pending`,
+      ['approvals'],
+    )))
+    return groups.flat()
+  }, [approvalRunIdsKey])
+  const visibleApprovals = approvals.data.filter((approval) => awaitingApprovalRunIds.includes(stringId(approval.run_id)))
   const refreshMessages = messages.refresh
   const refreshRuns = runs.refresh
   const refreshContext = context.refresh
   const setMessagesState = messages.setState
   const setApprovalsState = approvals.setState
   const settingsLocked = activeRunStatuses.has(activeRun?.status || '') || !['idle', 'terminal'].includes(liveRun.status)
+
+  useEffect(() => {
+    if (liveRun.status !== 'terminal' || !liveRun.runId || !hasVisibleCompletedThought(liveRun.thought)) return
+    setCompletedThoughtsByRun((current) => current[liveRun.runId] === liveRun.thought ? current : { ...current, [liveRun.runId]: liveRun.thought })
+  }, [liveRun.runId, liveRun.status, liveRun.thought])
+
+  useEffect(() => {
+    setCompletedThoughtsByRun({})
+    loadedThoughtRunIdsRef.current = new Set()
+  }, [activeId])
+
+  useEffect(() => {
+    if (!activeId) return
+    let cancelled = false
+    const finishedRuns = runs.data.filter((run) => (!run.session_id || run.session_id === activeId) && isTerminalRunStatus(run.status))
+    for (const run of finishedRuns) {
+      if (loadedThoughtRunIdsRef.current.has(run.id)) continue
+      loadedThoughtRunIdsRef.current.add(run.id)
+      void api.list<RunEvent>(`/api/runs/${encodeURIComponent(run.id)}/events`, ['events']).then((events) => {
+        if (cancelled || activeIdRef.current !== activeId) return
+        const timeline = timelineFromRunEvents(events.map((event) => ({ ...event, type: event.type || event.event_type || '' })))
+        if (hasVisibleCompletedThought(timeline)) setCompletedThoughtsByRun((current) => ({ ...current, [run.id]: timeline }))
+      }).catch(() => { loadedThoughtRunIdsRef.current.delete(run.id) })
+    }
+    return () => { cancelled = true }
+  }, [activeId, runs.data])
   useEffect(() => {
     if (settingsLocked || sending) {
       setSettingsMenuOpen(false)
       setSettingsSubmenu(null)
+      setAddMenuOpen(false)
+      setSkillSubmenuOpen(false)
+      setPermissionMenuOpen(false)
     }
   }, [sending, settingsLocked])
 
@@ -607,7 +857,7 @@ function SessionsPage() {
     setDraftActive(false)
     setDraftRootPath('')
     setDraftSettings(emptyDraftSettings)
-    setLiveRun({ runId: '', phase: '', draft: '', status: 'idle', error: '' })
+    setLiveRun(emptyLiveRun())
     draftIdempotencyKeyRef.current = ''
   }
 
@@ -620,7 +870,7 @@ function SessionsPage() {
     setComposer('')
     setDraftRootPath(selectedProjectRoot)
     setDraftSettings(emptyDraftSettings)
-    setLiveRun({ runId: '', phase: '', draft: '', status: 'idle', error: '' })
+    setLiveRun(emptyLiveRun())
     draftIdempotencyKeyRef.current = createDraftIdempotencyKey()
     setExpandedWorkspaceIds(selectedProjectId ? new Set([selectedProjectId]) : new Set())
     setActiveId('')
@@ -692,21 +942,25 @@ function SessionsPage() {
     streamRunIdRef.current = ''
   }, [])
 
-  const sessionRunStillCurrent = useCallback((sessionId: string, runId: string) => {
-    return isCurrentSessionRun(activeIdRef.current, activeRunIdRef.current, streamRunIdRef.current, sessionId, runId)
-  }, [])
-
-  const refreshApprovalsForRun = useCallback(async (runId: string, sessionId: string) => {
-    if (!sessionRunStillCurrent(sessionId, runId)) return undefined
+  const refreshApprovalsForSession = useCallback(async (sessionId: string) => {
+    if (!sessionId || activeIdRef.current !== sessionId) return undefined
     try {
-      const data = await api.list<Approval>(`/api/approvals?run_id=${encodeURIComponent(runId)}&status=pending`, ['approvals'])
-      if (!sessionRunStillCurrent(sessionId, runId)) return undefined
+      const latestRuns = await api.list<Run>(`/api/runs?session_id=${encodeURIComponent(sessionId)}`, ['runs'])
+      const runIds = latestRuns
+        .filter((run) => run.status === 'awaiting_approval')
+        .map((run) => run.id)
+      const groups = await Promise.all(runIds.map((runId) => api.list<Approval>(
+        `/api/approvals?run_id=${encodeURIComponent(runId)}&status=pending`,
+        ['approvals'],
+      )))
+      if (activeIdRef.current !== sessionId) return undefined
+      const data = groups.flat()
       setApprovalsState({ data, loading: false, error: '' })
       return data
     } catch {
       return undefined
     }
-  }, [sessionRunStillCurrent, setApprovalsState])
+  }, [setApprovalsState])
 
   const syncTerminalRun = useCallback(async (runId: string, event?: RunStreamEvent, sessionId = activeIdRef.current) => {
     const syncVersion = ++terminalSyncVersionRef.current
@@ -717,6 +971,7 @@ function SessionsPage() {
       phase: event ? runStreamPhase(event) : previous.phase,
       status: 'terminal',
       error: event?.error ? String(event.error) : previous.error,
+      thought: event ? updateThoughtTimeline(previous.thought, event) : previous.thought,
     }))
 
     let refreshedMessages: OwnedSessionMessages | undefined
@@ -731,7 +986,7 @@ function SessionsPage() {
     }
     if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
 
-    await Promise.all([refreshRuns(), refreshContext(), refreshApprovalsForRun(runId, sessionId)])
+    await Promise.all([refreshRuns(), refreshContext(), refreshApprovalsForSession(sessionId)])
     if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
 
     const assistantCount = refreshedMessages?.ownerSessionId === sessionId
@@ -741,9 +996,9 @@ function SessionsPage() {
     const hasDraft = Boolean(liveRunRef.current.runId === runId && liveRunRef.current.draft)
     if (event?.error) setActionError(`运行失败：${String(event.error)}`)
     if (hasPersistedReply || !hasDraft) {
-      setLiveRun({ runId: '', phase: '', draft: '', status: 'idle', error: '' })
+      setLiveRun(emptyLiveRun())
     }
-  }, [closeRunTransport, refreshApprovalsForRun, refreshContext, refreshMessages, refreshRuns])
+  }, [closeRunTransport, refreshApprovalsForSession, refreshContext, refreshMessages, refreshRuns])
 
   const startRunFallback = useCallback((runId: string, sessionId = activeIdRef.current) => {
     eventSourceRef.current?.close()
@@ -784,7 +1039,7 @@ function SessionsPage() {
           error: '',
         }))
         void refreshRuns()
-        if (status === 'awaiting_approval') void refreshApprovalsForRun(runId, sessionId)
+        if (status === 'awaiting_approval') void refreshApprovalsForSession(sessionId)
         if (isTerminalRunStatus(status)) {
           await syncTerminalRun(runId, { type: 'run_state', status, terminal: true, error: status === 'failed' ? run.stop_reason : undefined, reason: run.stop_reason }, sessionId)
         }
@@ -795,7 +1050,7 @@ function SessionsPage() {
 
     void poll()
     fallbackTimerRef.current = window.setInterval(() => void poll(), 4000)
-  }, [refreshApprovalsForRun, refreshRuns, syncTerminalRun])
+  }, [refreshApprovalsForSession, refreshRuns, syncTerminalRun])
 
   const startRunStream = useCallback((runId: string, sessionId = activeIdRef.current) => {
     if (!runId || activeIdRef.current !== sessionId) return
@@ -821,6 +1076,8 @@ function SessionsPage() {
       draft: previous.runId === runId ? previous.draft : '',
       status: 'connecting',
       error: '',
+      thought: previous.runId === runId ? previous.thought : { ...emptyThoughtTimeline, startedAt: Date.now() },
+      thinkingStatus: previous.thinkingStatus || thinkingStatusForRun(runId),
     }))
 
     let source: EventSource
@@ -848,7 +1105,10 @@ function SessionsPage() {
       if (!parsed) return
       if (!rememberRunStreamEvent(seenStreamEventsRef.current.eventIds, parsed, message.lastEventId)) return
       const terminal = isTerminalRunStreamEvent(parsed)
-      const waitingApproval = parsed.type === 'approval_requested' || (parsed.type === 'run_state' && parsed.status === 'awaiting_approval')
+      const delegatedChildEvent = parsed.type.startsWith('delegated_child_')
+      const waitingApproval = parsed.type === 'approval_requested'
+        || parsed.type === 'delegated_child_awaiting_approval'
+        || (parsed.type === 'run_state' && parsed.status === 'awaiting_approval')
       setLiveRun((previous) => ({
         ...previous,
         runId,
@@ -856,8 +1116,13 @@ function SessionsPage() {
         draft: appendAssistantDelta(previous.draft, parsed),
         status: terminal ? 'terminal' : waitingApproval ? 'awaiting_approval' : 'live',
         error: parsed.error ? String(parsed.error) : previous.error,
+        thought: updateThoughtTimeline(previous.thought, parsed),
       }))
-      if (waitingApproval) void refreshApprovalsForRun(runId, sessionId)
+      if (waitingApproval) void refreshApprovalsForSession(sessionId)
+      if (delegatedChildEvent) {
+        void refreshRuns()
+        void refreshMessages()
+      }
       if (terminal) void syncTerminalRun(runId, parsed, sessionId)
     }
 
@@ -878,13 +1143,13 @@ function SessionsPage() {
         startRunFallback(runId, sessionId)
       }, streamErrorCountRef.current >= 3 ? 3500 : 6500)
     }
-  }, [refreshApprovalsForRun, startRunFallback, syncTerminalRun])
+  }, [refreshApprovalsForSession, refreshMessages, refreshRuns, startRunFallback, syncTerminalRun])
 
   useEffect(() => {
     closeRunTransport()
     terminalSyncVersionRef.current += 1
     seenStreamEventsRef.current = { runId: '', eventIds: new Set() }
-    setLiveRun({ runId: '', phase: '', draft: '', status: 'idle', error: '' })
+    setLiveRun(emptyLiveRun())
     stickToBottomRef.current = true
     return () => {
       closeRunTransport()
@@ -922,12 +1187,12 @@ function SessionsPage() {
   async function sendMessage(event: FormEvent) {
     event.preventDefault()
     const content = composer.trim()
-    if (sendingRef.current || (!activeId && !draftActive) || !content || settingsSaving || settingsLocked) return
+    if (sendingRef.current || (!activeId && !draftActive) || !content || settingsSaving || capabilitySaving || settingsLocked) return
     sendingRef.current = true
     setSending(true); setActionError('')
     stickToBottomRef.current = true
     runStartMessageCountRef.current = visibleMessages.filter((message) => message.role === 'assistant').length
-    setLiveRun({ runId: '', phase: '思考中…', draft: '', status: 'connecting', error: '' })
+    setLiveRun({ ...emptyLiveRun(), phase: '思考中…', status: 'connecting', thought: { ...emptyThoughtTimeline, startedAt: Date.now() }, thinkingStatus: pickThinkingStatus() })
     try {
       if (draftActive) {
         const draftVersion = draftVersionRef.current
@@ -960,7 +1225,7 @@ function SessionsPage() {
       void context.refresh()
       startRunStream(launched.id, targetSessionId)
     } catch (error) {
-      setLiveRun({ runId: '', phase: '', draft: '', status: 'idle', error: '' })
+      setLiveRun(emptyLiveRun())
       setActionError(describeError(error))
     } finally {
       sendingRef.current = false
@@ -968,22 +1233,33 @@ function SessionsPage() {
     }
   }
 
-  async function decideApproval(id: string, decision: 'approve' | 'reject') {
+  async function decideApproval(id: string, decision: 'approve' | 'reject', approvalRunId: string) {
     const approvalSessionId = activeIdRef.current
-    const approvalRunId = activeRunIdRef.current || streamRunIdRef.current
-    if (!sessionRunStillCurrent(approvalSessionId, approvalRunId)) return
+    if (!approvalSessionId || !approvalRunId || !sessionRuns.some((run) => run.id === approvalRunId)) return
     setActionError(''); setDecidingApproval(id)
     try {
       await api.post(`/api/approvals/${id}/decide`, { decision })
-      if (!sessionRunStillCurrent(approvalSessionId, approvalRunId)) return
-      await Promise.all([refreshApprovalsForRun(approvalRunId, approvalSessionId), refreshRuns()])
-      if (!sessionRunStillCurrent(approvalSessionId, approvalRunId)) return
+      if (activeIdRef.current !== approvalSessionId) return
+      const refreshes: Promise<unknown>[] = [
+        refreshApprovalsForSession(approvalSessionId),
+        refreshRuns(),
+      ]
+      if (shouldRefreshConversationAfterApprovalDecision(decision)) refreshes.push(refreshMessages())
+      await Promise.all(refreshes)
+      if (activeIdRef.current !== approvalSessionId) return
+      if (decision === 'reject') {
+        setLiveRun((previous) => (
+          previous.runId === approvalRunId ? emptyLiveRun() : previous
+        ))
+        return
+      }
       setLiveRun((previous) => {
-        if (!sessionRunStillCurrent(approvalSessionId, approvalRunId) || !shouldMarkApprovalResuming(previous.status, previous.runId, approvalRunId)) return previous
+        if (previous.runId !== approvalRunId || previous.status !== 'awaiting_approval') return previous
         return { ...previous, phase: decision === 'approve' ? '审批已通过，继续处理…' : '正在停止运行…', status: 'connecting', error: '' }
       })
+      startRunStream(approvalRunId, approvalSessionId)
     } catch (error) {
-      if (sessionRunStillCurrent(approvalSessionId, approvalRunId)) setActionError(describeError(error))
+      if (activeIdRef.current === approvalSessionId) setActionError(describeError(error))
     } finally { setDecidingApproval('') }
   }
 
@@ -991,6 +1267,7 @@ function SessionsPage() {
     if (settingsLocked || sending) return
     if (draftActive) {
       setDraftSettings((current) => ({
+        ...current,
         model_connection_id: payload.model_connection_id === undefined ? current.model_connection_id : payload.model_connection_id,
         model_id: payload.model_id === undefined ? current.model_id : payload.model_id,
         thinking_level: payload.thinking_level ?? current.thinking_level,
@@ -1001,6 +1278,34 @@ function SessionsPage() {
     setSettingsSaving(true); setActionError('')
     try { await api.patch(`/api/sessions/${activeId}`, payload); await sessions.reload() }
     catch (error) { setActionError(describeError(error)) } finally { setSettingsSaving(false) }
+  }
+
+  async function updateSessionCapabilities(payload: { skill_ids?: string[]; permission_mode?: PermissionMode }) {
+    if (settingsLocked || sending || capabilitySaving) return
+    if (draftActive) {
+      setDraftSettings((current) => ({
+        ...current,
+        skill_ids: payload.skill_ids ?? current.skill_ids,
+        permission_mode: payload.permission_mode ?? current.permission_mode,
+      }))
+      return
+    }
+    if (!activeId) return
+    setCapabilitySaving(true); setActionError('')
+    try { await api.patch(`/api/sessions/${activeId}`, payload); await sessions.reload() }
+    catch (error) { setActionError(describeError(error)) } finally { setCapabilitySaving(false) }
+  }
+
+  const selectedSessionSkillIds = draftActive ? draftSettings.skill_ids : activeSession?.skill_ids ?? []
+  const selectedPermissionMode: PermissionMode = draftActive ? draftSettings.permission_mode : activeSession?.permission_mode ?? 'smart'
+
+  function toggleSessionSkill(skillId: string) {
+    void updateSessionCapabilities({ skill_ids: toggleSelectedId(selectedSessionSkillIds, skillId) })
+  }
+
+  function selectPermissionMode(mode: PermissionMode) {
+    setPermissionMenuOpen(false)
+    void updateSessionCapabilities({ permission_mode: mode })
   }
 
   const settingsSession: Session | undefined = activeSession ?? (draftActive ? {
@@ -1100,9 +1405,14 @@ function SessionsPage() {
                   stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
                 }}
               >
-                {draftActive ? liveRun.status === 'idle' && <EmptyState icon={MessageSquare} title="开始一次新任务" description="直接描述目标；需要处理本地文件时，可以在输入框中选择一个项目文件夹。" /> : messages.error && !visibleMessages.length ? <ErrorState message={messages.error} onRetry={messages.reload} /> : messages.loading && !visibleMessages.length ? <LoadingState /> : visibleMessages.length ? visibleMessages.map((message) => <MessageBubble key={message.id} message={message} />) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
+                {draftActive ? liveRun.status === 'idle' && <EmptyState icon={MessageSquare} title="开始一次新任务" description="直接描述目标；需要处理本地文件时，可以在输入框中选择一个项目文件夹。" /> : messages.error && !visibleMessages.length ? <ErrorState message={messages.error} onRetry={messages.reload} /> : messages.loading && !visibleMessages.length ? <LoadingState /> : visibleMessages.length ? visibleMessages.map((message) => {
+                  const messageRunId = message.role === 'assistant' ? stringId(message.metadata?.run_id) : ''
+                  const completedThought = messageRunId ? completedThoughtsByRun[messageRunId] : undefined
+                  const thoughtRun = messageRunId ? sessionRuns.find((run) => run.id === messageRunId) : undefined
+                  return <Fragment key={message.id}>{completedThought && <CompletedThoughtTimeline runId={messageRunId} run={thoughtRun} timeline={completedThought} />}<MessageBubble message={message} /></Fragment>
+                }) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
                 {!draftActive && messages.error && !!visibleMessages.length && <p className="inline-error" role="alert">消息同步失败：{messages.error}</p>}
-                {liveRun.status !== 'idle' && <LiveAssistantMessage liveRun={liveRun} />}
+                {liveRun.status !== 'idle' && !completedThoughtsByRun[liveRun.runId] && <LiveAssistantMessage liveRun={liveRun} />}
                 {!draftActive && approvals.error && <ErrorState message={`审批状态读取失败：${approvals.error}`} onRetry={approvals.reload} />}
                 {!draftActive && approvals.loading && activeRunId && !visibleApprovals.length && liveRun.status === 'awaiting_approval' && <LoadingState label="正在读取审批状态" />}
                 {!draftActive && visibleApprovals.map((approval) => <ApprovalCard key={approval.id} approval={approval} deciding={decidingApproval === approval.id} onDecision={decideApproval} />)}
@@ -1115,6 +1425,33 @@ function SessionsPage() {
                 </div>}
                 <textarea aria-label="给 Agent 发送消息" value={composer} disabled={draftActive && sending} onChange={(event) => setComposer(event.target.value)} placeholder={draftActive ? '描述你想完成的任务……' : '告诉 PGAgent 你想完成什么……'} rows={2} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} />
                 <div className="composer-toolbar">
+                  <div className="composer-left-actions">
+                    <div className="session-capability-picker" ref={addMenuRef}>
+                      <button type="button" className="composer-tool-button composer-plus-button" aria-label="添加能力" aria-haspopup="menu" aria-expanded={addMenuOpen} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setAddMenuOpen((open) => !open); setSkillSubmenuOpen(false); setPermissionMenuOpen(false) }}>
+                        {capabilitySaving ? <LoaderCircle className="spin" size={14} /> : <Plus size={15} />}
+                        {!!selectedSessionSkillIds.length && <b>{selectedSessionSkillIds.length}</b>}
+                      </button>
+                      {addMenuOpen && <div className="capability-popover capability-level-two" role="menu" aria-label="添加能力">
+                        <button type="button" className={skillSubmenuOpen ? 'active' : ''} role="menuitem" aria-haspopup="menu" aria-expanded={skillSubmenuOpen} onMouseEnter={() => setSkillSubmenuOpen(true)} onClick={() => setSkillSubmenuOpen((open) => !open)}><BookOpen size={14} /><span>Skill</span><small>{selectedSessionSkillIds.length ? `已选 ${selectedSessionSkillIds.length}` : '未选择'}</small><ChevronRight size={13} /></button>
+                        {skillSubmenuOpen && <div className="capability-popover capability-level-three" role="menu" aria-label="选择 Skill">
+                          <p>可用 Skill</p>
+                          {skills.error ? <div className="capability-menu-state error"><AlertCircle size={13} /><span>{skills.error}</span><button type="button" onClick={() => void skills.reload()}>重试</button></div>
+                            : skills.loading ? <div className="capability-menu-state"><LoaderCircle className="spin" size={13} />正在读取…</div>
+                              : skills.data.length ? skills.data.map((skill) => {
+                                const selected = selectedSessionSkillIds.includes(skill.id)
+                                return <button key={skill.id} type="button" role="menuitemcheckbox" aria-checked={selected} className={selected ? 'selected' : ''} disabled={skill.enabled === false || capabilitySaving} onClick={() => toggleSessionSkill(skill.id)}><span><strong>{skill.name}</strong><small>{skill.description || skill.slug || 'Skill'}</small></span>{selected && <Check size={14} />}</button>
+                              }) : <div className="capability-menu-state">技能库中暂无 Skill。</div>}
+                        </div>}
+                      </div>}
+                    </div>
+                    <div className="session-capability-picker permission-picker" ref={permissionMenuRef}>
+                      <button type="button" className="composer-tool-button permission-trigger" aria-label={`权限模式：${permissionLabel(selectedPermissionMode)}`} aria-haspopup="menu" aria-expanded={permissionMenuOpen} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setPermissionMenuOpen((open) => !open); setAddMenuOpen(false); setSkillSubmenuOpen(false) }}><ShieldCheck size={14} /><span>{permissionLabel(selectedPermissionMode)}</span><ChevronRight size={12} /></button>
+                      {permissionMenuOpen && <div className="capability-popover permission-popover" role="menu" aria-label="权限模式">
+                        <p>权限</p>
+                        {permissionOptions.map((option) => <button key={option.value} type="button" role="menuitemradio" aria-checked={selectedPermissionMode === option.value} className={selectedPermissionMode === option.value ? 'selected' : ''} onClick={() => selectPermissionMode(option.value)}><span>{option.label}</span>{selectedPermissionMode === option.value && <Check size={14} />}</button>)}
+                      </div>}
+                    </div>
+                  </div>
                   <div className="composer-actions">
                     {draftActive ? <ContextUsageRing context={emptyDraftContext} /> : context.error ? <button type="button" className="context-state context-error" aria-label="上下文占用读取失败，点击重试" title={context.error} onClick={() => void context.reload()}><AlertCircle size={15} /></button> : context.loading || !context.data ? <span className="context-state" role="status" aria-label="正在读取上下文占用"><LoaderCircle className="spin" size={15} /></span> : <ContextUsageRing context={context.data} />}
                     <div className="session-settings-picker" ref={settingsMenuRef} title={settingsLocked ? '当前运行结束或审批完成后才能切换模型和思考强度' : undefined}>
@@ -1155,7 +1492,7 @@ function SessionsPage() {
                         </div>}
                       </div>}
                     </div>
-                    <button className="send-button" aria-label="发送" disabled={sending || settingsSaving || settingsLocked || !composer.trim()}>{sending ? <LoaderCircle className="spin" /> : <Send />}</button>
+                    <button className="send-button" aria-label="发送" disabled={sending || settingsSaving || capabilitySaving || settingsLocked || !composer.trim()}>{sending ? <LoaderCircle className="spin" /> : <Send />}</button>
                   </div>
                 </div>
               </form>
@@ -1168,20 +1505,66 @@ function SessionsPage() {
 
 function MessageBubble({ message }: { message: Message }) {
   const isTool = message.role === 'tool' || !!message.tool_name
+  const isDelegatedChild = message.metadata?.delegated_child === true
+  const childAgentName = typeof message.metadata?.child_agent_name === 'string'
+    ? message.metadata.child_agent_name
+    : '子 Agent'
+  const speaker = message.role === 'user'
+    ? '你'
+    : isTool
+      ? message.tool_name || '工具结果'
+      : isDelegatedChild
+        ? `${childAgentName}（子 Agent）`
+        : 'PGAgent'
   return (
     <article className={`message ${message.role} ${isTool ? 'tool-message' : ''}`}>
       <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <Sparkles size={16} />}</div>
-      <div className="message-body"><div className="message-meta"><strong>{message.role === 'user' ? '你' : isTool ? message.tool_name || '工具结果' : 'PGAgent'}</strong><time>{formatDate(message.created_at)}</time></div><div className="message-content">{message.content}</div>{message.status && <StatusBadge status={message.status} />}</div>
+      <div className="message-body"><div className="message-meta"><strong>{speaker}</strong><time>{formatDate(message.created_at)}</time></div><div className="message-content">{message.content}</div>{message.status && <StatusBadge status={message.status} />}</div>
     </article>
   )
 }
 
+function ThoughtTimeline({ timeline }: { timeline: ThoughtTimelineState }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (timeline.startedAt === null || timeline.finished) return
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), 100)
+    return () => window.clearInterval(timer)
+  }, [timeline.finished, timeline.startedAt])
+  if (timeline.startedAt === null && !timeline.tools.length) return null
+  const elapsed = timeline.finished ? timeline.elapsedMs : Math.max(0, now - (timeline.startedAt ?? now))
+  return <section className="thought-timeline" aria-label="思考与工具时间线">
+    <header><span>+</span><strong>Thought:</strong><time>{formatThoughtDuration(elapsed)}</time></header>
+    {!!timeline.tools.length && <div>{timeline.tools.map((tool) => <p key={tool.id} className={`thought-tool ${tool.status}`}><span>{tool.name.startsWith('Web') ? '⌁' : '→'}</span><strong>{tool.name}</strong>{tool.target && <code title={tool.target}>{tool.target}</code>}{tool.status === 'running' && <i aria-label="运行中" />}</p>)}</div>}
+  </section>
+}
+
+function CompletedThoughtTimeline({ runId, run, timeline }: { runId: string; run?: Run; timeline: ThoughtTimelineState }) {
+  return <article className="completed-thought">
+    <div className="completed-thought-meta"><span>{run?.title || `运行 ${runId.slice(0, 8)}`}</span><time>{formatDate(run?.finished_at || run?.updated_at)}</time></div>
+    <ThoughtTimeline timeline={timeline} />
+  </article>
+}
+
 function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunState }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (liveRun.thought.startedAt === null || liveRun.thought.finished) return
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), 100)
+    return () => window.clearInterval(timer)
+  }, [liveRun.thought.finished, liveRun.thought.startedAt])
+  const liveThoughtMs = liveRun.thought.startedAt === null ? 0 : Math.max(0, now - liveRun.thought.startedAt)
+  const phase = !liveRun.thought.finished && liveRun.status !== 'awaiting_approval' && liveRun.thinkingStatus
+    ? `${liveRun.thinkingStatus} ${formatLiveThinkingDuration(liveThoughtMs)}`
+    : liveRun.phase || '已完成'
   return (
     <article className={`message assistant live-message ${liveRun.status === 'terminal' ? 'live-message-terminal' : ''}`}>
       <div className="message-avatar"><Sparkles size={16} /></div>
       <div className="message-body">
-        <div className="message-meta"><strong>PGAgent</strong><span className="live-phase"><i aria-hidden="true" />{liveRun.phase || '思考中…'}</span></div>
+        <div className="message-meta"><strong>PGAgent</strong><span className="live-phase"><i aria-hidden="true" />{phase}</span></div>
+        <ThoughtTimeline timeline={liveRun.thought} />
         {liveRun.draft && <div className="message-content">{liveRun.draft}</div>}
         {liveRun.error && <p className="live-error">{liveRun.error}</p>}
       </div>
@@ -1189,13 +1572,14 @@ function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunState }) {
   )
 }
 
-function ApprovalCard({ approval, deciding, onDecision }: { approval: Approval; deciding: boolean; onDecision: (id: string, decision: 'approve' | 'reject') => void }) {
+function ApprovalCard({ approval, deciding, onDecision }: { approval: Approval; deciding: boolean; onDecision: (id: string, decision: 'approve' | 'reject', runId: string) => void }) {
+  const runId = stringId(approval.run_id)
   return (
     <article className="approval-card">
       <header><span><ShieldCheck size={17} /></span><div><strong>需要你的批准</strong><p>Agent 请求执行有副作用的工具</p></div><StatusBadge status={approval.status || 'pending'} /></header>
       <div className="approval-command"><span>{approval.tool_name || 'unknown_tool'}</span><pre>{JSON.stringify(approval.arguments ?? {}, null, 2)}</pre></div>
       {approval.reason && <p className="approval-reason">理由：{approval.reason}</p>}
-      <footer><button className="button button-danger" disabled={deciding} onClick={() => onDecision(approval.id, 'reject')}><XCircle size={15} />拒绝</button><button className="button button-primary" disabled={deciding} onClick={() => onDecision(approval.id, 'approve')}>{deciding ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}允许本次</button></footer>
+      <footer><button className="button button-danger" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'reject', runId)}><XCircle size={15} />拒绝</button><button className="button button-primary" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'approve', runId)}>{deciding ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}允许本次</button></footer>
     </article>
   )
 }

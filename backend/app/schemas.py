@@ -40,6 +40,88 @@ class WorkspaceRead(ORMModel):
 
 ThinkingLevel = Literal["off", "auto", "low", "medium", "high", "xhigh"]
 AgentMode = Literal["auto", "direct", "plan"]
+PermissionMode = Literal["ask", "smart", "full"]
+
+
+class ToolRead(BaseModel):
+    id: str
+    name: str
+    label: str
+    description: str
+    category: str
+    risk_level: str
+    enabled: bool
+    is_builtin: bool = True
+    availability: str
+    runtime_tool_id: str | None = None
+    requires_approval: bool = False
+
+
+class SkillRead(ORMModel):
+    id: str
+    slug: str
+    name: str
+    description: str
+    source: str
+    source_url: str | None
+    root_path: str
+    version: str | None
+    enabled: bool
+    installed_at: datetime
+
+
+class SkillImportRequest(BaseModel):
+    source_path: str = Field(min_length=1, max_length=4096)
+
+
+class SkillMarketSearchRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=200)
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class SkillMarketItem(BaseModel):
+    id: str
+    slug: str
+    name: str
+    source: str
+    source_url: str | None = None
+    market_url: str | None = None
+    installs: int | None = None
+
+
+class SkillMarketSearchRead(BaseModel):
+    provider: str = "skills.sh"
+    available: bool
+    message: str | None = None
+    items: list[SkillMarketItem] = Field(default_factory=list)
+
+
+class SkillMarketInstallRequest(BaseModel):
+    market_id: str | None = Field(default=None, min_length=3, max_length=300)
+    source_url: str | None = Field(default=None, min_length=8, max_length=2048)
+    skill_path: str | None = Field(default=None, max_length=512)
+    confirm: bool = False
+
+    @model_validator(mode="after")
+    def _require_exactly_one_source(self) -> "SkillMarketInstallRequest":
+        sources = [item for item in (self.market_id, self.source_url) if item and item.strip()]
+        if len(sources) != 1:
+            raise ValueError("provide exactly one of market_id or source_url")
+        return self
+
+
+class SkillFilePreview(BaseModel):
+    path: str
+    size: int
+
+
+class SkillInstallRead(BaseModel):
+    installed: bool
+    source_url: str
+    candidates: list[str] = Field(default_factory=list)
+    files: list[SkillFilePreview] = Field(default_factory=list)
+    skill: SkillRead | None = None
+    message: str | None = None
 
 
 class AgentCreate(BaseModel):
@@ -52,6 +134,8 @@ class AgentCreate(BaseModel):
     thinking_level: ThinkingLevel = "auto"
     mode: AgentMode = "auto"
     enabled: bool = True
+    tool_ids: list[str] = Field(default_factory=list, max_length=64)
+    skill_ids: list[str] = Field(default_factory=list, max_length=128)
 
 
 class AgentUpdate(BaseModel):
@@ -64,6 +148,8 @@ class AgentUpdate(BaseModel):
     thinking_level: ThinkingLevel | None = None
     mode: AgentMode | None = None
     enabled: bool | None = None
+    tool_ids: list[str] | None = Field(default=None, max_length=64)
+    skill_ids: list[str] | None = Field(default=None, max_length=128)
 
 
 class AgentRead(ORMModel):
@@ -78,6 +164,8 @@ class AgentRead(ORMModel):
     mode: str
     enabled: bool
     is_default: bool
+    tool_ids: list[str]
+    skill_ids: list[str]
     created_at: datetime
     updated_at: datetime
 
@@ -89,6 +177,8 @@ class SessionCreate(BaseModel):
     model_connection_id: str | None = None
     model_id: str | None = None
     thinking_level: ThinkingLevel = "auto"
+    permission_mode: PermissionMode = "smart"
+    skill_ids: list[str] = Field(default_factory=list, max_length=128)
     context_summary: str = ""
 
 
@@ -99,6 +189,8 @@ class SessionUpdate(BaseModel):
     model_connection_id: str | None = None
     model_id: str | None = None
     thinking_level: ThinkingLevel | None = None
+    permission_mode: PermissionMode | None = None
+    skill_ids: list[str] | None = Field(default=None, max_length=128)
     context_summary: str | None = None
     status: str | None = None
 
@@ -111,6 +203,8 @@ class SessionRead(ORMModel):
     model_connection_id: str | None
     model_id: str | None
     thinking_level: str
+    permission_mode: str
+    skill_ids: list[str]
     context_summary: str
     context_tokens: int
     last_compacted_at: datetime | None
@@ -189,6 +283,8 @@ class DraftLaunchRequest(BaseModel):
     model_connection_id: str | None = Field(default=None, max_length=36)
     model_id: str | None = Field(default=None, max_length=255)
     thinking_level: ThinkingLevel = "auto"
+    permission_mode: PermissionMode = "smart"
+    skill_ids: list[str] = Field(default_factory=list, max_length=128)
 
     @field_validator("idempotency_key", "title", "content")
     @classmethod

@@ -21,6 +21,8 @@ from app.database import (
     Run,
     RunEvent,
     Session,
+    TeamTask,
+    AgentMessage,
     Workspace,
     configure_database,
     init_db,
@@ -196,6 +198,142 @@ def test_approval_decision_is_restored_when_resume_cannot_be_scheduled(
         assert restored_approval.reason == "write access"
         assert restored_approval.decided_at is None
         assert restored_run is not None and restored_run.status == "awaiting_approval"
+
+
+def test_rejecting_delegated_child_approval_settles_its_task_and_parent_audit(
+    client: tuple[TestClient, dict[str, list]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_client, launched = client
+    continuation_events: list[dict[str, object] | None] = []
+    monkeypatch.setattr(
+        coordinator,
+        "launch_parent_continuation_if_queued",
+        lambda event: continuation_events.append(event) or True,
+    )
+    workspace_id, agent_id, session_id = _seed()
+    with database.SessionLocal() as db:
+        parent = Run(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            agent_id=DEFAULT_AGENT_ID,
+            status="stopped",
+            stop_reason="delegated_child_awaiting_approval",
+        )
+        child = Run(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            status="awaiting_approval",
+        )
+        db.add_all([parent, child])
+        db.flush()
+        task = TeamTask(
+            team_id=f"run:{parent.id}",
+            title="delegated child",
+            status="in_progress",
+            assignee_agent_id=agent_id,
+            lease_owner=f"run:{parent.id}",
+            result={
+                "child_run_id": child.id,
+                "status": "awaiting_approval",
+                "binding": {
+                    "model_connection_id": "child-connection",
+                    "provider": "openai_compatible",
+                    "model_id": "child-model",
+                    "thinking_level": "high",
+                    "permission_mode": "smart",
+                    "allowed_tool_names": ["read"],
+                    "skill_ids": [],
+                },
+            },
+        )
+        db.add(task)
+        db.flush()
+        db.add(AgentMessage(
+            team_id=task.team_id,
+            task_id=task.id,
+            sender_agent_id=DEFAULT_AGENT_ID,
+            recipient_agent_id=agent_id,
+            message_type="TASK_ASSIGNED",
+            payload={"child_run_id": child.id},
+            idempotency_key=f"assignment:{task.id}",
+        ))
+        db.add_all([
+            RunEvent(
+                run_id=child.id,
+                event_type="delegation_link",
+                payload={
+                    "team_task_id": task.id,
+                    "parent_run_id": parent.id,
+                    "parent_agent_id": DEFAULT_AGENT_ID,
+                    "parent_session_id": session_id,
+                },
+            ),
+            RunEvent(
+                run_id=child.id,
+                event_type="runtime_snapshot",
+                payload={
+                    "status": "awaiting_approval",
+                    "runtime_binding": {
+                        "delegation_version": 1,
+                        "agent_id": agent_id,
+                        "model_connection_id": "child-connection",
+                        "provider": "openai_compatible",
+                        "model_id": "child-model",
+                        "thinking_level": "high",
+                        "permission_mode": "smart",
+                        "allowed_tool_names": ["read"],
+                        "skill_ids": [],
+                    },
+                    "pending_approval": {
+                        "id": "child-call",
+                        "tool_name": "write",
+                        "arguments": {"path": "child.txt", "content": "secret"},
+                    },
+                },
+            ),
+        ])
+        approval = Approval(
+            run_id=child.id,
+            tool_name="write",
+            arguments={"path": "child.txt", "content": "secret"},
+        )
+        db.add(approval)
+        db.commit()
+        approval_id, task_id, parent_run_id = approval.id, task.id, parent.id
+
+    response = test_client.post(
+        f"/api/approvals/{approval_id}/decide",
+        json={"decision": "reject", "reason": "not now"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "rejected"
+    assert launched["calls"] == []
+    assert len(continuation_events) == 1
+    assert continuation_events[0] is not None
+    assert continuation_events[0]["continuation_queued"] is True
+    with database.SessionLocal() as db:
+        task = db.get(TeamTask, task_id)
+        assert task is not None and task.status == "blocked"
+        assert task.result["status"] == "stopped"
+        assert task.result["binding"]["model_id"] == "child-model"
+        assert task.result["binding"]["allowed_tool_names"] == ["read"]
+        parent = db.get(Run, parent_run_id)
+        assert parent is not None and parent.status == "received"
+        messages = list(db.scalars(select(AgentMessage).where(
+            AgentMessage.task_id == task_id,
+        ).order_by(AgentMessage.created_at.asc())))
+        assert [item.message_type for item in messages] == ["TASK_ASSIGNED", "BLOCKED"]
+        assert db.scalar(select(RunEvent).where(
+            RunEvent.run_id == parent_run_id,
+            RunEvent.event_type == "delegated_child_stopped",
+        )) is not None
+        child_message = next(
+            item for item in db.scalars(select(ChatMessage).where(ChatMessage.session_id == session_id))
+            if item.extra.get("delegated_child") is True
+        )
+        assert child_message.extra["delegated_status"] == "stopped"
 
 
 def test_approval_decision_rejects_run_not_awaiting_approval(

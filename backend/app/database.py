@@ -22,13 +22,16 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    delete,
     event,
     inspect,
     or_,
     update,
 )
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session as OrmSession, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session as OrmSession, mapped_column, relationship, sessionmaker
+
+from app.capabilities import BUILTIN_TOOL_IDS
 
 
 def utcnow() -> datetime:
@@ -52,7 +55,7 @@ DEFAULT_AGENT_SYSTEM_PROMPT = """你是 PGAgent 主控，负责整个会话的�
 
 你的职责是：理解用户意图与约束，判断任务难度，必要时形成清晰计划，汇总已经获得的证据与结果，并决定应继续推进还是直接给出结果。简单、明确且可安全完成的任务可以由你直接完成。
 
-用户创建的 Agent 是未来可供委派的子 Agent 配置；当前版本尚未启用实际的子 Agent、工具或 Skill 委派。不要声称已经调用了不存在的子 Agent、工具或 Skill。遇到需要这些能力的复杂或专业任务时，应如实说明当前限制，并先完成你能够可靠完成的分析、规划或结果整理。
+用户创建的 Agent 是可供委派的子 Agent 配置；当系统在 Agent 配置中提供“可委派的子 Agent”列表时，你可以且只能用 task 工具把明确子任务交给其中的精确 agent_id。不要声称已经调用了不存在、未启用或未完成的子 Agent、工具或 Skill；应先确认工具返回的结构化结果，再汇总给用户。遇到没有合适子 Agent 的复杂或专业任务时，先完成你能够可靠完成的分析、规划或结果整理。
 
 始终以用户目标为中心；在不确定、可能破坏数据或需要额外授权时先说明原因。输出应区分已验证事实、推断和下一步建议。"""
 
@@ -98,6 +101,27 @@ class ModelConnection(TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
+class Skill(TimestampMixin, Base):
+    """A locally managed, inert Skill package.
+
+    Installation only copies declared files into the application data folder.
+    The runtime does not execute those files merely because this record exists.
+    """
+
+    __tablename__ = "skills"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    slug: Mapped[str] = mapped_column(String(120), unique=True, index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    source: Mapped[str] = mapped_column(String(32), default="local", nullable=False)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    root_path: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    installed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class Agent(TimestampMixin, Base):
     __tablename__ = "agents"
 
@@ -116,6 +140,50 @@ class Agent(TimestampMixin, Base):
     mode: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    tool_bindings: Mapped[list["AgentTool"]] = relationship(
+        back_populates="agent", cascade="all, delete-orphan", lazy="selectin"
+    )
+    skill_bindings: Mapped[list["AgentSkill"]] = relationship(
+        back_populates="agent", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+    @property
+    def tool_ids(self) -> list[str]:
+        return sorted(binding.tool_id for binding in self.tool_bindings)
+
+    @property
+    def tools(self) -> list["AgentTool"]:
+        """Compatibility alias for consumers that expect an Agent.tools relation."""
+
+        return self.tool_bindings
+
+    @property
+    def skill_ids(self) -> list[str]:
+        return sorted(binding.skill_id for binding in self.skill_bindings)
+
+
+class AgentTool(Base):
+    """Persisted catalog selections for a user-configured Agent."""
+
+    __tablename__ = "agent_tools"
+
+    agent_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="CASCADE"), primary_key=True
+    )
+    tool_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    agent: Mapped[Agent] = relationship(back_populates="tool_bindings")
+
+
+class AgentSkill(Base):
+    __tablename__ = "agent_skills"
+
+    agent_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="CASCADE"), primary_key=True
+    )
+    skill_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("skills.id", ondelete="RESTRICT"), primary_key=True
+    )
+    agent: Mapped[Agent] = relationship(back_populates="skill_bindings")
 
 
 class Session(TimestampMixin, Base):
@@ -134,10 +202,30 @@ class Session(TimestampMixin, Base):
     )
     model_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     thinking_level: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
+    permission_mode: Mapped[str] = mapped_column(String(16), default="smart", nullable=False)
     context_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
     context_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_compacted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    skill_bindings: Mapped[list["SessionSkill"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+    @property
+    def skill_ids(self) -> list[str]:
+        return sorted(binding.skill_id for binding in self.skill_bindings)
+
+
+class SessionSkill(Base):
+    __tablename__ = "session_skills"
+
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True
+    )
+    skill_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("skills.id", ondelete="RESTRICT"), primary_key=True
+    )
+    session: Mapped[Session] = relationship(back_populates="skill_bindings")
 
 
 class ChatMessage(Base):
@@ -357,6 +445,7 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "model_connection_id": "VARCHAR(36)",
         "model_id": "VARCHAR(255)",
         "thinking_level": "VARCHAR(16) NOT NULL DEFAULT 'auto'",
+        "permission_mode": "VARCHAR(16) NOT NULL DEFAULT 'smart'",
         "context_tokens": "INTEGER NOT NULL DEFAULT 0",
         "last_compacted_at": "DATETIME",
     },
@@ -439,6 +528,11 @@ def _seed_defaults() -> None:
         agent.mode = "auto"
         agent.enabled = True
         agent.is_default = True
+
+        # The system-owned coordinator always advertises the complete built-in
+        # catalog.  User-created Agents keep their own persisted selections.
+        db.execute(delete(AgentTool).where(AgentTool.agent_id == DEFAULT_AGENT_ID))
+        db.add_all(AgentTool(agent_id=DEFAULT_AGENT_ID, tool_id=tool_id) for tool_id in BUILTIN_TOOL_IDS)
 
         # Older databases may contain rows marked as default by a previous
         # implementation. Those are user-created child profiles, so make them

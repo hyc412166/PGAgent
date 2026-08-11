@@ -13,7 +13,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app import __version__
-from app.api import connections, resources, runtime, system, usage
+from app.api import capabilities, connections, resources, runtime, system, usage
 from app.config import PROJECT_ROOT, settings
 from app.database import init_db
 from app.services.run_service import coordinator
@@ -24,10 +24,12 @@ async def lifespan(_app: FastAPI):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.workspaces_dir.mkdir(parents=True, exist_ok=True)
     init_db()
-    coordinator.reconcile_interrupted_runs()
+    continuation_run_ids = coordinator.reconcile_interrupted_runs()
     async with AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_path)) as saver:
         await saver.setup()
         coordinator.set_checkpointer(saver)
+        for run_id in continuation_run_ids:
+            coordinator.launch_delegated_child_continuation(run_id)
         yield
         await coordinator.shutdown()
         coordinator.set_checkpointer(None)
@@ -78,6 +80,7 @@ async def enforce_local_browser_origin(request: Request, call_next):  # type: ig
 
 
 app.include_router(resources.router)
+app.include_router(capabilities.router)
 app.include_router(connections.router)
 app.include_router(runtime.router)
 app.include_router(system.router)
