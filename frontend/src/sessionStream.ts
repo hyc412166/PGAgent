@@ -1,0 +1,106 @@
+export interface RunStreamEvent {
+  type: string
+  delta?: string
+  tool_name?: string
+  error?: string
+  reason?: string
+  status?: string
+  terminal?: boolean
+  event_id?: string
+  [key: string]: unknown
+}
+
+const terminalTypes = new Set(['run_completed', 'run_stopped', 'model_failed', 'integration_failed', 'failed', 'completed', 'stopped'])
+const terminalStatuses = new Set(['completed', 'stopped', 'failed', 'cancelled'])
+
+export function parseRunStreamEvent(raw: string, fallbackType = ''): RunStreamEvent | null {
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>
+    const type = String(value.type || value.event_type || fallbackType || '')
+    if (!type) return null
+    return { ...value, type } as RunStreamEvent
+  } catch {
+    return fallbackType === 'assistant_delta' ? { type: fallbackType, delta: raw } : null
+  }
+}
+
+export function runStreamPhase(event: RunStreamEvent): string {
+  switch (event.type) {
+    case 'run_state': return runStatusPhase(event.status)
+    case 'context_prepared':
+    case 'context_resumed':
+    case 'context_compacted': return '正在准备上下文…'
+    case 'model_step_started':
+    case 'model_retry': return '思考中…'
+    case 'assistant_delta': return '正在回复…'
+    case 'tool_started': return event.tool_name ? `正在调用 ${event.tool_name}…` : '正在调用工具…'
+    case 'tool_finished': return '正在读取工具结果…'
+    case 'approval_requested': return '等待你的审批'
+    case 'approval_granted': return '审批已通过，继续处理…'
+    case 'run_completed':
+    case 'completed': return '已完成'
+    case 'run_stopped':
+    case 'stopped': return '已停止'
+    case 'model_failed':
+    case 'integration_failed':
+    case 'failed': return '运行失败'
+    default: return '处理中…'
+  }
+}
+
+export function isTerminalRunStreamEvent(event: RunStreamEvent): boolean {
+  return event.terminal === true || terminalTypes.has(event.type) || (event.type === 'run_state' && isTerminalRunStatus(event.status))
+}
+
+export function isTerminalRunStatus(status?: string): boolean {
+  return terminalStatuses.has(status || '')
+}
+
+export function runStatusPhase(status?: string): string {
+  switch (status) {
+    case 'received':
+    case 'preparing_context': return '正在准备上下文…'
+    case 'planning':
+    case 'running':
+    case 'acting': return '思考中…'
+    case 'observing': return '正在读取工具结果…'
+    case 'awaiting_approval': return '等待你的审批'
+    case 'completed': return '已完成'
+    case 'stopped':
+    case 'cancelled': return '已停止'
+    case 'failed': return '运行失败'
+    default: return '处理中…'
+  }
+}
+
+export function appendAssistantDelta(current: string, event: RunStreamEvent): string {
+  return event.type === 'assistant_delta' && typeof event.delta === 'string' ? current + event.delta : current
+}
+
+export function rememberRunStreamEvent(seenEventIds: Set<string>, event: RunStreamEvent, lastEventId = ''): boolean {
+  const eventId = String(event.event_id || lastEventId || '')
+  if (!eventId) return true
+  if (seenEventIds.has(eventId)) return false
+  seenEventIds.add(eventId)
+  return true
+}
+
+export function visibleSessionItems<T>(ownerSessionId: string, activeSessionId: string, items: T[]): T[] {
+  return ownerSessionId === activeSessionId ? items : []
+}
+
+export function isCurrentSessionRun(
+  activeSessionId: string,
+  activeRunId: string,
+  streamRunId: string,
+  expectedSessionId: string,
+  expectedRunId: string,
+): boolean {
+  return Boolean(expectedSessionId && expectedRunId)
+    && activeSessionId === expectedSessionId
+    && (activeRunId === expectedRunId || streamRunId === expectedRunId)
+}
+
+export function shouldMarkApprovalResuming(status: string, liveRunId: string, approvalRunId: string): boolean {
+  return status === 'awaiting_approval' && Boolean(approvalRunId) && liveRunId === approvalRunId
+}

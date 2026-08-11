@@ -1,0 +1,42 @@
+:root {
+  font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  color: #2b2927;
+  background: #f6f4ef;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --bg: #f6f4ef;
+  --surface: #fffefa;
+  --surface-soft: #faf8f3;
+  --surface-deep: #f1eee7;
+  --ink: #242220;
+  --muted: #716d67;
+  --muted-2: #98928a;
+  --line: #e7e2d9;
+  --line-strong: #dcd5ca;
+  --orange: #ed6d35;
+  --orange-dark: #cf5221;
+  --orange-soft: #fff0e7;
+  --green: #26815f;
+  --green-soft: #e8f5ee;
+  --yellow: #a76c12;
+  --yellow-soft: #fff4dc;
+  --red: #bb4b41;
+  --red-soft: #fcecea;
+  --violet: #7252a4;
+  --violet-soft: #f0ebf8;
+  --shadow-sm: 0 1px 2px rgb(47 39 30 / 4%), 0 6px 18px rgb(47 39 30 / 4%);
+  --shadow-md: 0 18px 50px rgb(47 39 30 / 12%);
+}
+
+* { box-sizing: border-box; }
+html { min-width: 320px; background: var(--bg); }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input, textarea, select { font: inherit; }
+button { color: inherit; }
+button:not(:disabled), select:not(:disabled) { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .55; }
+button, a, input, textarea, select { -webkit-tap-highlight-color: transparent; }
+:focus-visible { outline: 3px solid rgb(237 109 53 / 24%); outline-offset: 2px; }
+::selection { color: var(--ink); background: #ffd6bf; }
+#root { min-height: 100vh; }

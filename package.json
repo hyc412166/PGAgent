@@ -1,0 +1,13 @@
+{
+  "name": "pgagent",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "install:web": "npm --prefix frontend install",
+    "dev:web": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "lint": "npm --prefix frontend run lint",
+    "test:web": "npm --prefix frontend run test -- --run"
+  }
+}
+
