@@ -1,0 +1,104 @@
+"""PGAgent FastAPI application and local SPA host."""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from app import __version__
+from app.api import connections, resources, runtime, system, usage
+from app.config import PROJECT_ROOT, settings
+from app.database import init_db
+from app.services.run_service import coordinator
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.workspaces_dir.mkdir(parents=True, exist_ok=True)
+    init_db()
+    coordinator.reconcile_interrupted_runs()
+    async with AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_path)) as saver:
+        await saver.setup()
+        coordinator.set_checkpointer(saver)
+        yield
+        await coordinator.shutdown()
+        coordinator.set_checkpointer(None)
+
+
+_LOCAL_BROWSER_HOSTS = frozenset({"127.0.0.1", "localhost"})
+_SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _is_local_browser_origin(origin: str) -> bool:
+    try:
+        parsed = urlsplit(origin)
+        # Accessing port also rejects malformed values such as ":not-a-port".
+        parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() in {"http", "https"}
+        and parsed.hostname in _LOCAL_BROWSER_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path == ""
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+app = FastAPI(title="PGAgent", version=__version__, lifespan=lifespan)
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost", "testserver"],
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def enforce_local_browser_origin(request: Request, call_next):  # type: ignore[no-untyped-def]
+    origin = request.headers.get("origin")
+    if request.method.upper() not in _SAFE_HTTP_METHODS and origin and not _is_local_browser_origin(origin):
+        return JSONResponse(status_code=403, content={"detail": "State-changing browser requests require a local origin"})
+    return await call_next(request)
+
+
+app.include_router(resources.router)
+app.include_router(connections.router)
+app.include_router(runtime.router)
+app.include_router(system.router)
+app.include_router(usage.router)
+
+
+@app.get("/api/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "name": "PGAgent", "version": __version__}
+
+
+FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
+
+
+@app.get("/{path:path}", include_in_schema=False)
+def frontend(path: str) -> FileResponse:
+    if path == "api" or path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="API endpoint not found")
+    if not FRONTEND_DIST.exists():
+        raise HTTPException(status_code=503, detail="前端尚未构建，请先运行 npm run build")
+    requested = (FRONTEND_DIST / path).resolve()
+    if path and requested.is_file() and FRONTEND_DIST.resolve() in requested.parents:
+        return FileResponse(requested)
+    return FileResponse(FRONTEND_DIST / "index.html")
