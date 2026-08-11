@@ -332,10 +332,15 @@ class RunCoordinator:
             if run is None:
                 raise LookupError("运行不存在")
             session = db.get(Session, run.session_id) if run.session_id else None
-            agent_id = run.agent_id or (session.agent_id if session else None) or DEFAULT_AGENT_ID
+            # Session runs always use the fixed PGAgent coordinator. Keep
+            # standalone runs backwards compatible with their explicit Agent.
+            agent_id = DEFAULT_AGENT_ID if session is not None else (run.agent_id or DEFAULT_AGENT_ID)
             agent = db.get(Agent, agent_id) or db.get(Agent, DEFAULT_AGENT_ID)
             if agent is None:
                 raise ModelConfigurationError("当前会话没有选择 Agent")
+            if session is not None:
+                session.agent_id = DEFAULT_AGENT_ID
+                run.agent_id = DEFAULT_AGENT_ID
             workspace_id = (
                 run.workspace_id
                 or (session.workspace_id if session else None)

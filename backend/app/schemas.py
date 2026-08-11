@@ -13,7 +13,9 @@ class ORMModel(BaseModel):
 
 
 class WorkspaceCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
+    # The project picker normally provides only a directory. Keep ``name``
+    # optional for that path while accepting the older explicit-name payload.
+    name: str | None = Field(default=None, min_length=1, max_length=120)
     description: str = ""
     root_path: str = Field(min_length=1)
     enabled: bool = True
@@ -170,6 +172,48 @@ class RunRead(ORMModel):
     error_message: str | None
     started_at: datetime
     finished_at: datetime | None
+
+
+class DraftLaunchRequest(BaseModel):
+    """Materialise one unsaved conversation draft and launch its first run.
+
+    ``idempotency_key`` is generated and retained by the client for the life
+    of the in-memory draft.  Sending the same key again is a retry, not a new
+    conversation.
+    """
+
+    idempotency_key: str = Field(min_length=1, max_length=255)
+    title: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=100_000)
+    root_path: str | None = Field(default=None, max_length=4096)
+    model_connection_id: str | None = Field(default=None, max_length=36)
+    model_id: str | None = Field(default=None, max_length=255)
+    thinking_level: ThinkingLevel = "auto"
+
+    @field_validator("idempotency_key", "title", "content")
+    @classmethod
+    def _require_non_blank_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("must not be blank")
+        return normalized
+
+    @field_validator("root_path", "model_connection_id", "model_id")
+    @classmethod
+    def _normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class DraftLaunchRead(BaseModel):
+    """The persisted resources that now own a previously in-memory draft."""
+
+    workspace: WorkspaceRead | None
+    session: SessionRead
+    run: RunRead
+    reused: bool = False
 
 
 class RunEventCreate(BaseModel):

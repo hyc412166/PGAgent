@@ -12,7 +12,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, event, inspect
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    event,
+    inspect,
+    or_,
+    update,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session as OrmSession, mapped_column, sessionmaker
 
@@ -30,6 +44,17 @@ DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "pgagent.db"
 DEFAULT_DATABASE_URL = f"sqlite:///{DEFAULT_DATABASE_PATH.as_posix()}"
 DEFAULT_WORKSPACE_ID = "00000000-0000-0000-0000-000000000001"
 DEFAULT_AGENT_ID = "00000000-0000-0000-0000-000000000002"
+DEFAULT_WORKSPACE_NAME = "一次性任务"
+DEFAULT_WORKSPACE_DESCRIPTION = "未选择项目目录的单次任务会话归属。"
+DEFAULT_AGENT_NAME = "PGAgent 主控"
+DEFAULT_AGENT_DESCRIPTION = "固定主控：理解意图、分析编排、汇总结果并决定继续执行或输出。"
+DEFAULT_AGENT_SYSTEM_PROMPT = """你是 PGAgent 主控，负责整个会话的协调与交付。
+
+你的职责是：理解用户意图与约束，判断任务难度，必要时形成清晰计划，汇总已经获得的证据与结果，并决定应继续推进还是直接给出结果。简单、明确且可安全完成的任务可以由你直接完成。
+
+用户创建的 Agent 是未来可供委派的子 Agent 配置；当前版本尚未启用实际的子 Agent、工具或 Skill 委派。不要声称已经调用了不存在的子 Agent、工具或 Skill。遇到需要这些能力的复杂或专业任务时，应如实说明当前限制，并先完成你能够可靠完成的分析、规划或结果整理。
+
+始终以用户目标为中心；在不确定、可能破坏数据或需要额外授权时先说明原因。输出应区分已验证事实、推断和下一步建议。"""
 
 
 class Base(DeclarativeBase):
@@ -153,6 +178,31 @@ class Run(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DraftLaunch(TimestampMixin, Base):
+    """Durable idempotency record for materialising an unsaved chat draft.
+
+    A draft is deliberately client-only until its first send.  This row binds
+    that first-send request to the workspace/session/run created for it, so a
+    browser retry can safely return the original resources instead of creating
+    another conversation or scheduling another coordinator run.
+    """
+
+    __tablename__ = "draft_launches"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    workspace_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True
+    )
+    session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class RunEvent(Base):
@@ -351,13 +401,19 @@ def _seed_defaults() -> None:
             )
             db.add(workspace)
             db.flush()
+        # The built-in workspace holds one-off tasks that have no project
+        # directory. Its identity and filesystem root stay stable on upgrade.
+        workspace.name = DEFAULT_WORKSPACE_NAME
+        workspace.description = DEFAULT_WORKSPACE_DESCRIPTION
+        workspace.root_path = str(root)
+        workspace.enabled = True
         agent = db.get(Agent, DEFAULT_AGENT_ID)
         if agent is None:
             db.add(Agent(
                 id=DEFAULT_AGENT_ID,
-                name="默认 Agent",
-                description="PGAgent 默认助手",
-                system_prompt="",
+                name=DEFAULT_AGENT_NAME,
+                description=DEFAULT_AGENT_DESCRIPTION,
+                system_prompt=DEFAULT_AGENT_SYSTEM_PROMPT,
                 workspace_id=DEFAULT_WORKSPACE_ID,
                 mode="auto",
                 enabled=True,
@@ -365,7 +421,41 @@ def _seed_defaults() -> None:
             ))
         else:
             agent.is_default = True
-            agent.system_prompt = ""
+            agent.system_prompt = DEFAULT_AGENT_SYSTEM_PROMPT
+        # Always repair the system-owned coordinator, including legacy rows
+        # whose fields were changed before the fixed-master policy existed.
+        # SessionLocal deliberately has autoflush disabled, so flush a newly
+        # added coordinator before retrieving it for the common repair path.
+        db.flush()
+        agent = db.get(Agent, DEFAULT_AGENT_ID)
+        assert agent is not None
+        agent.name = DEFAULT_AGENT_NAME
+        agent.description = DEFAULT_AGENT_DESCRIPTION
+        agent.system_prompt = DEFAULT_AGENT_SYSTEM_PROMPT
+        agent.workspace_id = DEFAULT_WORKSPACE_ID
+        agent.model_connection_id = None
+        agent.model_id = None
+        agent.thinking_level = "auto"
+        agent.mode = "auto"
+        agent.enabled = True
+        agent.is_default = True
+
+        # Older databases may contain rows marked as default by a previous
+        # implementation. Those are user-created child profiles, so make them
+        # editable again without deleting their configuration.
+        db.execute(
+            update(Agent)
+            .where(Agent.id != DEFAULT_AGENT_ID, Agent.is_default.is_(True))
+            .values(is_default=False)
+        )
+
+        # Keep all historic sessions/messages, but make the fixed coordinator
+        # their primary Agent from now on. Runs and messages are untouched.
+        db.execute(
+            update(Session)
+            .where(or_(Session.agent_id.is_(None), Session.agent_id != DEFAULT_AGENT_ID))
+            .values(agent_id=DEFAULT_AGENT_ID)
+        )
         db.commit()
 
 

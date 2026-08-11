@@ -7,7 +7,6 @@ import {
   Check,
   CheckCircle2,
   ChevronRight,
-  Clock3,
   ChartNoAxesCombined,
   Database,
   FolderOpen,
@@ -24,7 +23,6 @@ import {
   Pencil,
   Plus,
   RefreshCw,
-  Search,
   Send,
   Settings2,
   ShieldCheck,
@@ -42,7 +40,9 @@ import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'reac
 import { api, apiUrl, describeError } from './api'
 import { modelSelectionPayload, resolveEffectiveThinking, shortModelLabel, thinkingLevelLabels } from './composerSettings'
 import { buildContextUsageView } from './contextUsage'
+import { buildDraftLaunchPayload, createDraftIdempotencyKey } from './draftLaunch'
 import { availableConnectionModels, resolveEffectiveModelSettings } from './modelSettings'
+import { buildSessionNavigation, folderName, isDefaultWorkspace, projectRootForSession } from './sessionNavigation'
 import { appendAssistantDelta, isCurrentSessionRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, visibleSessionItems, type RunStreamEvent } from './sessionStream'
 import type {
   AgentProfile,
@@ -66,6 +66,11 @@ import './App.css'
 type LoadState<T> = { data: T; loading: boolean; error: string }
 type LiveRunState = { runId: string; phase: string; draft: string; status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'; error: string }
 type OwnedSessionMessages = { ownerSessionId: string; items: Message[] }
+type DraftSessionSettings = { model_connection_id: string | null; model_id: string | null; thinking_level: ThinkingLevel }
+type DraftLaunchResponse = { session: Session; run: Run; workspace?: Workspace }
+
+const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'auto' }
+const emptyDraftContext: SessionContext = { used_tokens: 0, limit_tokens: 100_000, compact_threshold_tokens: 90_000, percent: 0 }
 
 const runStreamEventNames = [
   'run_state',
@@ -273,7 +278,6 @@ function SlidePanel({ title, description, onClose, children }: { title: string; 
 
 const navigation = [
   { path: '/dashboard', label: '总览', icon: LayoutDashboard },
-  { path: '/workspaces', label: '工作区', icon: Folder },
   { path: '/agents', label: 'Agent', icon: Bot },
   { path: '/sessions', label: '会话', icon: MessageSquare },
   { path: '/runs', label: '运行记录', icon: History },
@@ -304,13 +308,13 @@ function AppShell() {
         </div>
         <nav aria-label="主导航">
           <p className="nav-label">工作台</p>
-          {navigation.slice(0, 6).map(({ path, label, icon: Icon }) => (
+          {navigation.slice(0, 5).map(({ path, label, icon: Icon }) => (
             <NavLink key={path} to={path} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={collapsed ? label : undefined}>
               <Icon size={18} /><span>{label}</span>
             </NavLink>
           ))}
           <p className="nav-label nav-label-spaced">协作与系统</p>
-          {navigation.slice(6).map(({ path, label, icon: Icon }) => (
+          {navigation.slice(5).map(({ path, label, icon: Icon }) => (
             <NavLink key={path} to={path} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={collapsed ? label : undefined}>
               <Icon size={18} /><span>{label}</span>
             </NavLink>
@@ -326,7 +330,7 @@ function AppShell() {
       <main className="main-content">
         <Routes>
           <Route path="/dashboard" element={<DashboardPage />} />
-          <Route path="/workspaces" element={<WorkspacesPage />} />
+          <Route path="/workspaces" element={<Navigate to="/sessions" replace />} />
           <Route path="/agents" element={<AgentsPage />} />
           <Route path="/sessions" element={<SessionsPage />} />
           <Route path="/runs" element={<RunsPage />} />
@@ -410,77 +414,6 @@ function RunRow({ run, onClick }: { run: Run; onClick?: () => void }) {
   )
 }
 
-function WorkspacesPage() {
-  const workspaces = useApiData<Workspace[]>([], () => api.list<Workspace>('/api/workspaces', ['workspaces']), [])
-  const [panelOpen, setPanelOpen] = useState(false)
-  const [formError, setFormError] = useState('')
-  const [saving, setSaving] = useState(false)
-  const [selectedPath, setSelectedPath] = useState('')
-  const [pickingFolder, setPickingFolder] = useState(false)
-
-  function openPanel() {
-    setSelectedPath('')
-    setFormError('')
-    setPanelOpen(true)
-  }
-
-  async function selectFolder() {
-    setPickingFolder(true); setFormError('')
-    try {
-      const result = await api.post<FolderSelection>('/api/system/select-folder')
-      if (result.path) setSelectedPath(result.path)
-    } catch (error) { setFormError(describeError(error)) } finally { setPickingFolder(false) }
-  }
-
-  async function createWorkspace(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const form = new FormData(event.currentTarget)
-    setSaving(true); setFormError('')
-    try {
-      if (!selectedPath) throw new Error('请先选择一个文件夹。')
-      await api.post('/api/workspaces', { name: form.get('name'), root_path: selectedPath, description: form.get('description') })
-      setPanelOpen(false)
-      await workspaces.reload()
-    } catch (error) { setFormError(describeError(error)) } finally { setSaving(false) }
-  }
-
-  return (
-    <div className="page">
-      <PageHeader eyebrow="LOCAL SANDBOX" title="工作区" description="把 Agent 的文件访问限制在明确的本地目录内。" action={<button className="button button-primary" onClick={openPanel}><Plus size={16} />新建工作区</button>} />
-      <div className="notice"><ShieldCheck size={18} /><p><strong>路径校验已启用</strong> 文件工具会校验工作区边界；命令工具经你审批后在本机执行，请确认命令内容。</p></div>
-      {workspaces.error ? <ErrorState message={workspaces.error} onRetry={workspaces.reload} /> : workspaces.loading ? <LoadingState /> : workspaces.data.length ? (
-        <section className="entity-grid">
-          {workspaces.data.map((workspace) => (
-            <article className="entity-card workspace-card" key={workspace.id}>
-              <div className="entity-card-top"><div className="folder-icon"><Folder size={21} /></div><span className="menu-dot">•••</span></div>
-              <h2>{workspace.name}</h2><p>{workspace.description || '暂无工作区说明'}</p>
-              <div className="path-chip" title={workspace.path || workspace.root_path}><span>{workspace.path || workspace.root_path || '路径由 PGAgent 管理'}</span></div>
-              <footer><span><Clock3 size={14} />{formatDate(workspace.updated_at || workspace.created_at)}</span><span>安全边界已启用</span></footer>
-            </article>
-          ))}
-        </section>
-      ) : <EmptyState icon={Folder} title="先创建一个工作区" description="工作区是 Agent 可以读写文件的安全边界。" action={<button className="button button-primary" onClick={openPanel}><Plus size={16} />新建工作区</button>} />}
-      {panelOpen && <SlidePanel title="新建工作区" description="所选目录将成为此工作区唯一允许访问的文件边界。" onClose={() => setPanelOpen(false)}>
-        <form className="panel-form" onSubmit={createWorkspace}>
-          <Field label="名称"><input name="name" required placeholder="例如：产品调研" autoFocus /></Field>
-          <Field label="工作区文件夹" hint="PGAgent 会打开 Windows 文件夹选择器，不需要手动输入路径。">
-            <button type="button" className={`folder-picker ${selectedPath ? 'selected' : ''}`} onClick={() => void selectFolder()} disabled={pickingFolder}>
-              <span className="folder-picker-icon">{pickingFolder ? <LoaderCircle className="spin" size={21} /> : <FolderOpen size={21} />}</span>
-              <span><strong>{selectedPath ? '已选择文件夹' : '选择文件夹'}</strong><small>{selectedPath || '从这台电脑中浏览目录'}</small></span>
-              <ChevronRight size={17} />
-            </button>
-          </Field>
-          <Field label="说明"><textarea name="description" rows={4} placeholder="这个工作区用来处理什么？" /></Field>
-          {formError && <p className="form-error" role="alert">{formError}</p>}
-          <div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setPanelOpen(false)}>取消</button><button className="button button-primary" disabled={saving || !selectedPath}>{saving && <LoaderCircle className="spin" size={15} />}创建</button></div>
-        </form>
-      </SlidePanel>}
-    </div>
-  )
-}
-
-const builtInTools = ['list_files', 'read_file', 'search_files', 'get_current_time', 'write_file', 'run_command']
-
 function AgentsPage() {
   const agents = useApiData<AgentProfile[]>([], () => api.list<AgentProfile>('/api/agents', ['agents']), [])
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
@@ -489,6 +422,7 @@ function AgentsPage() {
   const [saving, setSaving] = useState(false)
   const [deletingId, setDeletingId] = useState('')
   const [formError, setFormError] = useState('')
+  const childAgents = agents.data.filter((agent) => !agent.is_default)
 
   function openAgentPanel(agent?: AgentProfile) {
     if (agent?.is_default) return
@@ -521,28 +455,28 @@ function AgentsPage() {
 
   return (
     <div className="page">
-      <PageHeader eyebrow="REUSABLE INTELLIGENCE" title="Agent" description="配置角色、模型与工具边界，让不同任务使用稳定的工作方式。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建 Agent</button>} />
+      <PageHeader eyebrow="REUSABLE INTELLIGENCE" title="子 Agent" description="创建可复用的专业子 Agent，为不同任务配置角色、系统指令与模型偏好。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />
       {formError && !panelOpen && <p className="form-error page-form-error" role="alert">{formError}</p>}
-      {agents.error ? <ErrorState message={agents.error} onRetry={agents.reload} /> : agents.loading ? <LoadingState /> : agents.data.length ? (
+      {agents.error ? <ErrorState message={agents.error} onRetry={agents.reload} /> : agents.loading ? <LoadingState /> : childAgents.length ? (
         <section className="entity-grid agent-grid">
-          {agents.data.map((agent) => (
+          {childAgents.map((agent) => (
             <article className="entity-card agent-card" key={agent.id}>
-              <div className="agent-head"><div className="agent-avatar"><Bot size={22} /></div><div className="agent-card-actions"><StatusBadge status={agent.is_default ? 'default' : agent.status || 'idle'} /><button className="icon-button" aria-label={`编辑 ${agent.name}`} disabled={agent.is_default} title={agent.is_default ? '默认助手保持无提示词，不可编辑' : '编辑 Agent'} onClick={() => openAgentPanel(agent)}><Pencil size={15} /></button><button className="icon-button danger-icon" aria-label={`删除 ${agent.name}`} disabled={agent.is_default || deletingId === agent.id} title={agent.is_default ? '默认助手不可删除' : '删除 Agent'} onClick={() => void deleteAgent(agent)}>{deletingId === agent.id ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}</button></div></div>
-              <h2>{agent.name}</h2><p className="agent-role">{agent.is_default ? '无提示词默认助手' : agent.role || '通用执行 Agent'}</p><p>{agent.is_default ? '没有预设系统提示词，直接按照当前会话的目标与模型设置工作。' : agent.description || '暂无角色说明'}</p>
-              <div className="agent-meta"><span><Sparkles size={14} />{agent.model || agent.model_id || '继承默认模型'}</span><span><SquareTerminal size={14} />{agent.tools?.length ?? builtInTools.length} 个工具</span></div>
-              <footer><span>{formatDate(agent.created_at)}</span><span>{agent.is_default ? '无预设提示词' : `思考：${agent.thinking_level || 'auto'}`}</span></footer>
+              <div className="agent-head"><div className="agent-avatar"><Bot size={22} /></div><div className="agent-card-actions"><StatusBadge status={agent.status || 'idle'} /><button className="icon-button" aria-label={`编辑 ${agent.name}`} title="编辑子 Agent" onClick={() => openAgentPanel(agent)}><Pencil size={15} /></button><button className="icon-button danger-icon" aria-label={`删除 ${agent.name}`} disabled={deletingId === agent.id} title="删除子 Agent" onClick={() => void deleteAgent(agent)}>{deletingId === agent.id ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}</button></div></div>
+              <h2>{agent.name}</h2><p className="agent-role">{agent.role || '通用执行子 Agent'}</p><p>{agent.description || '暂无角色说明'}</p>
+              <div className="agent-meta"><span><Sparkles size={14} />{agent.model || agent.model_id || '继承默认模型'}</span><span><Workflow size={14} />委派能力待开放</span></div>
+              <footer><span>{formatDate(agent.created_at)}</span><span>{`思考：${agent.thinking_level || 'auto'}`}</span></footer>
             </article>
           ))}
         </section>
-      ) : <EmptyState icon={Bot} title="创建你的第一个 Agent" description="定义角色、模型和可使用的工具，然后就能在会话中调用它。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建 Agent</button>} />}
-      {panelOpen && <SlidePanel title={editing ? '编辑 Agent' : '创建 Agent'} description="Agent 会根据任务复杂度自行判断是否需要先规划。" onClose={() => { setPanelOpen(false); setEditing(null) }}>
+      ) : <EmptyState icon={Bot} title="创建你的第一个子 Agent" description="定义专业角色、系统指令与模型偏好；主 Agent 的自动委派会在后续版本开放。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />}
+      {panelOpen && <SlidePanel title={editing ? '编辑子 Agent' : '创建子 Agent'} description="当前保存角色、系统指令与模型偏好；工具、Skill 和自动委派将在后续版本开放。" onClose={() => { setPanelOpen(false); setEditing(null) }}>
         <form className="panel-form" onSubmit={saveAgent} key={editing?.id || 'new-agent'}>
           <Field label="名称"><input name="name" required placeholder="例如：代码协作者" autoFocus defaultValue={editing?.name || ''} /></Field>
           <Field label="简介"><input name="description" placeholder="简要描述擅长处理的任务" defaultValue={editing?.description || ''} /></Field>
           <Field label="系统指令"><textarea name="system_prompt" rows={6} placeholder="说明工作原则、输出风格和边界……" defaultValue={editing?.system_prompt || ''} /></Field>
           <div className="form-row"><Field label="模型连接"><select name="connection_id" defaultValue={editing?.model_connection_id || editing?.connection_id || ''}><option value="">使用默认连接</option>{connections.data.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="模型 ID"><input name="model" placeholder="例如：deepseek-chat" defaultValue={editing?.model_id || editing?.model || ''} /></Field></div>
           <Field label="思考强度"><select name="thinking_level" defaultValue={editing?.thinking_level || 'auto'}><option value="off">关闭</option><option value="auto">自动</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option></select></Field>
-          <div className="tool-summary"><strong>内置工具</strong><div>{builtInTools.map((tool) => <span key={tool}>{tool}</span>)}</div><small>write_file 与 run_command 默认需要人工审批。</small></div>
+          <div className="tool-summary"><strong>工具与 Skill</strong><small>当前版本暂不为子 Agent 单独配置工具或 Skill，也不会伪造自动委派；这些能力将在后续版本开放。</small></div>
           {formError && <p className="form-error" role="alert">{formError}</p>}
           <div className="form-actions"><button type="button" className="button button-secondary" onClick={() => { setPanelOpen(false); setEditing(null) }}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}{editing ? '保存修改' : '创建'}</button></div>
         </form>
@@ -557,7 +491,6 @@ function SessionsPage() {
   const workspaces = useApiData<Workspace[]>([], () => api.list<Workspace>('/api/workspaces', ['workspaces']), [])
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
   const [activeId, setActiveId] = useState('')
-  const [sessionQuery, setSessionQuery] = useState('')
   const [composer, setComposer] = useState('')
   const [sending, setSending] = useState(false)
   const [settingsSaving, setSettingsSaving] = useState(false)
@@ -569,7 +502,13 @@ function SessionsPage() {
   const thinkingSubmenuRef = useRef<HTMLDivElement>(null)
   const [decidingApproval, setDecidingApproval] = useState('')
   const [actionError, setActionError] = useState('')
-  const [newSession, setNewSession] = useState(false)
+  const [draftActive, setDraftActive] = useState(false)
+  const [draftRootPath, setDraftRootPath] = useState('')
+  const [draftSettings, setDraftSettings] = useState<DraftSessionSettings>(emptyDraftSettings)
+  const [expandedWorkspaceIds, setExpandedWorkspaceIds] = useState<Set<string>>(() => new Set())
+  const [addingProject, setAddingProject] = useState(false)
+  const [pickingDraftProject, setPickingDraftProject] = useState(false)
+  const [projectError, setProjectError] = useState('')
   const [liveRun, setLiveRun] = useState<LiveRunState>({ runId: '', phase: '', draft: '', status: 'idle', error: '' })
   const eventSourceRef = useRef<EventSource | null>(null)
   const fallbackTimerRef = useRef<number | null>(null)
@@ -583,13 +522,17 @@ function SessionsPage() {
   const activeRunIdRef = useRef('')
   const stickToBottomRef = useRef(true)
   const terminalSyncVersionRef = useRef(0)
+  const pendingDraftRunRef = useRef<{ sessionId: string; runId: string } | null>(null)
+  const draftIdempotencyKeyRef = useRef('')
+  const draftVersionRef = useRef(0)
+  const sendingRef = useRef(false)
   activeIdRef.current = activeId
   const liveRunRef = useRef(liveRun)
   liveRunRef.current = liveRun
 
   useEffect(() => {
-    if (!activeId && sessions.data[0]) setActiveId(stringId(sessions.data[0].id))
-  }, [activeId, sessions.data])
+    if (!activeId && !draftActive && sessions.data[0]) setActiveId(stringId(sessions.data[0].id))
+  }, [activeId, draftActive, sessions.data])
 
   useEffect(() => {
     if (!settingsMenuOpen) return
@@ -632,6 +575,7 @@ function SessionsPage() {
   const activeRunId = activeRun?.id || ''
   activeRunIdRef.current = activeRunId
   const visibleMessages = visibleSessionItems(messages.data.ownerSessionId, activeId, messages.data.items)
+  const sessionNavigation = buildSessionNavigation(workspaces.data, sessions.data)
   const approvals = useApiData<Approval[]>([], () => activeRunId ? api.list<Approval>(`/api/approvals?run_id=${encodeURIComponent(activeRunId)}&status=pending`, ['approvals']) : Promise.resolve([]), [activeRunId])
   const visibleApprovals = approvals.data.filter((approval) => !approval.run_id || approval.run_id === activeRunId)
   const refreshMessages = messages.refresh
@@ -640,7 +584,6 @@ function SessionsPage() {
   const setMessagesState = messages.setState
   const setApprovalsState = approvals.setState
   const settingsLocked = activeRunStatuses.has(activeRun?.status || '') || !['idle', 'terminal'].includes(liveRun.status)
-  const visibleSessions = sessions.data.filter((session) => (session.title || '').toLowerCase().includes(sessionQuery.trim().toLowerCase()))
   useEffect(() => {
     if (settingsLocked || sending) {
       setSettingsMenuOpen(false)
@@ -651,6 +594,88 @@ function SessionsPage() {
   useEffect(() => {
     setMessagesState({ data: { ownerSessionId: activeId, items: [] }, loading: true, error: '' })
   }, [activeId, setMessagesState])
+
+  useEffect(() => {
+    if (draftActive) return
+    const workspaceId = activeSession?.workspace_id || ''
+    const isProject = workspaces.data.some((workspace) => workspace.id === workspaceId && !isDefaultWorkspace(workspace))
+    setExpandedWorkspaceIds(isProject ? new Set([workspaceId]) : new Set())
+  }, [activeSession?.workspace_id, draftActive, workspaces.data])
+
+  function clearDraftState() {
+    draftVersionRef.current += 1
+    setDraftActive(false)
+    setDraftRootPath('')
+    setDraftSettings(emptyDraftSettings)
+    setLiveRun({ runId: '', phase: '', draft: '', status: 'idle', error: '' })
+    draftIdempotencyKeyRef.current = ''
+  }
+
+  function beginDraft() {
+    if (sendingRef.current) return
+    const selectedProjectRoot = projectRootForSession(workspaces.data, activeSession)
+    const selectedProjectId = selectedProjectRoot ? activeSession?.workspace_id : ''
+    draftVersionRef.current += 1
+    setActionError('')
+    setComposer('')
+    setDraftRootPath(selectedProjectRoot)
+    setDraftSettings(emptyDraftSettings)
+    setLiveRun({ runId: '', phase: '', draft: '', status: 'idle', error: '' })
+    draftIdempotencyKeyRef.current = createDraftIdempotencyKey()
+    setExpandedWorkspaceIds(selectedProjectId ? new Set([selectedProjectId]) : new Set())
+    setActiveId('')
+    setDraftActive(true)
+  }
+
+  function openExistingSession(sessionId: string) {
+    if (draftActive && sendingRef.current) return
+    if (draftActive) {
+      clearDraftState()
+      setComposer('')
+    }
+    setActionError('')
+    setActiveId(sessionId)
+  }
+
+  function toggleProject(workspaceId: string) {
+    setExpandedWorkspaceIds((current) => {
+      const next = new Set(current)
+      if (next.has(workspaceId)) next.delete(workspaceId)
+      else next.add(workspaceId)
+      return next
+    })
+  }
+
+  async function addProjectFromFolder() {
+    if (addingProject) return
+    setAddingProject(true); setProjectError('')
+    try {
+      const selection = await api.post<FolderSelection>('/api/system/select-folder')
+      if (!selection.path) return
+      const workspace = await api.post<Workspace>('/api/workspaces', { root_path: selection.path })
+      await workspaces.refresh()
+      setExpandedWorkspaceIds((current) => new Set([...current, workspace.id]))
+    } catch (error) {
+      setProjectError(describeError(error))
+    } finally { setAddingProject(false) }
+  }
+
+  async function selectDraftProject() {
+    if (pickingDraftProject) return
+    setPickingDraftProject(true); setActionError('')
+    try {
+      const selection = await api.post<FolderSelection>('/api/system/select-folder')
+      if (selection.path) {
+        draftVersionRef.current += 1
+        setDraftRootPath(selection.path)
+      }
+    } catch (error) { setActionError(describeError(error)) } finally { setPickingDraftProject(false) }
+  }
+
+  function clearDraftProject() {
+    draftVersionRef.current += 1
+    setDraftRootPath('')
+  }
 
   const closeRunTransport = useCallback(() => {
     eventSourceRef.current?.close()
@@ -868,6 +893,17 @@ function SessionsPage() {
   }, [activeId, closeRunTransport])
 
   useEffect(() => {
+    const pending = pendingDraftRunRef.current
+    if (!pending || pending.sessionId !== activeId) return
+    pendingDraftRunRef.current = null
+    runStartMessageCountRef.current = visibleMessages.filter((message) => message.role === 'assistant').length
+    startRunStream(pending.runId, pending.sessionId)
+    void refreshMessages()
+    void refreshRuns()
+    void refreshContext()
+  }, [activeId, refreshContext, refreshMessages, refreshRuns, startRunStream, visibleMessages])
+
+  useEffect(() => {
     if (!activeId || messages.loading || !activeRun?.id || !activeRunStatuses.has(activeRun.status || '') || liveRun.status === 'terminal') return
     if (streamRunIdRef.current === activeRun.id) return
     runStartMessageCountRef.current = visibleMessages.filter((message) => message.role === 'assistant').length
@@ -885,32 +921,51 @@ function SessionsPage() {
 
   async function sendMessage(event: FormEvent) {
     event.preventDefault()
-    if (!activeId || !composer.trim() || settingsSaving || settingsLocked) return
+    const content = composer.trim()
+    if (sendingRef.current || (!activeId && !draftActive) || !content || settingsSaving || settingsLocked) return
+    sendingRef.current = true
     setSending(true); setActionError('')
     stickToBottomRef.current = true
     runStartMessageCountRef.current = visibleMessages.filter((message) => message.role === 'assistant').length
     setLiveRun({ runId: '', phase: '思考中…', draft: '', status: 'connecting', error: '' })
     try {
-      const launched = await api.post<Run>(`/api/sessions/${activeId}/run`, { content: composer.trim() })
+      if (draftActive) {
+        const draftVersion = draftVersionRef.current
+        const idempotencyKey = draftIdempotencyKeyRef.current || createDraftIdempotencyKey()
+        draftIdempotencyKeyRef.current = idempotencyKey
+        const launched = await api.post<DraftLaunchResponse>('/api/drafts/launch', buildDraftLaunchPayload(
+          idempotencyKey,
+          content,
+          draftRootPath,
+          draftSettings,
+        ))
+        if (draftVersionRef.current !== draftVersion) return
+        const sessionId = stringId(launched.session?.id)
+        const runId = stringId(launched.run?.id)
+        if (!sessionId || !runId) throw new Error('草稿启动响应缺少会话或运行标识。')
+        pendingDraftRunRef.current = { sessionId, runId }
+        setComposer('')
+        clearDraftState()
+        setActiveId(sessionId)
+        void sessions.refresh()
+        if (draftRootPath || launched.workspace) void workspaces.refresh()
+        return
+      }
+
+      const targetSessionId = activeId
+      const launched = await api.post<Run>(`/api/sessions/${targetSessionId}/run`, { content })
       setComposer('')
       void messages.refresh()
       void runs.refresh()
       void context.refresh()
-      startRunStream(launched.id, activeId)
+      startRunStream(launched.id, targetSessionId)
     } catch (error) {
       setLiveRun({ runId: '', phase: '', draft: '', status: 'idle', error: '' })
       setActionError(describeError(error))
-    } finally { setSending(false) }
-  }
-
-  async function createSession(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const form = new FormData(event.currentTarget)
-    setSending(true); setActionError('')
-    try {
-      const created = await api.post<Session>('/api/sessions', { title: form.get('title'), agent_id: form.get('agent_id') || undefined, workspace_id: form.get('workspace_id') || undefined })
-      setNewSession(false); await sessions.reload(); setActiveId(stringId(created.id))
-    } catch (error) { setActionError(describeError(error)) } finally { setSending(false) }
+    } finally {
+      sendingRef.current = false
+      setSending(false)
+    }
   }
 
   async function decideApproval(id: string, decision: 'approve' | 'reject') {
@@ -933,23 +988,38 @@ function SessionsPage() {
   }
 
   async function updateSessionSettings(payload: { model_connection_id?: string | null; model_id?: string | null; thinking_level?: ThinkingLevel | null }) {
-    if (!activeId || settingsLocked || sending) return
+    if (settingsLocked || sending) return
+    if (draftActive) {
+      setDraftSettings((current) => ({
+        model_connection_id: payload.model_connection_id === undefined ? current.model_connection_id : payload.model_connection_id,
+        model_id: payload.model_id === undefined ? current.model_id : payload.model_id,
+        thinking_level: payload.thinking_level ?? current.thinking_level,
+      }))
+      return
+    }
+    if (!activeId) return
     setSettingsSaving(true); setActionError('')
     try { await api.patch(`/api/sessions/${activeId}`, payload); await sessions.reload() }
     catch (error) { setActionError(describeError(error)) } finally { setSettingsSaving(false) }
   }
 
-  const effectiveSettings = resolveEffectiveModelSettings(connections.data, activeSession, activeAgent)
+  const settingsSession: Session | undefined = activeSession ?? (draftActive ? {
+    id: 'local-draft',
+    model_connection_id: draftSettings.model_connection_id || undefined,
+    model_id: draftSettings.model_id || undefined,
+    thinking_level: draftSettings.thinking_level,
+  } : undefined)
+  const effectiveSettings = resolveEffectiveModelSettings(connections.data, settingsSession, activeAgent)
   const effectiveConnection = effectiveSettings.connection
   const effectiveModel = effectiveSettings.model
   const automaticSessionConnection = effectiveSettings.automaticConnection
   const automaticModel = effectiveSettings.automaticModel
-  const effectiveThinking = resolveEffectiveThinking(activeSession?.thinking_level, activeAgent?.thinking_level, effectiveConnection?.thinking_level)
+  const effectiveThinking = resolveEffectiveThinking(settingsSession?.thinking_level, activeAgent?.thinking_level, effectiveConnection?.thinking_level)
   const modelOptions = connections.data.filter((connection) => connection.enabled !== false).flatMap((connection) => {
     return availableConnectionModels(connection).map((model) => ({ value: `${connection.id}::${model}`, label: model, connection: connection.name }))
   })
   const selectedModelValue = effectiveSettings.selectedValue
-  const selectedThinkingValue = activeSession?.thinking_level && activeSession.thinking_level !== 'auto' ? activeSession.thinking_level : 'auto'
+  const selectedThinkingValue = settingsSession?.thinking_level && settingsSession.thinking_level !== 'auto' ? settingsSession.thinking_level : 'auto'
   const modelButtonLabel = shortModelLabel(effectiveModel)
   const thinkingOptions: Array<{ value: ThinkingLevel; label: string; hint?: string }> = [
     { value: 'auto', label: '自动 / 继承', hint: `当前：${thinkingLevelLabels[effectiveThinking]}` },
@@ -984,19 +1054,43 @@ function SessionsPage() {
   return (
     <div className="page page-chat">
       <div className="chat-shell">
-          <aside className="session-list">
-            <button className="session-create" onClick={() => { setActionError(''); setNewSession(true) }}><Plus size={15} />新建对话</button>
-            <div className="session-search"><Search size={15} /><input aria-label="搜索会话" placeholder="搜索会话" value={sessionQuery} onChange={(event) => setSessionQuery(event.target.value)} /></div>
+          <aside className="session-list project-session-sidebar">
+            <section className="draft-tree-section">
+              <button type="button" className="new-draft-button" disabled={sending} onClick={beginDraft}><Plus size={14} />新建对话</button>
+            </section>
+            <section className="project-tree-section">
+              <header className="sidebar-section-heading"><strong>项目</strong><button type="button" aria-label="从文件夹添加项目" title="从文件夹添加项目" disabled={addingProject || (draftActive && sending)} onClick={() => void addProjectFromFolder()}>{addingProject ? <LoaderCircle className="spin" size={14} /> : <Plus size={15} />}</button></header>
+              {projectError && <div className="sidebar-inline-error"><AlertCircle size={13} /><span>{projectError}</span></div>}
+              {sessionNavigation.projects.map(({ workspace, sessions: projectSessions }) => {
+                const expanded = expandedWorkspaceIds.has(workspace.id)
+                const path = workspace.root_path || workspace.path || '未提供路径'
+                return <div className={`project-node ${expanded ? 'expanded' : ''}`} key={workspace.id}>
+                  <div className="project-row-wrap">
+                    <button type="button" className="project-row" aria-expanded={expanded} title={`${projectSessions.length} 个对话\n${path}`} onClick={() => toggleProject(workspace.id)}>
+                      <ChevronRight className="project-chevron" size={13} /><Folder size={15} /><span>{workspace.name}</span>
+                    </button>
+                    <div className="project-tooltip" role="tooltip"><strong>{projectSessions.length} 个对话</strong><span>{path}</span></div>
+                  </div>
+                  {expanded && <div className="project-children">
+                    {projectSessions.length ? projectSessions.map((session) => <button type="button" key={session.id} className={`tree-session-item ${activeId === stringId(session.id) && !draftActive ? 'active' : ''}`} disabled={draftActive && sending} onClick={() => openExistingSession(stringId(session.id))}><MessageSquare size={13} /><span>{session.title || '未命名对话'}</span></button>) : <p className="tree-empty">暂无对话</p>}
+                  </div>}
+                </div>
+              })}
+              {!sessionNavigation.projects.length && !workspaces.loading && <p className="tree-empty tree-empty-projects">点击右上角 + 添加项目</p>}
+            </section>
+
+            <section className="task-tree-section">
+              <header className="sidebar-section-heading"><strong>任务</strong></header>
+              {sessionNavigation.tasks.map((session) => <button type="button" key={session.id} className={`tree-session-item task-session-item ${activeId === stringId(session.id) && !draftActive ? 'active' : ''}`} disabled={draftActive && sending} onClick={() => openExistingSession(stringId(session.id))}><MessageSquare size={13} /><span>{session.title || '未命名对话'}</span></button>)}
+              {!draftActive && !sessionNavigation.tasks.length && !sessions.loading && <p className="tree-empty">暂无一次性任务</p>}
+            </section>
+
             {sessions.error && <div className="session-list-error"><AlertCircle size={14} /><span>{sessions.error}</span><button type="button" onClick={() => void sessions.reload()}>重试</button></div>}
             {!!dependencyErrors.length && <div className="session-list-error"><AlertCircle size={14} /><span>{dependencyErrors.join('；')}</span><button type="button" onClick={() => { void Promise.all([agents.reload(), workspaces.reload(), connections.reload()]) }}>重试</button></div>}
-            {sessions.loading && !sessions.data.length ? <LoadingState /> : visibleSessions.length ? visibleSessions.map((session) => (
-              <button key={session.id} className={`session-item ${activeId === stringId(session.id) ? 'active' : ''}`} onClick={() => setActiveId(stringId(session.id))}>
-                <MessageSquare size={17} /><span><strong>{session.title || '未命名会话'}</strong><small>{formatDate(session.updated_at || session.created_at)}</small></span>
-              </button>
-            )) : <div className="mini-empty"><MessageSquare size={20} /><p>{sessions.data.length ? '没有匹配的会话' : '还没有会话'}</p></div>}
+            {sessions.loading && !sessions.data.length && <LoadingState />}
           </aside>
           <section className="conversation">
-            {activeSession ? <>
+            {activeSession || draftActive ? <>
               <div
                 className="messages"
                 ref={messagesRef}
@@ -1006,19 +1100,23 @@ function SessionsPage() {
                   stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
                 }}
               >
-                {messages.error && !visibleMessages.length ? <ErrorState message={messages.error} onRetry={messages.reload} /> : messages.loading && !visibleMessages.length ? <LoadingState /> : visibleMessages.length ? visibleMessages.map((message) => <MessageBubble key={message.id} message={message} />) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
-                {messages.error && !!visibleMessages.length && <p className="inline-error" role="alert">消息同步失败：{messages.error}</p>}
+                {draftActive ? liveRun.status === 'idle' && <EmptyState icon={MessageSquare} title="开始一次新任务" description="直接描述目标；需要处理本地文件时，可以在输入框中选择一个项目文件夹。" /> : messages.error && !visibleMessages.length ? <ErrorState message={messages.error} onRetry={messages.reload} /> : messages.loading && !visibleMessages.length ? <LoadingState /> : visibleMessages.length ? visibleMessages.map((message) => <MessageBubble key={message.id} message={message} />) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
+                {!draftActive && messages.error && !!visibleMessages.length && <p className="inline-error" role="alert">消息同步失败：{messages.error}</p>}
                 {liveRun.status !== 'idle' && <LiveAssistantMessage liveRun={liveRun} />}
-                {approvals.error && <ErrorState message={`审批状态读取失败：${approvals.error}`} onRetry={approvals.reload} />}
-                {approvals.loading && activeRunId && !visibleApprovals.length && liveRun.status === 'awaiting_approval' && <LoadingState label="正在读取审批状态" />}
-                {visibleApprovals.map((approval) => <ApprovalCard key={approval.id} approval={approval} deciding={decidingApproval === approval.id} onDecision={decideApproval} />)}
+                {!draftActive && approvals.error && <ErrorState message={`审批状态读取失败：${approvals.error}`} onRetry={approvals.reload} />}
+                {!draftActive && approvals.loading && activeRunId && !visibleApprovals.length && liveRun.status === 'awaiting_approval' && <LoadingState label="正在读取审批状态" />}
+                {!draftActive && visibleApprovals.map((approval) => <ApprovalCard key={approval.id} approval={approval} deciding={decidingApproval === approval.id} onDecision={decideApproval} />)}
               </div>
               <form className="composer" onSubmit={sendMessage}>
                 {actionError && <p className="form-error" role="alert">{actionError}</p>}
-                <textarea aria-label="给 Agent 发送消息" value={composer} onChange={(event) => setComposer(event.target.value)} placeholder="告诉 PGAgent 你想完成什么……" rows={3} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} />
+                {draftActive && <div className="draft-project-controls">
+                  <button type="button" className="draft-project-button" disabled={pickingDraftProject || sending} onClick={() => void selectDraftProject()}>{pickingDraftProject ? <LoaderCircle className="spin" size={13} /> : <FolderOpen size={13} />}选择项目</button>
+                  {draftRootPath && <span className="draft-folder-pill" title={draftRootPath}><Folder size={12} /><span>{folderName(draftRootPath)}</span><button type="button" aria-label="清除所选项目" disabled={sending} onClick={clearDraftProject}><X size={11} /></button></span>}
+                </div>}
+                <textarea aria-label="给 Agent 发送消息" value={composer} disabled={draftActive && sending} onChange={(event) => setComposer(event.target.value)} placeholder={draftActive ? '描述你想完成的任务……' : '告诉 PGAgent 你想完成什么……'} rows={2} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} />
                 <div className="composer-toolbar">
                   <div className="composer-actions">
-                    {context.error ? <button type="button" className="context-state context-error" aria-label="上下文占用读取失败，点击重试" title={context.error} onClick={() => void context.reload()}><AlertCircle size={15} /></button> : context.loading || !context.data ? <span className="context-state" role="status" aria-label="正在读取上下文占用"><LoaderCircle className="spin" size={15} /></span> : <ContextUsageRing context={context.data} />}
+                    {draftActive ? <ContextUsageRing context={emptyDraftContext} /> : context.error ? <button type="button" className="context-state context-error" aria-label="上下文占用读取失败，点击重试" title={context.error} onClick={() => void context.reload()}><AlertCircle size={15} /></button> : context.loading || !context.data ? <span className="context-state" role="status" aria-label="正在读取上下文占用"><LoaderCircle className="spin" size={15} /></span> : <ContextUsageRing context={context.data} />}
                     <div className="session-settings-picker" ref={settingsMenuRef} title={settingsLocked ? '当前运行结束或审批完成后才能切换模型和思考强度' : undefined}>
                       <button
                         ref={settingsTriggerRef}
@@ -1061,18 +1159,9 @@ function SessionsPage() {
                   </div>
                 </div>
               </form>
-            </> : <EmptyState icon={MessageSquare} title="选择或创建会话" description="不选择 Agent 时会自动使用无预设提示词的默认助手。" action={<button className="button button-primary" onClick={() => setNewSession(true)}>新建会话</button>} />}
+            </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={beginDraft}>新建对话</button>} />}
           </section>
       </div>
-      {newSession && <SlidePanel title="新建会话" description="Agent 与工作区都可以留空，由 PGAgent 自动选择默认项。" onClose={() => setNewSession(false)}>
-        <form className="panel-form" onSubmit={createSession}>
-          <Field label="会话名称"><input name="title" required placeholder="例如：整理本周需求" autoFocus /></Field>
-          <Field label="Agent" hint="不选择时使用没有预设提示词的默认助手。"><select name="agent_id" defaultValue=""><option value="">自动（默认助手）</option>{agents.data.filter((agent) => !agent.is_default).map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></Field>
-          <Field label="工作区" hint="不选择时使用 PGAgent 的默认安全工作区。"><select name="workspace_id" defaultValue=""><option value="">自动（默认工作区）</option>{workspaces.data.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}</select></Field>
-          {actionError && <p className="form-error" role="alert">{actionError}</p>}
-          <div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setNewSession(false)}>取消</button><button className="button button-primary" disabled={sending}>{sending && <LoaderCircle className="spin" size={15} />}创建</button></div>
-        </form>
-      </SlidePanel>}
     </div>
   )
 }
@@ -1187,6 +1276,7 @@ function TeamsPage() {
   const [panelOpen, setPanelOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [formError, setFormError] = useState('')
+  const assignableAgents = agents.data.filter((agent) => !agent.is_default)
 
   async function createTask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget); setSaving(true); setFormError('')
@@ -1203,7 +1293,7 @@ function TeamsPage() {
           {columns.map((column) => { const columnTasks = tasks.data.filter((task) => (task.status || 'todo') === column.key); return <div className="kanban-column" key={column.key}><header><span>{column.label}</span><b>{columnTasks.length}</b></header><div className="kanban-list">{columnTasks.map((task) => <article className="task-card" key={task.id}><div className="task-priority">{task.priority || 'normal'}</div><h3>{task.title}</h3><p>{task.description || '暂无任务说明'}</p><footer><span><Bot size={14} />{task.assignee_name || '尚未指派'}</span><small>v{task.version ?? 1}</small></footer></article>)}{!columnTasks.length && <div className="column-empty">暂无任务</div>}</div></div> })}
         </section>
       )}
-      {panelOpen && <SlidePanel title="创建团队任务" description="任务将写入持久化任务板，供 Lead 或 Worker 认领。" onClose={() => setPanelOpen(false)}><form className="panel-form" onSubmit={createTask}><Field label="任务标题"><input name="title" required placeholder="清晰描述可独立交付的子任务" autoFocus /></Field><Field label="任务说明"><textarea name="description" rows={5} placeholder="包含输入、约束和验收标准" /></Field><div className="form-row"><Field label="优先级"><select name="priority" defaultValue="normal"><option value="low">低</option><option value="normal">普通</option><option value="high">高</option></select></Field><Field label="指派 Agent"><select name="assignee_agent_id"><option value="">暂不指派</option>{agents.data.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></Field></div>{formError && <p className="form-error">{formError}</p>}<div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setPanelOpen(false)}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}创建</button></div></form></SlidePanel>}
+      {panelOpen && <SlidePanel title="创建团队任务" description="任务将写入持久化任务板，供 Lead 或 Worker 认领。" onClose={() => setPanelOpen(false)}><form className="panel-form" onSubmit={createTask}><Field label="任务标题"><input name="title" required placeholder="清晰描述可独立交付的子任务" autoFocus /></Field><Field label="任务说明"><textarea name="description" rows={5} placeholder="包含输入、约束和验收标准" /></Field><div className="form-row"><Field label="优先级"><select name="priority" defaultValue="normal"><option value="low">低</option><option value="normal">普通</option><option value="high">高</option></select></Field><Field label="指派子 Agent"><select name="assignee_agent_id"><option value="">暂不指派</option>{assignableAgents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></Field></div>{formError && <p className="form-error">{formError}</p>}<div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setPanelOpen(false)}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}创建</button></div></form></SlidePanel>}
     </div>
   )
 }

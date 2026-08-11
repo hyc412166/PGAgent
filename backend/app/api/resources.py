@@ -98,6 +98,19 @@ def _require_enabled_model_connection(db: Session, connection_id: str | None) ->
         raise HTTPException(status_code=409, detail="Selected model connection is disabled")
 
 
+def _normalized_workspace_root(root_path: str) -> str:
+    """Return the canonical absolute root stored for a selected project."""
+
+    return str(Path(root_path).expanduser().resolve())
+
+
+def _workspace_name_from_root(root_path: str) -> str:
+    """Derive a project label from an absolute path, including filesystem roots."""
+
+    name = Path(root_path).name.strip()
+    return name or "项目"
+
+
 @router.get("/dashboard", response_model=DashboardRead)
 def dashboard(db: Session = Depends(get_db)) -> DashboardRead:
     count = lambda model: db.scalar(select(func.count()).select_from(model)) or 0
@@ -128,9 +141,30 @@ def list_workspaces(db: Session = Depends(get_db)) -> list[Workspace]:
 
 
 @router.post("/workspaces", response_model=WorkspaceRead, status_code=status.HTTP_201_CREATED)
-def create_workspace(payload: WorkspaceCreate, db: Session = Depends(get_db)) -> Workspace:
-    item = Workspace(**payload.model_dump())
-    item.root_path = str(Path(item.root_path).expanduser().resolve())
+def create_workspace(
+    payload: WorkspaceCreate,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> Workspace:
+    root_path = _normalized_workspace_root(payload.root_path)
+    # Existing databases may contain relative roots. Compare canonical paths
+    # so choosing the same folder is idempotent across old and new clients.
+    for existing in db.scalars(select(Workspace).order_by(Workspace.created_at.asc())):
+        if _normalized_workspace_root(existing.root_path) == root_path:
+            if existing.root_path != root_path:
+                existing.root_path = root_path
+                _commit(db)
+                db.refresh(existing)
+            response.status_code = status.HTTP_200_OK
+            return existing
+
+    name = (payload.name or "").strip() or _workspace_name_from_root(root_path)
+    item = Workspace(
+        name=name,
+        description=payload.description,
+        root_path=root_path,
+        enabled=payload.enabled,
+    )
     db.add(item)
     _commit(db)
     db.refresh(item)
@@ -149,7 +183,7 @@ def update_workspace(
     item = _require(db, Workspace, workspace_id, "Workspace")
     _apply(item, payload)
     if payload.root_path is not None:
-        item.root_path = str(Path(payload.root_path).expanduser().resolve())
+        item.root_path = _normalized_workspace_root(payload.root_path)
     _commit(db)
     db.refresh(item)
     return item
@@ -192,11 +226,12 @@ def update_agent(agent_id: str, payload: AgentUpdate, db: Session = Depends(get_
     item = _require(db, Agent, agent_id, "Agent")
     updates = payload.model_dump(exclude_unset=True)
     is_default = item.id == DEFAULT_AGENT_ID or item.is_default
-    if is_default and updates.get("system_prompt", "") != "":
-        raise HTTPException(status_code=409, detail="The default agent must keep an empty system prompt")
+    if is_default and updates:
+        raise HTTPException(
+            status_code=409,
+            detail="The PGAgent coordinator is managed by the system and cannot be modified",
+        )
     _apply(item, payload)
-    if is_default:
-        item.system_prompt = ""
     _commit(db)
     db.refresh(item)
     return item
@@ -233,11 +268,13 @@ def list_sessions(
 def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> ChatSession:
     data = payload.model_dump()
     data["workspace_id"] = data.get("workspace_id") or DEFAULT_WORKSPACE_ID
-    data["agent_id"] = data.get("agent_id") or DEFAULT_AGENT_ID
+    # Keep the field in the public schema for old clients, but all
+    # conversations are coordinated by the built-in PGAgent master.
+    data["agent_id"] = DEFAULT_AGENT_ID
     if db.get(Workspace, data["workspace_id"]) is None:
         raise HTTPException(status_code=409, detail="Selected workspace does not exist")
-    if db.get(Agent, data["agent_id"]) is None:
-        raise HTTPException(status_code=409, detail="Selected agent does not exist")
+    if db.get(Agent, DEFAULT_AGENT_ID) is None:
+        raise HTTPException(status_code=409, detail="PGAgent coordinator is unavailable")
     _require_enabled_model_connection(db, data.get("model_connection_id"))
     item = ChatSession(**data)
     db.add(item)
@@ -275,6 +312,9 @@ def update_session(
                 detail="Model and thinking settings cannot change while the session has an active or awaiting run",
             )
     _apply(item, payload)
+    # Accept stale clients that still send agent_id, without letting a child
+    # Agent replace the session's fixed coordinator.
+    item.agent_id = DEFAULT_AGENT_ID
     _commit(db)
     db.refresh(item)
     return item
@@ -337,7 +377,12 @@ def list_runs(
 
 @router.post("/runs", response_model=RunRead, status_code=status.HTTP_201_CREATED)
 def create_run(payload: RunCreate, db: Session = Depends(get_db)) -> Run:
-    item = Run(**payload.model_dump())
+    data = payload.model_dump()
+    if data.get("session_id"):
+        chat_session = _require(db, ChatSession, data["session_id"], "Session")
+        data["agent_id"] = DEFAULT_AGENT_ID
+        data["workspace_id"] = data.get("workspace_id") or chat_session.workspace_id or DEFAULT_WORKSPACE_ID
+    item = Run(**data)
     db.add(item)
     _commit(db)
     db.refresh(item)

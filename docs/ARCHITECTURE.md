@@ -8,6 +8,14 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 - `data/langgraph_checkpoints.db`：LangGraph checkpoint。
 - `data/workspaces/{workspace_id}/`：工具可以访问的工作目录。所有路径必须经过 resolve 后仍位于对应工作区。
 
+## 项目、会话与主控
+
+工作区在产品界面中称为“项目”：目录路径规范化后作为项目唯一标识依据，重复选择同一目录会复用已有项目。默认工作区不显示在项目树中，它承载没有选择目录的一次性任务。
+
+新建对话先存在于前端草稿状态，不写 SQLite；当用户从某个项目会话发起新对话时，草稿仅在前端预选该项目目录，仍可重新选择或清除。第一次发送通过 `POST /api/drafts/launch` 的单个事务创建（或复用）项目、以首条内容生成会话标题、创建会话、用户消息、运行和幂等记录，提交后才启动运行。浏览器保留草稿级幂等键；同键同内容重试只返回原会话和原运行，不会二次启动模型，同键不同内容会明确返回冲突。离开未发送的草稿不会留下会话、消息、运行或 Token 用量。
+
+每个会话固定绑定 `DEFAULT_AGENT_ID`，即不可编辑、不可删除的 PGAgent 主控。主控负责意图识别、复杂度判断、规划、执行结果汇总和继续/输出决策。用户创建的 Agent 是待后续委派机制使用的子 Agent；当前不会伪造尚未实现的自动委派。
+
 ## 外层状态机
 
 `received -> preparing_context -> acting -> awaiting_approval -> observing -> completed|failed|stopped`

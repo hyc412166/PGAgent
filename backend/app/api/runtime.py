@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session as OrmSession
 
 from app import database as database_module
@@ -20,13 +23,22 @@ from app.database import (
     Agent,
     Approval,
     ChatMessage,
+    DraftLaunch,
+    ModelConnection,
     Run,
     RunEvent,
     Session,
     Workspace,
     get_db,
 )
-from app.schemas import ApprovalRead, RunRead
+from app.schemas import (
+    ApprovalRead,
+    DraftLaunchRead,
+    DraftLaunchRequest,
+    RunRead,
+    SessionRead,
+    WorkspaceRead,
+)
 from app.services.run_service import (
     ACTIVE_STATUSES,
     _prepare_session_history,
@@ -56,6 +68,241 @@ class ApprovalRuntimeDecision(BaseModel):
     reason: str | None = None
 
 
+def _normalized_workspace_root(root_path: str) -> str:
+    """Canonicalize a selected project directory before comparing it."""
+
+    return str(Path(root_path).expanduser().resolve())
+
+
+def _workspace_name_from_root(root_path: str) -> str:
+    name = Path(root_path).name.strip()
+    return name or "项目"
+
+
+def _begin_draft_transaction(db: OrmSession) -> None:
+    """Serialize local SQLite draft launches before checking project roots.
+
+    ``root_path`` has no legacy database uniqueness constraint.  Taking an
+    immediate write lock before the lookup makes two distinct first-send
+    requests for the same normalized path observe one project row instead of
+    racing to insert two.  Other database engines retain their normal
+    transaction semantics and the draft idempotency unique key still protects
+    retry requests.
+    """
+
+    if db.get_bind().dialect.name != "sqlite":
+        return
+    try:
+        db.execute(text("BEGIN IMMEDIATE"))
+    except OperationalError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Draft launch is busy; retry with the same idempotency key",
+        ) from exc
+
+
+def _draft_request_fingerprint(payload: DraftLaunchRequest, normalized_root: str | None) -> str:
+    """Bind an idempotency key to its exact materialisation request."""
+
+    canonical = {
+        "title": payload.title,
+        "content": payload.content,
+        "root_path": normalized_root,
+        "model_connection_id": payload.model_connection_id,
+        "model_id": payload.model_id,
+        "thinking_level": payload.thinking_level,
+    }
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _workspace_for_root(db: OrmSession, normalized_root: str) -> Workspace | None:
+    """Find an existing project while repairing legacy non-canonical paths."""
+
+    for workspace in db.scalars(select(Workspace).order_by(Workspace.created_at.asc(), Workspace.id.asc())):
+        if _normalized_workspace_root(workspace.root_path) == normalized_root:
+            workspace.root_path = normalized_root
+            return workspace
+    return None
+
+
+def _draft_launch_response(
+    record: DraftLaunch,
+    *,
+    expected_fingerprint: str,
+    db: OrmSession,
+    reused: bool,
+) -> DraftLaunchRead:
+    if record.request_fingerprint != expected_fingerprint:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Idempotency key was already used with a different draft payload",
+        )
+    chat_session = db.get(Session, record.session_id) if record.session_id else None
+    run = db.get(Run, record.run_id) if record.run_id else None
+    if chat_session is None or run is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The resources for this draft launch are no longer available",
+        )
+    workspace_id = record.workspace_id or chat_session.workspace_id
+    workspace = db.get(Workspace, workspace_id) if workspace_id else None
+    return DraftLaunchRead(
+        workspace=WorkspaceRead.model_validate(workspace) if workspace is not None else None,
+        session=SessionRead.model_validate(chat_session),
+        run=RunRead.model_validate(run),
+        reused=reused,
+    )
+
+
+def _mark_unscheduled_draft_run(db: OrmSession, run: Run) -> None:
+    """Persist a terminal outcome if the post-commit coordinator cannot start."""
+
+    run.status = "failed"
+    run.error_code = "launch_unavailable"
+    run.error_message = "The local run coordinator could not be scheduled"
+    run.finished_at = datetime.now(timezone.utc)
+    db.commit()
+
+
+@router.post("/drafts/launch", response_model=DraftLaunchRead, status_code=status.HTTP_202_ACCEPTED)
+async def launch_draft(
+    payload: DraftLaunchRequest,
+    response: Response,
+    db: OrmSession = Depends(get_db),
+) -> DraftLaunchRead:
+    """Atomically turn a client-only draft into its first persisted run.
+
+    The browser may retry a request after a navigation or transport failure.
+    All rows are created in one transaction and the coordinator is scheduled
+    only after that transaction commits, so reusing the same key is a pure
+    read of the original launch rather than another side effect.
+    """
+
+    normalized_root = _normalized_workspace_root(payload.root_path) if payload.root_path else None
+    fingerprint = _draft_request_fingerprint(payload, normalized_root)
+    try:
+        _begin_draft_transaction(db)
+        existing = db.scalar(
+            select(DraftLaunch).where(DraftLaunch.idempotency_key == payload.idempotency_key)
+        )
+        if existing is not None:
+            result = _draft_launch_response(
+                existing,
+                expected_fingerprint=fingerprint,
+                db=db,
+                reused=True,
+            )
+            db.commit()
+            response.status_code = status.HTTP_200_OK
+            return result
+
+        agent = db.get(Agent, DEFAULT_AGENT_ID)
+        if agent is None or not agent.enabled:
+            raise HTTPException(status_code=409, detail="PGAgent main coordinator is unavailable")
+        if payload.model_connection_id is not None:
+            connection = db.get(ModelConnection, payload.model_connection_id)
+            if connection is None:
+                raise HTTPException(status_code=409, detail="Selected model connection does not exist")
+            if not connection.enabled:
+                raise HTTPException(status_code=409, detail="Selected model connection is disabled")
+
+        if normalized_root is None:
+            workspace = db.get(Workspace, DEFAULT_WORKSPACE_ID)
+            if workspace is None or not workspace.enabled:
+                raise HTTPException(status_code=409, detail="The default task workspace is unavailable")
+        else:
+            workspace = _workspace_for_root(db, normalized_root)
+            if workspace is None:
+                workspace = Workspace(
+                    name=_workspace_name_from_root(normalized_root),
+                    description="",
+                    root_path=normalized_root,
+                    enabled=True,
+                )
+                db.add(workspace)
+                db.flush()
+
+        chat_session = Session(
+            title=payload.title,
+            workspace_id=workspace.id,
+            agent_id=DEFAULT_AGENT_ID,
+            model_connection_id=payload.model_connection_id,
+            model_id=payload.model_id,
+            thinking_level=payload.thinking_level,
+            status="active",
+        )
+        db.add(chat_session)
+        db.flush()
+        message = ChatMessage(
+            session_id=chat_session.id,
+            role="user",
+            content=payload.content,
+            extra={"mode": "auto", "source": "draft_launch"},
+        )
+        run = Run(
+            session_id=chat_session.id,
+            workspace_id=workspace.id,
+            agent_id=DEFAULT_AGENT_ID,
+            mode="auto",
+            status="received",
+        )
+        db.add_all([message, run])
+        db.flush()
+        record = DraftLaunch(
+            idempotency_key=payload.idempotency_key,
+            request_fingerprint=fingerprint,
+            workspace_id=workspace.id,
+            session_id=chat_session.id,
+            run_id=run.id,
+        )
+        db.add(record)
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except IntegrityError as exc:
+        # A non-SQLite deployment can still race the idempotency unique key.
+        # Its losing transaction is wholly rolled back before returning the
+        # winning launch, so no partial workspace/session/message/run remains.
+        db.rollback()
+        existing = db.scalar(
+            select(DraftLaunch).where(DraftLaunch.idempotency_key == payload.idempotency_key)
+        )
+        if existing is not None:
+            result = _draft_launch_response(
+                existing,
+                expected_fingerprint=fingerprint,
+                db=db,
+                reused=True,
+            )
+            db.commit()
+            response.status_code = status.HTTP_200_OK
+            return result
+        raise HTTPException(status_code=409, detail="Draft launch could not be persisted") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    result = _draft_launch_response(record, expected_fingerprint=fingerprint, db=db, reused=False)
+    try:
+        scheduled = coordinator.launch(run.id)
+    except Exception as exc:
+        _mark_unscheduled_draft_run(db, run)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The draft was saved, but its run could not be scheduled",
+        ) from exc
+    if not scheduled:
+        _mark_unscheduled_draft_run(db, run)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The draft was saved, but its run could not be scheduled",
+        )
+    return result
+
+
 @router.post("/sessions/{session_id}/run", response_model=RunRead, status_code=status.HTTP_202_ACCEPTED)
 async def launch_session_run(
     session_id: str, payload: SessionRunRequest, db: OrmSession = Depends(get_db)
@@ -63,11 +310,12 @@ async def launch_session_run(
     chat_session = db.get(Session, session_id)
     if chat_session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    agent = db.get(Agent, chat_session.agent_id or DEFAULT_AGENT_ID)
+    # A session always runs through the fixed PGAgent coordinator. This also
+    # repairs a legacy session lazily if it predates the coordinator migration.
+    agent = db.get(Agent, DEFAULT_AGENT_ID)
     if agent is None:
-        agent = db.get(Agent, DEFAULT_AGENT_ID)
-    if agent is None:
-        raise HTTPException(status_code=409, detail="请先为会话选择 Agent")
+        raise HTTPException(status_code=409, detail="PGAgent 主控不可用")
+    chat_session.agent_id = DEFAULT_AGENT_ID
     workspace_id = chat_session.workspace_id or agent.workspace_id or DEFAULT_WORKSPACE_ID
     if not workspace_id or db.get(Workspace, workspace_id) is None:
         raise HTTPException(status_code=409, detail="请先为会话或 Agent 选择有效工作区")

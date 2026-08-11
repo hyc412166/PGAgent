@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app import database
 from app.api.runtime import router
@@ -16,6 +17,7 @@ from app.database import (
     Approval,
     Base,
     ChatMessage,
+    DraftLaunch,
     Run,
     RunEvent,
     Session,
@@ -71,6 +73,9 @@ def test_launch_session_run_persists_message_and_returns_immediately(
     with database.SessionLocal() as db:
         run = db.get(Run, run_id)
         assert run is not None and run.mode == "auto"
+        assert run.agent_id == DEFAULT_AGENT_ID
+        session = db.get(Session, session_id)
+        assert session is not None and session.agent_id == DEFAULT_AGENT_ID
         assert db.query(database.ChatMessage).filter_by(session_id=session_id).one().content == "读取文件"
 
 
@@ -265,6 +270,172 @@ def test_launch_uses_fixed_defaults_when_session_has_no_bindings(
         assert run.agent_id == DEFAULT_AGENT_ID
         assert run.workspace_id == DEFAULT_WORKSPACE_ID
         assert run.mode == "auto"
+
+
+def _draft_payload(
+    *,
+    key: str,
+    content: str = "Create the project summary",
+    title: str = "Create project summary",
+    root_path: str | None = None,
+    model_connection_id: str | None = None,
+) -> dict[str, str]:
+    payload = {
+        "idempotency_key": key,
+        "title": title,
+        "content": content,
+        "thinking_level": "high",
+    }
+    if root_path is not None:
+        payload["root_path"] = root_path
+    if model_connection_id is not None:
+        payload["model_connection_id"] = model_connection_id
+    return payload
+
+
+def _draft_resource_counts() -> tuple[int, int, int, int]:
+    with database.SessionLocal() as db:
+        return (
+            db.query(Workspace).count(),
+            db.query(Session).count(),
+            db.query(ChatMessage).count(),
+            db.query(DraftLaunch).count(),
+        )
+
+
+def test_launch_draft_materializes_once_and_retries_without_rescheduling(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, launched = client
+    payload = _draft_payload(key="draft-repeat")
+
+    first = test_client.post("/api/drafts/launch", json=payload)
+    assert first.status_code == 202, first.text
+    first_body = first.json()
+    assert first_body["reused"] is False
+    assert first_body["workspace"]["id"] == DEFAULT_WORKSPACE_ID
+
+    retry = test_client.post("/api/drafts/launch", json=payload)
+    assert retry.status_code == 200, retry.text
+    retry_body = retry.json()
+    assert retry_body["reused"] is True
+    assert retry_body["session"]["id"] == first_body["session"]["id"]
+    assert retry_body["run"]["id"] == first_body["run"]["id"]
+    assert launched["calls"] == [(first_body["run"]["id"], False)]
+
+    with database.SessionLocal() as db:
+        session = db.get(Session, first_body["session"]["id"])
+        run = db.get(Run, first_body["run"]["id"])
+        assert session is not None
+        assert session.workspace_id == DEFAULT_WORKSPACE_ID
+        assert session.agent_id == DEFAULT_AGENT_ID
+        assert session.model_connection_id is None
+        assert session.thinking_level == "high"
+        assert run is not None and run.agent_id == DEFAULT_AGENT_ID
+        messages = list(db.scalars(select(ChatMessage).where(ChatMessage.session_id == session.id)))
+        assert [(item.role, item.content) for item in messages] == [("user", payload["content"])]
+        assert db.query(DraftLaunch).count() == 1
+
+
+def test_launch_draft_rejects_reusing_key_for_different_request(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, launched = client
+    first = test_client.post("/api/drafts/launch", json=_draft_payload(key="draft-mismatch"))
+    assert first.status_code == 202, first.text
+    counts_after_first = _draft_resource_counts()
+
+    changed = test_client.post(
+        "/api/drafts/launch",
+        json=_draft_payload(key="draft-mismatch", title="A different destination"),
+    )
+    assert changed.status_code == 409
+    assert "different draft payload" in changed.json()["detail"]
+    assert _draft_resource_counts() == counts_after_first
+    assert launched["calls"] == [(first.json()["run"]["id"], False)]
+
+
+@pytest.mark.parametrize("failure_mode", ["false", "exception"])
+def test_launch_draft_marks_persisted_run_failed_when_initial_scheduling_fails(
+    client: tuple[TestClient, dict[str, list]],
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    test_client, launched = client
+    attempts: list[tuple[str, bool]] = []
+
+    def cannot_schedule(run_id: str, resume: bool = False) -> bool:
+        attempts.append((run_id, resume))
+        if failure_mode == "exception":
+            raise RuntimeError("coordinator unavailable")
+        return False
+
+    monkeypatch.setattr(coordinator, "launch", cannot_schedule)
+    payload = _draft_payload(key=f"draft-schedule-{failure_mode}")
+    failed = test_client.post("/api/drafts/launch", json=payload)
+    assert failed.status_code == 503, failed.text
+    assert _draft_resource_counts() == (1, 1, 1, 1)
+
+    with database.SessionLocal() as db:
+        record = db.scalar(select(DraftLaunch).where(DraftLaunch.idempotency_key == payload["idempotency_key"]))
+        assert record is not None and record.run_id is not None
+        run = db.get(Run, record.run_id)
+        assert run is not None
+        assert run.status == "failed"
+        assert run.error_code == "launch_unavailable"
+        run_id = run.id
+
+    retry = test_client.post("/api/drafts/launch", json=payload)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["run"]["id"] == run_id
+    assert retry.json()["run"]["status"] == "failed"
+    assert _draft_resource_counts() == (1, 1, 1, 1)
+    assert attempts == [(run_id, False)]
+    assert launched["calls"] == []
+
+
+def test_launch_draft_reuses_project_for_distinct_keys_with_same_normalized_root(
+    client: tuple[TestClient, dict[str, list]], tmp_path: Path
+) -> None:
+    test_client, _launched = client
+    project_root = tmp_path / "project-root"
+    project_root.mkdir()
+    first = test_client.post(
+        "/api/drafts/launch",
+        json=_draft_payload(key="draft-project-one", root_path=str(project_root / ".")),
+    )
+    second = test_client.post(
+        "/api/drafts/launch",
+        json=_draft_payload(key="draft-project-two", root_path=str(project_root)),
+    )
+    assert first.status_code == 202, first.text
+    assert second.status_code == 202, second.text
+    assert first.json()["workspace"]["id"] == second.json()["workspace"]["id"]
+    assert first.json()["workspace"]["root_path"] == str(project_root.resolve())
+    with database.SessionLocal() as db:
+        assert db.query(Workspace).count() == 2  # default one-off workspace + selected project
+
+
+def test_invalid_or_unavailable_draft_launch_leaves_no_rows(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, launched = client
+    before = _draft_resource_counts()
+
+    invalid = test_client.post(
+        "/api/drafts/launch",
+        json=_draft_payload(key="draft-invalid", title="   "),
+    )
+    assert invalid.status_code == 422
+    assert _draft_resource_counts() == before
+
+    unavailable = test_client.post(
+        "/api/drafts/launch",
+        json=_draft_payload(key="draft-unavailable", model_connection_id="not-a-connection"),
+    )
+    assert unavailable.status_code == 409
+    assert _draft_resource_counts() == before
+    assert launched["calls"] == []
 
 
 def test_session_context_recalculates_migrated_messages_when_cache_is_zero(
