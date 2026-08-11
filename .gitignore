@@ -12,6 +12,8 @@ frontend/dist/
 .env
 data/*.db
 data/*.db-*
+data/backups/
+data/*.log
 data/workspaces/*
 !data/workspaces/.gitkeep
 
