@@ -77,11 +77,29 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
     assert response.status_code == 200
     tools = response.json()
     by_id = {item["id"]: item for item in tools}
-    assert {"bash", "read", "write", "edit", "glob", "grep", "webfetch", "websearch", "task", "todowrite", "question", "skill"}.issubset(by_id)
+    assert {
+        "bash",
+        "read",
+        "write",
+        "edit",
+        "glob",
+        "grep",
+        "webfetch",
+        "websearch",
+        "task",
+        "todowrite",
+        "question",
+        "skill",
+        "git_status",
+        "git_diff",
+        "file_info",
+    }.issubset(by_id)
     assert by_id["bash"]["runtime_tool_id"] == "bash"
     assert by_id["read"]["risk_level"] == "low"
     assert by_id["write"]["risk_level"] == "adaptive"
     assert by_id["write"]["requires_approval"] is False
+    assert by_id["git_diff"]["risk_level"] == "low"
+    assert by_id["file_info"]["availability"] == "available"
     assert {"availability", "enabled", "is_builtin"}.issubset(by_id["skill"])
 
     default_agent = test_client.get(f"/api/agents/{DEFAULT_AGENT_ID}")

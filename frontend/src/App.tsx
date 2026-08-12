@@ -7,6 +7,7 @@ import {
   Box,
   CalendarDays,
   Check,
+  CheckCheck,
   CheckCircle2,
   ChevronRight,
   ChartNoAxesCombined,
@@ -14,12 +15,14 @@ import {
   Download,
   FolderOpen,
   Folder,
+  Copy,
   History,
   KeyRound,
   LayoutDashboard,
   LoaderCircle,
   Menu,
   MessageSquare,
+  Moon,
   Network,
   PanelRightClose,
   PanelRightOpen,
@@ -41,6 +44,7 @@ import {
   Workflow,
   X,
   XCircle,
+  Sun,
   type LucideIcon,
 } from 'lucide-react'
 import { Fragment, type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
@@ -56,6 +60,7 @@ import { buildSessionNavigation, folderName, isDefaultWorkspace, projectRootForS
 import { appendAssistantDelta, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldRefreshConversationAfterApprovalDecision, visibleSessionItems, type RunStreamEvent } from './sessionStream'
 import { emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline, type ThoughtTimelineState } from './thoughtTimeline'
 import { usageDateKey, usageDateOptions, usageDatePresetBounds, usageDateRange, usageRangeLabel, type QuickUsageDatePreset, type UsageDatePreset } from './usageDateRange'
+import { agentTemplates, type AgentTemplate } from './features/agents/templates'
 import type {
   AgentProfile,
   Approval,
@@ -89,6 +94,7 @@ import type {
   Workspace,
 } from './types'
 import './App.css'
+import './styles/pgagent-ui.css'
 
 type LoadState<T> = { data: T; loading: boolean; error: string }
 type LiveRunState = { runId: string; phase: string; draft: string; status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'; error: string; thought: ThoughtTimelineState; thinkingStatus: string }
@@ -366,23 +372,42 @@ const navigation = [
 function AppShell() {
   const [mobileOpen, setMobileOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(false)
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    try {
+      return window.localStorage.getItem('pgagent-theme') === 'dark' ? 'dark' : 'light'
+    } catch {
+      return 'light'
+    }
+  })
   const location = useLocation()
   const health = useApiData<Health | null>(null, () => api.get<Health>('/api/health'), [])
 
   useEffect(() => setMobileOpen(false), [location.pathname])
+  useEffect(() => {
+    try { window.localStorage.setItem('pgagent-theme', theme) } catch { /* local storage is optional */ }
+  }, [theme])
 
   return (
-    <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''}`}>
+    <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''} theme-${theme}`}>
       <button className="mobile-menu" aria-label="打开导航" onClick={() => setMobileOpen(true)}><Menu /></button>
       {mobileOpen && <button className="mobile-backdrop" aria-label="关闭导航" onClick={() => setMobileOpen(false)} />}
       <aside className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
-        <div className="brand">
-          <div className="brand-mark" aria-hidden="true"><Sparkles size={20} /></div>
-          <div className="brand-copy"><strong>PGAgent</strong><span>Local Workbench</span></div>
-          <button className="collapse-button" onClick={() => setCollapsed((value) => !value)} aria-label={collapsed ? '展开导航' : '收起导航'}>
-            <PanelLeftClose size={17} />
-          </button>
-        </div>
+          <div className="brand">
+            <div className="brand-mark" aria-hidden="true"><Sparkles size={20} /></div>
+            <div className="brand-copy"><strong>PGAgent</strong><span>Local Workbench</span></div>
+            <button
+              className="theme-toggle icon-button"
+              type="button"
+              aria-label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+              title={theme === 'dark' ? '浅色主题' : '深色主题'}
+              onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}
+            >
+              {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+            </button>
+            <button className="collapse-button" onClick={() => setCollapsed((value) => !value)} aria-label={collapsed ? '展开导航' : '收起导航'}>
+              <PanelLeftClose size={17} />
+            </button>
+          </div>
         <nav aria-label="主导航">
           <p className="nav-label">工作台</p>
           {navigation.slice(0, 6).map(({ path, label, icon: Icon }) => (
@@ -503,13 +528,24 @@ function AgentsPage() {
   const [saving, setSaving] = useState(false)
   const [deletingId, setDeletingId] = useState('')
   const [formError, setFormError] = useState('')
+  const [template, setTemplate] = useState<AgentTemplate | null>(null)
   const childAgents = agents.data.filter((agent) => !agent.is_default)
 
   function openAgentPanel(agent?: AgentProfile) {
     if (agent?.is_default) return
     setEditing(agent ?? null)
+    setTemplate(null)
     setSelectedToolIds(agent?.tool_ids ?? [])
     setSelectedSkillIds(agent?.skill_ids ?? [])
+    setFormError('')
+    setPanelOpen(true)
+  }
+
+  function openTemplatePanel(nextTemplate: AgentTemplate) {
+    setEditing(null)
+    setTemplate(nextTemplate)
+    setSelectedToolIds(nextTemplate.toolIds.filter((id) => tools.data.some((item) => item.id === id)))
+    setSelectedSkillIds([])
     setFormError('')
     setPanelOpen(true)
   }
@@ -529,7 +565,7 @@ function AgentsPage() {
       }
       if (editing) await api.patch(`/api/agents/${editing.id}`, payload)
       else await api.post('/api/agents', payload)
-      setPanelOpen(false); setEditing(null); await agents.reload()
+      setPanelOpen(false); setEditing(null); setTemplate(null); await agents.reload()
     } catch (error) { setFormError(describeError(error)) } finally { setSaving(false) }
   }
 
@@ -543,6 +579,14 @@ function AgentsPage() {
   return (
     <div className="page">
       <PageHeader eyebrow="REUSABLE INTELLIGENCE" title="子 Agent" description="创建可复用的专业子 Agent，为不同任务配置角色、系统指令与模型偏好。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />
+      <section className="agent-starter-strip" aria-label="专业 Agent 模板">
+        <div className="agent-starter-copy"><span className="eyebrow">QUICK START</span><strong>从一个清晰的角色开始</strong><p>模板只会预填角色和能力，保存前仍可逐项调整。</p></div>
+        <div className="agent-template-list">
+          {agentTemplates.map((item) => <button type="button" key={item.id} className={`agent-template-card template-${item.accent}`} onClick={() => openTemplatePanel(item)}>
+            <span className="agent-template-icon"><Bot size={16} /></span><span><strong>{item.name}</strong><small>{item.description}</small></span><ChevronRight size={15} />
+          </button>)}
+        </div>
+      </section>
       {formError && !panelOpen && <p className="form-error page-form-error" role="alert">{formError}</p>}
       {agents.error ? <ErrorState message={agents.error} onRetry={agents.reload} /> : agents.loading ? <LoadingState /> : childAgents.length ? (
         <section className="entity-grid agent-grid">
@@ -556,17 +600,17 @@ function AgentsPage() {
           ))}
         </section>
       ) : <EmptyState icon={Bot} title="创建你的第一个子 Agent" description="定义专业角色、系统指令、模型与可用能力；主 Agent 会在复杂、专业或你明确要求时委派匹配的子 Agent。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />}
-      {panelOpen && <SlidePanel title={editing ? '编辑子 Agent' : '创建子 Agent'} description="配置角色、模型以及允许这个子 Agent 使用的工具和 Skill。主 Agent 会在需要时将任务委派给匹配的子 Agent。" onClose={() => { setPanelOpen(false); setEditing(null) }}>
+      {panelOpen && <SlidePanel title={editing ? '编辑子 Agent' : template ? `使用「${template.name}」模板` : '创建子 Agent'} description="配置角色、模型以及允许这个子 Agent 使用的工具和 Skill。主 Agent 会在需要时将任务委派给匹配的子 Agent。" onClose={() => { setPanelOpen(false); setEditing(null); setTemplate(null) }}>
         <form className="panel-form" onSubmit={saveAgent} key={editing?.id || 'new-agent'}>
-          <Field label="名称"><input name="name" required placeholder="例如：代码协作者" autoFocus defaultValue={editing?.name || ''} /></Field>
-          <Field label="简介"><input name="description" placeholder="简要描述擅长处理的任务" defaultValue={editing?.description || ''} /></Field>
-          <Field label="系统指令"><textarea name="system_prompt" rows={6} placeholder="说明工作原则、输出风格和边界……" defaultValue={editing?.system_prompt || ''} /></Field>
+          <Field label="名称"><input name="name" required placeholder="例如：代码协作者" autoFocus defaultValue={editing?.name || template?.name || ''} /></Field>
+          <Field label="简介"><input name="description" placeholder="简要描述擅长处理的任务" defaultValue={editing?.description || template?.description || ''} /></Field>
+          <Field label="系统指令"><textarea name="system_prompt" rows={6} placeholder="说明工作原则、输出风格和边界……" defaultValue={editing?.system_prompt || template?.systemPrompt || ''} /></Field>
           <div className="form-row"><Field label="模型连接"><select name="connection_id" defaultValue={editing?.model_connection_id || editing?.connection_id || ''}><option value="">使用默认连接</option>{connections.data.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="模型 ID"><input name="model" placeholder="例如：deepseek-chat" defaultValue={editing?.model_id || editing?.model || ''} /></Field></div>
           <Field label="思考强度"><select name="thinking_level" defaultValue={editing?.thinking_level || 'auto'}><option value="off">关闭</option><option value="auto">自动</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option></select></Field>
           <CapabilityMultiSelect label="工具" items={tools.data.map((item) => ({ ...item, name: item.label || item.name }))} selectedIds={selectedToolIds} loading={tools.loading} error={tools.error} onRetry={() => void tools.reload()} onToggle={(id) => setSelectedToolIds((current) => toggleSelectedId(current, id))} />
           <CapabilityMultiSelect label="Skill" items={skills.data} selectedIds={selectedSkillIds} loading={skills.loading} error={skills.error} onRetry={() => void skills.reload()} onToggle={(id) => setSelectedSkillIds((current) => toggleSelectedId(current, id))} />
           {formError && <p className="form-error" role="alert">{formError}</p>}
-          <div className="form-actions"><button type="button" className="button button-secondary" onClick={() => { setPanelOpen(false); setEditing(null) }}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}{editing ? '保存修改' : '创建'}</button></div>
+          <div className="form-actions"><button type="button" className="button button-secondary" onClick={() => { setPanelOpen(false); setEditing(null); setTemplate(null) }}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}{editing ? '保存修改' : '创建'}</button></div>
         </form>
       </SlidePanel>}
     </div>
@@ -930,6 +974,7 @@ function SessionsPage() {
   const context = useApiData<SessionContext | null>(null, () => activeId ? api.get<SessionContext>(`/api/sessions/${activeId}/context`) : Promise.resolve(null), [activeId])
   const activeSession = sessions.data.find((item) => stringId(item.id) === activeId)
   const activeAgent = agents.data.find((item) => item.id === activeSession?.agent_id)
+  const activeWorkspace = workspaces.data.find((item) => item.id === activeSession?.workspace_id)
   const sessionRuns = runs.data.filter((item) => !item.session_id || item.session_id === activeId)
   const awaitingApprovalRunIds = sessionRuns
     .filter((item) => item.status === 'awaiting_approval')
@@ -1572,12 +1617,17 @@ function SessionsPage() {
             {sessions.loading && !sessions.data.length && <LoadingState />}
           </aside>
           <section className={`conversation ${childPanelOpen ? 'with-child-panel' : ''}`}>
+            <header className="conversation-header">
+              <div className="conversation-heading">
+                <div className="conversation-agent-mark"><Sparkles size={16} /></div>
+                <div><span className="conversation-kicker">PGAgent · {activeWorkspace?.name || 'Default Workspace'}</span><strong>{activeSession?.title || (draftActive ? '新任务草稿' : '选择一个会话')}</strong></div>
+              </div>
+              <div className="conversation-header-meta">
+                {activeSession && <span className="conversation-model-pill"><span>{modelButtonLabel}</span><b>{thinkingLevelLabels[effectiveThinking]}</b></span>}
+                {hasChildActivity && <button type="button" className="child-panel-toggle" aria-label={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} title={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} aria-expanded={childPanelOpen} onClick={() => setChildPanelOpen((open) => !open)}>{childPanelOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}</button>}
+              </div>
+            </header>
             {activeSession || draftActive ? <>
-              {hasChildActivity && <div className="child-panel-toggle-row">
-                <button type="button" className="child-panel-toggle" aria-label={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} title={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} aria-expanded={childPanelOpen} onClick={() => setChildPanelOpen((open) => !open)}>
-                  {childPanelOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}
-                </button>
-              </div>}
               <div
                 className="messages"
                 ref={messagesRef}
@@ -1763,6 +1813,7 @@ function ChildAgentPanel({
 }
 
 function MessageBubble({ message }: { message: Message }) {
+  const [copied, setCopied] = useState(false)
   const isTool = message.role === 'tool' || !!message.tool_name
   const isDelegatedChild = message.metadata?.delegated_child === true
   const childAgentName = typeof message.metadata?.child_agent_name === 'string'
@@ -1775,10 +1826,19 @@ function MessageBubble({ message }: { message: Message }) {
       : isDelegatedChild
         ? `${childAgentName}（子 Agent）`
         : 'PGAgent'
+  async function copyMessage() {
+    try {
+      await navigator.clipboard.writeText(message.content || '')
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1400)
+    } catch {
+      setCopied(false)
+    }
+  }
   return (
     <article className={`message ${message.role} ${isTool ? 'tool-message' : ''}`}>
       <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <Sparkles size={16} />}</div>
-      <div className="message-body"><div className="message-meta"><strong>{speaker}</strong><time>{formatDate(message.created_at)}</time></div><div className="message-content">{message.content}</div>{message.status && <StatusBadge status={message.status} />}</div>
+      <div className="message-body"><div className="message-meta"><strong>{speaker}</strong><time>{formatDate(message.created_at)}</time><button type="button" className="message-copy-button" aria-label={copied ? '已复制' : '复制消息'} title={copied ? '已复制' : '复制消息'} onClick={() => void copyMessage()}>{copied ? <CheckCheck size={13} /> : <Copy size={13} />}</button></div><div className="message-content">{message.content}</div>{message.status && <StatusBadge status={message.status} />}</div>
     </article>
   )
 }

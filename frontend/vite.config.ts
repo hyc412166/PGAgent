@@ -9,7 +9,10 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        // Keep the dev proxy aligned with the documented local backend port.
+        // VITE_API_PROXY_TARGET can still override this for another local
+        // instance without changing the frontend source.
+        target: process.env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:8765',
         changeOrigin: true,
       },
     },

@@ -5,7 +5,16 @@ import subprocess
 import time
 from pathlib import Path
 
-from app.tools.builtins import list_files, read_file, run_command, search_files, write_file
+from app.tools.builtins import (
+    file_info,
+    git_diff,
+    git_status,
+    list_files,
+    read_file,
+    run_command,
+    search_files,
+    write_file,
+)
 from app.tools.sandbox import SandboxViolation, WorkspaceSandbox
 
 
@@ -160,6 +169,42 @@ def test_run_command_timeout_terminates_process_tree(tmp_path: Path) -> None:
     assert not result.ok
     assert result.error_code == "timeout"
     assert result.metadata["process_tree_terminated"] is True
+
+
+def test_read_only_developer_tools_stay_inside_workspace(tmp_path: Path) -> None:
+    initialized = subprocess.run(
+        ["git", "init", "-q"], cwd=tmp_path, capture_output=True, check=False
+    )
+    if initialized.returncode != 0:
+        return
+    tracked = tmp_path / "notes.txt"
+    tracked.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "add", "notes.txt"], cwd=tmp_path, capture_output=True, check=False)
+    subprocess.run(
+        ["git", "-c", "user.name=PGAgent", "-c", "user.email=pgagent@example.invalid", "commit", "-qm", "seed"],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+    )
+    tracked.write_text("after\n", encoding="utf-8")
+
+    sandbox = WorkspaceSandbox(tmp_path)
+    status = git_status(sandbox)
+    assert status.ok
+    assert "notes.txt" in status.content
+    diff = git_diff(sandbox, path="notes.txt")
+    assert diff.ok
+    assert "-before" in diff.content and "+after" in diff.content
+    metadata = file_info(sandbox, "notes.txt")
+    assert metadata.ok
+    assert metadata.metadata["kind"] == "file"
+    assert metadata.metadata["read_only"] is True
+
+
+def test_read_only_git_tools_report_non_repository(tmp_path: Path) -> None:
+    result = git_status(WorkspaceSandbox(tmp_path))
+    assert not result.ok
+    assert result.error_code == "not_git_repository"
 
 
 def test_timeout_kills_delayed_child_before_it_can_write(tmp_path: Path) -> None:

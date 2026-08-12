@@ -13,7 +13,7 @@ PGAgent 是一个本地优先、单用户的 Agent 工作台。它参考了视�
 - 会话输入区可直接切换模型和思考强度，并显示当前上下文 Token 占用。
 - OpenAI 兼容中转站、OpenRouter、DeepSeek 等连接；填写 Base URL 与 API Key 后自动请求 `/models`，也支持手动模型 ID。
 - `off / auto / low / medium / high / xhigh` 思考强度，调用时由 provider adapter 映射。
-- 主控的运行时工具为 `bash/read/write/edit/glob/grep/webfetch/websearch/task/todowrite/question/skill`；每次运行只把当前 Agent 已选择的工具暴露给模型，并把该列表冻结到运行快照。
+- 主控的运行时工具为 `bash/read/write/edit/glob/grep/webfetch/websearch/task/todowrite/question/skill/git_status/git_diff/file_info`；每次运行只把当前 Agent 已选择的工具暴露给模型，并把该列表冻结到运行快照。后三个开发工具是受边界限制的只读能力，分别用于查看 Git 状态、Git 差异和文件元数据。
 - `bash` 只运行工作区 cwd 中的 allowlist 命令，绝不启动 shell；`read/write/edit/glob/grep` 始终受工作区真实路径、符号链接和 Junction 边界保护。
 - `webfetch` 仅访问公开 HTTP(S) 地址，拒绝私网/回环地址、环境代理、自动重定向和超大响应；`websearch` 使用公开 DuckDuckGo HTML，服务不可用时明确报错而不编造结果。
 - `todowrite` 保存结构化待办并随运行快照恢复；`question` 会将本轮安全结束为一条澄清消息，等待用户下一条回复；`task` 会创建幂等任务、结构化 Agent 消息和独立子运行，完成后返回子 Agent、Run、状态、计数和输出摘要，不会假称已委派。
@@ -25,6 +25,7 @@ PGAgent 是一个本地优先、单用户的 Agent 工作台。它参考了视�
 - 单个会话上下文预算为 100k Token，达到 90k 时自动压缩；会话、工作区、全局三级记忆继续分层保存。
 - 用量页统计请求数、输入/输出/缓存 Token、缓存命中率、估算成本以及逐模型明细；无法识别价格的模型成本显示为 0。
 - 多 Agent 任务使用 SQLite 任务板、CAS 版本、lease、幂等键、TTL、hop 上限以及 pending/delivered/ack 消息状态。
+- UI 视觉层采用独立的磨砂玻璃样式文件，支持浅色/深色主题、居中阅读列、固定输入栏、消息内联时间线和四个专业 Agent 快速模板；设计取舍与响应式约束见 `docs/UI_ARCHITECTURE.md`。
 
 ## 运行环境
 
@@ -94,4 +95,4 @@ E:\anaconda3\envs\agent_dock\python.exe -m uvicorn app.main:app --app-dir backen
 - 模型能力由提供商决定。部分中转站不支持工具调用或思考强度参数，PGAgent 会尽量丢弃不支持的可选参数，但无法替代提供商能力。
 - 同步 SDK 调用超时后结果会被丢弃，但 Python 无法强杀已进入第三方库的线程；PGAgent 默认使用 LiteLLM 异步调用避免这一问题。
 
-更多设计细节见 `docs/ARCHITECTURE.md`。
+更多运行时设计细节见 `docs/ARCHITECTURE.md`，UI 设计与 Apix 对比见 `docs/UI_ARCHITECTURE.md`。
