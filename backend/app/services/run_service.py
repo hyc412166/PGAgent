@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-from sqlalchemy import case, or_, select
+from sqlalchemy import case, func, or_, select
 
 from app import database as database_module
 from app.config import settings
@@ -17,6 +18,10 @@ from app.database import (
     Agent,
     Approval,
     ChatMessage,
+    Artifact,
+    CompactionAttempt,
+    ContextCheckpoint,
+    ContextEpoch,
     DelegatedTask,
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
@@ -95,6 +100,10 @@ def _message_payload(message: ChatMessage) -> dict[str, Any]:
         payload["name"] = message.tool_name
     if message.tool_call_id:
         payload["tool_call_id"] = message.tool_call_id
+    metadata = message.extra if isinstance(message.extra, dict) else {}
+    tool_calls = metadata.get("tool_calls")
+    if message.role == "assistant" and isinstance(tool_calls, list) and tool_calls:
+        payload["tool_calls"] = _json_safe(tool_calls)
     return payload
 
 
@@ -103,13 +112,373 @@ def _conversation_token_count(summary: str, messages: list[dict[str, Any]]) -> i
     return summary_tokens + sum(message_tokens(message) for message in messages)
 
 
-def _prepare_session_history(db: Any, session: Session) -> list[dict[str, Any]]:
-    """Return uncompacted history and compact it once the 90% threshold is hit."""
+def _context_snapshot_from_db(db: Any, session: Session) -> dict[str, Any]:
+    """Load the active durable checkpoint as a provider-facing snapshot.
 
+    ``ContextEpoch`` is the promoted generation; the checkpoint fallback keeps
+    recovery possible if a process stopped between writing the immutable
+    checkpoint and promoting the epoch.  The original ChatMessage transcript
+    is never replaced by this view.
+    """
+
+    epoch = db.scalar(
+        select(ContextEpoch)
+        .where(ContextEpoch.session_id == session.id, ContextEpoch.status == "active")
+        .order_by(ContextEpoch.epoch_number.desc(), ContextEpoch.created_at.desc())
+    )
+    if epoch is not None:
+        return {
+            "session_id": session.id,
+            "epoch_id": epoch.id,
+            "sequence": int(epoch.end_sequence or 0),
+            "summary": _json_safe(epoch.summary_json or {}),
+            "task_state": _json_safe(epoch.task_state or {}),
+            "retained_messages": _json_safe(epoch.retained_messages or []),
+            "artifact_refs": _json_safe(epoch.artifact_refs or []),
+            "pinned_rules": _json_safe(epoch.pinned_rules or []),
+            "version": int(epoch.version or 0),
+            "created_at": epoch.created_at.isoformat() if epoch.created_at else None,
+        }
+    checkpoint = db.scalar(
+        select(ContextCheckpoint)
+        .where(ContextCheckpoint.session_id == session.id, ContextCheckpoint.status == "completed")
+        .order_by(ContextCheckpoint.created_at.desc(), ContextCheckpoint.id.desc())
+    )
+    if checkpoint is None:
+        return {}
+    return {
+        "session_id": session.id,
+        "epoch_id": checkpoint.epoch_id or checkpoint.id,
+        "sequence": int(checkpoint.end_sequence or 0),
+        "summary": _json_safe(checkpoint.summary_json or {}),
+        "task_state": _json_safe(checkpoint.task_state or {}),
+        "retained_messages": _json_safe(checkpoint.retained_messages or []),
+        "artifact_refs": _json_safe(checkpoint.artifact_refs or []),
+        "pinned_rules": _json_safe(checkpoint.pinned_rules or []),
+        "version": int(checkpoint.source_version or 0),
+        "created_at": checkpoint.created_at.isoformat() if checkpoint.created_at else None,
+    }
+
+
+def _chat_message_key(message: Mapping[str, Any]) -> str:
+    """Stable multiset key used to append only new runtime transcript items."""
+
+    selected = {
+        "role": message.get("role"),
+        "content": message.get("content"),
+        "name": message.get("name"),
+        "tool_call_id": message.get("tool_call_id"),
+        "tool_calls": message.get("tool_calls") or [],
+    }
+    return json.dumps(_json_safe(selected), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _append_runtime_transcript(db: Any, run_id: str, session_id: str, outcome: RunOutcome) -> None:
+    """Persist newly produced assistant/tool items without duplicating history.
+
+    Runtime state contains the current provider view (which may include many
+    older messages and checkpoint material).  We consume matching rows as a
+    multiset and append only items not already durable.  System/checkpoint
+    messages are model-view metadata, not user transcript rows, and are kept in
+    the ContextCheckpoint instead.
+    """
+
+    existing_rows = list(
+        db.scalars(
+            select(ChatMessage)
+            .where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+        )
+    )
+    existing = Counter(_chat_message_key(_message_payload(row)) for row in existing_rows)
+    next_sequence = max((int(getattr(row, "sequence", 0) or 0) for row in existing_rows), default=0) + 1
+    final_reply_persisted = False
+    for raw in outcome.messages:
+        if not isinstance(raw, dict):
+            continue
+        role = str(raw.get("role") or "").strip().lower()
+        if role == "system" or not role:
+            continue
+        payload = {
+            "role": role,
+            "content": str(raw.get("content") or ""),
+        }
+        if raw.get("name"):
+            payload["name"] = str(raw["name"])
+        if raw.get("tool_call_id"):
+            payload["tool_call_id"] = str(raw["tool_call_id"])
+        if role == "assistant" and isinstance(raw.get("tool_calls"), list):
+            payload["tool_calls"] = _json_safe(raw["tool_calls"])
+        key = _chat_message_key(payload)
+        if existing[key] > 0:
+            existing[key] -= 1
+            continue
+        # ``run_id`` remains reserved for the user-visible final assistant
+        # reply for backwards-compatible chat APIs. Internal tool turns are
+        # still durable, but use ``runtime_run_id`` so they do not appear as
+        # duplicate assistant replies in existing consumers.
+        is_final_assistant = role == "assistant" and not payload.get("tool_calls")
+        final_reply_persisted = final_reply_persisted or is_final_assistant
+        metadata: dict[str, Any] = {
+            ("run_id" if is_final_assistant else "runtime_run_id"): run_id,
+            "source": "runtime_transcript",
+        }
+        if payload.get("tool_calls"):
+            metadata["tool_calls"] = payload["tool_calls"]
+        db.add(
+            ChatMessage(
+                session_id=session_id,
+                role=role,
+                content=payload["content"],
+                tool_name=payload.get("name"),
+                tool_call_id=payload.get("tool_call_id"),
+                sequence=next_sequence,
+                extra=metadata,
+            )
+        )
+        next_sequence += 1
+        # Consume this item in case the same runtime message appears twice in
+        # one outcome (for example a resumed approval path).
+        existing[key] = 0
+
+    # Tool-driven terminal paths (for example ``question``) carry their final
+    # user-facing text in RunOutcome.output but intentionally do not append a
+    # second assistant provider message to the tool transcript.
+    if outcome.output and not final_reply_persisted:
+        final_payload = {"role": "assistant", "content": str(outcome.output)}
+        db.add(ChatMessage(
+            session_id=session_id,
+            role="assistant",
+            content=str(outcome.output),
+            sequence=next_sequence,
+            extra={"run_id": run_id, "source": "runtime_transcript"},
+        ))
+
+
+def _persist_context_snapshot(db: Any, session: Session, run_id: str, outcome: RunOutcome) -> None:
+    """Promote a runtime snapshot atomically with its checkpoint/audit rows."""
+
+    snapshot = dict(outcome.context_snapshot or {})
+    compaction_finished = [
+        event for event in outcome.events
+        if event.get("type") == "context_compaction_finished"
+    ]
+    compaction_failed = [
+        event for event in outcome.events
+        if event.get("type") == "context_compaction_failed"
+    ]
+    if not snapshot.get("epoch_id"):
+        if compaction_failed:
+            last = compaction_failed[-1]
+            db.add(CompactionAttempt(
+                session_id=session.id,
+                trigger="threshold",
+                phase="before_model",
+                status="failed",
+                attempt_number=1,
+                error_code=str(last.get("error_type") or "compaction_failed"),
+                error_message=str(last.get("error") or ""),
+                details={"run_id": run_id},
+                finished_at=_utcnow(),
+            ))
+        elif compaction_finished:
+            last = compaction_finished[-1]
+            db.add(CompactionAttempt(
+                session_id=session.id,
+                trigger=str(last.get("reason") or "threshold"),
+                phase=str(last.get("phase") or "before_model"),
+                status="completed" if bool(last.get("effective")) else "ineffective",
+                attempt_number=max(1, int(last.get("attempts") or 1)),
+                before_tokens=max(0, int(last.get("before_tokens") or 0)),
+                after_tokens=max(0, int(last.get("after_tokens") or 0)),
+                details={"run_id": run_id, "snapshot_missing": True},
+                finished_at=_utcnow(),
+            ))
+        return
+
+    summary = _json_safe(snapshot.get("summary") or {})
+    retained_messages = _json_safe(snapshot.get("retained_messages") or [])
+    task_state = _json_safe(snapshot.get("task_state") or {})
+    artifact_refs = _json_safe(snapshot.get("artifact_refs") or [])
+    end_sequence = max(0, int(snapshot.get("sequence") or snapshot.get("end_sequence") or 0))
+    version = max(0, int(snapshot.get("version") or 0))
+    last_finished = compaction_finished[-1] if compaction_finished else {}
+    before_tokens = max(0, int(last_finished.get("before_tokens") or 0))
+    after_tokens = max(0, int(last_finished.get("after_tokens") or 0))
+
+    # Idempotency: a retry of persistence must not create a second active view
+    # for the same semantic epoch.
+    existing_checkpoint = db.scalar(
+        select(ContextCheckpoint)
+        .where(
+            ContextCheckpoint.session_id == session.id,
+            ContextCheckpoint.end_sequence == end_sequence,
+            ContextCheckpoint.source_version == version,
+            ContextCheckpoint.status == "completed",
+        )
+        .order_by(ContextCheckpoint.created_at.desc(), ContextCheckpoint.id.desc())
+    )
+    if existing_checkpoint is not None:
+        session.context_summary = json.dumps(summary, ensure_ascii=False, sort_keys=True)
+        session.context_tokens = after_tokens or session.context_tokens
+        return
+
+    current_active = db.scalar(
+        select(ContextEpoch)
+        .where(ContextEpoch.session_id == session.id, ContextEpoch.status == "active")
+        .order_by(ContextEpoch.version.desc(), ContextEpoch.epoch_number.desc())
+    )
+    if current_active is not None and (
+        int(current_active.version or 0) > version
+        or int(current_active.end_sequence or 0) > end_sequence
+    ):
+        # A newer transcript/checkpoint won the race while the compactor was
+        # running.  Never replace it with an older semantic view.
+        db.add(CompactionAttempt(
+            session_id=session.id,
+            epoch_id=current_active.id,
+            trigger=str(last_finished.get("reason") or "threshold"),
+            phase="before_model",
+            status="conflict",
+            attempt_number=max(1, int(last_finished.get("attempts") or 1)),
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
+            source_version=version,
+            target_version=int(current_active.version or 0),
+            details={
+                "run_id": run_id,
+                "expected_sequence": end_sequence,
+                "current_sequence": int(current_active.end_sequence or 0),
+            },
+            finished_at=_utcnow(),
+        ))
+        return
+
+    active_epochs = list(db.scalars(
+        select(ContextEpoch).where(ContextEpoch.session_id == session.id, ContextEpoch.status == "active")
+    ))
+    for old_epoch in active_epochs:
+        old_epoch.status = "superseded"
+    next_number = int(db.scalar(
+        select(func.max(ContextEpoch.epoch_number)).where(ContextEpoch.session_id == session.id)
+    ) or -1) + 1
+    epoch = ContextEpoch(
+        session_id=session.id,
+        epoch_number=next_number,
+        status="active",
+        start_sequence=0,
+        end_sequence=end_sequence,
+        summary_json=summary,
+        retained_messages=retained_messages,
+        task_state=task_state,
+        artifact_refs=artifact_refs,
+        pinned_rules=_json_safe(snapshot.get("pinned_rules") or []),
+        compaction_reason=str(last_finished.get("reason") or "threshold"),
+        before_tokens=before_tokens,
+        after_tokens=after_tokens,
+        version=version,
+    )
+    db.add(epoch)
+    db.flush()
+    checkpoint = ContextCheckpoint(
+        session_id=session.id,
+        epoch_id=epoch.id,
+        start_sequence=0,
+        end_sequence=end_sequence,
+        summary_json=summary,
+        retained_messages=retained_messages,
+        task_state=task_state,
+        artifact_refs=artifact_refs,
+        pinned_rules=_json_safe(snapshot.get("pinned_rules") or []),
+        compaction_reason=str(last_finished.get("reason") or "threshold"),
+        before_tokens=before_tokens,
+        after_tokens=after_tokens,
+        status="completed",
+        source_version=version,
+        promoted_at=_utcnow(),
+    )
+    db.add(checkpoint)
+    db.flush()
+    for raw_ref in artifact_refs:
+        if not isinstance(raw_ref, dict):
+            continue
+        artifact_id = str(raw_ref.get("artifact_id") or raw_ref.get("id") or "")
+        if not artifact_id:
+            continue
+        db.add(Artifact(
+            session_id=session.id,
+            epoch_id=epoch.id,
+            kind=str(raw_ref.get("kind") or "tool_output"),
+            name=artifact_id[:255],
+            storage_path=str(raw_ref.get("storage_key") or artifact_id),
+            sha256=str(raw_ref.get("sha256") or "") or None,
+            mime_type=str(raw_ref.get("mime_type") or "text/plain"),
+            size_bytes=max(0, int(raw_ref.get("size") or 0)),
+            preview=str(raw_ref.get("preview") or ""),
+            metadata_json={"runtime_artifact_id": artifact_id},
+        ))
+
+    attempt_count = max(1, int(last_finished.get("attempts") or 1))
+    for attempt_number in range(1, attempt_count + 1):
+        db.add(CompactionAttempt(
+            session_id=session.id,
+            epoch_id=epoch.id,
+            checkpoint_id=checkpoint.id,
+            trigger=str(last_finished.get("reason") or "threshold"),
+            phase="before_model",
+            status="completed" if bool(last_finished.get("effective", True)) else "ineffective",
+            attempt_number=attempt_number,
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
+            source_version=max(0, version - 1),
+            target_version=version,
+            details={
+                "run_id": run_id,
+                "used_model": bool(last_finished.get("used_model")),
+                "fallback": bool(last_finished.get("fallback")),
+            },
+            finished_at=_utcnow(),
+        ))
+    session.context_summary = json.dumps(summary, ensure_ascii=False, sort_keys=True)
+    session.context_tokens = after_tokens or session.context_tokens
+    session.last_compacted_at = _utcnow()
+
+
+def _prepare_session_history(db: Any, session: Session) -> list[dict[str, Any]]:
+    """Return the active checkpoint tail plus the append-only transcript.
+
+    New sessions use an ordinal boundary captured in ``ContextEpoch``.  The
+    legacy timestamp/extractive path remains only for databases created before
+    checkpoint tables existed; it is never used once a durable epoch is active.
+    """
+
+    all_rows = list(db.scalars(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session.id)
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+    ))
+    snapshot = _context_snapshot_from_db(db, session)
+    if snapshot:
+        boundary = max(0, int(snapshot.get("sequence") or 0))
+        # The runtime records the number of transcript rows visible when it
+        # compacted.  Clamp malformed/old values rather than hiding messages.
+        if all_rows and all(int(getattr(row, "sequence", 0) or 0) > 0 for row in all_rows):
+            rows = [row for row in all_rows if int(row.sequence or 0) > boundary]
+        else:
+            rows = all_rows[boundary:] if boundary <= len(all_rows) else []
+        messages = [_message_payload(item) for item in rows]
+        summary_tokens = estimate_tokens(snapshot.get("summary") or {})
+        retained_tokens = sum(message_tokens(item) for item in snapshot.get("retained_messages") or [])
+        used_tokens = summary_tokens + retained_tokens + sum(message_tokens(item) for item in messages)
+        session.context_tokens = min(used_tokens, settings.context_limit_tokens)
+        return messages
+
+    # Compatibility fallback for old sessions with only context_summary and a
+    # timestamp cursor.  It is intentionally isolated from the new path.
     query = select(ChatMessage).where(ChatMessage.session_id == session.id)
     if session.last_compacted_at is not None:
         query = query.where(ChatMessage.created_at > session.last_compacted_at)
-    rows = list(db.scalars(query.order_by(ChatMessage.created_at.asc())))
+    rows = list(db.scalars(query.order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())))
     messages = [_message_payload(item) for item in rows]
     used_tokens = _conversation_token_count(session.context_summary or "", messages)
 
@@ -1008,6 +1377,7 @@ class RunCoordinator:
             "usage": outcome.usage,
             "active_elapsed_seconds": outcome.active_elapsed_seconds,
             "runtime_binding": outcome.runtime_binding,
+            "context_snapshot": outcome.context_snapshot,
         })
 
     @staticmethod
@@ -1027,6 +1397,7 @@ class RunCoordinator:
             usage=normalize_usage(payload.get("usage")),
             active_elapsed_seconds=max(0.0, float(payload.get("active_elapsed_seconds") or 0.0)),
             runtime_binding=dict(payload.get("runtime_binding") or {}),
+            context_snapshot=dict(payload.get("context_snapshot") or {}),
         )
 
     @staticmethod
@@ -1070,6 +1441,17 @@ class RunCoordinator:
                 raise ModelConfigurationError("当前 Agent 没有可用工作区")
 
             messages = _prepare_session_history(db, session) if session else []
+            context_snapshot = _context_snapshot_from_db(db, session) if session else {}
+            if session:
+                count = int(db.scalar(
+                    select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session.id)
+                ) or 0)
+                max_sequence = int(db.scalar(
+                    select(func.max(ChatMessage.sequence)).where(ChatMessage.session_id == session.id)
+                ) or 0)
+                transcript_sequence = max_sequence or count
+            else:
+                transcript_sequence = 0
             agent_tool_ids = list(getattr(agent, "tool_ids", []) or [])
             agent_skill_ids = list(getattr(agent, "skill_ids", []) or [])
             session_skill_ids = list(getattr(session, "skill_ids", []) or []) if session else []
@@ -1220,6 +1602,7 @@ class RunCoordinator:
                 # the exact enabled child IDs needed by the task tool without
                 # exposing child prompts, credentials, or workspaces.
                 "agent_instructions": delegate_catalog_prompt,
+                "permission_policy": f"permission_mode={permission_mode}",
                 "workspace_rules": f"仅访问工作区：{workspace_root}",
                 "summary": session.context_summary if session else "",
                 "memories": [{"content": item.content, "pinned": item.pinned} for item in memories],
@@ -1240,6 +1623,10 @@ class RunCoordinator:
                 "skill_instructions": skill_instructions,
                 "todo_state": todo_state,
                 "max_run_seconds": runtime_max_run_seconds,
+                "session_id": session.id if session else None,
+                "context_snapshot": context_snapshot,
+                "context_sequence": transcript_sequence,
+                "context_version": int(context_snapshot.get("version") or 0),
             }
             db.commit()
 
@@ -1527,6 +1914,13 @@ class RunCoordinator:
                 runtime_binding=outcome.runtime_binding,
             )
 
+            if run.session_id and not outcome.runtime_binding.get("delegation_version"):
+                _append_runtime_transcript(db, run_id, run.session_id, outcome)
+                db.flush()
+                session_for_context = db.get(Session, run.session_id)
+                if session_for_context is not None:
+                    _persist_context_snapshot(db, session_for_context, run_id, outcome)
+
             usage = normalize_usage(outcome.usage)
             if usage["request_count"]:
                 connection_id = usage["model_connection_id"]
@@ -1578,20 +1972,24 @@ class RunCoordinator:
                         arguments=dict(pending.get("arguments") or {}),
                         reason=str(pending.get("reason") or "该工具会修改本机状态，需要你的确认"),
                     ))
-            elif (
-                outcome.status == "completed"
-                and outcome.output
-                and run.session_id
-                and not outcome.runtime_binding.get("delegation_version")
-            ):
-                db.add(ChatMessage(session_id=run.session_id, role="assistant", content=outcome.output, extra={"run_id": run_id}))
-                db.flush()
-
             if run.session_id:
                 session = db.get(Session, run.session_id)
                 if session is not None:
                     session.updated_at = _utcnow()
                     _prepare_session_history(db, session)
+                    prepared = next(
+                        (
+                            event for event in reversed(outcome.events)
+                            if event.get("type") == "context_prepared"
+                            and isinstance(event.get("estimated_tokens"), (int, float))
+                        ),
+                        None,
+                    )
+                    if prepared is not None:
+                        session.context_tokens = min(
+                            max(0, int(prepared.get("estimated_tokens") or 0)),
+                            settings.context_limit_tokens,
+                        )
             db.commit()
             persisted = True
         if persisted and publish_event is not None:
@@ -1615,6 +2013,7 @@ class RunCoordinator:
                 recent_messages=context["recent_messages"],
                 mode=context["mode"],
                 thread_id=run_id,
+                context_snapshot=context.get("context_snapshot"),
             )
             outcome.runtime_binding = {
                 **dict(context["runtime_binding"]),

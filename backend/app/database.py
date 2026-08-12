@@ -19,13 +19,17 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    Index,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     delete,
     event,
+    func,
     inspect,
     or_,
+    select,
     update,
 )
 from sqlalchemy.engine import Engine
@@ -210,6 +214,22 @@ class Session(TimestampMixin, Base):
     skill_bindings: Mapped[list["SessionSkill"]] = relationship(
         back_populates="session", cascade="all, delete-orphan", lazy="selectin"
     )
+    context_epochs: Mapped[list["ContextEpoch"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", lazy="selectin",
+        order_by="ContextEpoch.epoch_number",
+    )
+    context_checkpoints: Mapped[list["ContextCheckpoint"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", lazy="selectin",
+        order_by="ContextCheckpoint.created_at",
+    )
+    artifacts: Mapped[list["Artifact"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", lazy="selectin",
+        order_by="Artifact.created_at",
+    )
+    compaction_attempts: Mapped[list["CompactionAttempt"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", lazy="selectin",
+        order_by="CompactionAttempt.created_at",
+    )
 
     @property
     def skill_ids(self) -> list[str]:
@@ -228,6 +248,179 @@ class SessionSkill(Base):
     session: Mapped[Session] = relationship(back_populates="skill_bindings")
 
 
+class ContextEpoch(TimestampMixin, Base):
+    """A durable context-generation boundary for a conversation.
+
+    An epoch is the logical view of a transcript that the model is currently
+    allowed to see.  It does not replace or delete ``ChatMessage`` rows.  A
+    new epoch is created after compaction and carries the structured state
+    needed to reconstruct the active prompt without relying on prose alone.
+    ``epoch_number`` is scoped to a session and starts at zero for a fresh
+    conversation.
+    """
+
+    __tablename__ = "context_epochs"
+    __table_args__ = (
+        UniqueConstraint("session_id", "epoch_number", name="uq_context_epochs_session_number"),
+        Index("ix_context_epochs_session_status", "session_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    epoch_number: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True, nullable=False)
+    start_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    end_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    summary_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    retained_messages: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    task_state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    artifact_refs: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    pinned_rules: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    compaction_reason: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    before_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    after_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    session: Mapped[Session] = relationship(back_populates="context_epochs")
+    checkpoints: Mapped[list["ContextCheckpoint"]] = relationship(
+        back_populates="epoch", cascade="all, delete-orphan", lazy="selectin"
+    )
+    compaction_attempts: Mapped[list["CompactionAttempt"]] = relationship(
+        back_populates="epoch", lazy="selectin"
+    )
+
+
+class ContextCheckpoint(TimestampMixin, Base):
+    """Immutable-ish snapshot produced by a context compaction.
+
+    Checkpoints are intentionally separate from epochs: an epoch represents
+    the active generation, while each checkpoint records the exact compacted
+    replacement that produced it.  Keeping both makes retries and audit
+    history safe, and allows a later runtime to use compare-and-swap on
+    ``source_version`` before promoting a checkpoint.
+    """
+
+    __tablename__ = "context_checkpoints"
+    __table_args__ = (
+        Index("ix_context_checkpoints_session_created", "session_id", "created_at"),
+        Index("ix_context_checkpoints_session_status", "session_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    epoch_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("context_epochs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    start_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    end_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    summary_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    retained_messages: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    task_state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    artifact_refs: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    pinned_rules: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    compaction_reason: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    before_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    after_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="completed", index=True, nullable=False)
+    source_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    session: Mapped[Session] = relationship(back_populates="context_checkpoints")
+    epoch: Mapped[ContextEpoch | None] = relationship(back_populates="checkpoints")
+    compaction_attempts: Mapped[list["CompactionAttempt"]] = relationship(
+        back_populates="checkpoint", lazy="selectin"
+    )
+
+
+class Artifact(TimestampMixin, Base):
+    """Externalized large content referenced from an active context.
+
+    Tool output, files, images, and child-agent transcripts can be stored as
+    artifacts.  The prompt keeps only ``id``/``preview``/metadata, so context
+    compaction never needs to inline the entire payload again.
+    """
+
+    __tablename__ = "artifacts"
+    __table_args__ = (
+        Index("ix_artifacts_session_kind", "session_id", "kind"),
+        Index("ix_artifacts_session_sha256", "session_id", "sha256"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    epoch_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("context_epochs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String(40), default="tool_output", index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), default="artifact", nullable=False)
+    storage_path: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    preview: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    source_event_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="available", index=True, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    session: Mapped[Session | None] = relationship(back_populates="artifacts")
+    epoch: Mapped[ContextEpoch | None] = relationship()
+
+
+class CompactionAttempt(TimestampMixin, Base):
+    """Audit and retry state for one compaction attempt.
+
+    Attempts are separate rows rather than flags on ``Session`` so a failed
+    provider call, a local fallback, and a successfully promoted checkpoint
+    remain distinguishable.  ``source_version`` is the value read before
+    compaction and is suitable for a compare-and-swap commit by the runtime.
+    """
+
+    __tablename__ = "compaction_attempts"
+    __table_args__ = (
+        Index("ix_compaction_attempts_session_created", "session_id", "created_at"),
+        Index("ix_compaction_attempts_session_status", "session_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    epoch_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("context_epochs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    checkpoint_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("context_checkpoints.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    trigger: Mapped[str] = mapped_column(String(32), default="threshold", nullable=False)
+    phase: Mapped[str] = mapped_column(String(32), default="before_model", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="started", index=True, nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    model_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    before_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    after_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    source_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    target_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    details: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    session: Mapped[Session] = relationship(back_populates="compaction_attempts")
+    epoch: Mapped[ContextEpoch | None] = relationship(back_populates="compaction_attempts")
+    checkpoint: Mapped[ContextCheckpoint | None] = relationship(back_populates="compaction_attempts")
+
+
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
@@ -239,8 +432,20 @@ class ChatMessage(Base):
     content: Mapped[str] = mapped_column(Text, default="", nullable=False)
     tool_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     tool_call_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Monotonic per-session transcript cursor.  It is the compaction boundary;
+    # timestamps remain display metadata only.
+    sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
     extra: Mapped[dict] = mapped_column("metadata", JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+def next_chat_message_sequence(db: OrmSession, session_id: str) -> int:
+    """Return the next per-session transcript sequence for a pending insert."""
+
+    current = db.scalar(
+        select(func.max(ChatMessage.sequence)).where(ChatMessage.session_id == session_id)
+    )
+    return int(current or 0) + 1
 
 
 class Run(Base):
@@ -479,6 +684,9 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "context_tokens": "INTEGER NOT NULL DEFAULT 0",
         "last_compacted_at": "DATETIME",
     },
+    "chat_messages": {
+        "sequence": "INTEGER NOT NULL DEFAULT 0",
+    },
 }
 
 
@@ -498,6 +706,22 @@ def _migrate_sqlite_columns() -> None:
                 if column_name not in existing:
                     connection.exec_driver_sql(
                         f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {declaration}'
+                    )
+            if table_name == "chat_messages" and "sequence" not in existing:
+                # Backfill a deterministic per-session cursor for old rows.
+                # SQLite's row order is not a durable ordering guarantee, so
+                # use the existing display timestamp plus the UUID tie-breaker
+                # exactly once during migration; all new writes use the cursor.
+                rows = connection.exec_driver_sql(
+                    'SELECT id, session_id FROM chat_messages ORDER BY session_id, created_at, id'
+                ).fetchall()
+                counters: dict[str, int] = {}
+                for row_id, session_id in rows:
+                    key = str(session_id)
+                    counters[key] = counters.get(key, 0) + 1
+                    connection.exec_driver_sql(
+                        'UPDATE chat_messages SET sequence = ? WHERE id = ?',
+                        (counters[key], row_id),
                     )
 
 

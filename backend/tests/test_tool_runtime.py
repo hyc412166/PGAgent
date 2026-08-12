@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn
+from app.runtime.context import ContextManager
+from app.runtime.context_service import ContextAssembler, SemanticCompactor
+from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig
 from app.tools import create_default_registry
 from app.tools.policy import assess_tool_call
 
@@ -242,6 +244,51 @@ async def test_question_finishes_the_current_run_and_emits_timeline_events(tmp_p
     assert isinstance(started["monotonic_ms"], int)
     assert tool_started["tool_name"] == "question"
     assert "thought_duration_ms" in tool_started
+
+
+@pytest.mark.asyncio
+async def test_provider_context_overflow_compacts_once_and_retries_without_loop(tmp_path) -> None:
+    class ContextOverflow(RuntimeError):
+        status_code = 400
+
+    calls: list[str] = []
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(kwargs.get("mode")))
+        if kwargs.get("mode") == "auto" and calls.count("auto") == 1:
+            raise ContextOverflow("maximum context length exceeded")
+        return ModelTurn(content="recovered")
+
+    assembler = ContextAssembler(
+        max_tokens=4_096,
+        compaction_threshold=1_800,
+        output_reserve_tokens=500,
+        safety_buffer_tokens=100,
+    )
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+        context_manager=ContextManager(max_tokens=4_096),
+        context_assembler=assembler,
+        semantic_compactor=SemanticCompactor(model_call=model_call, retain_tokens=100),
+    )
+    outcome = await runtime.run(
+        system_prompt="rules",
+        agent_instructions="instructions",
+        recent_messages=[{"role": "user", "content": "x" * 16_000}],
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.output == "recovered"
+    assert calls.count("auto") == 2
+    overflow_events = [
+        event for event in outcome.events
+        if event.get("reason") == "provider_context_overflow"
+    ]
+    assert [event["type"] for event in overflow_events] == [
+        "context_compaction_started",
+        "context_compaction_finished",
+    ]
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,15 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from .context import ContextManager
+from .context import ContextBundle, ContextManager, message_tokens
+from .context_service import (
+    ContextAssembler,
+    ContextSnapshot,
+    InMemoryArtifactStore,
+    PromptLayout,
+    SemanticCompactor,
+    micro_compact_messages,
+)
 from .errors import APIErrorKind, call_with_retry
 from .graph import RunGraphState, build_outer_graph
 from .guards import GuardDecision, LoopGuard
@@ -112,6 +120,34 @@ def safe_approval_request_summary(pending: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def is_context_overflow_error(error: BaseException) -> bool:
+    """Recognize provider context-window failures without retrying other 4xx errors."""
+
+    if getattr(error, "context_overflow", False) is True:
+        return True
+    status = getattr(error, "status_code", None)
+    response = getattr(error, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    message = str(error).casefold()
+    markers = (
+        "context length",
+        "context window",
+        "maximum context",
+        "max context",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+        "context_length_exceeded",
+        "context_window_exceeded",
+    )
+    return bool(any(marker in message for marker in markers) and (status is None or 400 <= status < 500))
+
+
 def empty_usage(
     *,
     model_connection_id: str | None = None,
@@ -134,10 +170,22 @@ def normalize_usage(value: Mapping[str, Any] | None) -> dict[str, Any]:
     prompt_details = raw.get("prompt_tokens_details") or {}
     if not isinstance(prompt_details, Mapping):
         prompt_details = {}
-    cache_creation = raw.get("cache_creation_tokens", raw.get("cache_creation_input_tokens", 0))
+    cache_creation = raw.get(
+        "cache_creation_tokens",
+        raw.get(
+            "cache_creation_input_tokens",
+            raw.get("prompt_cache_miss_tokens", raw.get("cache_miss_tokens", 0)),
+        ),
+    )
     cache_read = raw.get(
         "cache_read_tokens",
-        raw.get("cache_read_input_tokens", prompt_details.get("cached_tokens", 0)),
+        raw.get(
+            "cache_read_input_tokens",
+            raw.get(
+                "prompt_cache_hit_tokens",
+                raw.get("cache_hit_tokens", prompt_details.get("cached_tokens", 0)),
+            ),
+        ),
     )
 
     def safe_int(candidate: Any) -> int:
@@ -274,6 +322,12 @@ class RuntimeConfig:
     # LangGraph requires a recursion ceiling. Keep it outside any realistic
     # task size; application stopping is governed by the anti-loop signals.
     recursion_limit: int = 1_000_000
+    # Context budgeting reserves room for the model response and provider
+    # overhead.  Semantic compaction is bounded per run to prevent retry loops.
+    context_output_reserve_tokens: int = 8_000
+    context_safety_buffer_tokens: int = 2_000
+    context_compaction_retain_tokens: int = 8_000
+    max_compactions_per_run: int = 2
 
 
 @dataclass(slots=True)
@@ -292,6 +346,7 @@ class RunOutcome:
     usage: dict[str, Any] = field(default_factory=empty_usage)
     active_elapsed_seconds: float = 0.0
     runtime_binding: dict[str, Any] = field(default_factory=dict)
+    context_snapshot: dict[str, Any] = field(default_factory=dict)
 
 
 ModelCall = Callable[..., Any | Awaitable[Any]]
@@ -312,19 +367,26 @@ class AgentRuntime:
         config: RuntimeConfig | None = None,
         checkpointer: Any | None = None,
         clock: Callable[[], float] = time.monotonic,
+        context_assembler: ContextAssembler | None = None,
+        semantic_compactor: SemanticCompactor | None = None,
     ) -> None:
         self.model_call = model_call
         try:
             model_signature = inspect.signature(model_call)
+            accepts_var_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in model_signature.parameters.values()
+            )
             self._model_accepts_delta = (
                 "on_delta" in model_signature.parameters
-                or any(
-                    parameter.kind is inspect.Parameter.VAR_KEYWORD
-                    for parameter in model_signature.parameters.values()
-                )
+                or accepts_var_kwargs
+            )
+            self._model_accepts_prompt_cache_key = (
+                "prompt_cache_key" in model_signature.parameters or accepts_var_kwargs
             )
         except (TypeError, ValueError):
             self._model_accepts_delta = False
+            self._model_accepts_prompt_cache_key = False
         self.tool_registry = tool_registry
         self.context_manager = context_manager or ContextManager()
         self.event_sink = event_sink
@@ -332,6 +394,21 @@ class AgentRuntime:
         self.config = config or RuntimeConfig()
         self.checkpointer = checkpointer
         self.clock = clock
+        artifact_store = InMemoryArtifactStore()
+        self.context_assembler = context_assembler or ContextAssembler(
+            max_tokens=self.context_manager.max_tokens,
+            output_reserve_tokens=self.config.context_output_reserve_tokens,
+            safety_buffer_tokens=self.config.context_safety_buffer_tokens,
+            artifact_store=artifact_store,
+        )
+        # By default semantic compaction uses the current conversation model.
+        # It receives ``mode=compaction`` and an empty tool list, so no tool can
+        # be executed during summarisation.
+        self.semantic_compactor = semantic_compactor or SemanticCompactor(
+            model_call=self.model_call,
+            retain_tokens=self.config.context_compaction_retain_tokens,
+            artifact_store=artifact_store,
+        )
 
     async def _publish(self, state: RunGraphState, event_type: str, **payload: Any) -> list[dict[str, Any]]:
         event = {"type": event_type, **payload}
@@ -425,6 +502,7 @@ class AgentRuntime:
         prior_usage: Mapping[str, Any] | None = None,
         prior_seen_observations: Sequence[str] = (),
         prior_active_elapsed_seconds: float = 0.0,
+        context_snapshot: Mapping[str, Any] | None = None,
     ) -> RunOutcome:
         """Execute until a final answer, approval pause, failure or safety stop."""
 
@@ -448,6 +526,37 @@ class AgentRuntime:
             no_progress_limit=self.config.no_progress_limit,
         )
         guard.restore(dict(guard_snapshot or {}))
+
+        def render_instructions(context: Mapping[str, Any]) -> str:
+            instructions = context.get("agent_instructions")
+            auto_rule = "根据任务复杂度自行决定是否先在内部规则中规划；简单任务可直接执行。"
+            rendered = f"{instructions}\n{auto_rule}" if instructions else auto_rule
+            skill_catalog = self.tool_registry.skill_catalog_prompt
+            return f"{rendered}\n{skill_catalog}" if skill_catalog else rendered
+
+        def render_stable_prefix(context: Mapping[str, Any]) -> list[dict[str, Any]]:
+            return ContextAssembler.stable_prefix(
+                system_rules=context.get("system_prompt"),
+                workspace_rules=context.get("workspace_rules"),
+                permission_policy=context.get("permission_policy"),
+                extra_messages=[{"role": "system", "content": render_instructions(context)}],
+            )
+
+        def messages_after_snapshot(
+            dynamic: Sequence[Mapping[str, Any]],
+            snapshot: ContextSnapshot | None,
+        ) -> list[dict[str, Any]]:
+            """Remove the retained checkpoint tail before appending new turns."""
+
+            if snapshot is None or not snapshot.retained_messages:
+                return [dict(item) for item in dynamic]
+            retained = [dict(item) for item in snapshot.retained_messages]
+            if len(dynamic) < len(retained):
+                return [dict(item) for item in dynamic]
+            for index, item in enumerate(retained):
+                if json.dumps(dict(dynamic[index]), ensure_ascii=False, sort_keys=True, default=str) != json.dumps(item, ensure_ascii=False, sort_keys=True, default=str):
+                    return [dict(entry) for entry in dynamic]
+            return [dict(item) for item in dynamic[len(retained):]]
 
         async def prepare_node(state: RunGraphState) -> RunGraphState:
             if state.get("messages"):
@@ -474,24 +583,176 @@ class AgentRuntime:
             skill_catalog = self.tool_registry.skill_catalog_prompt
             if skill_catalog:
                 instructions = f"{instructions}\n{skill_catalog}"
-            bundle = self.context_manager.build(
-                system_prompt=context["system_prompt"],
-                agent_instructions=instructions,
-                workspace_rules=context.get("workspace_rules"),
-                summary=context.get("summary"),
-                memories=context.get("memories", []),
-                recent_messages=context.get("recent_messages", []),
-                tool_results=context.get("tool_results", []),
-                task_anchor=context.get("task_anchor"),
-            )
+            # The legacy builder remains useful for tiny custom test budgets
+            # and old snapshots. Production sessions use the new checkpoint
+            # assembler so the stable rules stay byte-for-byte at the front.
+            use_context_service = self.context_manager.max_tokens >= 4_096
+            snapshot_payload = state.get("context_snapshot") or context.get("context_snapshot")
+            if use_context_service:
+                stable_prefix = ContextAssembler.stable_prefix(
+                    system_rules=context["system_prompt"],
+                    workspace_rules=context.get("workspace_rules"),
+                    permission_policy=context.get("permission_policy"),
+                    extra_messages=[{"role": "system", "content": instructions}],
+                )
+                snapshot = (
+                    ContextSnapshot.from_dict(snapshot_payload)
+                    if isinstance(snapshot_payload, Mapping) and snapshot_payload.get("epoch_id")
+                    else None
+                )
+                layout = self.context_assembler.assemble(
+                    stable_prefix=stable_prefix,
+                    snapshot=snapshot,
+                    task_state=context.get("task_state"),
+                    recent_messages=[
+                        *list(context.get("recent_messages", [])),
+                        *list(context.get("tool_results", [])),
+                    ],
+                    cache_key=context.get("prompt_cache_key_seed"),
+                    max_tokens=self.context_assembler.input_budget,
+                )
+                bundle = ContextBundle(
+                    messages=layout.messages,
+                    estimated_tokens=layout.estimated_tokens,
+                    omitted_messages=0,
+                    truncated=layout.truncated,
+                )
+            else:
+                bundle = self.context_manager.build(
+                    system_prompt=context["system_prompt"],
+                    agent_instructions=instructions,
+                    workspace_rules=context.get("workspace_rules"),
+                    summary=context.get("summary"),
+                    memories=context.get("memories", []),
+                    recent_messages=context.get("recent_messages", []),
+                    tool_results=context.get("tool_results", []),
+                    task_anchor=context.get("task_anchor"),
+                )
+            # Keep the provider-facing prompt cache prefix stable: all leading
+            # system messages are fixed, while the conversation/checkpoint is
+            # the dynamic suffix.  Small unit-test budgets intentionally stay
+            # on the legacy assembler because no output reserve can fit.
+            prompt_cache_key = str(context.get("prompt_cache_key") or "")
+            tool_fingerprint = hashlib.sha256(
+                json.dumps(
+                    self.tool_registry.schemas,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+            stable_messages = stable_prefix if use_context_service else [
+                item for item in bundle.messages if item.get("role") == "system"
+            ]
+            if not prompt_cache_key:
+                layout = self.context_assembler.assemble(
+                    stable_prefix=stable_messages,
+                    recent_messages=[item for item in bundle.messages if item.get("role") != "system"],
+                    max_tokens=max(self.context_manager.max_tokens, 256),
+                    micro_compact=False,
+                )
+                prompt_cache_key = f"{layout.cache_key}:tools-{tool_fingerprint}"
+            elif ":tools-" not in prompt_cache_key:
+                prompt_cache_key = f"{prompt_cache_key}:tools-{tool_fingerprint}"
+            compaction_count = int(state.get("compaction_count", 0) or 0)
+            # Semantic compaction is performed before a provider turn, never
+            # while a tool is executing.  The active conversation model is used
+            # by SemanticCompactor by default; tools are disabled there.
+            if (
+                bundle.estimated_tokens >= self.semantic_compactor.retain_tokens
+                and bundle.estimated_tokens >= self.context_assembler.compaction_threshold
+                and compaction_count < self.config.max_compactions_per_run
+                and len(bundle.messages) > 2
+            ):
+                compaction_started = await self._publish(
+                    state,
+                    "context_compaction_started",
+                    reason="threshold",
+                    phase="before_model",
+                    before_tokens=bundle.estimated_tokens,
+                    model="current_session_model",
+                )
+                try:
+                    semantic_messages = [
+                        item for item in bundle.messages if item.get("role") != "system"
+                    ]
+                    active_summary = (
+                        snapshot.summary
+                        if snapshot is not None
+                        else context.get("summary")
+                    )
+                    active_task_state = (
+                        snapshot.task_state
+                        if snapshot is not None
+                        else context.get("task_state")
+                    )
+                    result = await self.semantic_compactor.compact(
+                        semantic_messages,
+                        session_id=str(context.get("session_id") or ""),
+                        sequence=int(context.get("context_sequence") or len(bundle.messages)),
+                        existing_summary=active_summary if isinstance(active_summary, Mapping) else None,
+                        task_state=active_task_state if isinstance(active_task_state, Mapping) else None,
+                        reason="threshold",
+                        version=int(context.get("context_version") or 0),
+                    )
+                    if result.epoch is not None and not result.ineffective:
+                        snapshot_payload = result.epoch.to_dict()
+                        snapshot = ContextSnapshot.from_epoch(result.epoch)
+                        compacted_layout = self.context_assembler.assemble(
+                            stable_prefix=stable_messages,
+                            snapshot=snapshot,
+                            max_tokens=self.context_assembler.input_budget,
+                            micro_compact=False,
+                            cache_key=prompt_cache_key,
+                        )
+                        bundle = type(bundle)(
+                            messages=compacted_layout.messages,
+                            estimated_tokens=compacted_layout.estimated_tokens,
+                            omitted_messages=0,
+                            truncated=compacted_layout.truncated,
+                        )
+                        compaction_count += 1
+                        snapshot_payload = result.epoch.to_dict()
+                    events = await self._publish(
+                        {**state, "events": compaction_started},
+                        "context_compaction_finished",
+                        reason="threshold",
+                        before_tokens=result.before_tokens,
+                        after_tokens=result.after_tokens,
+                        used_model=result.used_model,
+                        fallback=result.fallback,
+                        effective=not result.ineffective,
+                        attempts=len(result.attempts),
+                        context_snapshot=snapshot_payload,
+                    )
+                except Exception as exc:  # compaction must not destroy a run
+                    events = await self._publish(
+                        {**state, "events": compaction_started},
+                        "context_compaction_failed",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    state = {**state, "events": events}
+                else:
+                    state = {**state, "events": events}
             events = await self._publish(
                 state,
                 "context_prepared",
                 estimated_tokens=bundle.estimated_tokens,
                 omitted_messages=bundle.omitted_messages,
                 task_anchor_preserved=self.context_manager.has_task_anchor(bundle.messages),
+                prompt_cache_key=prompt_cache_key,
+                context_epoch=(snapshot_payload or {}).get("epoch_id") if isinstance(snapshot_payload, Mapping) else None,
             )
-            return {**state, "status": "acting", "messages": bundle.messages, "events": events}
+            return {
+                **state,
+                "status": "acting",
+                "messages": bundle.messages,
+                "events": events,
+                "context_snapshot": dict(snapshot_payload or {}),
+                "compaction_count": compaction_count,
+                "prompt_cache_key": prompt_cache_key,
+            }
 
         async def act_node(state: RunGraphState) -> RunGraphState:
             time_decision = self._run_time_decision(active_elapsed_base, active_started_at)
@@ -520,15 +781,101 @@ class AgentRuntime:
             )
             state = {**state, "events": events}
 
-            trimmed_messages, omitted = self.context_manager.trim_runtime_messages(state.get("messages", []))
-            if omitted:
-                state = {**state, "messages": trimmed_messages}
-                state["events"] = await self._publish(
-                    state,
-                    "context_compacted",
-                    omitted_messages=omitted,
-                    task_anchor_preserved=self.context_manager.has_task_anchor(trimmed_messages),
+            if self.context_manager.max_tokens >= 4_096:
+                runtime_context = state.get("context") or {}
+                stable = render_stable_prefix(runtime_context)
+                raw_snapshot = state.get("context_snapshot") or runtime_context.get("context_snapshot") or {}
+                active_snapshot = (
+                    ContextSnapshot.from_dict(raw_snapshot)
+                    if isinstance(raw_snapshot, Mapping) and raw_snapshot.get("epoch_id")
+                    else None
                 )
+                dynamic_messages = [
+                    dict(item) for item in state.get("messages", [])
+                    if item.get("role") != "system"
+                ]
+                recent_messages = messages_after_snapshot(dynamic_messages, active_snapshot)
+                layout = self.context_assembler.assemble(
+                    stable_prefix=stable,
+                    snapshot=active_snapshot,
+                    recent_messages=recent_messages,
+                    max_tokens=self.context_assembler.input_budget,
+                    micro_compact=True,
+                    cache_key=state.get("prompt_cache_key"),
+                )
+                state = {**state, "messages": layout.messages}
+                compaction_count = int(state.get("compaction_count", 0) or 0)
+                if (
+                    layout.estimated_tokens >= self.context_assembler.compaction_threshold
+                    and compaction_count < self.config.max_compactions_per_run
+                    and dynamic_messages
+                ):
+                    started = await self._publish(
+                        state,
+                        "context_compaction_started",
+                        reason="threshold",
+                        phase="before_model",
+                        before_tokens=layout.estimated_tokens,
+                        model="current_session_model",
+                    )
+                    try:
+                        result = await self.semantic_compactor.compact(
+                            dynamic_messages,
+                            session_id=str(runtime_context.get("session_id") or ""),
+                            sequence=int(runtime_context.get("context_sequence") or 0) + len(recent_messages),
+                            existing_summary=(active_snapshot.summary if active_snapshot is not None else None),
+                            task_state=(active_snapshot.task_state if active_snapshot is not None else runtime_context.get("task_state")),
+                            reason="threshold",
+                            version=int(runtime_context.get("context_version") or (active_snapshot.version if active_snapshot else 0)),
+                        )
+                        if result.epoch is not None and not result.ineffective:
+                            promoted_snapshot = ContextSnapshot.from_epoch(result.epoch)
+                            compacted_layout = self.context_assembler.assemble(
+                                stable_prefix=stable,
+                                snapshot=promoted_snapshot,
+                                recent_messages=[],
+                                max_tokens=self.context_assembler.input_budget,
+                                micro_compact=False,
+                                cache_key=state.get("prompt_cache_key"),
+                            )
+                            state = {
+                                **state,
+                                "messages": compacted_layout.messages,
+                                "context_snapshot": promoted_snapshot.to_dict(),
+                                "compaction_count": compaction_count + 1,
+                            }
+                        state["events"] = await self._publish(
+                            {**state, "events": started},
+                            "context_compaction_finished",
+                            reason="threshold",
+                            phase="before_model",
+                            before_tokens=result.before_tokens,
+                            after_tokens=result.after_tokens,
+                            used_model=result.used_model,
+                            fallback=result.fallback,
+                            effective=not result.ineffective,
+                            attempts=len(result.attempts),
+                            context_snapshot=state.get("context_snapshot") or {},
+                        )
+                    except Exception as exc:  # compaction must not strand the turn
+                        state["events"] = await self._publish(
+                            {**state, "events": started},
+                            "context_compaction_failed",
+                            reason="threshold",
+                            phase="before_model",
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
+            else:
+                trimmed_messages, omitted = self.context_manager.trim_runtime_messages(state.get("messages", []))
+                if omitted:
+                    state = {**state, "messages": trimmed_messages}
+                    state["events"] = await self._publish(
+                        state,
+                        "context_compacted",
+                        omitted_messages=omitted,
+                        task_anchor_preserved=self.context_manager.has_task_anchor(trimmed_messages),
+                    )
 
             async def retry_event(attempt: int, delay: float, kind: APIErrorKind, error: BaseException) -> None:
                 state["events"] = await self._publish(
@@ -539,6 +886,113 @@ class AgentRuntime:
                     error_kind=kind.value,
                     error_type=type(error).__name__,
                 )
+
+            async def recover_from_context_overflow(current_state: RunGraphState) -> RunGraphState | None:
+                """Compact once after a provider overflow, then rebuild the same turn."""
+
+                if self.context_manager.max_tokens < 4_096:
+                    return None
+                if int(current_state.get("context_overflow_retries", 0) or 0) >= 1:
+                    return None
+                context = current_state.get("context") or {}
+                raw_snapshot = current_state.get("context_snapshot") or context.get("context_snapshot") or {}
+                snapshot = (
+                    ContextSnapshot.from_dict(raw_snapshot)
+                    if isinstance(raw_snapshot, Mapping) and raw_snapshot.get("epoch_id")
+                    else None
+                )
+                dynamic = [
+                    item for item in current_state.get("messages", [])
+                    if item.get("role") != "system"
+                ]
+                if not dynamic:
+                    return None
+                started = await self._publish(
+                    current_state,
+                    "context_compaction_started",
+                    reason="provider_context_overflow",
+                    phase="after_provider_overflow",
+                    before_tokens=sum(message_tokens(item) for item in current_state.get("messages", [])),
+                    model="current_session_model",
+                )
+                try:
+                    stable = render_stable_prefix(context)
+                    old_tokens = sum(message_tokens(item) for item in current_state.get("messages", []))
+                    # The initial pre-turn semantic pass is the normal path.
+                    # For an actual provider overflow, use a deterministic,
+                    # single-shot emergency view: preserve stable rules and the
+                    # newest complete dynamic item, never replaying a tool call.
+                    # This path is deliberately model-free so a second model
+                    # failure cannot create an overflow/compaction loop.
+                    retained_dynamic = dynamic[-1:]
+                    if retained_dynamic and retained_dynamic[0].get("role") == "tool":
+                        for candidate in reversed(dynamic[:-1]):
+                            if candidate.get("role") == "assistant" and candidate.get("tool_calls"):
+                                retained_dynamic = [candidate, dynamic[-1]]
+                                break
+                    target_budget = max(256, min(self.context_assembler.input_budget, old_tokens // 2 or 256))
+                    layout = self.context_assembler.assemble(
+                        stable_prefix=stable,
+                        snapshot=None,
+                        recent_messages=retained_dynamic,
+                        max_tokens=target_budget,
+                        micro_compact=True,
+                        cache_key=current_state.get("prompt_cache_key"),
+                    )
+                    if layout.estimated_tokens >= old_tokens:
+                        # A provider may have a smaller hard limit than our
+                        # estimate. Keep only the stable prefix plus a bounded
+                        # final user message, fitting each message explicitly.
+                        minimal: list[dict[str, Any]] = []
+                        emergency_budget = max(64, old_tokens // 2)
+                        remaining = emergency_budget
+                        for item in [*stable[:1], *retained_dynamic[-1:]]:
+                            fitted, _ = self.context_manager._fit_message(item, remaining)
+                            if fitted is None:
+                                continue
+                            minimal.append(fitted)
+                            remaining -= message_tokens(fitted)
+                        if sum(message_tokens(item) for item in minimal) < old_tokens:
+                            layout = PromptLayout(
+                                stable_prefix=[item for item in minimal if item.get("role") == "system"],
+                                dynamic_suffix=[item for item in minimal if item.get("role") != "system"],
+                                cache_key=layout.cache_key,
+                                cache_breakpoints=(sum(1 for item in minimal if item.get("role") == "system"),),
+                                estimated_tokens=sum(message_tokens(item) for item in minimal),
+                                truncated=True,
+                            )
+                    if layout.estimated_tokens >= old_tokens:
+                        return None
+                    finished = await self._publish(
+                        {**current_state, "events": started},
+                        "context_compaction_finished",
+                        reason="provider_context_overflow",
+                        before_tokens=sum(message_tokens(item) for item in current_state.get("messages", [])),
+                        after_tokens=layout.estimated_tokens,
+                        used_model=False,
+                        fallback=True,
+                        effective=True,
+                        attempts=0,
+                        context_snapshot=current_state.get("context_snapshot") or {},
+                        fallback_error="provider_overflow_emergency_trim",
+                    )
+                    return {
+                        **current_state,
+                        "messages": layout.messages,
+                        "context_snapshot": dict(current_state.get("context_snapshot") or {}),
+                        "events": finished,
+                        "compaction_count": int(current_state.get("compaction_count", 0) or 0) + 1,
+                        "context_overflow_retries": 1,
+                    }
+                except Exception as exc:  # overflow recovery is best effort
+                    failed = await self._publish(
+                        {**current_state, "events": started},
+                        "context_compaction_failed",
+                        reason="provider_context_overflow",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    return {**current_state, "events": failed}
 
             try:
                 async def model_attempt() -> Any:
@@ -556,6 +1010,8 @@ class AgentRuntime:
                     }
                     if self._model_accepts_delta:
                         kwargs["on_delta"] = on_delta
+                    if self._model_accepts_prompt_cache_key:
+                        kwargs["prompt_cache_key"] = state.get("prompt_cache_key")
                     is_async_call = inspect.iscoroutinefunction(self.model_call)
 
                     async def invoke() -> Any:
@@ -594,12 +1050,22 @@ class AgentRuntime:
                             ) from exc
                         raise
 
-                response = await call_with_retry(
-                    model_attempt,
-                    max_attempts=self.config.api_max_attempts,
-                    base_delay=self.config.api_base_delay,
-                    on_retry=retry_event,
-                )
+                while True:
+                    try:
+                        response = await call_with_retry(
+                            model_attempt,
+                            max_attempts=self.config.api_max_attempts,
+                            base_delay=self.config.api_base_delay,
+                            on_retry=retry_event,
+                        )
+                        break
+                    except Exception as exc:
+                        if not is_context_overflow_error(exc):
+                            raise
+                        recovered = await recover_from_context_overflow(state)
+                        if recovered is None:
+                            raise
+                        state = recovered
                 turn = ModelTurn.from_response(response)
             except RunTimeLimitExceeded:
                 decision = self._run_time_decision(active_elapsed_base, active_started_at)
@@ -875,7 +1341,11 @@ class AgentRuntime:
                 "recent_messages": [dict(item) for item in recent_messages],
                 "tool_results": [dict(item) for item in tool_results],
                 "task_anchor": self.context_manager.task_from_messages(recent_messages),
+                "context_snapshot": dict(context_snapshot or {}),
             },
+            "context_snapshot": dict(context_snapshot or {}),
+            "compaction_count": 0,
+            "context_overflow_retries": 0,
         }
         graph_config: dict[str, Any] = {"recursion_limit": self.config.recursion_limit}
         if self.checkpointer is not None:
@@ -895,6 +1365,7 @@ class AgentRuntime:
             guard_snapshot=guard.snapshot(),
             usage=normalize_usage(final.get("usage")),
             active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
+            context_snapshot=dict(final.get("context_snapshot") or {}),
         )
 
     async def resume_after_approval(
@@ -958,6 +1429,7 @@ class AgentRuntime:
                 guard_snapshot=restored.snapshot(),
                 usage=normalize_usage(prior.usage),
                 active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
+                context_snapshot=dict(prior.context_snapshot),
             )
 
         resume_state: RunGraphState = {"events": list(prior.events)}
@@ -1264,6 +1736,7 @@ class AgentRuntime:
             prior_usage=prior.usage,
             prior_seen_observations=seen,
             prior_active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
+            context_snapshot=prior.context_snapshot,
         )
 
     @staticmethod
@@ -1445,4 +1918,5 @@ class AgentRuntime:
             guard_snapshot=restored.snapshot(),
             prior_usage=prior.usage,
             prior_active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
+            context_snapshot=prior.context_snapshot,
         )

@@ -29,6 +29,7 @@ from app.database import (
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
     get_db,
+    next_chat_message_sequence,
 )
 from app.schemas import (
     AgentCreate,
@@ -580,7 +581,12 @@ def create_message(
 ) -> ChatMessage:
     session = _require(db, ChatSession, session_id, "Session")
     data = payload.model_dump(exclude={"metadata"})
-    item = ChatMessage(session_id=session_id, extra=payload.metadata, **data)
+    item = ChatMessage(
+        session_id=session_id,
+        sequence=next_chat_message_sequence(db, session_id),
+        extra=payload.metadata,
+        **data,
+    )
     session.updated_at = datetime.now(timezone.utc)
     db.add(item)
     _commit(db)

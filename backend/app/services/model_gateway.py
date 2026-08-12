@@ -25,6 +25,10 @@ class ProviderConfig:
     model_connection_id: str | None = None
     thinking_level: str = "auto"
     custom_headers: dict[str, str] = field(default_factory=dict)
+    # Keep provider turns bounded even when a relay defaults to a very large
+    # completion window.  Context budgeting reserves the same order of room;
+    # callers can override this per connection in a future settings surface.
+    max_output_tokens: int = 8_000
 
 
 class ModelConfigurationError(RuntimeError):
@@ -253,8 +257,8 @@ def build_model_call(config: ProviderConfig):
         tools: list[dict[str, Any]],
         mode: str,
         on_delta: DeltaCallback | None = None,
+        prompt_cache_key: str | None = None,
     ) -> Any:
-        del mode  # The runtime prompt already carries automatic planning behavior.
         api_key = get_api_key(config.secret_ref)
         if not api_key:
             raise ModelConfigurationError("The model connection API Key is missing")
@@ -271,9 +275,17 @@ def build_model_call(config: ProviderConfig):
             "stream_options": {"include_usage": True},
             "drop_params": True,
         }
+        output_limit = 2_000 if mode == "compaction" else config.max_output_tokens
+        if output_limit > 0:
+            kwargs["max_tokens"] = int(output_limit)
+        if prompt_cache_key:
+            # LiteLLM forwards this to OpenAI-compatible providers that support
+            # explicit prompt caching.  Providers that do not support it safely
+            # ignore it through ``drop_params``.
+            kwargs["prompt_cache_key"] = prompt_cache_key
         if config.custom_headers:
             kwargs["extra_headers"] = dict(config.custom_headers)
-        if config.thinking_level not in {"off", "auto", ""}:
+        if mode != "compaction" and config.thinking_level not in {"off", "auto", ""}:
             kwargs["reasoning_effort"] = config.thinking_level
 
         try:
