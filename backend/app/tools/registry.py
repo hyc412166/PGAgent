@@ -150,6 +150,34 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {"skill_id": {"type": "string"}, "name": {"type": "string"}},
         },
     },
+    "git_status": {
+        "description": "Read-only Git branch and working-tree status for the current workspace.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "include_untracked": {"type": "boolean"},
+                "max_chars": {"type": "integer"},
+            },
+        },
+    },
+    "git_diff": {
+        "description": "Read-only, bounded Git diff for the current workspace or one relative path.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "staged": {"type": "boolean"},
+                "path": {"type": "string"},
+                "max_chars": {"type": "integer"},
+            },
+        },
+    },
+    "file_info": {
+        "description": "Read-only metadata for a workspace-relative file or directory.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+        },
+    },
     "get_current_time": {
         "description": "获取本机当前时间和时区。",
         "parameters": {"type": "object", "properties": {"timezone_name": {"type": "string"}}},
@@ -203,6 +231,9 @@ PUBLIC_TOOL_NAMES: tuple[str, ...] = (
     "todowrite",
     "question",
     "skill",
+    "git_status",
+    "git_diff",
+    "file_info",
 )
 LEGACY_TOOL_NAMES: tuple[str, ...] = (
     "list_files",
@@ -298,6 +329,9 @@ class ToolRegistry:
             "todowrite": lambda sandbox, **kwargs: builtins.todo_write(sandbox, todo_state=self._todo_state, **kwargs),
             "question": builtins.ask_question,
             "skill": lambda sandbox, **kwargs: builtins.load_skill(sandbox, skill_instructions=self._skill_instructions, **kwargs),
+            "git_status": builtins.git_status,
+            "git_diff": builtins.git_diff,
+            "file_info": builtins.file_info,
             "get_current_time": lambda _sandbox, **kwargs: builtins.get_current_time(**kwargs),
             "list_files": builtins.list_files,
             "read_file": builtins.read_file,

@@ -954,6 +954,124 @@ def get_current_time(*, timezone_name: str | None = None) -> ToolResult:
     )
 
 
+def _run_readonly_git(
+    sandbox: WorkspaceSandbox,
+    arguments: list[str],
+    *,
+    tool_name: str,
+    max_chars: int,
+) -> ToolResult:
+    """Run a bounded, read-only git query inside the workspace.
+
+    These helpers deliberately do not reuse ``run_command``: git inspection is
+    safe in smart/ask mode and should not create an approval interruption, while
+    still using the same process, timeout and output-size boundaries.
+    """
+
+    limit = min(max(int(max_chars), 256), 100_000)
+    try:
+        check = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=sandbox.root,
+            capture_output=True,
+            check=False,
+            timeout=10,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if check.returncode != 0 or check.stdout.strip().lower() != "true":
+            return ToolResult(tool_name, False, "当前工作区不是 Git 仓库", error_code="not_git_repository")
+        result = subprocess.run(
+            arguments,
+            cwd=sandbox.root,
+            capture_output=True,
+            check=False,
+            timeout=20,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        output = output.strip()
+        truncated = len(output) > limit
+        if truncated:
+            output = output[:limit]
+        return ToolResult(
+            tool_name,
+            result.returncode == 0,
+            output or f"git 命令结束，退出码 {result.returncode}",
+            error_code=None if result.returncode == 0 else "git_error",
+            metadata={"truncated": truncated, "read_only": True, "exit_code": result.returncode},
+        )
+    except subprocess.TimeoutExpired:
+        return ToolResult(tool_name, False, "Git 查询超时", error_code="timeout")
+    except OSError as exc:
+        return ToolResult(tool_name, False, f"Git 不可用: {exc}", error_code="git_unavailable")
+
+
+def git_status(
+    sandbox: WorkspaceSandbox,
+    *,
+    include_untracked: bool = True,
+    max_chars: int = 20_000,
+) -> ToolResult:
+    """Return branch and working-tree status without changing the repository."""
+
+    arguments = ["git", "--no-optional-locks", "status", "--short", "--branch"]
+    if not include_untracked:
+        arguments.extend(["--untracked-files=no"])
+    return _run_readonly_git(sandbox, arguments, tool_name="git_status", max_chars=max_chars)
+
+
+def git_diff(
+    sandbox: WorkspaceSandbox,
+    *,
+    staged: bool = False,
+    path: str | None = None,
+    max_chars: int = 40_000,
+) -> ToolResult:
+    """Return a bounded diff, optionally limited to one workspace-relative path."""
+
+    arguments = ["git", "--no-pager", "diff", "--no-ext-diff", "--unified=3"]
+    if staged:
+        arguments.append("--cached")
+    if path:
+        try:
+            resolved = sandbox.resolve(path, must_exist=True)
+            arguments.extend(["--", sandbox.relative(resolved)])
+        except (SandboxViolation, FileNotFoundError, OSError) as exc:
+            return ToolResult("git_diff", False, str(exc), error_code="path_error")
+    return _run_readonly_git(sandbox, arguments, tool_name="git_diff", max_chars=max_chars)
+
+
+def file_info(
+    sandbox: WorkspaceSandbox,
+    path: str = ".",
+) -> ToolResult:
+    """Return safe metadata for one workspace-relative file or directory."""
+
+    try:
+        target = sandbox.resolve(path, must_exist=True)
+        stat = target.stat()
+        kind = "directory" if target.is_dir() else "file" if target.is_file() else "other"
+        metadata: dict[str, Any] = {
+            "path": sandbox.relative(target),
+            "kind": kind,
+            "size_bytes": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(),
+            "read_only": True,
+        }
+        if target.is_dir():
+            try:
+                metadata["children"] = sum(1 for _ in target.iterdir())
+            except OSError:
+                metadata["children"] = None
+        return ToolResult("file_info", True, f"{metadata['path']} ({kind}, {stat.st_size} bytes)", metadata=metadata)
+    except (SandboxViolation, FileNotFoundError, OSError) as exc:
+        return ToolResult("file_info", False, str(exc), error_code="path_error")
+
+
 def write_file(
     sandbox: WorkspaceSandbox,
     path: str,
