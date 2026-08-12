@@ -20,6 +20,10 @@ class RunGraphState(TypedDict, total=False):
     seen_observations: list[str]
     usage: dict[str, Any]
     context: dict[str, Any]
+    context_snapshot: dict[str, Any]
+    compaction_count: int
+    context_overflow_retries: int
+    prompt_cache_key: str
 
 
 Node = Callable[[RunGraphState], RunGraphState | Awaitable[RunGraphState]]

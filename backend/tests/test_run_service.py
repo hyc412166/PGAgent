@@ -11,6 +11,9 @@ from app import database
 from app.database import (
     Agent,
     Approval,
+    ContextCheckpoint,
+    ContextEpoch,
+    CompactionAttempt,
     Base,
     ChatMessage,
     ModelConnection,
@@ -96,6 +99,101 @@ def test_completed_outcome_persists_snapshot_and_assistant_message(seeded_run: t
         assert message is not None and message.content == "任务完成"
         snapshot = db.scalar(select(RunEvent).where(RunEvent.run_id == run_id, RunEvent.event_type == "runtime_snapshot"))
         assert snapshot is not None and snapshot.payload["guard_snapshot"]["calls"] == 1
+
+
+def test_context_epoch_is_promoted_and_transcript_tail_is_loaded(
+    seeded_run: tuple[str, str],
+) -> None:
+    run_id, session_id = seeded_run
+    with database.SessionLocal() as db:
+        session = db.get(Session, session_id)
+        run = db.get(Run, run_id)
+        assert session is not None and run is not None
+        db.add(ChatMessage(session_id=session_id, role="user", content="old request", sequence=1))
+        db.flush()
+
+    outcome = RunOutcome(
+        status="completed",
+        output="new answer",
+        messages=[
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "new answer"},
+        ],
+        events=[{
+            "type": "context_compaction_finished",
+            "reason": "threshold",
+            "before_tokens": 10_000,
+            "after_tokens": 800,
+            "used_model": True,
+            "fallback": False,
+            "effective": True,
+            "attempts": 1,
+        }],
+        steps=1,
+        tool_calls=0,
+        context_snapshot={
+            "epoch_id": "runtime-epoch",
+            "sequence": 1,
+            "summary": {"objective": "old request", "completed_work": ["answered"]},
+            "task_state": {"status": "done"},
+            "retained_messages": [{"role": "user", "content": "old request"}],
+            "artifact_refs": [],
+            "version": 1,
+        },
+    )
+    RunCoordinator._persist_outcome(run_id, outcome)
+
+    with database.SessionLocal() as db:
+        session = db.get(Session, session_id)
+        assert session is not None
+        assert db.query(ContextEpoch).filter_by(session_id=session_id, status="active").count() == 1
+        assert db.query(ContextCheckpoint).filter_by(session_id=session_id, status="completed").count() == 1
+        assert db.query(CompactionAttempt).filter_by(session_id=session_id).count() == 1
+        assert _prepare_session_history(db, session) == [{"role": "assistant", "content": "new answer"}]
+
+
+def test_older_context_snapshot_cannot_overwrite_newer_epoch(
+    seeded_run: tuple[str, str],
+) -> None:
+    run_id, session_id = seeded_run
+    with database.SessionLocal() as db:
+        db.add(ContextEpoch(
+            session_id=session_id,
+            epoch_number=1,
+            status="active",
+            end_sequence=5,
+            version=3,
+            summary_json={"objective": "new"},
+        ))
+        db.commit()
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="answer",
+        messages=[{"role": "assistant", "content": "answer"}],
+        events=[{
+            "type": "context_compaction_finished",
+            "reason": "threshold",
+            "before_tokens": 100,
+            "after_tokens": 50,
+            "effective": True,
+            "attempts": 1,
+        }],
+        steps=1,
+        tool_calls=0,
+        context_snapshot={
+            "epoch_id": "stale",
+            "sequence": 2,
+            "version": 2,
+            "summary": {"objective": "stale"},
+        },
+    ))
+    with database.SessionLocal() as db:
+        active = db.scalar(select(ContextEpoch).where(
+            ContextEpoch.session_id == session_id,
+            ContextEpoch.status == "active",
+        ))
+        assert active is not None and active.summary_json["objective"] == "new"
+        assert db.query(CompactionAttempt).filter_by(session_id=session_id, status="conflict").count() == 1
 
 
 def test_awaiting_outcome_creates_exact_pending_approval(seeded_run: tuple[str, str]) -> None:

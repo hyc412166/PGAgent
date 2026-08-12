@@ -19,7 +19,12 @@ from app.database import (
     DEFAULT_WORKSPACE_ID,
     DEFAULT_WORKSPACE_DESCRIPTION,
     DEFAULT_WORKSPACE_NAME,
+    Artifact,
     ModelConnection,
+    CompactionAttempt,
+    ContextCheckpoint,
+    ContextEpoch,
+    Session,
     configure_database,
     init_db,
 )
@@ -58,7 +63,83 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
         "team_tasks",
         "agent_messages",
         "usage_records",
+        "context_epochs",
+        "context_checkpoints",
+        "artifacts",
+        "compaction_attempts",
     }.issubset(tables)
+
+
+def test_context_persistence_models_round_trip_and_cascade(tmp_path: Path) -> None:
+    """New context records are durable and follow their owning session."""
+
+    configure_database(f"sqlite:///{(tmp_path / 'context.db').as_posix()}")
+    init_db()
+    with database.SessionLocal() as db:
+        session = Session(title="Context persistence")
+        db.add(session)
+        db.flush()
+        epoch = ContextEpoch(
+            session_id=session.id,
+            epoch_number=0,
+            start_sequence=1,
+            end_sequence=4,
+            summary_json={"objective": "keep task state"},
+            task_state={"pending_work": ["verify"]},
+        )
+        db.add(epoch)
+        db.flush()
+        checkpoint = ContextCheckpoint(
+            session_id=session.id,
+            epoch_id=epoch.id,
+            start_sequence=1,
+            end_sequence=4,
+            summary_json={"objective": "keep task state"},
+            before_tokens=100_000,
+            after_tokens=10_000,
+            source_version=3,
+            promoted_at=database.utcnow(),
+        )
+        artifact = Artifact(
+            session_id=session.id,
+            epoch_id=epoch.id,
+            kind="tool_output",
+            name="listing.json",
+            storage_path="artifacts/listing.json",
+            sha256="a" * 64,
+            preview="two files",
+        )
+        attempt = CompactionAttempt(
+            session_id=session.id,
+            epoch_id=epoch.id,
+            checkpoint_id=checkpoint.id,
+            trigger="threshold",
+            phase="before_model",
+            status="completed",
+            source_version=3,
+            target_version=4,
+            before_tokens=100_000,
+            after_tokens=10_000,
+            finished_at=database.utcnow(),
+        )
+        db.add_all((checkpoint, artifact, attempt))
+        db.commit()
+        session_id = session.id
+        epoch_id = epoch.id
+
+    with database.SessionLocal() as db:
+        restored = db.get(Session, session_id)
+        assert restored is not None
+        assert restored.context_epochs[0].id == epoch_id
+        assert restored.context_checkpoints[0].after_tokens == 10_000
+        assert restored.artifacts[0].sha256 == "a" * 64
+        assert restored.compaction_attempts[0].target_version == 4
+        db.delete(restored)
+        db.commit()
+        assert db.get(ContextEpoch, epoch_id) is None
+        assert db.query(ContextCheckpoint).count() == 0
+        assert db.query(Artifact).count() == 0
+        assert db.query(CompactionAttempt).count() == 0
 
 
 def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path: Path) -> None:

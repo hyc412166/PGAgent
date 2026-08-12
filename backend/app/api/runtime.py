@@ -29,6 +29,7 @@ from app.database import (
     RunEvent,
     Session,
     Workspace,
+    next_chat_message_sequence,
     get_db,
 )
 from app.schemas import (
@@ -247,6 +248,7 @@ async def launch_draft(
             session_id=chat_session.id,
             role="user",
             content=payload.content,
+            sequence=next_chat_message_sequence(db, chat_session.id),
             extra={"mode": "auto", "source": "draft_launch"},
         )
         run = Run(
@@ -332,7 +334,13 @@ async def launch_session_run(
         raise HTTPException(status_code=409, detail="当前会话已有运行或待审批工具，请先处理后再发送")
 
     mode = "auto"
-    message = ChatMessage(session_id=session_id, role="user", content=payload.content.strip(), extra={"mode": mode})
+    message = ChatMessage(
+        session_id=session_id,
+        role="user",
+        content=payload.content.strip(),
+        sequence=next_chat_message_sequence(db, session_id),
+        extra={"mode": mode},
+    )
     run = Run(session_id=session_id, workspace_id=workspace_id, agent_id=agent.id, mode=mode, status="received")
     db.add_all([message, run])
     chat_session.updated_at = datetime.now(timezone.utc)

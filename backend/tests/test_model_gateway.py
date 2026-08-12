@@ -64,6 +64,34 @@ async def test_gateway_maps_openai_compatible_connection_and_thinking(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_gateway_uses_bounded_compaction_output_and_disables_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    async def fake_completion(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return {
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+        }
+
+    monkeypatch.setattr(model_gateway, "get_api_key", lambda _ref: "secret")
+    monkeypatch.setattr(model_gateway.litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(model_gateway.litellm, "completion_cost", lambda **_kwargs: 0.0)
+    call = build_model_call(ProviderConfig(
+        provider="deepseek",
+        base_url="https://api.test/v1",
+        secret_ref="credential:test",
+        model_id="chat",
+        thinking_level="high",
+        max_output_tokens=8_000,
+    ))
+
+    await call(messages=[{"role": "user", "content": "compact"}], tools=[], mode="compaction")
+    assert captured["max_tokens"] == 2_000
+    assert "reasoning_effort" not in captured
+
+
+@pytest.mark.asyncio
 async def test_gateway_rejects_missing_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(model_gateway, "get_api_key", lambda _ref: None)
     call = build_model_call(ProviderConfig(

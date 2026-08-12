@@ -1,6 +1,27 @@
 """PGAgent runtime, context assembly, retry policy, guards and state graph."""
 
 from .context import DEFAULT_COMPACT_THRESHOLD_TOKENS, DEFAULT_CONTEXT_LIMIT_TOKENS, ContextBundle, ContextManager
+from .context_service import (
+    ArtifactRef,
+    ArtifactStore,
+    CompactionAttempt,
+    CompactionGuard,
+    CompactionResult,
+    ContextAssembler,
+    ContextEpoch,
+    ContextSnapshot,
+    InMemoryArtifactStore,
+    MicroCompactResult,
+    PromptLayout,
+    SemanticCompactor,
+    StructuredSummary,
+    SummaryParseError,
+    VersionConflictError,
+    compact_with_compare_and_swap,
+    micro_compact_messages,
+    normalize_summary,
+    parse_structured_summary,
+)
 from .engine import AgentRuntime, ModelToolCall, ModelTurn, RunOutcome, RuntimeConfig, empty_usage, merge_usage, normalize_usage
 from .errors import APIErrorKind, classify_api_error, call_with_retry
 from .guards import GuardDecision, LoopGuard
@@ -10,6 +31,25 @@ __all__ = [
     "AgentRuntime",
     "ContextBundle",
     "ContextManager",
+    "ArtifactRef",
+    "ArtifactStore",
+    "CompactionAttempt",
+    "CompactionGuard",
+    "CompactionResult",
+    "ContextAssembler",
+    "ContextEpoch",
+    "ContextSnapshot",
+    "InMemoryArtifactStore",
+    "MicroCompactResult",
+    "PromptLayout",
+    "SemanticCompactor",
+    "StructuredSummary",
+    "SummaryParseError",
+    "VersionConflictError",
+    "compact_with_compare_and_swap",
+    "micro_compact_messages",
+    "normalize_summary",
+    "parse_structured_summary",
     "DEFAULT_COMPACT_THRESHOLD_TOKENS",
     "DEFAULT_CONTEXT_LIMIT_TOKENS",
     "GuardDecision",
