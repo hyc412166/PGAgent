@@ -10,12 +10,15 @@ frontend/dist/
 
 # Local state and secrets
 .env
+.env.local
+.vercel/
 data/*.db
 data/*.db-*
 data/backups/
 data/*.log
 data/workspaces/*
 !data/workspaces/.gitkeep
+data/skills/
 
 # Editors and OS
 .vscode/
@@ -23,3 +26,5 @@ data/workspaces/*
 .DS_Store
 Thumbs.db
 
+.vercel
+.env*

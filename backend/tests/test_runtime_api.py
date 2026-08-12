@@ -17,6 +17,7 @@ from app.database import (
     Approval,
     Base,
     ChatMessage,
+    DelegatedTask,
     DraftLaunch,
     Run,
     RunEvent,
@@ -200,7 +201,7 @@ def test_approval_decision_is_restored_when_resume_cannot_be_scheduled(
         assert restored_run is not None and restored_run.status == "awaiting_approval"
 
 
-def test_rejecting_delegated_child_approval_settles_its_task_and_parent_audit(
+def test_rejecting_delegated_child_approval_settles_its_delegation_and_parent_audit(
     client: tuple[TestClient, dict[str, list]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -228,12 +229,15 @@ def test_rejecting_delegated_child_approval_settles_its_task_and_parent_audit(
         )
         db.add_all([parent, child])
         db.flush()
-        task = TeamTask(
-            team_id=f"run:{parent.id}",
+        task = DelegatedTask(
+            parent_run_id=parent.id,
+            parent_session_id=session_id,
+            child_run_id=child.id,
+            child_agent_id=agent_id,
             title="delegated child",
+            description="delegated child",
             status="in_progress",
-            assignee_agent_id=agent_id,
-            lease_owner=f"run:{parent.id}",
+            idempotency_key=f"delegated-child:{child.id}",
             result={
                 "child_run_id": child.id,
                 "status": "awaiting_approval",
@@ -250,21 +254,12 @@ def test_rejecting_delegated_child_approval_settles_its_task_and_parent_audit(
         )
         db.add(task)
         db.flush()
-        db.add(AgentMessage(
-            team_id=task.team_id,
-            task_id=task.id,
-            sender_agent_id=DEFAULT_AGENT_ID,
-            recipient_agent_id=agent_id,
-            message_type="TASK_ASSIGNED",
-            payload={"child_run_id": child.id},
-            idempotency_key=f"assignment:{task.id}",
-        ))
         db.add_all([
             RunEvent(
                 run_id=child.id,
                 event_type="delegation_link",
                 payload={
-                    "team_task_id": task.id,
+                    "delegation_id": task.id,
                     "parent_run_id": parent.id,
                     "parent_agent_id": DEFAULT_AGENT_ID,
                     "parent_session_id": session_id,
@@ -314,26 +309,25 @@ def test_rejecting_delegated_child_approval_settles_its_task_and_parent_audit(
     assert continuation_events[0] is not None
     assert continuation_events[0]["continuation_queued"] is True
     with database.SessionLocal() as db:
-        task = db.get(TeamTask, task_id)
+        task = db.get(DelegatedTask, task_id)
         assert task is not None and task.status == "blocked"
         assert task.result["status"] == "stopped"
         assert task.result["binding"]["model_id"] == "child-model"
         assert task.result["binding"]["allowed_tool_names"] == ["read"]
         parent = db.get(Run, parent_run_id)
         assert parent is not None and parent.status == "received"
-        messages = list(db.scalars(select(AgentMessage).where(
-            AgentMessage.task_id == task_id,
-        ).order_by(AgentMessage.created_at.asc())))
-        assert [item.message_type for item in messages] == ["TASK_ASSIGNED", "BLOCKED"]
+        assert list(db.scalars(select(TeamTask))) == []
+        assert list(db.scalars(select(AgentMessage))) == []
         assert db.scalar(select(RunEvent).where(
             RunEvent.run_id == parent_run_id,
             RunEvent.event_type == "delegated_child_stopped",
         )) is not None
-        child_message = next(
+        # A stopped child is visible through its DelegatedTask and child Run, not
+        # injected as a duplicate assistant message in the conversation.
+        assert not [
             item for item in db.scalars(select(ChatMessage).where(ChatMessage.session_id == session_id))
             if item.extra.get("delegated_child") is True
-        )
-        assert child_message.extra["delegated_status"] == "stopped"
+        ]
 
 
 def test_approval_decision_rejects_run_not_awaiting_approval(

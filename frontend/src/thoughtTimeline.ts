@@ -201,6 +201,18 @@ export function hasVisibleCompletedThought(timeline: ThoughtTimelineState): bool
   return timeline.finished && (timeline.startedAt !== null || timeline.tools.length > 0)
 }
 
+export function summarizeThoughtConclusion(content: string, maxLength = 72): string {
+  const firstMeaningfulLine = content
+    .replace(/```[\s\S]*?```/g, '代码内容已生成')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s{0,3}(?:#{1,6}|[-*+]\s+|\d+[.)]\s+)/, '').replace(/[*_`]/g, '').trim())
+    .find(Boolean)
+
+  if (!firstMeaningfulLine) return '任务已完成'
+  if (firstMeaningfulLine.length <= maxLength) return firstMeaningfulLine
+  return `${firstMeaningfulLine.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…`
+}
+
 export function formatThoughtDuration(milliseconds: number): string {
   if (milliseconds < 1000) return `${Math.max(0, Math.round(milliseconds))}ms`
   const seconds = milliseconds / 1000

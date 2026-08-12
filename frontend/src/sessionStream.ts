@@ -39,6 +39,7 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'tool_result': return '正在读取工具结果…'
     case 'approval_requested': return '等待你的审批'
     case 'approval_granted': return '审批已通过，继续处理…'
+    case 'delegated_child_started': return '子 Agent 正在处理任务…'
     case 'delegated_child_awaiting_approval': return '子 Agent 正等待你的审批'
     case 'delegated_child_completed': return '子 Agent 已返回结果'
     case 'delegated_child_continuation_started': return '主 Agent 正在汇总子 Agent 结果…'

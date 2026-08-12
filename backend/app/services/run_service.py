@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +15,9 @@ from app import database as database_module
 from app.config import settings
 from app.database import (
     Agent,
-    AgentMessage,
     Approval,
     ChatMessage,
+    DelegatedTask,
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
     Memory,
@@ -26,7 +26,6 @@ from app.database import (
     RunEvent,
     Session,
     Skill,
-    TeamTask,
     UsageRecord,
     Workspace,
 )
@@ -360,8 +359,8 @@ class _SubagentTaskDelegate:
     """One parent runtime's bounded bridge to a user-created child Agent.
 
     The delegate is intentionally not a queue that can spawn arbitrary work:
-    one ``task`` call produces at most one persisted TeamTask and one child
-    Run.  The child uses the parent run's already-frozen workspace and
+    one ``task`` call produces at most one persisted ``DelegatedTask`` and
+    one child Run.  The child uses the parent run's already-frozen workspace and
     permission mode, an intersected tool allowlist, and never receives the
     ``task`` tool.  It therefore cannot recursively create an unbounded agent
     tree or escape the user's active conversation policy.
@@ -436,6 +435,7 @@ class _SubagentTaskDelegate:
 
     def _tool_result_from_payload(self, payload: dict[str, Any]) -> ToolResult:
         status = str(payload.get("status") or "failed")
+        delegation_id = str(payload.get("delegation_id") or payload.get("task_id") or "")
         return ToolResult(
             "task",
             status == "completed",
@@ -443,7 +443,8 @@ class _SubagentTaskDelegate:
             changed=bool(payload.get("workspace_changed")),
             error_code=self._error_code_for_status(status),
             metadata={
-                "task_id": str(payload.get("task_id") or ""),
+                "task_id": delegation_id,
+                "delegation_id": delegation_id,
                 "child_run_id": str(payload.get("child_run_id") or ""),
                 "child_agent_id": str(payload.get("agent", {}).get("id") or "")
                 if isinstance(payload.get("agent"), dict)
@@ -467,6 +468,7 @@ class _SubagentTaskDelegate:
     ) -> ToolResult:
         payload = {
             "task_id": task_id,
+            "delegation_id": task_id,
             "child_run_id": child_run_id,
             "agent": {
                 "id": agent.id if agent is not None else "",
@@ -481,46 +483,13 @@ class _SubagentTaskDelegate:
             False,
             _delegate_result_content(payload),
             error_code=code,
-            metadata={"task_id": task_id or "", "child_run_id": child_run_id or "", "status": "blocked"},
+            metadata={
+                "task_id": task_id or "",
+                "delegation_id": task_id or "",
+                "child_run_id": child_run_id or "",
+                "status": "blocked",
+            },
         )
-
-    def _persist_blocked_task(
-        self,
-        *,
-        task_id: str,
-        child_run_id: str | None,
-        agent: Agent,
-        code: str,
-        message: str,
-    ) -> None:
-        payload = {
-            "task_id": task_id,
-            "child_run_id": child_run_id,
-            "agent": {"id": agent.id, "name": _single_line(agent.name, limit=120)},
-            "status": "blocked",
-            "error_code": code,
-            "error": _single_line(message, limit=1_000),
-        }
-        with database_module.SessionLocal() as db:
-            task = db.get(TeamTask, task_id)
-            if task is None:
-                return
-            task.status = "blocked"
-            task.result = payload
-            task.lease_owner = None
-            task.lease_expires_at = None
-            task.version += 1
-            db.add(AgentMessage(
-                team_id=task.team_id,
-                task_id=task.id,
-                sender_agent_id=agent.id,
-                recipient_agent_id=self.parent_agent_id,
-                message_type="BLOCKED",
-                payload=payload,
-                idempotency_key=f"delegate-result:{task.id}",
-                hop_count=1,
-            ))
-            db.commit()
 
     def _remaining_parent_run_seconds(self, db: Any) -> float | None:
         """Return the child budget left in its parent run, if bounded.
@@ -644,14 +613,16 @@ class _SubagentTaskDelegate:
         requested_agent_id = str(agent_id or "").strip()
         idempotency_key = self._task_idempotency_key(call_id=call_id, task=task, agent_id=requested_agent_id)
         child: Agent | None = None
-        team_task_id: str | None = None
+        delegation_id: str | None = None
         child_run_id: str | None = None
         provider_config: ProviderConfig | None = None
         child_binding: dict[str, Any] | None = None
         child_skill_instructions: list[dict[str, str]] = []
         child_max_run_seconds: float | None = None
         with database_module.SessionLocal() as db:
-            existing = db.scalar(select(TeamTask).where(TeamTask.idempotency_key == idempotency_key))
+            existing = db.scalar(
+                select(DelegatedTask).where(DelegatedTask.idempotency_key == idempotency_key)
+            )
             if existing is not None:
                 result = dict(existing.result or {})
                 if result:
@@ -702,20 +673,13 @@ class _SubagentTaskDelegate:
                     message="The parent run has no remaining execution time for a delegated child.",
                 )
 
-            lease_owner = f"run:{self.parent_run_id}"
-            team_task = TeamTask(
-                team_id=lease_owner,
+            delegation = DelegatedTask(
+                parent_run_id=self.parent_run_id,
+                parent_session_id=db.scalar(select(Run.session_id).where(Run.id == self.parent_run_id)),
                 title=self._task_title(task),
                 description=task,
-                priority="normal",
                 status="in_progress",
-                assignee_agent_id=child.id,
-                lease_owner=lease_owner,
-                lease_expires_at=(
-                    _utcnow() + timedelta(seconds=child_max_run_seconds)
-                    if child_max_run_seconds is not None
-                    else None
-                ),
+                child_agent_id=child.id,
                 idempotency_key=idempotency_key,
                 result={
                     "status": "in_progress",
@@ -734,62 +698,69 @@ class _SubagentTaskDelegate:
                 mode="auto",
                 status="received",
             )
-            db.add_all([team_task, child_run])
+            db.add_all([delegation, child_run])
             db.flush()
             child_run.workspace_id = db.scalar(
                 select(Run.workspace_id).where(Run.id == self.parent_run_id)
             )
             child_binding = {
                 **child_binding,
-                "team_task_id": team_task.id,
+                "delegation_id": delegation.id,
                 "parent_agent_id": self.parent_agent_id,
                 "parent_session_id": child_run.session_id,
                 "max_run_seconds": child_max_run_seconds,
             }
-            team_task.result = {
-                **dict(team_task.result or {}),
-                "task_id": team_task.id,
+            delegation.child_run_id = child_run.id
+            delegation.result = {
+                **dict(delegation.result or {}),
+                "task_id": delegation.id,
+                "delegation_id": delegation.id,
                 "child_run_id": child_run.id,
                 "parent_run_id": self.parent_run_id,
                 "parent_session_id": child_run.session_id,
             }
-            # This link exists before model I/O.  It lets terminal failure
-            # handling reconcile the TeamTask even if no runtime snapshot was
+            # This link exists before model I/O. It lets terminal failure
+            # handling reconcile the delegation even if no runtime snapshot was
             # ever produced.
             db.add(RunEvent(
                 run_id=child_run.id,
                 event_type="delegation_link",
                 payload={
-                    "team_task_id": team_task.id,
+                    "delegation_id": delegation.id,
                     "parent_run_id": self.parent_run_id,
                     "parent_agent_id": self.parent_agent_id,
                     "parent_session_id": child_run.session_id,
                 },
             ))
-            # The parent frozen root is the authority even if a user edits a
-            # child profile's workspace while this delegate runs.
-            db.add(AgentMessage(
-                team_id=team_task.team_id,
-                task_id=team_task.id,
-                sender_agent_id=self.parent_agent_id,
-                recipient_agent_id=child.id,
-                message_type="TASK_ASSIGNED",
+            # This lightweight parent event reaches the active conversation
+            # before the synchronous child model work begins.  The browser can
+            # therefore reveal the child side panel immediately instead of
+            # looking frozen until the child has a terminal result.
+            db.add(RunEvent(
+                run_id=self.parent_run_id,
+                event_type="delegated_child_started",
                 payload={
-                    "task": task,
-                    "parent_run_id": self.parent_run_id,
+                    "task_id": delegation.id,
                     "child_run_id": child_run.id,
-                    "parent_session_id": child_run.session_id,
-                    "binding": self._public_binding(child_binding),
+                    "child_agent_id": child.id,
+                    "child_agent_name": _single_line(child.name, limit=120),
+                    "task_title": self._task_title(task),
                 },
-                idempotency_key=f"delegate-assignment:{team_task.id}",
-                hop_count=1,
             ))
             db.commit()
-            team_task_id = team_task.id
+            delegation_id = delegation.id
             child_run_id = child_run.id
 
         assert child is not None and provider_config is not None and child_binding is not None
-        assert team_task_id is not None and child_run_id is not None
+        assert delegation_id is not None and child_run_id is not None
+        run_stream_broker.publish(self.parent_run_id, {
+            "type": "delegated_child_started",
+            "task_id": delegation_id,
+            "child_run_id": child_run_id,
+            "child_agent_id": child.id,
+            "child_agent_name": _single_line(child.name, limit=120),
+            "task_title": self._task_title(task),
+        })
         child_registry = create_default_registry(
             str(child_binding["workspace_root"]),
             allowed_tool_names=child_binding["allowed_tool_names"],
@@ -834,7 +805,7 @@ class _SubagentTaskDelegate:
         except Exception as exc:
             RunCoordinator._persist_failure(child_run_id, exc)
             return self._blocked_result(
-                task_id=team_task_id,
+                task_id=delegation_id,
                 child_run_id=child_run_id,
                 agent=child,
                 code="delegate_execution_error",
@@ -847,16 +818,16 @@ class _SubagentTaskDelegate:
         }
         RunCoordinator._persist_outcome(child_run_id, outcome)
         with database_module.SessionLocal() as db:
-            persisted_task = db.get(TeamTask, team_task_id)
-            if persisted_task is None:
+            persisted_delegation = db.get(DelegatedTask, delegation_id)
+            if persisted_delegation is None:
                 return self._blocked_result(
-                    task_id=team_task_id,
+                    task_id=delegation_id,
                     child_run_id=child_run_id,
                     agent=child,
                     code="delegate_task_missing",
                     message="Delegated task record disappeared before its outcome could be read.",
                 )
-            payload = dict(persisted_task.result or {})
+            payload = dict(persisted_delegation.result or {})
         return self._tool_result_from_payload(payload)
 
 
@@ -1316,9 +1287,9 @@ class RunCoordinator:
         """Find the durable parent/task link for a delegated child run."""
 
         binding = dict(runtime_binding or {})
-        if binding.get("delegation_version") and binding.get("team_task_id"):
+        if binding.get("delegation_version") and binding.get("delegation_id"):
             return {
-                "team_task_id": str(binding["team_task_id"]),
+                "delegation_id": str(binding["delegation_id"]),
                 "parent_run_id": str(binding.get("parent_run_id") or ""),
                 "parent_agent_id": str(binding.get("parent_agent_id") or ""),
                 "parent_session_id": binding.get("parent_session_id"),
@@ -1331,15 +1302,15 @@ class RunCoordinator:
         if link is None or not isinstance(link.payload, dict):
             return None
         payload = link.payload
-        task_id = str(payload.get("team_task_id") or "").strip()
-        if not task_id:
-            return None
-        return {
-            "team_task_id": task_id,
-            "parent_run_id": str(payload.get("parent_run_id") or ""),
-            "parent_agent_id": str(payload.get("parent_agent_id") or ""),
-            "parent_session_id": payload.get("parent_session_id"),
-        }
+        delegation_id = str(payload.get("delegation_id") or "").strip()
+        if delegation_id:
+            return {
+                "delegation_id": delegation_id,
+                "parent_run_id": str(payload.get("parent_run_id") or ""),
+                "parent_agent_id": str(payload.get("parent_agent_id") or ""),
+                "parent_session_id": payload.get("parent_session_id"),
+            }
+        return None
 
     @staticmethod
     def _sync_delegated_child_state(
@@ -1358,22 +1329,18 @@ class RunCoordinator:
         workspace_changed: bool = False,
         runtime_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Atomically mirror a child state into its task and parent audit trail.
-
-        ``Run`` is updated by the caller in the same database transaction.
-        This method intentionally keeps a waiting child as ``in_progress`` on
-        the task board, creates a distinct waiting message, and emits one
-        durable parent event.  Terminal states clear the lease and produce an
-        idempotent result message instead of overwriting the waiting record.
-        """
+        """Atomically mirror a child state into its delegation and parent audit trail."""
 
         link = RunCoordinator._delegation_link(db, run, runtime_binding)
         if link is None:
             return None
-        task = db.get(TeamTask, link["team_task_id"])
+        delegation_id = str(link.get("delegation_id") or "")
+        if not delegation_id:
+            return None
+        task = db.get(DelegatedTask, delegation_id)
         if task is None:
             return None
-        existing_child_run_id = str((task.result or {}).get("child_run_id") or "")
+        existing_child_run_id = str(task.child_run_id or (task.result or {}).get("child_run_id") or "")
         if existing_child_run_id and existing_child_run_id != run.id:
             return None
 
@@ -1390,17 +1357,18 @@ class RunCoordinator:
                     binding = dict(stored_binding)
         if not binding:
             # Failures before a first runtime snapshot still have the public
-            # frozen selection captured when the TeamTask was created.
+            # frozen selection captured when the delegation was created.
             stored_binding = (task.result or {}).get("binding")
             if isinstance(stored_binding, dict):
                 binding = dict(stored_binding)
-        child = db.get(Agent, run.agent_id or task.assignee_agent_id)
-        child_id = child.id if child is not None else (run.agent_id or task.assignee_agent_id or "")
+        child = db.get(Agent, run.agent_id or task.child_agent_id)
+        child_id = child.id if child is not None else (run.agent_id or task.child_agent_id or "")
         child_name = _single_line(child.name, limit=120) if child is not None else "Child Agent"
         public_binding = _SubagentTaskDelegate._public_binding(binding) if binding else {}
         safe_pending = _SubagentTaskDelegate._safe_pending_summary(pending_approval)
         payload = {
             "task_id": task.id,
+            "delegation_id": task.id,
             "child_run_id": run.id,
             "parent_run_id": link["parent_run_id"],
             "parent_session_id": run.session_id or link.get("parent_session_id"),
@@ -1428,36 +1396,6 @@ class RunCoordinator:
         if changed:
             task.status = task_status
             task.result = payload
-            if task_status != "in_progress":
-                task.lease_owner = None
-                task.lease_expires_at = None
-            task.version += 1
-
-        if status == "awaiting_approval":
-            pending_id = str((pending_approval or {}).get("id") or "pending")
-            message_key = "delegate-awaiting-approval:%s:%s" % (
-                task.id,
-                hashlib.sha256(pending_id.encode("utf-8")).hexdigest()[:24],
-            )
-            message_type = "TASK_AWAITING_APPROVAL"
-        else:
-            message_key = f"delegate-result:{task.id}"
-            message_type = "TASK_COMPLETED" if status == "completed" else "BLOCKED"
-        message = db.scalar(select(AgentMessage).where(AgentMessage.idempotency_key == message_key))
-        if message is None:
-            db.add(AgentMessage(
-                team_id=task.team_id,
-                task_id=task.id,
-                sender_agent_id=child_id or None,
-                recipient_agent_id=link["parent_agent_id"] or None,
-                message_type=message_type,
-                payload=payload,
-                idempotency_key=message_key,
-                hop_count=1,
-            ))
-        elif _canonical_arguments(message.payload) != _canonical_arguments(payload) or message.message_type != message_type:
-            message.message_type = message_type
-            message.payload = payload
 
         event_type = {
             "awaiting_approval": "delegated_child_awaiting_approval",
@@ -1488,6 +1426,7 @@ class RunCoordinator:
                     payload={
                         "child_run_id": run.id,
                         "task_id": task.id,
+                        "delegation_id": task.id,
                         "child_status": status,
                     },
                 ))
@@ -1496,6 +1435,7 @@ class RunCoordinator:
             "type": event_type,
             "parent_run_id": link["parent_run_id"],
             "task_id": task.id,
+            "delegation_id": task.id,
             "child_run_id": run.id,
             "child_agent_id": child_id,
             "status": status,
@@ -1511,30 +1451,12 @@ class RunCoordinator:
                 payload=parent_event,
             ))
 
-        # The child result is visible in the parent conversation, but it is
-        # explicitly labelled as a child result.  The parent run itself is
-        # stopped while approval is outstanding and is never presented as the
-        # one that summarized this result.
-        if changed and status in {"completed", "failed", "stopped"} and run.session_id:
-            if status == "completed":
-                message_content = str(output or "").strip() or "Child Agent completed without text output."
-            else:
-                reason = _single_line(error or stop_reason, limit=1_000) or "no further detail"
-                message_content = f"Child Agent {child_name} did not complete ({status}): {reason}"
-            db.add(ChatMessage(
-                session_id=run.session_id,
-                role="assistant",
-                content=message_content,
-                extra={
-                    "run_id": run.id,
-                    "delegated_child": True,
-                    "child_agent_id": child_id,
-                    "child_agent_name": child_name,
-                    "delegated_status": status,
-                    "parent_run_id": link["parent_run_id"],
-                    "team_task_id": task.id,
-                },
-            ))
+        # A child response is deliberately *not* a normal chat message.
+        # Its complete structured result remains on DelegatedTask and in the
+        # child Run timeline, while the parent coordinator is solely
+        # responsible for the user-facing final reply.  This prevents the
+        # same answer appearing once as a child transcript and again as the
+        # parent's synthesis.
         return parent_event if (changed or continuation_queued) and link["parent_run_id"] else None
 
     def reconcile_delegated_child_terminal(

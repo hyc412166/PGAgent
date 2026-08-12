@@ -451,8 +451,22 @@ class AgentRuntime:
 
         async def prepare_node(state: RunGraphState) -> RunGraphState:
             if state.get("messages"):
-                events = await self._publish(state, "context_resumed", estimated_tokens=None)
-                return {**state, "status": "acting", "events": events}
+                anchored_messages = self.context_manager.ensure_task_anchor(
+                    state["messages"],
+                    task=state.get("context", {}).get("task_anchor"),
+                )
+                events = await self._publish(
+                    state,
+                    "context_resumed",
+                    estimated_tokens=None,
+                    task_anchor_preserved=self.context_manager.has_task_anchor(anchored_messages),
+                )
+                return {
+                    **state,
+                    "status": "acting",
+                    "messages": anchored_messages,
+                    "events": events,
+                }
             context = state["context"]
             instructions = context.get("agent_instructions")
             auto_rule = "根据任务复杂度自行决定是否先在内部规划；简单任务可直接执行。"
@@ -468,12 +482,14 @@ class AgentRuntime:
                 memories=context.get("memories", []),
                 recent_messages=context.get("recent_messages", []),
                 tool_results=context.get("tool_results", []),
+                task_anchor=context.get("task_anchor"),
             )
             events = await self._publish(
                 state,
                 "context_prepared",
                 estimated_tokens=bundle.estimated_tokens,
                 omitted_messages=bundle.omitted_messages,
+                task_anchor_preserved=self.context_manager.has_task_anchor(bundle.messages),
             )
             return {**state, "status": "acting", "messages": bundle.messages, "events": events}
 
@@ -511,6 +527,7 @@ class AgentRuntime:
                     state,
                     "context_compacted",
                     omitted_messages=omitted,
+                    task_anchor_preserved=self.context_manager.has_task_anchor(trimmed_messages),
                 )
 
             async def retry_event(attempt: int, delay: float, kind: APIErrorKind, error: BaseException) -> None:
@@ -857,6 +874,7 @@ class AgentRuntime:
                 "memories": list(memories),
                 "recent_messages": [dict(item) for item in recent_messages],
                 "tool_results": [dict(item) for item in tool_results],
+                "task_anchor": self.context_manager.task_from_messages(recent_messages),
             },
         }
         graph_config: dict[str, Any] = {"recursion_limit": self.config.recursion_limit}

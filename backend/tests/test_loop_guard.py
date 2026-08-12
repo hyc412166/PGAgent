@@ -5,6 +5,7 @@ import time
 
 import pytest
 
+from app.runtime.context import ContextManager
 from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage
 from app.runtime.errors import APIErrorKind, call_with_retry, classify_api_error
 from app.runtime.guards import LoopGuard
@@ -111,7 +112,7 @@ async def test_active_runtime_accumulates_across_approval_pause(tmp_path) -> Non
 
     runtime = AgentRuntime(
         model_call=model_call,
-        tool_registry=create_default_registry(str(tmp_path)),
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
         config=RuntimeConfig(max_run_seconds=1.0),
         clock=clock,
     )
@@ -160,7 +161,7 @@ async def test_observation_history_is_not_truncated_to_200_before_approval(tmp_p
 
     runtime = AgentRuntime(
         model_call=model_call,
-        tool_registry=create_default_registry(str(tmp_path)),
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
         config=RuntimeConfig(observation_history_limit=1_000),
     )
     outcome = await runtime.run(system_prompt="safe", recent_messages=[])
@@ -235,7 +236,7 @@ async def test_runtime_pauses_before_side_effect(tmp_path) -> None:
 
     runtime = AgentRuntime(
         model_call=model_call,
-        tool_registry=create_default_registry(str(tmp_path)),
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
     )
     outcome = await runtime.run(system_prompt="safe", recent_messages=[])
     assert outcome.status == "awaiting_approval"
@@ -278,7 +279,7 @@ async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> Non
         assert kwargs["messages"][-1]["tool_call_id"] == "approved-write"
         return ModelTurn(content="完成")
 
-    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path)))
+    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"))
     waiting = await runtime.run(system_prompt="safe", recent_messages=[], mode="auto")
     resumed = await runtime.resume_after_approval(waiting)
     assert resumed.status == "completed"
@@ -286,6 +287,67 @@ async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> Non
     assert resumed.output == "完成"
     assert turns == 2
     assert (tmp_path / "done.txt").read_text(encoding="utf-8") == "yes"
+
+
+@pytest.mark.asyncio
+async def test_runtime_trim_keeps_current_task_anchor_through_approval_resume(tmp_path) -> None:
+    task = "Create the approved report and do not lose this task after context compaction."
+    calls = 0
+
+    async def model_call(**kwargs) -> ModelTurn:
+        nonlocal calls
+        calls += 1
+        messages = kwargs["messages"]
+        anchors = [item for item in messages if ContextManager.is_task_anchor(item)]
+        assert len(anchors) == 1
+        assert task in anchors[0]["content"]
+        if calls == 1:
+            # The retained prior observation remains a complete provider-valid
+            # assistant/tool pair even as the old user turn is discarded.
+            old_assistant = next(index for index, item in enumerate(messages) if item.get("role") == "assistant")
+            assert messages[old_assistant + 1].get("tool_call_id") == "old-read"
+            return ModelTurn(tool_calls=[
+                ModelToolCall("approved-write", "write_file", {"path": "report.txt", "content": "approved"}),
+                ModelToolCall("second-read", "read_file", {"path": "report.txt"}),
+            ])
+        assert any(item.get("tool_call_id") == "approved-write" for item in messages)
+        return ModelTurn(content="report complete")
+
+    durable_events: list[dict] = []
+    recent_messages = [
+        {"role": "user", "content": task},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "old-read", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "old-read",
+            "name": "read_file",
+            "content": "old observation " + ("z" * 2_500),
+        },
+    ]
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
+        context_manager=ContextManager(max_tokens=560),
+        event_sink=durable_events.append,
+    )
+
+    waiting = await runtime.run(
+        system_prompt="Follow safety rules.",
+        recent_messages=recent_messages,
+    )
+    assert waiting.error is None, waiting.error
+    assert waiting.status == "awaiting_approval"
+    resumed = await runtime.resume_after_approval(waiting)
+    assert resumed.status == "completed"
+    assert resumed.output == "report complete"
+    assert (tmp_path / "report.txt").read_text(encoding="utf-8") == "approved"
+    assert calls == 2
+    compacted = [event for event in durable_events if event["type"] == "context_compacted"]
+    assert compacted and compacted[-1]["task_anchor_preserved"] is True
 
 
 @pytest.mark.asyncio
@@ -306,7 +368,7 @@ async def test_approval_resume_completes_entire_multi_tool_batch(tmp_path) -> No
         assert tool_ids[-3:] == ["read-before", "write-middle", "list-after"]
         return ModelTurn(content="batch complete")
 
-    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path)))
+    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"))
     waiting = await runtime.run(system_prompt="safe", recent_messages=[])
     assert waiting.status == "awaiting_approval"
     resumed = await runtime.resume_after_approval(waiting)
@@ -330,7 +392,7 @@ async def test_multi_side_effect_batch_pauses_for_each_approval(tmp_path) -> Non
             ])
         return ModelTurn(content="done")
 
-    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path)))
+    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"))
     first = await runtime.run(system_prompt="safe", recent_messages=[])
     second = await runtime.resume_after_approval(first)
     assert second.status == "awaiting_approval"
@@ -398,7 +460,7 @@ async def test_resume_guard_stop_is_published_to_event_sink(tmp_path) -> None:
 
     runtime = AgentRuntime(
         model_call=model_call,
-        tool_registry=create_default_registry(str(tmp_path)),
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
         event_sink=published.append,
         config=RuntimeConfig(max_tool_calls=1),
     )
@@ -473,7 +535,7 @@ async def test_approval_resume_carries_usage_forward_without_double_counting(tmp
             )
         return ModelTurn(content="done", usage=usage)
 
-    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path)))
+    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"))
     waiting = await runtime.run(system_prompt="safe", recent_messages=[])
     assert waiting.usage["request_count"] == 1
     resumed = await runtime.resume_after_approval(waiting)
@@ -498,7 +560,7 @@ async def test_approval_resume_preserves_seen_observations_for_no_progress_guard
             return ModelTurn(tool_calls=[ModelToolCall("read-again", "read_file", {"path": "stable.txt"})])
         return ModelTurn(tool_calls=[ModelToolCall(f"missing-{turns}", f"missing-{turns}", {})])
 
-    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path)))
+    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"))
     waiting = await runtime.run(system_prompt="safe", recent_messages=[])
     resumed = await runtime.resume_after_approval(waiting)
     assert resumed.status == "stopped"

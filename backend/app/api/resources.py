@@ -18,6 +18,7 @@ from app.database import (
     AgentMessage,
     Approval,
     ChatMessage,
+    DelegatedTask,
     Memory,
     ModelConnection,
     Run,
@@ -39,6 +40,7 @@ from app.schemas import (
     ChatMessageCreate,
     ChatMessageRead,
     DashboardRead,
+    DelegatedTaskRead,
     MemoryCreate,
     MemoryRead,
     MemoryUpdate,
@@ -72,7 +74,14 @@ _PUBLIC_RUN_EVENT_TYPES = frozenset({
     "approval_requested",
     "completed",
     "context_prepared",
+    "context_compacted",
     "context_resumed",
+    "delegated_child_started",
+    "delegated_child_awaiting_approval",
+    "delegated_child_completed",
+    "delegated_child_stopped",
+    "delegated_child_failed",
+    "delegated_child_continuation_started",
     "failed",
     "integration_failed",
     "model_failed",
@@ -104,7 +113,7 @@ _PUBLIC_EVENT_NUMBER_FIELDS = frozenset({
     "thought_duration_ms",
 })
 _PUBLIC_EVENT_BOOLEAN_FIELDS = frozenset({
-    "changed", "has_output", "ok", "pending_approval", "requires_next_message", "terminal",
+    "changed", "has_output", "ok", "pending_approval", "requires_next_message", "task_anchor_preserved", "terminal",
 })
 
 
@@ -234,6 +243,12 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
                 request_public["remaining_call_count"] = count
             if request_public:
                 public["request"] = request_public
+
+    if event_type.startswith("delegated_child_"):
+        for key in ("task_id", "delegation_id", "child_run_id", "child_agent_id", "child_agent_name", "task_title", "status"):
+            text = _public_event_text(source.get(key), limit=200)
+            if text is not None:
+                public[key] = text
 
     # Controlled status labels are useful for diagnostics, while free-form
     # error/reason/output text is intentionally kept out of this endpoint.
@@ -482,6 +497,21 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> Cha
 @router.get("/sessions/{session_id}", response_model=SessionRead)
 def get_session(session_id: str, db: Session = Depends(get_db)) -> ChatSession:
     return _require(db, ChatSession, session_id, "Session")
+
+
+@router.get("/sessions/{session_id}/delegations", response_model=list[DelegatedTaskRead])
+def list_session_delegations(
+    session_id: str,
+    db: Session = Depends(get_db),
+) -> list[DelegatedTask]:
+    """Return child-Agent work for one conversation, never team-board work."""
+
+    _require(db, ChatSession, session_id, "Session")
+    return list(db.scalars(
+        select(DelegatedTask)
+        .where(DelegatedTask.parent_session_id == session_id)
+        .order_by(DelegatedTask.updated_at.desc(), DelegatedTask.created_at.desc())
+    ))
 
 
 @router.patch("/sessions/{session_id}", response_model=SessionRead)

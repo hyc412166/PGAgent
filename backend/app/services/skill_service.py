@@ -11,8 +11,12 @@ import os
 import re
 import shutil
 import tempfile
+import threading
+import time
 import uuid
 import zipfile
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -37,9 +41,69 @@ MAX_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_ARCHIVE_FILES = 5_000
 MAX_ARCHIVE_EXPANDED_BYTES = 50 * 1024 * 1024
 SKILLS_SH_BASE_URL = "https://skills.sh"
+MARKET_BROWSE_VIEWS = frozenset({"all-time", "trending", "hot", "curated"})
+MARKET_LEADERBOARD_LIMIT = 6
+MARKET_LEADERBOARD_SEARCH_LIMIT = 50
+MARKET_LEADERBOARD_TTL_SECONDS = 30 * 60
 GITHUB_ALLOWED_HOSTS = frozenset({"github.com", "api.github.com", "codeload.github.com"})
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SAFE_GITHUB_PART_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+@dataclass(frozen=True, slots=True)
+class MarketLeaderboardDefinition:
+    """A user-facing Skills marketplace category backed by semantic search."""
+
+    id: str
+    name: str
+    description: str
+    query: str
+
+
+MARKET_LEADERBOARD_CATEGORIES: tuple[MarketLeaderboardDefinition, ...] = (
+    MarketLeaderboardDefinition(
+        id="frontend",
+        name="前端开发",
+        description="React、Next.js、CSS、组件与 Web UI 开发。",
+        query="frontend web React Next.js UI development",
+    ),
+    MarketLeaderboardDefinition(
+        id="programming",
+        name="编程开发",
+        description="软件工程、调试、测试、后端与开发工作流。",
+        query="software engineering programming coding development testing",
+    ),
+    MarketLeaderboardDefinition(
+        id="research",
+        name="论文研究",
+        description="文献检索、学术研究、论文阅读与引用。",
+        query="academic research paper literature review citations",
+    ),
+    MarketLeaderboardDefinition(
+        id="writing",
+        name="写作内容",
+        description="内容创作、技术写作、文案与编辑。",
+        query="writing content copywriting documentation editing",
+    ),
+    MarketLeaderboardDefinition(
+        id="data-ai",
+        name="数据分析 / AI",
+        description="数据分析、机器学习、AI 与模型开发。",
+        query="data analysis machine learning AI data science",
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _MarketLeaderboardCache:
+    categories: tuple[dict[str, Any], ...]
+    refreshed_at: datetime
+    expires_at: datetime
+    expires_at_monotonic: float
+
+
+_market_leaderboard_cache: _MarketLeaderboardCache | None = None
+_market_leaderboard_lock = threading.RLock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,32 +426,205 @@ def _skills_sh_json(path: str, *, params: dict[str, Any] | None = None) -> dict[
     return payload
 
 
+def _market_item(row: dict[str, Any], *, official_owner: str | None = None) -> dict[str, Any] | None:
+    """Expose only inert marketplace metadata to the browser.
+
+    In particular, never proxy a marketplace file body or an arbitrary install
+    command here.  File contents remain available only through the explicit
+    preview-before-confirmation install flow.
+    """
+
+    if not isinstance(row.get("id"), str):
+        return None
+    source_url = row.get("installUrl") if isinstance(row.get("installUrl"), str) else None
+    market_url = row.get("url") if isinstance(row.get("url"), str) else None
+    installs = row.get("installs")
+    change = row.get("change")
+    installs_yesterday = row.get("installsYesterday")
+    return {
+        "id": row["id"],
+        "slug": str(row.get("slug") or row["id"].rsplit("/", 1)[-1]),
+        "name": str(row.get("name") or row.get("slug") or row["id"]),
+        "source": str(row.get("source") or "skills.sh"),
+        "source_url": source_url,
+        "market_url": market_url,
+        "installs": installs if isinstance(installs, int) else None,
+        "change": change if isinstance(change, int) else None,
+        "installs_yesterday": installs_yesterday if isinstance(installs_yesterday, int) else None,
+        "is_official": official_owner is not None,
+        "official_owner": official_owner,
+        "is_duplicate": row.get("isDuplicate") is True,
+    }
+
+
+def _market_items(rows: Any, *, official_owner: str | None = None) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail="skills.sh marketplace response has no data list")
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = _market_item(row, official_owner=official_owner)
+        if item is not None:
+            items.append(item)
+    return items
+
+
 def search_market(query: str, limit: int) -> tuple[bool, str | None, list[dict[str, Any]]]:
     available, message = market_status()
     if not available:
         return False, message, []
     payload = _skills_sh_json("/api/v1/skills/search", params={"q": query, "limit": limit})
-    rows = payload.get("data")
-    if not isinstance(rows, list):
-        raise HTTPException(status_code=502, detail="skills.sh marketplace response has no data list")
-    items: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
-            continue
-        source_url = row.get("installUrl") if isinstance(row.get("installUrl"), str) else None
-        market_url = row.get("url") if isinstance(row.get("url"), str) else None
-        items.append(
+    items = _market_items(payload.get("data"))
+    return True, None, items
+
+
+def browse_market(view: str, *, page: int, per_page: int) -> tuple[bool, str | None, list[dict[str, Any]], bool, int | None]:
+    """Read a leaderboard or curated listing without weakening install checks."""
+
+    if view not in MARKET_BROWSE_VIEWS:
+        raise HTTPException(status_code=422, detail="Unsupported marketplace view")
+    available, message = market_status()
+    if not available:
+        return False, message, [], False, None
+
+    if view == "curated":
+        payload = _skills_sh_json("/api/v1/skills/curated")
+        owners = payload.get("data")
+        if not isinstance(owners, list):
+            raise HTTPException(status_code=502, detail="skills.sh curated response has no data list")
+        all_items: list[dict[str, Any]] = []
+        for owner in owners:
+            if not isinstance(owner, dict):
+                continue
+            owner_name = owner.get("owner") if isinstance(owner.get("owner"), str) else None
+            all_items.extend(_market_items(owner.get("skills"), official_owner=owner_name))
+        start = page * per_page
+        selected = all_items[start : start + per_page]
+        return True, None, selected, start + per_page < len(all_items), len(all_items)
+
+    payload = _skills_sh_json(
+        "/api/v1/skills",
+        params={"view": view, "page": page, "per_page": per_page},
+    )
+    items = _market_items(payload.get("data"))
+    pagination = payload.get("pagination")
+    if not isinstance(pagination, dict):
+        pagination = {}
+    has_more = pagination.get("hasMore") is True
+    total = pagination.get("total")
+    return True, None, items, has_more, total if isinstance(total, int) else None
+
+
+def _leaderboard_items(rows: Any) -> list[dict[str, Any]]:
+    """Normalize, deduplicate, and rank one category's search results.
+
+    The skills.sh search API ranks by relevance.  A category leaderboard instead
+    needs a stable popularity order, so it uses that API only as a candidate
+    source and orders the safe, normalized metadata locally by install count.
+    """
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in _market_items(rows):
+        item_id = item["id"]
+        previous = by_id.get(item_id)
+        installs = item["installs"] if isinstance(item["installs"], int) else -1
+        previous_installs = (
+            previous["installs"] if previous is not None and isinstance(previous["installs"], int) else -1
+        )
+        if previous is None or installs > previous_installs:
+            by_id[item_id] = item
+    return sorted(
+        by_id.values(),
+        key=lambda item: (
+            -(item["installs"] if isinstance(item["installs"], int) else -1),
+            -(item["change"] if isinstance(item["change"], int) else -1),
+            item["name"].casefold(),
+            item["id"],
+        ),
+    )[:MARKET_LEADERBOARD_LIMIT]
+
+
+def _build_market_leaderboards() -> tuple[dict[str, Any], ...]:
+    categories: list[dict[str, Any]] = []
+    for definition in MARKET_LEADERBOARD_CATEGORIES:
+        payload = _skills_sh_json(
+            "/api/v1/skills/search",
+            params={"q": definition.query, "limit": MARKET_LEADERBOARD_SEARCH_LIMIT},
+        )
+        categories.append(
             {
-                "id": row["id"],
-                "slug": str(row.get("slug") or row["id"].rsplit("/", 1)[-1]),
-                "name": str(row.get("name") or row.get("slug") or row["id"]),
-                "source": str(row.get("source") or "skills.sh"),
-                "source_url": source_url,
-                "market_url": market_url,
-                "installs": int(row["installs"]) if isinstance(row.get("installs"), int) else None,
+                "id": definition.id,
+                "name": definition.name,
+                "description": definition.description,
+                "items": _leaderboard_items(payload.get("data")),
             }
         )
-    return True, None, items
+    return tuple(categories)
+
+
+def _market_leaderboard_snapshot(*, refresh: bool) -> tuple[_MarketLeaderboardCache, bool]:
+    """Return a process-local cache snapshot, rebuilding it after its TTL.
+
+    The external API itself caches short-lived search results.  This broader
+    30-minute cache prevents five semantic searches per page visit while a
+    manual refresh can still fetch a current snapshot immediately.
+    """
+
+    global _market_leaderboard_cache
+    now_monotonic = time.monotonic()
+    cached = _market_leaderboard_cache
+    if not refresh and cached is not None and now_monotonic < cached.expires_at_monotonic:
+        return cached, True
+
+    with _market_leaderboard_lock:
+        now_monotonic = time.monotonic()
+        cached = _market_leaderboard_cache
+        if not refresh and cached is not None and now_monotonic < cached.expires_at_monotonic:
+            return cached, True
+
+        refreshed_at = datetime.now(timezone.utc)
+        expires_at = refreshed_at + timedelta(seconds=MARKET_LEADERBOARD_TTL_SECONDS)
+        snapshot = _MarketLeaderboardCache(
+            categories=_build_market_leaderboards(),
+            refreshed_at=refreshed_at,
+            expires_at=expires_at,
+            expires_at_monotonic=now_monotonic + MARKET_LEADERBOARD_TTL_SECONDS,
+        )
+        _market_leaderboard_cache = snapshot
+        return snapshot, False
+
+
+def market_leaderboards(*, refresh: bool = False) -> dict[str, Any]:
+    """Return the five fixed, popularity-ranked marketplace categories.
+
+    This deliberately exposes only the same inert metadata as browse/search;
+    it never returns marketplace file contents, install commands, or the
+    bearer/OIDC credential used for the upstream request.
+    """
+
+    available, message = market_status()
+    if not available:
+        return {
+            "available": False,
+            "message": message,
+            "categories": [],
+            "refreshed_at": None,
+            "expires_at": None,
+            "ttl_seconds": MARKET_LEADERBOARD_TTL_SECONDS,
+            "cached": False,
+        }
+
+    snapshot, cached = _market_leaderboard_snapshot(refresh=refresh)
+    return {
+        "available": True,
+        "message": None,
+        "categories": deepcopy(list(snapshot.categories)),
+        "refreshed_at": snapshot.refreshed_at,
+        "expires_at": snapshot.expires_at,
+        "ttl_seconds": MARKET_LEADERBOARD_TTL_SECONDS,
+        "cached": cached,
+    }
 
 
 def _safe_relative_path(value: str) -> PurePosixPath:

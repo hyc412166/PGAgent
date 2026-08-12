@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $PythonPath = 'E:\anaconda3\envs\agent_dock\python.exe'
 $FrontendIndex = Join-Path $ProjectRoot 'frontend\dist\index.html'
+$LocalEnvironmentFile = Join-Path $ProjectRoot '.env.local'
 $Url = 'http://127.0.0.1:8765'
 
 if (-not (Test-Path -LiteralPath $PythonPath)) {
@@ -12,6 +13,28 @@ if (-not (Test-Path -LiteralPath $FrontendIndex)) {
     Write-Host 'Building the web interface...'
     Push-Location (Join-Path $ProjectRoot 'frontend')
     try { npm run build } finally { Pop-Location }
+}
+
+# Vercel writes the short-lived development OIDC token to .env.local.  Only
+# import this one value into the PGAgent process; never print or persist it.
+if (Test-Path -LiteralPath $LocalEnvironmentFile) {
+    $oidcLine = Get-Content -LiteralPath $LocalEnvironmentFile | Where-Object {
+        $_ -match '^\s*VERCEL_OIDC_TOKEN\s*='
+    } | Select-Object -Last 1
+    if ($oidcLine -match '^\s*VERCEL_OIDC_TOKEN\s*=\s*(.*?)\s*$') {
+        $oidcToken = $matches[1]
+        if (
+            $oidcToken.Length -ge 2 -and
+            (($oidcToken.StartsWith('"') -and $oidcToken.EndsWith('"')) -or
+             ($oidcToken.StartsWith("'") -and $oidcToken.EndsWith("'")))
+        ) {
+            $oidcToken = $oidcToken.Substring(1, $oidcToken.Length - 2)
+        }
+        if ($oidcToken) {
+            $env:VERCEL_OIDC_TOKEN = $oidcToken
+            Write-Host 'Loaded local Skill marketplace authentication.' -ForegroundColor DarkGray
+        }
+    }
 }
 
 $BrowserJob = Start-Job -ScriptBlock {
@@ -39,4 +62,3 @@ try {
     Stop-Job -Job $BrowserJob -ErrorAction SilentlyContinue
     Remove-Job -Job $BrowserJob -Force -ErrorAction SilentlyContinue
 }
-

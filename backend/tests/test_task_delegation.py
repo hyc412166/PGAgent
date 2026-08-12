@@ -16,6 +16,7 @@ from app.database import (
     Approval,
     Base,
     ChatMessage,
+    DelegatedTask,
     ModelConnection,
     Run,
     RunEvent,
@@ -27,6 +28,13 @@ from app.runtime import RunOutcome
 from app.runtime.engine import ModelToolCall, ModelTurn
 from app.services import run_service
 from app.services.run_service import RunCoordinator
+
+
+def assert_no_legacy_collaboration_records(db: object) -> None:
+    """Delegated child work must not populate future multi-user tables."""
+
+    assert list(db.scalars(select(TeamTask))) == []  # type: ignore[attr-defined]
+    assert list(db.scalars(select(AgentMessage))) == []  # type: ignore[attr-defined]
 
 
 @pytest.fixture()
@@ -169,9 +177,9 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
     assert observed_child_tools == ["read"]
 
     with database.SessionLocal() as db:
-        task = db.scalar(select(TeamTask))
+        task = db.scalar(select(DelegatedTask))
         assert task is not None and task.status == "completed"
-        assert task.assignee_agent_id == delegated_run["child_id"]
+        assert task.child_agent_id == delegated_run["child_id"]
         assert task.result["binding"]["model_id"] == "child-model"
         assert task.result["binding"]["allowed_tool_names"] == ["read"]
         assert task.result["binding"]["recursive_task_enabled"] is False
@@ -188,12 +196,11 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         assert frozen["workspace_root"] != delegated_run["child_root"]
         assert frozen["model_id"] == "child-model"
         assert frozen["allowed_tool_names"] == ["read"]
-        messages = list(db.scalars(select(AgentMessage).where(AgentMessage.task_id == task.id)))
-        assert [item.message_type for item in messages] == ["TASK_ASSIGNED", "TASK_COMPLETED"]
+        assert_no_legacy_collaboration_records(db)
 
 
 @pytest.mark.asyncio
-async def test_child_approval_stays_recoverable_then_syncs_task_and_message_atomically(
+async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicate_chat_message(
     delegated_run: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A child approval must not turn into a permanently blocked task."""
@@ -238,9 +245,9 @@ async def test_child_approval_stays_recoverable_then_syncs_task_and_message_atom
     monkeypatch.setattr(run_service, "build_model_call", fake_build_model_call)
     parent_runtime, context = RunCoordinator._resolve_runtime(delegated_run["run_id"])
     # The session is full access for this test so the parent can dispatch
-    # immediately.  The child is deliberately smart-approval to exercise its
-    # own resumable approval lifecycle.
-    parent_runtime.tool_registry._task_delegate.permission_mode = "smart"  # type: ignore[attr-defined]
+    # immediately.  Use request-approval for the child to exercise its own
+    # resumable approval lifecycle; smart mode now allows routine writes.
+    parent_runtime.tool_registry._task_delegate.permission_mode = "ask"  # type: ignore[attr-defined]
     parent_outcome = await parent_runtime.run(
         system_prompt=context["system_prompt"],
         agent_instructions=context["agent_instructions"],
@@ -260,7 +267,7 @@ async def test_child_approval_stays_recoverable_then_syncs_task_and_message_atom
     RunCoordinator._persist_outcome(delegated_run["run_id"], parent_outcome)
 
     with database.SessionLocal() as db:
-        task = db.scalar(select(TeamTask))
+        task = db.scalar(select(DelegatedTask))
         assert task is not None
         assert task.status == "in_progress"
         assert task.result["status"] == "awaiting_approval"
@@ -275,15 +282,7 @@ async def test_child_approval_stays_recoverable_then_syncs_task_and_message_atom
         approval.status = "approved"
         child_run.status = "received"
         db.commit()
-        awaiting_messages = list(db.scalars(
-            select(AgentMessage)
-            .where(AgentMessage.task_id == task_id)
-            .order_by(AgentMessage.created_at.asc())
-        ))
-        assert [item.message_type for item in awaiting_messages] == [
-            "TASK_ASSIGNED",
-            "TASK_AWAITING_APPROVAL",
-        ]
+        assert_no_legacy_collaboration_records(db)
 
     await run_service.coordinator._resume(child_run_id)
 
@@ -300,7 +299,7 @@ async def test_child_approval_stays_recoverable_then_syncs_task_and_message_atom
         pytest.fail("the parent run did not resume after the child completed")
 
     with database.SessionLocal() as db:
-        task = db.get(TeamTask, task_id)
+        task = db.get(DelegatedTask, task_id)
         child_run = db.get(Run, child_run_id)
         parent = db.get(Run, delegated_run["run_id"])
         assert task is not None and child_run is not None and parent is not None
@@ -308,24 +307,12 @@ async def test_child_approval_stays_recoverable_then_syncs_task_and_message_atom
         assert task.result["status"] == "completed"
         assert child_run.status == "completed"
         assert parent.status == "completed"
-        assert task.lease_owner is None and task.lease_expires_at is None
-        messages = list(db.scalars(
-            select(AgentMessage)
-            .where(AgentMessage.task_id == task.id)
-            .order_by(AgentMessage.created_at.asc())
-        ))
-        assert [item.message_type for item in messages] == [
-            "TASK_ASSIGNED",
-            "TASK_AWAITING_APPROVAL",
-            "TASK_COMPLETED",
-        ]
         session_messages = list(db.scalars(select(ChatMessage).where(
             ChatMessage.session_id == delegated_run["session_id"],
         )))
-        visible_result = next((item for item in session_messages if item.extra.get("delegated_child") is True), None)
-        assert visible_result is not None
-        assert visible_result.content == "child result after approval"
-        assert visible_result.extra["child_agent_id"] == delegated_run["child_id"]
+        # The child result belongs to DelegatedTask and its own Run;
+        # only the parent coordinator may write a user-visible chat reply.
+        assert not [item for item in session_messages if item.extra.get("delegated_child") is True]
         assert [item.content for item in session_messages if item.extra.get("run_id") == parent.id] == [
             "parent summary after delegated child",
         ]
@@ -337,8 +324,8 @@ async def test_child_approval_stays_recoverable_then_syncs_task_and_message_atom
             "delegated_child_completed",
             "delegated_child_continuation_queued",
         }
-        version_before = task.version
-        message_count_before = len(messages)
+        result_before = dict(task.result)
+        updated_at_before = task.updated_at
         visible_count_before = len(list(db.scalars(select(ChatMessage).where(
             ChatMessage.session_id == delegated_run["session_id"],
         ))))
@@ -352,9 +339,10 @@ async def test_child_approval_stays_recoverable_then_syncs_task_and_message_atom
     RunCoordinator._persist_outcome(child_run_id, duplicate_outcome)
 
     with database.SessionLocal() as db:
-        task = db.get(TeamTask, task_id)
-        assert task is not None and task.version == version_before
-        assert len(list(db.scalars(select(AgentMessage).where(AgentMessage.task_id == task_id)))) == message_count_before
+        task = db.get(DelegatedTask, task_id)
+        assert task is not None and task.result == result_before
+        assert task.updated_at == updated_at_before
+        assert_no_legacy_collaboration_records(db)
         assert len(list(db.scalars(select(ChatMessage).where(
             ChatMessage.session_id == delegated_run["session_id"],
         )))) == visible_count_before
@@ -363,7 +351,7 @@ async def test_child_approval_stays_recoverable_then_syncs_task_and_message_atom
 def test_restart_recovery_settles_active_delegated_child_and_keeps_binding(
     delegated_run: dict[str, str],
 ) -> None:
-    """A process restart cannot strand a delegated TeamTask as in_progress."""
+    """A process restart cannot strand a delegated child as in_progress."""
 
     with database.SessionLocal() as db:
         parent = db.get(Run, delegated_run["run_id"])
@@ -378,12 +366,15 @@ def test_restart_recovery_settles_active_delegated_child_and_keeps_binding(
         )
         db.add(child_run)
         db.flush()
-        task = TeamTask(
-            team_id=f"run:{delegated_run['run_id']}",
+        task = DelegatedTask(
+            parent_run_id=delegated_run["run_id"],
+            parent_session_id=delegated_run["session_id"],
+            child_run_id=child_run.id,
+            child_agent_id=delegated_run["child_id"],
             title="restart child",
+            description="restart child",
             status="in_progress",
-            assignee_agent_id=delegated_run["child_id"],
-            lease_owner=f"run:{delegated_run['run_id']}",
+            idempotency_key=f"restart-delegation:{child_run.id}",
             result={
                 "child_run_id": child_run.id,
                 "status": "in_progress",
@@ -400,27 +391,16 @@ def test_restart_recovery_settles_active_delegated_child_and_keeps_binding(
         )
         db.add(task)
         db.flush()
-        db.add_all([
-            AgentMessage(
-                team_id=task.team_id,
-                task_id=task.id,
-                sender_agent_id=None,
-                recipient_agent_id=delegated_run["child_id"],
-                message_type="TASK_ASSIGNED",
-                payload={"child_run_id": child_run.id},
-                idempotency_key=f"restart-assignment:{task.id}",
-            ),
-            RunEvent(
-                run_id=child_run.id,
-                event_type="delegation_link",
-                payload={
-                    "team_task_id": task.id,
-                    "parent_run_id": delegated_run["run_id"],
-                    "parent_agent_id": "",
-                    "parent_session_id": delegated_run["session_id"],
-                },
-            ),
-        ])
+        db.add(RunEvent(
+            run_id=child_run.id,
+            event_type="delegation_link",
+            payload={
+                "delegation_id": task.id,
+                "parent_run_id": delegated_run["run_id"],
+                "parent_agent_id": "",
+                "parent_session_id": delegated_run["session_id"],
+            },
+        ))
         db.commit()
         child_run_id, task_id = child_run.id, task.id
 
@@ -429,7 +409,7 @@ def test_restart_recovery_settles_active_delegated_child_and_keeps_binding(
 
     with database.SessionLocal() as db:
         child_run = db.get(Run, child_run_id)
-        task = db.get(TeamTask, task_id)
+        task = db.get(DelegatedTask, task_id)
         parent = db.get(Run, delegated_run["run_id"])
         assert child_run is not None and child_run.status == "stopped"
         assert child_run.stop_reason == "interrupted_restart"
@@ -437,10 +417,7 @@ def test_restart_recovery_settles_active_delegated_child_and_keeps_binding(
         assert parent is not None and parent.status == "received"
         assert task.result["status"] == "stopped"
         assert task.result["binding"]["model_id"] == "child-model"
-        messages = list(db.scalars(select(AgentMessage).where(
-            AgentMessage.task_id == task_id,
-        ).order_by(AgentMessage.created_at.asc())))
-        assert [message.message_type for message in messages] == ["TASK_ASSIGNED", "BLOCKED"]
+        assert_no_legacy_collaboration_records(db)
 
 
 @pytest.mark.asyncio
@@ -461,13 +438,10 @@ async def test_child_failure_blocks_once_and_repeated_delegate_call_is_idempoten
     assert first.error_code == second.error_code == "delegate_child_failed"
 
     with database.SessionLocal() as db:
-        task = db.scalar(select(TeamTask))
+        task = db.scalar(select(DelegatedTask))
         assert task is not None and task.status == "blocked"
         assert task.result["status"] == "failed"
-        messages = list(db.scalars(select(AgentMessage).where(
-            AgentMessage.task_id == task.id,
-        ).order_by(AgentMessage.created_at.asc())))
-        assert [item.message_type for item in messages] == ["TASK_ASSIGNED", "BLOCKED"]
+        assert_no_legacy_collaboration_records(db)
         assert len(list(db.scalars(select(RunEvent).where(
             RunEvent.run_id == delegated_run["run_id"],
             RunEvent.event_type == "delegated_child_failed",
@@ -510,3 +484,6 @@ async def test_child_timeout_is_limited_to_the_parent_remaining_budget(
     assert len(captured_limits) == 1
     assert captured_limits[0] is not None
     assert 0 < captured_limits[0] < 5
+    with database.SessionLocal() as db:
+        assert db.scalar(select(DelegatedTask)) is not None
+        assert_no_legacy_collaboration_records(db)

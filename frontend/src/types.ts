@@ -89,6 +89,11 @@ export interface SkillMarketplaceItem {
   source_url?: string
   market_url?: string
   installs?: number
+  change?: number
+  installs_yesterday?: number
+  is_official?: boolean
+  official_owner?: string
+  is_duplicate?: boolean
 }
 
 export interface SkillMarketplaceSearch {
@@ -96,6 +101,38 @@ export interface SkillMarketplaceSearch {
   available?: boolean
   message?: string
   items?: SkillMarketplaceItem[]
+}
+
+export type SkillMarketplaceView = 'all-time' | 'trending' | 'hot' | 'curated'
+
+export interface SkillMarketplaceCategory {
+  id: string
+  label?: string
+  name?: string
+  title?: string
+  description?: string
+  query?: string
+  items?: SkillMarketplaceItem[]
+  updated_at?: string
+  refreshed_at?: string
+}
+
+export interface SkillMarketplaceLeaderboards extends SkillMarketplaceSearch {
+  categories?: SkillMarketplaceCategory[]
+  updated_at?: string
+  refreshed_at?: string
+  expires_at?: string
+  refresh_after_seconds?: number
+  refresh_interval_seconds?: number
+  ttl_seconds?: number
+  cached?: boolean
+}
+
+export interface SkillMarketplaceBrowse extends SkillMarketplaceSearch {
+  view?: SkillMarketplaceView
+  page?: number
+  has_more?: boolean
+  total?: number | null
 }
 
 export interface SkillInstallPreview {
@@ -138,6 +175,39 @@ export interface ModelUsage {
   tokens: number
   total_cost_usd: number
   avg_cost_usd: number
+  cache_hit_rate: number
+}
+
+export interface UsageBreakdownItem {
+  id: string
+  title: string
+  path?: string
+  requests: number
+  tokens: number
+  total_cost_usd: number
+  avg_cost_usd: number
+  cache_hit_rate: number
+}
+
+export interface UsageSession {
+  session_id: string | null
+  title: string | null
+  requests: number
+  tokens: number
+  total_cost_usd: number
+  avg_cost_usd: number
+  cache_hit_rate: number
+}
+
+export interface UsageWorkspace {
+  workspace_id: string | null
+  name: string | null
+  path: string | null
+  requests: number
+  tokens: number
+  total_cost_usd: number
+  avg_cost_usd: number
+  cache_hit_rate: number
 }
 
 export interface Message {
@@ -223,6 +293,29 @@ export interface TeamTask {
   priority?: string
   version?: number
   lease_expires_at?: string
+  result?: ApiRecord
+  created_at?: string
+  updated_at?: string
+}
+
+/**
+ * A child-agent delegation belonging to one conversation.
+ *
+ * This is deliberately separate from TeamTask: TeamTask is reserved for the
+ * future multi-user collaboration board, while delegations are runtime
+ * records owned by a parent run/session.
+ */
+export interface DelegatedTask {
+  id: string
+  parent_run_id?: string
+  parent_session_id?: string
+  child_run_id?: string
+  child_agent_id?: string
+  child_agent_name?: string
+  title: string
+  description?: string
+  status?: string
+  result?: ApiRecord
   created_at?: string
   updated_at?: string
 }

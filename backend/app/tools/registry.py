@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from . import builtins
-from .policy import approval_reason, approval_required, normalize_permission_mode
+from .policy import assess_tool_call, normalize_permission_mode
 from .sandbox import WorkspaceSandbox
 from .types import ApprovalRequest, ToolResult
 
@@ -375,8 +375,15 @@ class ToolRegistry:
         # no-op first.
         if name == "task" and self._task_delegate is None:
             return self._rename_result(function(self.sandbox, **kwargs), name)
-        if approval_required(name, self.permission_mode, approved=approved):
-            return _approval(name, kwargs, approval_reason(name, self.permission_mode))
+        decision = assess_tool_call(
+            name,
+            self.permission_mode,
+            arguments=kwargs,
+            approved=approved,
+            workspace_root=self.sandbox.root,
+        )
+        if decision.requires_approval:
+            return _approval(name, kwargs, decision.reason)
         # Side-effecting builtins retain their own approval primitive for direct
         # callers.  The registry is the only runtime entry point and passes the
         # effective grant after policy has checked it.
@@ -423,8 +430,15 @@ class ToolRegistry:
             return ToolResult(name, False, "必须提供有效的子 Agent ID", error_code="invalid_delegate_agent")
         if self._task_delegate is None:
             return self._rename_result(function(self.sandbox, **kwargs), name)
-        if approval_required(name, self.permission_mode, approved=approved):
-            return _approval(name, kwargs, approval_reason(name, self.permission_mode))
+        decision = assess_tool_call(
+            name,
+            self.permission_mode,
+            arguments=kwargs,
+            approved=approved,
+            workspace_root=self.sandbox.root,
+        )
+        if decision.requires_approval:
+            return _approval(name, kwargs, decision.reason)
         try:
             result = await builtins.delegate_task_async(
                 self.sandbox,

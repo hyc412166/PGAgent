@@ -5,6 +5,7 @@ import {
   Bot,
   BookOpen,
   Box,
+  CalendarDays,
   Check,
   CheckCircle2,
   ChevronRight,
@@ -20,6 +21,8 @@ import {
   Menu,
   MessageSquare,
   Network,
+  PanelRightClose,
+  PanelRightOpen,
   PanelLeftClose,
   Play,
   Pencil,
@@ -42,20 +45,23 @@ import {
 } from 'lucide-react'
 import { Fragment, type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { api, apiUrl, describeError } from './api'
+import { ApiError, api, apiUrl, describeError } from './api'
 import { permissionLabel, permissionOptions, toggleSelectedId } from './capabilitySelection'
 import { modelSelectionPayload, resolveEffectiveThinking, shortModelLabel, thinkingLevelLabels } from './composerSettings'
+import { fallbackMarketCategories, leaderboardRefreshDelayMs, marketCategoryDefinitions, normalizeMarketCategories } from './skillMarketCategories'
 import { buildContextUsageView } from './contextUsage'
 import { buildDraftLaunchPayload, createDraftIdempotencyKey } from './draftLaunch'
 import { availableConnectionModels, resolveEffectiveModelSettings } from './modelSettings'
 import { buildSessionNavigation, folderName, isDefaultWorkspace, projectRootForSession } from './sessionNavigation'
 import { appendAssistantDelta, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldRefreshConversationAfterApprovalDecision, visibleSessionItems, type RunStreamEvent } from './sessionStream'
 import { emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline, type ThoughtTimelineState } from './thoughtTimeline'
+import { usageDateKey, usageDateOptions, usageDatePresetBounds, usageDateRange, usageRangeLabel, type QuickUsageDatePreset, type UsageDatePreset } from './usageDateRange'
 import type {
   AgentProfile,
   Approval,
   Connection,
   DashboardData,
+  DelegatedTask,
   Health,
   Message,
   Run,
@@ -64,14 +70,21 @@ import type {
   SessionContext,
   TeamTask,
   ThinkingLevel,
+  UsageBreakdownItem,
+  UsageSession,
   UsageSummary,
+  UsageWorkspace,
   ModelUsage,
   FolderSelection,
   PermissionMode,
   SkillCatalogItem,
   SkillInstallPreview,
+  SkillMarketplaceBrowse,
+  SkillMarketplaceCategory,
   SkillMarketplaceItem,
+  SkillMarketplaceLeaderboards,
   SkillMarketplaceSearch,
+  SkillMarketplaceView,
   ToolCatalogItem,
   Workspace,
 } from './types'
@@ -105,6 +118,7 @@ const runStreamEventNames = [
   'tool_result',
   'approval_requested',
   'approval_granted',
+  'delegated_child_started',
   'delegated_child_continuation_started',
   'delegated_child_awaiting_approval',
   'delegated_child_completed',
@@ -122,6 +136,7 @@ function useApiData<T>(initial: T, loader: () => Promise<T>, deps: readonly unkn
   const [state, setState] = useState<LoadState<T>>({ data: initial, loading: true, error: '' })
   const requestId = useRef(0)
   const hasLoaded = useRef(false)
+  const isInitialLoad = !hasLoaded.current
 
   const reload = useCallback(async () => {
     const currentRequest = ++requestId.current
@@ -161,7 +176,7 @@ function useApiData<T>(initial: T, loader: () => Promise<T>, deps: readonly unkn
     return () => { requestId.current += 1 }
   }, [reload])
 
-  return { ...state, reload, refresh, setState }
+  return { ...state, initialLoading: state.loading && isInitialLoad, refreshing: state.loading && !isInitialLoad, reload, refresh, setState }
 }
 
 function formatDate(value?: string) {
@@ -178,6 +193,11 @@ function formatDate(value?: string) {
 
 function stringId(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value) : ''
+}
+
+function numberFromRecord(record: Record<string, unknown> | undefined, key: string) {
+  const value = record?.[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
 const statusText: Record<string, string> = {
@@ -340,7 +360,6 @@ const navigation = [
   { path: '/sessions', label: '会话', icon: MessageSquare },
   { path: '/runs', label: '运行记录', icon: History },
   { path: '/usage', label: '用量统计', icon: ChartNoAxesCombined },
-  { path: '/teams', label: '团队任务', icon: Users },
   { path: '/settings/models', label: '模型设置', icon: Settings2 },
 ]
 
@@ -394,7 +413,6 @@ function AppShell() {
           <Route path="/sessions" element={<SessionsPage />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/usage" element={<UsagePage />} />
-          <Route path="/teams" element={<TeamsPage />} />
           <Route path="/settings/models" element={<ModelsPage />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
@@ -560,6 +578,11 @@ function SkillsPage() {
   const market = useApiData<SkillMarketplaceSearch>({}, () => api.get<SkillMarketplaceSearch>('/api/skills/market/status'), [])
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<SkillMarketplaceItem[]>([])
+  const [searchedQuery, setSearchedQuery] = useState('')
+  const [browseView, setBrowseView] = useState<SkillMarketplaceView>('trending')
+  const [browse, setBrowse] = useState<SkillMarketplaceBrowse>({})
+  const [browsing, setBrowsing] = useState(false)
+  const [browseError, setBrowseError] = useState('')
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
   const [marketMessage, setMarketMessage] = useState('')
@@ -567,6 +590,84 @@ function SkillsPage() {
   const [installingId, setInstallingId] = useState('')
   const [previews, setPreviews] = useState<Record<string, SkillInstallPreview>>({})
   const [actionError, setActionError] = useState('')
+  const [categoryBoards, setCategoryBoards] = useState<SkillMarketplaceCategory[]>([])
+  const [boardsLoading, setBoardsLoading] = useState(false)
+  const [boardsRefreshing, setBoardsRefreshing] = useState(false)
+  const [boardsError, setBoardsError] = useState('')
+  const [boardsUpdatedAt, setBoardsUpdatedAt] = useState('')
+  const [boardRefreshAfterSeconds, setBoardRefreshAfterSeconds] = useState(30 * 60)
+  const browseRequestRef = useRef(0)
+  const leaderboardRequestRef = useRef(0)
+
+  const showingSearchResults = searchedQuery !== '' && searchedQuery === query.trim() && !searchError && !searching
+  const activeMarketItems = showingSearchResults ? results : (browse.items ?? [])
+
+  const loadBrowse = useCallback(async (view: SkillMarketplaceView, page = 0, append = false) => {
+    const requestId = ++browseRequestRef.current
+    setBrowsing(true); setBrowseError('')
+    try {
+      const response = await api.get<SkillMarketplaceBrowse>(`/api/skills/market/browse?view=${encodeURIComponent(view)}&page=${page}&per_page=12`)
+      if (requestId === browseRequestRef.current) {
+        setBrowse((current) => ({
+          ...response,
+          items: append ? [...(current.items ?? []), ...(response.items ?? [])] : (response.items ?? []),
+        }))
+      }
+    } catch (error) {
+      if (requestId === browseRequestRef.current) setBrowseError(describeError(error))
+    } finally {
+      if (requestId === browseRequestRef.current) setBrowsing(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (market.data.available) void loadBrowse(browseView)
+  }, [browseView, loadBrowse, market.data.available])
+
+  const loadCategoryBoards = useCallback(async (manual = false) => {
+    const requestId = ++leaderboardRequestRef.current
+    if (manual) setBoardsRefreshing(true)
+    else setBoardsLoading(true)
+    setBoardsError('')
+    try {
+      let payload: SkillMarketplaceLeaderboards
+      try {
+        payload = manual
+          ? await api.post<SkillMarketplaceLeaderboards>('/api/skills/market/leaderboards/refresh')
+          : await api.get<SkillMarketplaceLeaderboards>('/api/skills/market/leaderboards')
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 404) throw error
+        const entries = await Promise.all(marketCategoryDefinitions.map(async (category) => {
+          const response = await api.post<SkillMarketplaceSearch>('/api/skills/market/search', { query: category.query, limit: 6 })
+          return [category.id, response.items ?? []] as const
+        }))
+        payload = { categories: fallbackMarketCategories(Object.fromEntries(entries)) }
+      }
+      if (requestId === leaderboardRequestRef.current) {
+        setCategoryBoards(normalizeMarketCategories(payload))
+        setBoardsUpdatedAt(payload.updated_at || payload.refreshed_at || new Date().toISOString())
+        setBoardRefreshAfterSeconds(payload.refresh_after_seconds || payload.refresh_interval_seconds || payload.ttl_seconds || 30 * 60)
+      }
+    } catch (error) {
+      if (requestId === leaderboardRequestRef.current) setBoardsError(describeError(error))
+    } finally {
+      if (requestId === leaderboardRequestRef.current) {
+        setBoardsLoading(false)
+        setBoardsRefreshing(false)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!market.data.available) return
+    void loadCategoryBoards()
+  }, [loadCategoryBoards, market.data.available])
+
+  useEffect(() => {
+    if (!market.data.available) return
+    const timer = window.setInterval(() => void loadCategoryBoards(), leaderboardRefreshDelayMs(boardRefreshAfterSeconds))
+    return () => window.clearInterval(timer)
+  }, [boardRefreshAfterSeconds, loadCategoryBoards, market.data.available])
 
   async function importLocalSkill() {
     if (importing) return
@@ -579,19 +680,30 @@ function SkillsPage() {
     } catch (error) { setActionError(describeError(error)) } finally { setImporting(false) }
   }
 
-  async function searchMarket(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const normalizedQuery = query.trim()
+  async function searchMarketQuery(normalizedQuery: string) {
     if (normalizedQuery.length < 2 || searching) return
     setSearching(true); setSearchError(''); setMarketMessage('')
     try {
       const response = await api.post<SkillMarketplaceSearch>('/api/skills/market/search', { query: normalizedQuery, limit: 20 })
       setResults(response.items ?? [])
+      setSearchedQuery(normalizedQuery)
       setMarketMessage(response.message ?? '')
     } catch (error) {
       setResults([])
+      setSearchedQuery('')
       setSearchError(describeError(error))
     } finally { setSearching(false) }
+  }
+
+  function searchMarket(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    void searchMarketQuery(query.trim())
+  }
+
+  function chooseBrowseView(view: SkillMarketplaceView) {
+    setResults([]); setQuery(''); setSearchedQuery(''); setSearchError(''); setMarketMessage('')
+    if (view !== browseView) setBrowseView(view)
+    else void loadBrowse(view)
   }
 
   async function previewMarketSkill(item: SkillMarketplaceItem) {
@@ -617,6 +729,13 @@ function SkillsPage() {
     } catch (error) { setActionError(describeError(error)) } finally { setInstallingId('') }
   }
 
+  function showCategorySearch(category: SkillMarketplaceCategory) {
+    const categoryQuery = category.query || category.label || ''
+    setQuery(categoryQuery)
+    void searchMarketQuery(categoryQuery)
+    window.requestAnimationFrame(() => document.querySelector<HTMLInputElement>('.skill-search input')?.focus())
+  }
+
   return <div className="page skills-page">
     <PageHeader eyebrow="CAPABILITY LIBRARY" title="技能库" description="管理已安装的 Skill，或从本地文件夹与在线市场添加新能力。" action={<button className="button button-primary" disabled={importing} onClick={() => void importLocalSkill()}>{importing ? <LoaderCircle className="spin" size={15} /> : <Upload size={15} />}导入本地 Skill</button>} />
     {actionError && <p className="form-error page-form-error" role="alert">{actionError}</p>}
@@ -631,18 +750,46 @@ function SkillsPage() {
       </div> : <EmptyState icon={BookOpen} title="还没有安装 Skill" description="选择本地 Skill 文件夹导入，或在下方搜索在线市场。" />}
     </section>
     <section className="skills-section skill-market-section">
-      <div className="skills-section-heading"><div><h2>在线市场</h2><p>{market.data.provider ? `来源：${market.data.provider}` : '搜索可下载的 Skill。'}</p></div></div>
+      <div className="skills-section-heading"><div><h2>在线市场</h2><p>{market.data.provider ? `来源：${market.data.provider} · 仅展示安装量，不代表活跃用户数。` : '搜索可下载的 Skill。'}</p></div></div>
       {market.error ? <ErrorState message={market.error} onRetry={market.reload} /> : market.loading ? <LoadingState label="正在检查市场服务" /> : market.data.available === false ? <ErrorState message={market.data.message || '在线市场当前不可用。'} onRetry={market.reload} /> : <>
+        <section className="market-leaderboards" aria-label="按类型浏览热门 Skill">
+          <header className="market-leaderboards-header">
+            <div><strong>热门分类榜单</strong><small>{boardsUpdatedAt ? `更新于 ${formatDate(boardsUpdatedAt)} · 定期自动刷新` : '每类展示安装量最高的 6 个 Skill · 定期自动刷新'}</small></div>
+            <button type="button" className="button button-secondary market-refresh-button" disabled={boardsLoading || boardsRefreshing} onClick={() => void loadCategoryBoards(true)}>{boardsLoading || boardsRefreshing ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}刷新榜单</button>
+          </header>
+          {boardsError ? <ErrorState message={boardsError} onRetry={() => void loadCategoryBoards(true)} /> : boardsLoading && !categoryBoards.length ? <LoadingState label="正在整理分类榜单" /> : <div className="market-category-grid">
+            {categoryBoards.map((category) => <section className="market-category-card" key={category.id}>
+              <header><div><h3>{category.label || category.id}</h3><p>{category.description || '热门可下载 Skill'}</p></div><button type="button" className="text-button" onClick={() => showCategorySearch(category)}>查看全部<ChevronRight size={13} /></button></header>
+              {category.items?.length ? <ol>{category.items.slice(0, 6).map((item, index) => {
+                const preview = previews[item.id]
+                return <Fragment key={item.id}>
+                  <li>
+                    <span className="market-category-rank">{index + 1}</span><div><strong title={item.name}>{item.name}</strong><small title={item.slug || item.source || item.id}>{item.slug || item.source || item.id}</small></div><span className="market-category-installs">{typeof item.installs === 'number' ? `${item.installs.toLocaleString()} 次` : '—'}</span><button type="button" className="market-category-download" aria-label={`预览并下载 ${item.name}`} disabled={!!installingId} onClick={() => void previewMarketSkill(item)}>{installingId === item.id ? <LoaderCircle className="spin" size={13} /> : <Download size={13} />}</button>
+                  </li>
+                  {preview && <li className="market-category-preview"><span>已预览 {preview.files?.length ?? 0} 个文件</span><button type="button" className="button button-primary" disabled={!!installingId} onClick={() => void confirmMarketSkill(item)}>{installingId === item.id ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}确认导入</button></li>}
+                </Fragment>
+              })}</ol> : <p className="market-category-empty">暂无可展示的 Skill，刷新后再试。</p>}
+            </section>)}
+          </div>}
+        </section>
         <form className="skill-search" onSubmit={searchMarket}>
           <Search size={16} /><input aria-label="搜索在线 Skill" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="输入至少 2 个字符搜索…" /><button className="button button-secondary" disabled={query.trim().length < 2 || searching}>{searching ? <LoaderCircle className="spin" size={14} /> : <Search size={14} />}搜索</button>
         </form>
         {searchError && <ErrorState message={searchError} onRetry={() => { const form = document.querySelector<HTMLFormElement>('.skill-search'); form?.requestSubmit() }} />}
+        {!searchError && <div className="market-browser">
+          <div className="market-browser-header"><strong>{showingSearchResults ? `搜索结果 · ${activeMarketItems.length}` : browse.total !== undefined && browse.total !== null ? `${browse.total.toLocaleString()} 个可浏览 Skill` : '发现 Skill'}</strong>{showingSearchResults && <button type="button" className="text-button" onClick={() => { setResults([]); setQuery(''); setSearchedQuery(''); void loadBrowse(browseView) }}>返回榜单</button>}</div>
+          <div className="market-view-tabs" role="tablist" aria-label="Skill 市场榜单">
+            {([{ id: 'trending', label: '趋势' }, { id: 'hot', label: '热度' }, { id: 'all-time', label: '热门' }, { id: 'curated', label: '官方精选' }] as Array<{ id: SkillMarketplaceView; label: string }>).map((tab) => <button key={tab.id} type="button" role="tab" aria-selected={!showingSearchResults && browseView === tab.id} className={!showingSearchResults && browseView === tab.id ? 'active' : ''} onClick={() => chooseBrowseView(tab.id)}>{tab.label}</button>)}
+          </div>
+        </div>}
         {marketMessage && <p className="market-message">{marketMessage}</p>}
-        {!searching && !searchError && results.length ? <div className="market-results">{results.map((item) => {
+        {browseError && !showingSearchResults && <ErrorState message={browseError} onRetry={() => void loadBrowse(browseView)} />}
+        {(searching || (browsing && !activeMarketItems.length)) && <LoadingState label={searching ? '正在搜索 Skill' : '正在读取榜单'} />}
+        {!searching && !browseError && activeMarketItems.length ? <div className="market-results">{activeMarketItems.map((item) => {
           const preview = previews[item.id]
           return <article key={item.id} className={preview ? 'has-preview' : ''}>
-            <div><strong>{item.name}</strong><small>{item.slug || item.source || item.id}</small></div>
-            {typeof item.installs === 'number' && <span>{item.installs.toLocaleString()} 次安装</span>}
+            <div><strong>{item.name}</strong><small>{item.slug || item.source || item.id}{item.is_duplicate ? ' · 重复来源' : ''}</small>{item.is_official && <em>官方精选{item.official_owner ? ` · ${item.official_owner}` : ''}</em>}</div>
+            <span className="market-metrics">{typeof item.installs === 'number' && <b>{item.installs.toLocaleString()} 次安装</b>}{browseView === 'hot' && typeof item.change === 'number' && <small className={item.change > 0 ? 'positive' : ''}>{item.change >= 0 ? '+' : ''}{item.change} / 小时</small>}</span>
             <button className="button button-secondary" disabled={!!installingId} onClick={() => void previewMarketSkill(item)}>{installingId === item.id && !preview ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}{preview ? '重新预览' : '下载'}</button>
             {preview && <div className="skill-preview">
               <p><strong>来源</strong><span title={preview.source_url}>{preview.source_url}</span></p>
@@ -651,7 +798,8 @@ function SkillsPage() {
               <button className="button button-primary" disabled={!!installingId} onClick={() => void confirmMarketSkill(item)}>{installingId === item.id ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}确认导入</button>
             </div>}
           </article>
-        })}</div> : !searching && !searchError && query.trim() && <p className="market-empty">提交搜索后，真实结果会显示在这里。</p>}
+        })}</div> : !searching && !browsing && !searchError && !browseError && <p className="market-empty">{showingSearchResults ? `未找到与“${searchedQuery}”匹配的 Skill。` : '这里会显示真实的市场结果。下载前会先展示文件清单，确认后才会导入。'}</p>}
+        {!showingSearchResults && !browseError && browse.has_more && <div className="market-load-more"><button type="button" className="button button-secondary" disabled={browsing} onClick={() => void loadBrowse(browseView, (browse.page ?? 0) + 1, true)}>{browsing ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}加载更多</button></div>}
       </>}
     </section>
   </div>
@@ -689,6 +837,8 @@ function SessionsPage() {
   const [pickingDraftProject, setPickingDraftProject] = useState(false)
   const [projectError, setProjectError] = useState('')
   const [completedThoughtsByRun, setCompletedThoughtsByRun] = useState<Record<string, ThoughtTimelineState>>({})
+  const [childPanelOpen, setChildPanelOpen] = useState(false)
+  const [selectedChildTaskId, setSelectedChildTaskId] = useState('')
   const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRun)
   const eventSourceRef = useRef<EventSource | null>(null)
   const fallbackTimerRef = useRef<number | null>(null)
@@ -762,6 +912,7 @@ function SessionsPage() {
   useEffect(() => {
     setSettingsMenuOpen(false); setSettingsSubmenu(null)
     setAddMenuOpen(false); setSkillSubmenuOpen(false); setPermissionMenuOpen(false)
+    setChildPanelOpen(false); setSelectedChildTaskId('')
   }, [activeId])
 
   const messages = useApiData<OwnedSessionMessages>(
@@ -772,6 +923,10 @@ function SessionsPage() {
     [activeId],
   )
   const runs = useApiData<Run[]>([], () => activeId ? api.list<Run>(`/api/runs?session_id=${encodeURIComponent(activeId)}`, ['runs']) : Promise.resolve([]), [activeId])
+  const childTasks = useApiData<DelegatedTask[]>([], async () => {
+    if (!activeId) return []
+    return api.list<DelegatedTask>(`/api/sessions/${encodeURIComponent(activeId)}/delegations`, ['delegations'])
+  }, [activeId])
   const context = useApiData<SessionContext | null>(null, () => activeId ? api.get<SessionContext>(`/api/sessions/${activeId}/context`) : Promise.resolve(null), [activeId])
   const activeSession = sessions.data.find((item) => stringId(item.id) === activeId)
   const activeAgent = agents.data.find((item) => item.id === activeSession?.agent_id)
@@ -787,8 +942,18 @@ function SessionsPage() {
     ?? sessionRuns.find((item) => activeRunStatuses.has(item.status || ''))
     ?? sessionRuns[0]
   const activeRunId = activeRun?.id || ''
+  // Legacy versions wrote raw child responses into the chat transcript. Hide
+  // those rows too; the source of truth is now the child side panel.
   const visibleMessages = visibleSessionItems(messages.data.ownerSessionId, activeId, messages.data.items)
+    .filter((message) => message.metadata?.delegated_child !== true)
   const sessionNavigation = buildSessionNavigation(workspaces.data, sessions.data)
+  const activeChildTask = childTasks.data.find((task) => task.id === selectedChildTaskId) ?? childTasks.data[0]
+  const childTaskRunId = stringId(activeChildTask?.child_run_id) || stringId(activeChildTask?.result?.child_run_id)
+  const childTaskRun = childTaskRunId ? sessionRuns.find((run) => run.id === childTaskRunId) : undefined
+  const childTaskEvents = useApiData<RunEvent[]>([], () => childTaskRunId
+    ? api.list<RunEvent>(`/api/runs/${encodeURIComponent(childTaskRunId)}/events`, ['events'])
+    : Promise.resolve([]), [childTaskRunId])
+  const hasChildActivity = childTasks.data.length > 0 || liveRun.phase.includes('子 Agent')
   const approvals = useApiData<Approval[]>([], async () => {
     const runIds = approvalRunIdsKey ? approvalRunIdsKey.split(',').filter(Boolean) : []
     if (!runIds.length) return []
@@ -801,6 +966,7 @@ function SessionsPage() {
   const visibleApprovals = approvals.data.filter((approval) => awaitingApprovalRunIds.includes(stringId(approval.run_id)))
   const refreshMessages = messages.refresh
   const refreshRuns = runs.refresh
+  const refreshChildTasks = childTasks.refresh
   const refreshContext = context.refresh
   const setMessagesState = messages.setState
   const setApprovalsState = approvals.setState
@@ -815,6 +981,16 @@ function SessionsPage() {
     setCompletedThoughtsByRun({})
     loadedThoughtRunIdsRef.current = new Set()
   }, [activeId])
+
+  useEffect(() => {
+    if (!childTasks.data.length) {
+      setSelectedChildTaskId('')
+      return
+    }
+    if (!childTasks.data.some((task) => task.id === selectedChildTaskId)) {
+      setSelectedChildTaskId(childTasks.data[0].id)
+    }
+  }, [childTasks.data, selectedChildTaskId])
 
   useEffect(() => {
     if (!activeId) return
@@ -986,7 +1162,7 @@ function SessionsPage() {
     }
     if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
 
-    await Promise.all([refreshRuns(), refreshContext(), refreshApprovalsForSession(sessionId)])
+    await Promise.all([refreshRuns(), refreshContext(), refreshChildTasks(), refreshApprovalsForSession(sessionId)])
     if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
 
     const assistantCount = refreshedMessages?.ownerSessionId === sessionId
@@ -998,7 +1174,7 @@ function SessionsPage() {
     if (hasPersistedReply || !hasDraft) {
       setLiveRun(emptyLiveRun())
     }
-  }, [closeRunTransport, refreshApprovalsForSession, refreshContext, refreshMessages, refreshRuns])
+  }, [closeRunTransport, refreshApprovalsForSession, refreshChildTasks, refreshContext, refreshMessages, refreshRuns])
 
   const startRunFallback = useCallback((runId: string, sessionId = activeIdRef.current) => {
     eventSourceRef.current?.close()
@@ -1121,7 +1297,8 @@ function SessionsPage() {
       if (waitingApproval) void refreshApprovalsForSession(sessionId)
       if (delegatedChildEvent) {
         void refreshRuns()
-        void refreshMessages()
+        void refreshChildTasks()
+        setChildPanelOpen(true)
       }
       if (terminal) void syncTerminalRun(runId, parsed, sessionId)
     }
@@ -1143,7 +1320,7 @@ function SessionsPage() {
         startRunFallback(runId, sessionId)
       }, streamErrorCountRef.current >= 3 ? 3500 : 6500)
     }
-  }, [refreshApprovalsForSession, refreshMessages, refreshRuns, startRunFallback, syncTerminalRun])
+  }, [refreshApprovalsForSession, refreshChildTasks, refreshRuns, startRunFallback, syncTerminalRun])
 
   useEffect(() => {
     closeRunTransport()
@@ -1394,8 +1571,13 @@ function SessionsPage() {
             {!!dependencyErrors.length && <div className="session-list-error"><AlertCircle size={14} /><span>{dependencyErrors.join('；')}</span><button type="button" onClick={() => { void Promise.all([agents.reload(), workspaces.reload(), connections.reload()]) }}>重试</button></div>}
             {sessions.loading && !sessions.data.length && <LoadingState />}
           </aside>
-          <section className="conversation">
+          <section className={`conversation ${childPanelOpen ? 'with-child-panel' : ''}`}>
             {activeSession || draftActive ? <>
+              {hasChildActivity && <div className="child-panel-toggle-row">
+                <button type="button" className="child-panel-toggle" aria-label={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} title={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} aria-expanded={childPanelOpen} onClick={() => setChildPanelOpen((open) => !open)}>
+                  {childPanelOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}
+                </button>
+              </div>}
               <div
                 className="messages"
                 ref={messagesRef}
@@ -1408,8 +1590,7 @@ function SessionsPage() {
                 {draftActive ? liveRun.status === 'idle' && <EmptyState icon={MessageSquare} title="开始一次新任务" description="直接描述目标；需要处理本地文件时，可以在输入框中选择一个项目文件夹。" /> : messages.error && !visibleMessages.length ? <ErrorState message={messages.error} onRetry={messages.reload} /> : messages.loading && !visibleMessages.length ? <LoadingState /> : visibleMessages.length ? visibleMessages.map((message) => {
                   const messageRunId = message.role === 'assistant' ? stringId(message.metadata?.run_id) : ''
                   const completedThought = messageRunId ? completedThoughtsByRun[messageRunId] : undefined
-                  const thoughtRun = messageRunId ? sessionRuns.find((run) => run.id === messageRunId) : undefined
-                  return <Fragment key={message.id}>{completedThought && <CompletedThoughtTimeline runId={messageRunId} run={thoughtRun} timeline={completedThought} />}<MessageBubble message={message} /></Fragment>
+                  return <Fragment key={message.id}>{completedThought && <CompletedThoughtTimeline runId={messageRunId} timeline={completedThought} />}<MessageBubble message={message} /></Fragment>
                 }) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
                 {!draftActive && messages.error && !!visibleMessages.length && <p className="inline-error" role="alert">消息同步失败：{messages.error}</p>}
                 {liveRun.status !== 'idle' && !completedThoughtsByRun[liveRun.runId] && <LiveAssistantMessage liveRun={liveRun} />}
@@ -1498,9 +1679,87 @@ function SessionsPage() {
               </form>
             </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={beginDraft}>新建对话</button>} />}
           </section>
+          {childPanelOpen && <ChildAgentPanel
+            tasks={childTasks.data}
+            loading={childTasks.loading}
+            error={childTasks.error}
+            selectedTask={activeChildTask}
+            run={childTaskRun}
+            events={childTaskEvents.data}
+            eventsLoading={childTaskEvents.loading}
+            eventsError={childTaskEvents.error}
+            onClose={() => setChildPanelOpen(false)}
+            onSelect={setSelectedChildTaskId}
+            onRetry={() => { void childTasks.reload(); void childTaskEvents.reload() }}
+          />}
       </div>
     </div>
   )
+}
+
+function childTaskStatusLabel(status?: string) {
+  return statusText[(status || '').toLowerCase()] ?? status ?? '处理中'
+}
+
+function childTaskOutput(task?: DelegatedTask) {
+  const output = task?.result?.output
+  if (typeof output === 'string' && output.trim()) return output
+  const error = task?.result?.error
+  if (typeof error === 'string' && error.trim()) return error
+  return ''
+}
+
+function ChildAgentPanel({
+  tasks,
+  loading,
+  error,
+  selectedTask,
+  run,
+  events,
+  eventsLoading,
+  eventsError,
+  onClose,
+  onSelect,
+  onRetry,
+}: {
+  tasks: DelegatedTask[]
+  loading: boolean
+  error: string
+  selectedTask?: DelegatedTask
+  run?: Run
+  events: RunEvent[]
+  eventsLoading: boolean
+  eventsError: string
+  onClose: () => void
+  onSelect: (taskId: string) => void
+  onRetry: () => void
+}) {
+  const output = childTaskOutput(selectedTask)
+  const toolEvents = events.filter((event) => ['tool_started', 'tool_finished', 'tool_result'].includes(event.type || event.event_type || ''))
+  return <aside className="child-agent-panel" aria-label="子 Agent 工作详情">
+    <header className="child-panel-header"><div><span className="eyebrow">协作执行</span><strong>子 Agent</strong></div><button type="button" className="icon-button" onClick={onClose} aria-label="收起子 Agent 侧栏"><X size={16} /></button></header>
+    {error ? <ErrorState message={error} onRetry={onRetry} /> : loading && !tasks.length ? <LoadingState label="正在读取子 Agent…" /> : !tasks.length ? <EmptyState icon={Users} title="子 Agent 正在启动" description="任务创建后会显示在这里。" /> : <>
+      <div className="child-task-list" role="list" aria-label="本次调用的子 Agent">
+        {tasks.map((task) => {
+          const selected = task.id === selectedTask?.id
+          const agent = task.result?.agent
+          const agentName = agent && typeof agent === 'object' && typeof (agent as Record<string, unknown>).name === 'string'
+            ? String((agent as Record<string, unknown>).name)
+            : task.child_agent_name || '子 Agent'
+          return <button key={task.id} type="button" className={selected ? 'selected' : ''} onClick={() => onSelect(task.id)}>
+            <span className="child-task-avatar"><Bot size={14} /></span><span><strong>{agentName}</strong><small>{task.title}</small></span><StatusBadge status={task.status} />
+          </button>
+        })}
+      </div>
+      {selectedTask && <section className="child-task-detail">
+        <header><div><strong>{selectedTask.title}</strong><small>{childTaskStatusLabel(selectedTask.status)}</small></div><StatusBadge status={selectedTask.status} /></header>
+        <dl className="child-task-stats"><div><dt>步骤</dt><dd>{numberFromRecord(selectedTask.result, 'steps') ?? run?.step_count ?? run?.current_step ?? 0}</dd></div><div><dt>工具</dt><dd>{numberFromRecord(selectedTask.result, 'tool_calls') ?? run?.tool_calls ?? 0}</dd></div></dl>
+        {selectedTask.description && <section className="child-detail-block"><strong>任务</strong><p>{selectedTask.description}</p></section>}
+        {output && <section className="child-detail-block"><strong>{selectedTask.status === 'completed' ? '结果' : '状态说明'}</strong><pre>{output}</pre></section>}
+        <section className="child-detail-block child-events"><strong>工作过程</strong>{eventsError ? <p className="inline-error">{eventsError}</p> : eventsLoading ? <p>正在读取运行事件…</p> : toolEvents.length ? <ol>{toolEvents.map((event, index) => <li key={event.id || index}><span>{event.type || event.event_type}</span><small>{formatDate(event.created_at)}</small></li>)}</ol> : <p>暂未记录工具调用。</p>}</section>
+      </section>}
+    </>}
+  </aside>
 }
 
 function MessageBubble({ message }: { message: Message }) {
@@ -1524,26 +1783,23 @@ function MessageBubble({ message }: { message: Message }) {
   )
 }
 
-function ThoughtTimeline({ timeline }: { timeline: ThoughtTimelineState }) {
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (timeline.startedAt === null || timeline.finished) return
-    setNow(Date.now())
-    const timer = window.setInterval(() => setNow(Date.now()), 100)
-    return () => window.clearInterval(timer)
-  }, [timeline.finished, timeline.startedAt])
-  if (timeline.startedAt === null && !timeline.tools.length) return null
-  const elapsed = timeline.finished ? timeline.elapsedMs : Math.max(0, now - (timeline.startedAt ?? now))
-  return <section className="thought-timeline" aria-label="思考与工具时间线">
-    <header><span>+</span><strong>Thought:</strong><time>{formatThoughtDuration(elapsed)}</time></header>
-    {!!timeline.tools.length && <div>{timeline.tools.map((tool) => <p key={tool.id} className={`thought-tool ${tool.status}`}><span>{tool.name.startsWith('Web') ? '⌁' : '→'}</span><strong>{tool.name}</strong>{tool.target && <code title={tool.target}>{tool.target}</code>}{tool.status === 'running' && <i aria-label="运行中" />}</p>)}</div>}
-  </section>
-}
+function CompletedThoughtTimeline({ runId, timeline }: { runId: string; timeline: ThoughtTimelineState }) {
+  const [expanded, setExpanded] = useState(false)
+  const duration = formatThoughtDuration(timeline.elapsedMs)
+  const hasDetails = timeline.tools.length > 0
 
-function CompletedThoughtTimeline({ runId, run, timeline }: { runId: string; run?: Run; timeline: ThoughtTimelineState }) {
-  return <article className="completed-thought">
-    <div className="completed-thought-meta"><span>{run?.title || `运行 ${runId.slice(0, 8)}`}</span><time>{formatDate(run?.finished_at || run?.updated_at)}</time></div>
-    <ThoughtTimeline timeline={timeline} />
+  return <article className={`completed-thought ${hasDetails && expanded ? 'expanded' : ''} ${hasDetails ? '' : 'no-details'}`}>
+    {hasDetails ? <button
+      type="button"
+      className="completed-thought-toggle"
+      aria-expanded={expanded}
+      aria-controls={`thought-details-${runId}`}
+      onClick={() => setExpanded((value) => !value)}
+    >
+      <span className="completed-thought-duration">已处理 {duration}</span>
+      <ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
+    </button> : <span className="completed-thought-duration completed-thought-static">已处理 {duration}</span>}
+    {hasDetails && expanded && <div id={`thought-details-${runId}`} className="thought-tool-list" aria-label="工具调用">{timeline.tools.map((tool) => <p key={tool.id} className={`thought-tool ${tool.status}`}><span>{tool.name.startsWith('Web') ? '⌁' : '→'}</span><strong>{tool.name}</strong>{tool.target && <code title={tool.target}>{tool.target}</code>}{tool.status === 'running' && <i aria-label="运行中" />}</p>)}</div>}
   </article>
 }
 
@@ -1556,7 +1812,9 @@ function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunState }) {
     return () => window.clearInterval(timer)
   }, [liveRun.thought.finished, liveRun.thought.startedAt])
   const liveThoughtMs = liveRun.thought.startedAt === null ? 0 : Math.max(0, now - liveRun.thought.startedAt)
-  const phase = !liveRun.thought.finished && liveRun.status !== 'awaiting_approval' && liveRun.thinkingStatus
+  const phase = liveRun.phase.includes('子 Agent')
+    ? liveRun.phase
+    : !liveRun.thought.finished && liveRun.status !== 'awaiting_approval' && liveRun.thinkingStatus
     ? `${liveRun.thinkingStatus} ${formatLiveThinkingDuration(liveThoughtMs)}`
     : liveRun.phase || '已完成'
   return (
@@ -1564,7 +1822,6 @@ function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunState }) {
       <div className="message-avatar"><Sparkles size={16} /></div>
       <div className="message-body">
         <div className="message-meta"><strong>PGAgent</strong><span className="live-phase"><i aria-hidden="true" />{phase}</span></div>
-        <ThoughtTimeline timeline={liveRun.thought} />
         {liveRun.draft && <div className="message-content">{liveRun.draft}</div>}
         {liveRun.error && <p className="live-error">{liveRun.error}</p>}
       </div>
@@ -1624,11 +1881,58 @@ function formatCost(value = 0) {
   return `$${value.toFixed(value >= 1 ? 4 : 6)}`
 }
 
+function usageRate(value = 0) {
+  const percent = value <= 1 ? value * 100 : value
+  return Math.min(100, Math.max(0, percent))
+}
+
 function UsagePage() {
   const emptySummary: UsageSummary = { total_requests: 0, input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, total_tokens: 0, total_cost_usd: 0, cache_hit_rate: 0 }
-  const summary = useApiData<UsageSummary>(emptySummary, () => api.get<UsageSummary>('/api/usage/summary'), [])
-  const models = useApiData<ModelUsage[]>([], () => api.list<ModelUsage>('/api/usage/models'), [])
-  const cacheRate = Math.min(100, Math.max(0, summary.data.cache_hit_rate <= 1 ? summary.data.cache_hit_rate * 100 : summary.data.cache_hit_rate))
+  const today = usageDateKey(new Date())
+  const [startDate, setStartDate] = useState(today)
+  const [endDate, setEndDate] = useState(today)
+  const [datePreset, setDatePreset] = useState<UsageDatePreset>('today')
+  const [rangeAnchor, setRangeAnchor] = useState(() => new Date())
+  const range = usageDateRange(startDate, endDate, datePreset, rangeAnchor)
+  const summary = useApiData<UsageSummary>(emptySummary, () => api.get<UsageSummary>(`/api/usage/summary${range}`), [range])
+  const models = useApiData<ModelUsage[]>([], () => api.list<ModelUsage>(`/api/usage/models${range}`), [range])
+  const sessions = useApiData<UsageSession[]>([], () => api.list<UsageSession>(`/api/usage/sessions${range}`), [range])
+  const projects = useApiData<UsageWorkspace[]>([], () => api.list<UsageWorkspace>(`/api/usage/workspaces${range}`), [range])
+  const sessionUsage = sessions.data.map((item): UsageBreakdownItem => ({
+    id: item.session_id ?? 'unassigned-session',
+    title: item.title || '未关联对话',
+    requests: item.requests,
+    tokens: item.tokens,
+    total_cost_usd: item.total_cost_usd,
+    avg_cost_usd: item.avg_cost_usd,
+    cache_hit_rate: item.cache_hit_rate,
+  }))
+  const workspaceUsage = projects.data.map((item): UsageBreakdownItem => ({
+    id: item.workspace_id ?? 'unassigned-workspace',
+    title: item.name || '未关联项目',
+    path: item.path || undefined,
+    requests: item.requests,
+    tokens: item.tokens,
+    total_cost_usd: item.total_cost_usd,
+    avg_cost_usd: item.avg_cost_usd,
+    cache_hit_rate: item.cache_hit_rate,
+  }))
+  const cacheRate = usageRate(summary.data.cache_hit_rate)
+  function setPreset(preset: QuickUsageDatePreset) {
+    const anchor = new Date()
+    const { start, end } = usageDatePresetBounds(preset, anchor)
+    setDatePreset(preset)
+    setRangeAnchor(anchor)
+    setStartDate(usageDateKey(start))
+    setEndDate(usageDateKey(end))
+  }
+  function reloadUsage() {
+    if (datePreset !== 'custom') {
+      setRangeAnchor(new Date())
+      return
+    }
+    void Promise.all([summary.reload(), models.reload(), sessions.reload(), projects.reload()])
+  }
   const usageCards = [
     { label: '输入 Token', value: formatTokens(summary.data.input_tokens), icon: ArrowRight },
     { label: '输出 Token', value: formatTokens(summary.data.output_tokens), icon: Sparkles },
@@ -1637,9 +1941,15 @@ function UsagePage() {
   ]
   return (
     <div className="page usage-page">
-      <PageHeader eyebrow="TOKEN & COST" title="用量统计" description="集中查看所有模型请求的 Token、缓存与成本；无法获得价格的模型按 $0 显示。" action={<button className="button button-secondary" onClick={() => void Promise.all([summary.reload(), models.reload()])}><RefreshCw size={15} />刷新</button>} />
-      {summary.error ? <ErrorState message={summary.error} onRetry={summary.reload} /> : summary.loading ? <LoadingState /> : <>
+      <PageHeader eyebrow="TOKEN & COST" title="用量统计" description="按时间范围查看模型、对话与项目的 Token、缓存和成本。" action={<button className="button button-secondary" onClick={reloadUsage}><RefreshCw size={15} />刷新</button>} />
+      <section className="usage-date-filter card" aria-label="用量日期范围">
+        <div className="usage-date-filter-head"><div><CalendarDays size={16} /><span>统计日期</span></div><small>{usageRangeLabel(startDate, endDate, datePreset)}</small></div>
+        <div className="usage-date-presets" role="group" aria-label="快捷日期范围">{usageDateOptions.map(({ id, label }) => <button key={id} type="button" className={datePreset === id ? 'active' : ''} onClick={() => setPreset(id)}>{label}</button>)}</div>
+        <div className="usage-date-inputs"><label><span>开始日期</span><input type="date" value={startDate} max={endDate || undefined} onChange={(event) => { setDatePreset('custom'); setStartDate(event.target.value) }} /></label><span className="usage-date-separator">至</span><label><span>结束日期</span><input type="date" value={endDate} min={startDate || undefined} max={today} onChange={(event) => { setDatePreset('custom'); setEndDate(event.target.value) }} /></label></div>
+      </section>
+      {summary.error && !summary.data.total_requests ? <ErrorState message={summary.error} onRetry={summary.reload} /> : summary.initialLoading ? <LoadingState /> : <>
         <section className="usage-hero card">
+          {summary.refreshing && <UsageRefreshBadge />}
           <div className="usage-total"><span className="usage-bolt"><ChartNoAxesCombined size={22} /></span><div><p>实际消耗 Token</p><strong>{summary.data.total_tokens.toLocaleString()}</strong><small>≈ {formatTokens(summary.data.total_tokens)}</small></div></div>
           <dl className="usage-mini-totals"><div><dt>成功模型响应数</dt><dd>{summary.data.total_requests.toLocaleString()}</dd></div><div><dt>总成本</dt><dd>{formatCost(summary.data.total_cost_usd)}</dd></div></dl>
           <div className="usage-card-grid">{usageCards.map(({ label, value, icon: Icon }) => <article key={label}><span><Icon size={15} />{label}</span><strong>{value}</strong></article>)}</div>
@@ -1647,14 +1957,29 @@ function UsagePage() {
         </section>
       </>}
       <section className="usage-models card">
-        <div className="card-heading"><div><p className="eyebrow">BY MODEL</p><h2>模型明细</h2></div></div>
-        {models.error ? <ErrorState message={models.error} onRetry={models.reload} /> : models.loading ? <LoadingState /> : models.data.length ? <div className="usage-table-wrap"><table><thead><tr><th>模型 / 提供商</th><th>响应数</th><th>Tokens</th><th>总成本</th><th>平均成本</th></tr></thead><tbody>{models.data.map((model) => <tr key={`${model.provider || 'unknown'}:${model.model_id}`}><th><span>{model.model_id || 'unknown'}</span><small>{model.provider || 'unknown provider'}</small></th><td>{model.requests.toLocaleString()}</td><td>{model.tokens.toLocaleString()}</td><td>{formatCost(model.total_cost_usd)}</td><td>{formatCost(model.avg_cost_usd)}</td></tr>)}</tbody></table></div> : <EmptyState icon={ChartNoAxesCombined} title="还没有用量记录" description="完成一次模型调用后，这里会按提供商与模型累计 Token 和成本。" />}
+        <div className="card-heading"><div><p className="eyebrow">BY MODEL</p><h2>模型明细</h2></div>{models.refreshing && <UsageRefreshBadge />}</div>
+        {models.error && !models.data.length ? <ErrorState message={models.error} onRetry={models.reload} /> : models.initialLoading ? <LoadingState /> : models.data.length ? <div className="usage-table-wrap"><table><thead><tr><th>模型 / 提供商</th><th>响应数</th><th>Tokens</th><th>命中率</th><th>总成本</th><th>平均成本</th></tr></thead><tbody>{models.data.map((model) => <tr key={`${model.provider || 'unknown'}:${model.model_id}`}><th><span>{model.model_id || 'unknown'}</span><small>{model.provider || 'unknown provider'}</small></th><td>{model.requests.toLocaleString()}</td><td>{model.tokens.toLocaleString()}</td><td>{usageRate(model.cache_hit_rate).toFixed(1)}%</td><td>{formatCost(model.total_cost_usd)}</td><td>{formatCost(model.avg_cost_usd)}</td></tr>)}</tbody></table></div> : <EmptyState icon={ChartNoAxesCombined} title="该日期范围暂无用量" description="调整日期范围，或在该范围内完成一次模型调用后再查看。" />}
       </section>
+      <UsageBreakdown title="对话用量" eyebrow="BY CONVERSATION" emptyDescription="该日期范围内暂无产生模型调用的对话。" data={sessionUsage} initialLoading={sessions.initialLoading} refreshing={sessions.refreshing} error={sessions.error} onRetry={sessions.reload} />
+      <UsageBreakdown title="项目用量" eyebrow="BY PROJECT" emptyDescription="该日期范围内暂无项目关联的模型调用。" data={workspaceUsage} initialLoading={projects.initialLoading} refreshing={projects.refreshing} error={projects.error} onRetry={projects.reload} />
     </div>
   )
 }
 
-function TeamsPage() {
+function UsageRefreshBadge() {
+  return <span className="usage-refresh-badge" role="status"><LoaderCircle className="spin" size={12} />更新中</span>
+}
+
+function UsageBreakdown({ title, eyebrow, emptyDescription, data, initialLoading, refreshing, error, onRetry }: { title: string; eyebrow: string; emptyDescription: string; data: UsageBreakdownItem[]; initialLoading: boolean; refreshing: boolean; error: string; onRetry: () => void }) {
+  return <section className="usage-models card">
+    <div className="card-heading"><div><p className="eyebrow">{eyebrow}</p><h2>{title}</h2></div>{refreshing && <UsageRefreshBadge />}</div>
+    {error && !data.length ? <ErrorState message={error} onRetry={onRetry} /> : initialLoading ? <LoadingState /> : data.length ? <div className="usage-table-wrap"><table><thead><tr><th>名称</th><th>响应数</th><th>Tokens</th><th>命中率</th><th>总成本</th><th>平均成本</th></tr></thead><tbody>{data.map((item) => <tr key={item.id}><th><span title={item.path || item.title}>{item.title}</span>{item.path && <small title={item.path}>{item.path}</small>}</th><td>{item.requests.toLocaleString()}</td><td>{item.tokens.toLocaleString()}</td><td>{usageRate(item.cache_hit_rate).toFixed(1)}%</td><td>{formatCost(item.total_cost_usd)}</td><td>{formatCost(item.avg_cost_usd)}</td></tr>)}</tbody></table></div> : <EmptyState icon={ChartNoAxesCombined} title="暂无用量记录" description={emptyDescription} />}
+  </section>
+}
+
+// Reserved for the future multi-user collaboration feature. It is intentionally
+// not routed or shown in navigation during the current release.
+export function TeamsPage() {
   const tasks = useApiData<TeamTask[]>([], () => api.list<TeamTask>('/api/teams/tasks', ['tasks']), [])
   const agents = useApiData<AgentProfile[]>([], () => api.list<AgentProfile>('/api/agents', ['agents']), [])
   const [panelOpen, setPanelOpen] = useState(false)

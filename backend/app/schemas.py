@@ -41,6 +41,7 @@ class WorkspaceRead(ORMModel):
 ThinkingLevel = Literal["off", "auto", "low", "medium", "high", "xhigh"]
 AgentMode = Literal["auto", "direct", "plan"]
 PermissionMode = Literal["ask", "smart", "full"]
+SkillMarketBrowseView = Literal["all-time", "trending", "hot", "curated"]
 
 
 class ToolRead(BaseModel):
@@ -87,6 +88,11 @@ class SkillMarketItem(BaseModel):
     source_url: str | None = None
     market_url: str | None = None
     installs: int | None = None
+    change: int | None = None
+    installs_yesterday: int | None = None
+    is_official: bool = False
+    official_owner: str | None = None
+    is_duplicate: bool = False
 
 
 class SkillMarketSearchRead(BaseModel):
@@ -94,6 +100,34 @@ class SkillMarketSearchRead(BaseModel):
     available: bool
     message: str | None = None
     items: list[SkillMarketItem] = Field(default_factory=list)
+
+
+class SkillMarketBrowseRead(SkillMarketSearchRead):
+    """A safe, normalized page from the skills.sh public catalog."""
+
+    view: SkillMarketBrowseView = "all-time"
+    page: int = 0
+    has_more: bool = False
+    total: int | None = None
+
+
+class SkillMarketLeaderboardCategory(BaseModel):
+    """One fixed topical leaderboard, with at most six popular Skills."""
+
+    id: str
+    name: str
+    description: str
+    items: list[SkillMarketItem] = Field(default_factory=list, max_length=6)
+
+
+class SkillMarketLeaderboardsRead(SkillMarketSearchRead):
+    """Cached, topic-based marketplace leaderboards."""
+
+    categories: list[SkillMarketLeaderboardCategory] = Field(default_factory=list)
+    refreshed_at: datetime | None = None
+    expires_at: datetime | None = None
+    ttl_seconds: int
+    cached: bool = False
 
 
 class SkillMarketInstallRequest(BaseModel):
@@ -489,6 +523,28 @@ class UsageModelRead(BaseModel):
     tokens: int
     total_cost_usd: float
     avg_cost_usd: float
+    cache_hit_rate: float
+
+
+class UsageSessionRead(BaseModel):
+    session_id: str | None
+    title: str | None
+    requests: int
+    tokens: int
+    total_cost_usd: float
+    avg_cost_usd: float
+    cache_hit_rate: float
+
+
+class UsageWorkspaceRead(BaseModel):
+    workspace_id: str | None
+    name: str | None
+    path: str | None
+    requests: int
+    tokens: int
+    total_cost_usd: float
+    avg_cost_usd: float
+    cache_hit_rate: float
 
 
 class DashboardRead(BaseModel):
@@ -543,6 +599,22 @@ class TeamTaskRead(ORMModel):
     lease_owner: str | None
     lease_expires_at: datetime | None
     idempotency_key: str | None
+    result: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class DelegatedTaskRead(ORMModel):
+    """Read-only child-Agent delegation state for a conversation."""
+
+    id: str
+    parent_run_id: str
+    parent_session_id: str | None
+    child_run_id: str | None
+    child_agent_id: str | None
+    title: str
+    description: str
+    status: str
     result: dict[str, Any]
     created_at: datetime
     updated_at: datetime

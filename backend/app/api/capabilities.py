@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -10,14 +10,19 @@ from app.database import Skill, get_db
 from app.schemas import (
     SkillImportRequest,
     SkillInstallRead,
+    SkillMarketBrowseRead,
     SkillMarketInstallRequest,
+    SkillMarketLeaderboardsRead,
     SkillMarketSearchRead,
     SkillMarketSearchRequest,
+    SkillMarketBrowseView,
     SkillRead,
     ToolRead,
 )
 from app.services.skill_service import (
+    browse_market,
     install_local_skill,
+    market_leaderboards,
     market_status,
     preview_github_skill,
     preview_market_skill,
@@ -60,6 +65,42 @@ def search_skill_market(payload: SkillMarketSearchRequest) -> SkillMarketSearchR
     return SkillMarketSearchRead(available=available, message=message, items=items)
 
 
+@router.get("/skills/market/browse", response_model=SkillMarketBrowseRead)
+def browse_skill_market(
+    view: SkillMarketBrowseView = "all-time",
+    page: int = Query(default=0, ge=0, le=10_000),
+    per_page: int = Query(default=12, ge=1, le=50),
+) -> SkillMarketBrowseRead:
+    """Browse popular marketplace Skills while keeping installation explicit."""
+
+    available, message, items, has_more, total = browse_market(view, page=page, per_page=per_page)
+    return SkillMarketBrowseRead(
+        available=available,
+        message=message,
+        items=items,
+        view=view,
+        page=page,
+        has_more=has_more,
+        total=total,
+    )
+
+
+@router.get("/skills/market/leaderboards", response_model=SkillMarketLeaderboardsRead)
+def get_market_leaderboards(
+    refresh: bool = Query(default=False),
+) -> SkillMarketLeaderboardsRead:
+    """Read five cached topic leaderboards; ``refresh=true`` rebuilds them."""
+
+    return SkillMarketLeaderboardsRead(**market_leaderboards(refresh=refresh))
+
+
+@router.post("/skills/market/leaderboards/refresh", response_model=SkillMarketLeaderboardsRead)
+def refresh_market_leaderboards() -> SkillMarketLeaderboardsRead:
+    """Explicitly rebuild the cached topic leaderboards."""
+
+    return SkillMarketLeaderboardsRead(**market_leaderboards(refresh=True))
+
+
 @router.post("/skills/market/install", response_model=SkillInstallRead)
 def preview_or_install_market_skill(
     payload: SkillMarketInstallRequest, db: Session = Depends(get_db)
@@ -84,4 +125,3 @@ def preview_or_install_market_skill(
         skill=SkillRead.model_validate(installed) if installed is not None else None,
         message=None if installed is not None else "Preview only. Set confirm=true to copy this Skill into PGAgent.",
     )
-
