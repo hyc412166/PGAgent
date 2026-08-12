@@ -1,0 +1,189 @@
+import {
+  Bot,
+  CheckCheck,
+  ChevronRight,
+  Copy,
+  LoaderCircle,
+  ShieldCheck,
+  Sparkles,
+  SquareTerminal,
+  Users,
+  X,
+  XCircle,
+  CheckCircle2,
+} from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { formatLiveThinkingDuration, formatThoughtDuration, type ThoughtTimelineState } from '../../thoughtTimeline'
+import type { Approval, DelegatedTask, Message, Run, RunEvent } from '../../types'
+import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../components/ui'
+import { statusText } from '../../components/status'
+
+export type LiveRunView = {
+  runId: string
+  phase: string
+  draft: string
+  status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'
+  error: string
+  thought: ThoughtTimelineState
+  thinkingStatus: string
+}
+
+function formatUiDate(value?: string) {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date)
+}
+
+function numberFromRecord(record: Record<string, unknown> | undefined, key: string) {
+  const value = record?.[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function childTaskStatusLabel(status?: string) {
+  return statusText[(status || '').toLowerCase()] ?? status ?? '处理中'
+}
+
+function childTaskOutput(task?: DelegatedTask) {
+  const output = task?.result?.output
+  if (typeof output === 'string' && output.trim()) return output
+  const error = task?.result?.error
+  if (typeof error === 'string' && error.trim()) return error
+  return ''
+}
+
+export function ChildAgentPanel({
+  tasks,
+  loading,
+  error,
+  selectedTask,
+  run,
+  events,
+  eventsLoading,
+  eventsError,
+  onClose,
+  onSelect,
+  onRetry,
+}: {
+  tasks: DelegatedTask[]
+  loading: boolean
+  error: string
+  selectedTask?: DelegatedTask
+  run?: Run
+  events: RunEvent[]
+  eventsLoading: boolean
+  eventsError: string
+  onClose: () => void
+  onSelect: (taskId: string) => void
+  onRetry: () => void
+}) {
+  const output = childTaskOutput(selectedTask)
+  const toolEvents = events.filter((event) => ['tool_started', 'tool_finished', 'tool_result'].includes(event.type || event.event_type || ''))
+  return <aside className="child-agent-panel" aria-label="子 Agent 工作详情">
+    <header className="child-panel-header"><div><span className="eyebrow">协作执行</span><strong>子 Agent</strong></div><button type="button" className="icon-button" onClick={onClose} aria-label="收起子 Agent 侧栏"><X size={16} /></button></header>
+    {error ? <ErrorState message={error} onRetry={onRetry} /> : loading && !tasks.length ? <LoadingState label="正在读取子 Agent…" /> : !tasks.length ? <EmptyState icon={Users} title="子 Agent 正在启动" description="任务创建后会显示在这里。" /> : <>
+      <div className="child-task-list" role="list" aria-label="本次调用的子 Agent">
+        {tasks.map((task) => {
+          const selected = task.id === selectedTask?.id
+          const agent = task.result?.agent
+          const agentName = agent && typeof agent === 'object' && typeof (agent as Record<string, unknown>).name === 'string'
+            ? String((agent as Record<string, unknown>).name)
+            : task.child_agent_name || '子 Agent'
+          return <button key={task.id} type="button" className={selected ? 'selected' : ''} onClick={() => onSelect(task.id)}>
+            <span className="child-task-avatar"><Bot size={14} /></span><span><strong>{agentName}</strong><small>{task.title}</small></span><StatusBadge status={task.status} />
+          </button>
+        })}
+      </div>
+      {selectedTask && <section className="child-task-detail">
+        <header><div><strong>{selectedTask.title}</strong><small>{childTaskStatusLabel(selectedTask.status)}</small></div><StatusBadge status={selectedTask.status} /></header>
+        <dl className="child-task-stats"><div><dt>步骤</dt><dd>{numberFromRecord(selectedTask.result, 'steps') ?? run?.step_count ?? run?.current_step ?? 0}</dd></div><div><dt>工具</dt><dd>{numberFromRecord(selectedTask.result, 'tool_calls') ?? run?.tool_calls ?? 0}</dd></div></dl>
+        {selectedTask.description && <section className="child-detail-block"><strong>任务</strong><p>{selectedTask.description}</p></section>}
+        {output && <section className="child-detail-block"><strong>{selectedTask.status === 'completed' ? '结果' : '状态说明'}</strong><pre>{output}</pre></section>}
+        <section className="child-detail-block child-events"><strong>工作过程</strong>{eventsError ? <p className="inline-error">{eventsError}</p> : eventsLoading ? <p>正在读取运行事件…</p> : toolEvents.length ? <ol>{toolEvents.map((event, index) => <li key={event.id || index}><span>{event.type || event.event_type}</span><small>{formatUiDate(event.created_at)}</small></li>)}</ol> : <p>暂未记录工具调用。</p>}</section>
+      </section>}
+    </>}
+  </aside>
+}
+
+export function MessageBubble({ message }: { message: Message }) {
+  const [copied, setCopied] = useState(false)
+  const isTool = message.role === 'tool' || !!message.tool_name
+  const isDelegatedChild = message.metadata?.delegated_child === true
+  const childAgentName = typeof message.metadata?.child_agent_name === 'string'
+    ? message.metadata.child_agent_name
+    : '子 Agent'
+  const speaker = message.role === 'user'
+    ? '你'
+    : isTool
+      ? message.tool_name || '工具结果'
+      : isDelegatedChild
+        ? `${childAgentName}（子 Agent）`
+        : 'PGAgent'
+  async function copyMessage() {
+    try {
+      await navigator.clipboard.writeText(message.content || '')
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1400)
+    } catch {
+      setCopied(false)
+    }
+  }
+  return (
+    <article className={`message ${message.role} ${isTool ? 'tool-message' : ''}`}>
+      <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <Sparkles size={16} />}</div>
+      <div className="message-body"><div className="message-meta"><strong>{speaker}</strong><time>{formatUiDate(message.created_at)}</time><button type="button" className="message-copy-button" aria-label={copied ? '已复制' : '复制消息'} title={copied ? '已复制' : '复制消息'} onClick={() => void copyMessage()}>{copied ? <CheckCheck size={13} /> : <Copy size={13} />}</button></div><div className="message-content">{message.content}</div>{message.status && <StatusBadge status={message.status} />}</div>
+    </article>
+  )
+}
+
+export function CompletedThoughtTimeline({ runId, timeline }: { runId: string; timeline: ThoughtTimelineState }) {
+  const [expanded, setExpanded] = useState(false)
+  const duration = formatThoughtDuration(timeline.elapsedMs)
+  const hasDetails = timeline.tools.length > 0
+
+  return <article className={`completed-thought ${hasDetails && expanded ? 'expanded' : ''} ${hasDetails ? '' : 'no-details'}`}>
+    {hasDetails ? <button type="button" className="completed-thought-toggle" aria-expanded={expanded} aria-controls={`thought-details-${runId}`} onClick={() => setExpanded((value) => !value)}>
+      <span className="completed-thought-duration">已处理 {duration}</span><ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
+    </button> : <span className="completed-thought-duration completed-thought-static">已处理 {duration}</span>}
+    {hasDetails && expanded && <div id={`thought-details-${runId}`} className="thought-tool-list" aria-label="工具调用">{timeline.tools.map((tool) => <p key={tool.id} className={`thought-tool ${tool.status}`}><span>{tool.name.startsWith('Web') ? '⌁' : '→'}</span><strong>{tool.name}</strong>{tool.target && <code title={tool.target}>{tool.target}</code>}{tool.status === 'running' && <i aria-label="运行中" />}</p>)}</div>}
+  </article>
+}
+
+export function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunView }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (liveRun.thought.startedAt === null || liveRun.thought.finished) return
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), 100)
+    return () => window.clearInterval(timer)
+  }, [liveRun.thought.finished, liveRun.thought.startedAt])
+  const liveThoughtMs = liveRun.thought.startedAt === null ? 0 : Math.max(0, now - liveRun.thought.startedAt)
+  const phase = liveRun.phase.includes('子 Agent')
+    ? liveRun.phase
+    : !liveRun.thought.finished && liveRun.status !== 'awaiting_approval' && liveRun.thinkingStatus
+      ? `${liveRun.thinkingStatus} ${formatLiveThinkingDuration(liveThoughtMs)}`
+      : liveRun.phase || '已完成'
+  return (
+    <article className={`message assistant live-message ${liveRun.status === 'terminal' ? 'live-message-terminal' : ''}`}>
+      <div className="message-avatar"><Sparkles size={16} /></div>
+      <div className="message-body"><div className="message-meta"><strong>PGAgent</strong><span className="live-phase"><i aria-hidden="true" />{phase}</span></div>{liveRun.draft && <div className="message-content">{liveRun.draft}</div>}{liveRun.error && <p className="live-error">{liveRun.error}</p>}</div>
+    </article>
+  )
+}
+
+export function ApprovalCard({ approval, deciding, onDecision }: { approval: Approval; deciding: boolean; onDecision: (id: string, decision: 'approve' | 'reject', runId: string) => void }) {
+  const runId = typeof approval.run_id === 'string' || typeof approval.run_id === 'number' ? String(approval.run_id) : ''
+  return (
+    <article className="approval-card">
+      <header><span><ShieldCheck size={17} /></span><div><strong>需要你的批准</strong><p>Agent 请求执行有副作用的工具</p></div><StatusBadge status={approval.status || 'pending'} /></header>
+      <div className="approval-command"><span>{approval.tool_name || 'unknown_tool'}</span><pre>{JSON.stringify(approval.arguments ?? {}, null, 2)}</pre></div>
+      {approval.reason && <p className="approval-reason">理由：{approval.reason}</p>}
+      <footer><button className="button button-danger" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'reject', runId)}><XCircle size={15} />拒绝</button><button className="button button-primary" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'approve', runId)}>{deciding ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}允许本次</button></footer>
+    </article>
+  )
+}

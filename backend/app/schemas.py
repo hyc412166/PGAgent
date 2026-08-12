@@ -516,6 +516,20 @@ class UsageSummaryRead(BaseModel):
     cache_hit_rate: float
 
 
+class UsageRunRead(BaseModel):
+    run_id: str
+    provider: str | None = None
+    model_id: str | None = None
+    requests: int
+    input_tokens: int
+    output_tokens: int
+    cache_creation_tokens: int
+    cache_read_tokens: int
+    total_tokens: int
+    total_cost_usd: float
+    cache_hit_rate: float
+
+
 class UsageModelRead(BaseModel):
     provider: str
     model_id: str

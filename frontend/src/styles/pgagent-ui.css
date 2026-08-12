@@ -314,6 +314,10 @@ select {
 .message-copy-button { display: inline-grid; place-items: center; width: 22px; height: 22px; margin-left: auto; padding: 0; border: 0; border-radius: 7px; color: var(--muted-2); opacity: 0; background: transparent; }
 .message:hover .message-copy-button, .message-copy-button:focus-visible { opacity: 1; }
 .message-copy-button:hover { color: var(--violet); background: var(--violet-soft); }
+.run-usage-heading { display: flex; align-items: center; gap: 7px; margin-top: 15px; color: var(--ink); }
+.run-usage-heading strong { font-size: 11px; }
+.run-usage-heading span { min-width: 0; overflow: hidden; color: var(--muted-2); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.run-usage-grid { margin-top: 8px; }
 .message-content { color: var(--ink); font-size: 12px; line-height: 1.78; }
 .message.assistant .message-content { max-width: 78ch; }
 .message.user .message-body { max-width: min(76%, 700px); }

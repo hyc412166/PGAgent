@@ -24,6 +24,7 @@ PGAgent 是一个本地优先、单用户的 Agent 工作台。它参考了视�
 - 401/403 不重试；429、5xx、连接失败和模型超时最多重试 3 次。
 - 单个会话上下文预算为 100k Token，达到 90k 时自动压缩；会话、工作区、全局三级记忆继续分层保存。
 - 用量页统计请求数、输入/输出/缓存 Token、缓存命中率、估算成本以及逐模型明细；无法识别价格的模型成本显示为 0。
+- 运行记录详情会在有 provider 用量回报时展示本次运行的输入/输出 Token、缓存命中率和成本；没有回报时明确标记为不可统计，不把汇总数据冒充单次数据。
 - 多 Agent 任务使用 SQLite 任务板、CAS 版本、lease、幂等键、TTL、hop 上限以及 pending/delivered/ack 消息状态。
 - UI 视觉层采用独立的磨砂玻璃样式文件，支持浅色/深色主题、居中阅读列、固定输入栏、消息内联时间线和四个专业 Agent 快速模板；设计取舍与响应式约束见 `docs/UI_ARCHITECTURE.md`。
 
@@ -61,6 +62,7 @@ API Key 不写入 SQLite，保存到 Windows Credential Manager；数据库只�
 ## Tool、Skill 与权限 API
 
 - `GET /api/tools`：内置工具目录，字段包括 `id/name/label/description/category/risk_level/enabled/is_builtin/availability` 和可选的 `runtime_tool_id`。
+- `GET /api/usage/runs/{run_id}`：读取单次运行的精确 Token/缓存/成本明细；无 provider 用量回报时返回 `null`。
 - `GET /api/skills`、`POST /api/skills/import`：列出或安全导入本地 `SKILL.md` 文件夹。
 - `GET /api/skills/market/status`、`POST /api/skills/market/search`：skills.sh 市场状态与搜索。市场 API 需要环境变量 `SKILLS_SH_API_TOKEN`（或 Vercel OIDC token）；未配置时会明确返回 `available=false`，不会伪造搜索结果。
 - `POST /api/skills/market/install`：传入 `market_id` 或受限的公开 GitHub 仓库/ZIP `source_url`。默认只返回候选 Skill 与文件预览；再次携带 `confirm=true` 才会复制，不执行任何 Skill 脚本。

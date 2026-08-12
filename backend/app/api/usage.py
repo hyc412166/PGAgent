@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.database import Run, Session as ChatSession, UsageRecord, Workspace, get_db
-from app.schemas import UsageModelRead, UsageSessionRead, UsageSummaryRead, UsageWorkspaceRead
+from app.schemas import UsageModelRead, UsageRunRead, UsageSessionRead, UsageSummaryRead, UsageWorkspaceRead
 
 
 router = APIRouter(prefix="/api/usage", tags=["usage"])
@@ -69,6 +69,32 @@ def usage_summary(
         total_tokens=int(total_tokens),
         total_cost_usd=float(total_cost),
         cache_hit_rate=_cache_hit_rate(int(input_tokens), int(cache_creation), int(cache_read)),
+    )
+
+
+@router.get("/runs/{run_id}", response_model=UsageRunRead | None)
+def usage_by_run(run_id: str, db: Session = Depends(get_db)) -> UsageRunRead | None:
+    """Return the exact usage record for one run, when the provider reported it."""
+
+    record = db.scalar(select(UsageRecord).where(UsageRecord.run_id == run_id))
+    if record is None:
+        return None
+    return UsageRunRead(
+        run_id=run_id,
+        provider=record.provider,
+        model_id=record.model_id,
+        requests=int(record.request_count),
+        input_tokens=int(record.input_tokens),
+        output_tokens=int(record.output_tokens),
+        cache_creation_tokens=int(record.cache_creation_tokens),
+        cache_read_tokens=int(record.cache_read_tokens),
+        total_tokens=int(record.total_tokens),
+        total_cost_usd=float(record.cost_usd),
+        cache_hit_rate=_cache_hit_rate(
+            int(record.input_tokens),
+            int(record.cache_creation_tokens),
+            int(record.cache_read_tokens),
+        ),
     )
 
 

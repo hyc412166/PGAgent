@@ -705,7 +705,11 @@ class AgentRuntime:
                             micro_compact=False,
                             cache_key=prompt_cache_key,
                         )
-                        bundle = type(bundle)(
+                        # Keep the concrete bundle type.  ``bundle`` is a
+                        # ContextBundle in both the legacy and checkpoint
+                        # paths; constructing its dynamic runtime type would
+                        # fail exactly when a real semantic compaction fires.
+                        bundle = ContextBundle(
                             messages=compacted_layout.messages,
                             estimated_tokens=compacted_layout.estimated_tokens,
                             omitted_messages=0,
