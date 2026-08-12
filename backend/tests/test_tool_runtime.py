@@ -4,6 +4,7 @@ import pytest
 
 from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn
 from app.tools import create_default_registry
+from app.tools.policy import assess_tool_call
 
 
 def test_registry_exposes_only_selected_tools_and_enforces_permission_modes(tmp_path) -> None:
@@ -40,6 +41,84 @@ def test_registry_exposes_only_selected_tools_and_enforces_permission_modes(tmp_
     blocked_command = full_registry.execute("bash", {"command": ["not-an-allowed-command"]})
     assert not blocked_command.ok
     assert blocked_command.error_code == "command_not_allowed"
+
+
+def test_smart_mode_allows_routine_code_edits_but_escalates_sensitive_or_broad_writes(tmp_path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("print('before')\n", encoding="utf-8")
+    (tmp_path / "large.txt").write_text("x" * 70_000, encoding="utf-8")
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["write", "edit"],
+        permission_mode="smart",
+    )
+
+    routine_edit = registry.execute(
+        "edit",
+        {"path": "src/app.py", "old_string": "before", "new_string": "after"},
+    )
+    assert routine_edit.ok
+    assert (tmp_path / "src" / "app.py").read_text(encoding="utf-8") == "print('after')\n"
+
+    routine_write = registry.execute("write", {"path": "src/new.py", "content": "print('ok')\n"})
+    assert routine_write.ok
+
+    sensitive = registry.execute("write", {"path": ".env", "content": "API_KEY=demo"})
+    assert sensitive.approval_required
+    assert "环境变量" in sensitive.content
+
+    control_plane = registry.execute("write", {"path": ".github/workflows/release.yml", "content": "jobs: {}"})
+    assert control_plane.approval_required
+    assert "自动化" in control_plane.content
+
+    destructive = registry.execute("write", {"path": "large.txt", "content": "short"})
+    assert destructive.approval_required
+    assert "显著缩小" in destructive.content
+
+
+def test_smart_mode_classifies_commands_by_exact_arguments(tmp_path) -> None:
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["bash"],
+        permission_mode="smart",
+    )
+
+    # A deterministic project check does not pause for approval. It may fail on
+    # an empty directory, which is unrelated to the approval decision.
+    pytest_check = registry.execute("bash", {"command": ["pytest", "--version"]})
+    assert not pytest_check.approval_required
+
+    git_status = assess_tool_call(
+        "bash",
+        "smart",
+        arguments={"command": ["git", "status", "--short"]},
+        approved=False,
+        workspace_root=tmp_path,
+    )
+    assert not git_status.requires_approval
+
+    for command, clue in (
+        (["git", "reset", "--hard"], "Git"),
+        (["npm", "install"], "npm"),
+        (["python", "-c", "print('arbitrary code')"], "Python"),
+        ("pytest && git status", "shell 控制符"),
+    ):
+        pending = registry.execute("bash", {"command": command})
+        assert pending.approval_required
+        assert clue in pending.content
+
+
+def test_permission_modes_keep_their_distinct_boundaries_for_the_same_write(tmp_path) -> None:
+    arguments = {"path": "src/app.py", "content": "print('ok')\n"}
+
+    ask = create_default_registry(str(tmp_path), allowed_tool_names=["write"], permission_mode="ask")
+    assert ask.execute("write", arguments).approval_required
+
+    smart = create_default_registry(str(tmp_path), allowed_tool_names=["write"], permission_mode="smart")
+    assert smart.execute("write", arguments).ok
+
+    full = create_default_registry(str(tmp_path), allowed_tool_names=["write"], permission_mode="full")
+    assert full.execute("write", {"path": ".env", "content": "API_KEY=demo"}).ok
 
 
 def test_edit_glob_and_grep_are_real_sandboxed_tools(tmp_path) -> None:
@@ -118,7 +197,7 @@ async def test_task_delegate_is_not_started_until_parent_approval(tmp_path) -> N
     registry = create_default_registry(
         str(tmp_path),
         allowed_tool_names=["task"],
-        permission_mode="smart",
+        permission_mode="ask",
         task_delegate=delegate,
     )
     pending = await registry.execute_async(

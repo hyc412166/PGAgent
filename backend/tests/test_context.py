@@ -184,3 +184,57 @@ def test_runtime_trim_drops_incomplete_tool_call_group() -> None:
     ])
     assert [message["role"] for message in trimmed] == ["system"]
     assert omitted == 2
+
+
+def test_task_anchor_survives_runtime_trim_with_the_newest_complete_tool_group() -> None:
+    manager = ContextManager(max_tokens=520)
+    task = "Produce the release checklist and keep validating the deployment result."
+    anchor = manager.task_anchor_message(task)
+    assert anchor is not None
+
+    messages = [
+        anchor,
+        {"role": "system", "content": "Follow workspace safety rules."},
+        {"role": "user", "content": task},
+        {"role": "user", "content": "old context " + ("x" * 2_000)},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "latest-read", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "latest-read",
+            "name": "read_file",
+            "content": "latest observation " + ("y" * 2_000),
+        },
+    ]
+
+    trimmed, omitted = manager.trim_runtime_messages(messages)
+
+    assert omitted >= 2
+    assert manager.has_task_anchor(trimmed)
+    assert task in next(item["content"] for item in trimmed if manager.is_task_anchor(item))
+    tool_pair = [item for item in trimmed if item.get("tool_call_id") == "latest-read"]
+    assert [item["role"] for item in tool_pair] == ["tool"]
+    assistant_index = next(index for index, item in enumerate(trimmed) if item.get("role") == "assistant")
+    assert trimmed[assistant_index + 1]["tool_call_id"] == "latest-read"
+    assert sum(message_tokens(item) for item in trimmed) <= 520
+
+
+def test_build_reserves_the_task_anchor_when_other_system_context_is_large() -> None:
+    manager = ContextManager(max_tokens=512)
+    task = "Keep this deployment task available throughout the current run."
+
+    result = manager.build(
+        system_prompt="s" * 20_000,
+        agent_instructions="i" * 20_000,
+        workspace_rules="w" * 20_000,
+        task_anchor=task,
+        recent_messages=[{"role": "user", "content": task}],
+    )
+
+    anchors = [message for message in result.messages if manager.is_task_anchor(message)]
+    assert len(anchors) == 1
+    assert task in anchors[0]["content"]
+    assert sum(message_tokens(message) for message in result.messages) <= 512

@@ -80,6 +80,8 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
     assert {"bash", "read", "write", "edit", "glob", "grep", "webfetch", "websearch", "task", "todowrite", "question", "skill"}.issubset(by_id)
     assert by_id["bash"]["runtime_tool_id"] == "bash"
     assert by_id["read"]["risk_level"] == "low"
+    assert by_id["write"]["risk_level"] == "adaptive"
+    assert by_id["write"]["requires_approval"] is False
     assert {"availability", "enabled", "is_builtin"}.issubset(by_id["skill"])
 
     default_agent = test_client.get(f"/api/agents/{DEFAULT_AGENT_ID}")
@@ -205,6 +207,233 @@ def test_market_status_does_not_pretend_an_unauthenticated_skills_sh_search_work
     assert search_response.status_code == 200
     assert search_response.json()["available"] is False
     assert search_response.json()["items"] == []
+    browse_response = test_client.get("/api/skills/market/browse?view=trending")
+    assert browse_response.status_code == 200
+    assert browse_response.json()["available"] is False
+    assert browse_response.json()["items"] == []
+
+
+def test_market_browse_normalizes_leaderboard_views_without_exposing_file_contents(
+    client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_client, _launched = client
+    monkeypatch.setenv("PGAGENT_SKILLS_SH_API_TOKEN", "test-market-token")
+    calls: list[tuple[str, dict | None]] = []
+
+    def fake_skills_sh(path: str, *, params: dict | None = None) -> dict:
+        calls.append((path, params))
+        return {
+            "data": [
+                {
+                    "id": "demo/repo/secure-skill",
+                    "slug": "secure-skill",
+                    "name": "Secure Skill",
+                    "source": "demo/repo",
+                    "installs": 321,
+                    "change": 29,
+                    "installsYesterday": 2,
+                    "installUrl": "https://github.com/demo/repo",
+                    "url": "https://skills.sh/demo/repo/secure-skill",
+                    "isDuplicate": True,
+                    "files": [{"path": "SKILL.md", "contents": "must never appear here"}],
+                }
+            ],
+            "pagination": {"page": 2, "perPage": 7, "total": 99, "hasMore": True},
+        }
+
+    monkeypatch.setattr(skill_service, "_skills_sh_json", fake_skills_sh)
+    response = test_client.get("/api/skills/market/browse?view=hot&page=2&per_page=7")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert calls == [("/api/v1/skills", {"view": "hot", "page": 2, "per_page": 7})]
+    assert body["view"] == "hot"
+    assert body["page"] == 2
+    assert body["has_more"] is True
+    assert body["total"] == 99
+    assert body["items"] == [{
+        "id": "demo/repo/secure-skill",
+        "slug": "secure-skill",
+        "name": "Secure Skill",
+        "source": "demo/repo",
+        "source_url": "https://github.com/demo/repo",
+        "market_url": "https://skills.sh/demo/repo/secure-skill",
+        "installs": 321,
+        "change": 29,
+        "installs_yesterday": 2,
+        "is_official": False,
+        "official_owner": None,
+        "is_duplicate": True,
+    }]
+    assert "must never appear here" not in response.text
+
+
+def test_market_browse_flattens_curated_owners_and_marks_official_skills(
+    client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_client, _launched = client
+    monkeypatch.setenv("PGAGENT_SKILLS_SH_API_TOKEN", "test-market-token")
+    monkeypatch.setattr(
+        skill_service,
+        "_skills_sh_json",
+        lambda path, *, params=None: {
+            "data": [
+                {
+                    "owner": "official-maker",
+                    "skills": [
+                        {"id": "official-maker/docs/product", "slug": "product", "name": "Product", "source": "official-maker/docs", "installs": 10},
+                        {"id": "official-maker/docs/second", "slug": "second", "name": "Second", "source": "official-maker/docs", "installs": 9},
+                    ],
+                }
+            ]
+        },
+    )
+
+    response = test_client.get("/api/skills/market/browse?view=curated&page=0&per_page=1")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["view"] == "curated"
+    assert body["total"] == 2
+    assert body["has_more"] is True
+    assert body["items"][0]["is_official"] is True
+    assert body["items"][0]["official_owner"] == "official-maker"
+
+
+def test_market_leaderboards_cache_five_topic_rankings_and_keep_sensitive_fields_private(
+    client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_client, _launched = client
+    monkeypatch.setenv("PGAGENT_SKILLS_SH_API_TOKEN", "test-market-token")
+    monkeypatch.setattr(skill_service, "_market_leaderboard_cache", None)
+    calls: list[dict[str, object]] = []
+    installs = [21, 90, 8, 72, 55, 31, 49, 7]
+
+    def fake_skills_sh(path: str, *, params: dict | None = None) -> dict:
+        assert path == "/api/v1/skills/search"
+        assert params is not None
+        calls.append(dict(params))
+        category = next(item for item in skill_service.MARKET_LEADERBOARD_CATEGORIES if item.query == params["q"])
+        return {
+            "data": [
+                {
+                    "id": f"demo/{category.id}/skill-{index}",
+                    "slug": f"skill-{index}",
+                    "name": f"{category.id} skill {index}",
+                    "source": "demo/skills",
+                    "installs": install_count,
+                    "files": [{"path": "SKILL.md", "contents": "private skill body"}],
+                    "token": "private-token",
+                }
+                for index, install_count in enumerate(installs)
+            ]
+        }
+
+    monkeypatch.setattr(skill_service, "_skills_sh_json", fake_skills_sh)
+    first = test_client.get("/api/skills/market/leaderboards")
+
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["available"] is True
+    assert body["cached"] is False
+    assert body["ttl_seconds"] == skill_service.MARKET_LEADERBOARD_TTL_SECONDS
+    assert [category["id"] for category in body["categories"]] == [
+        "frontend",
+        "programming",
+        "research",
+        "writing",
+        "data-ai",
+    ]
+    assert len(calls) == 5
+    assert all(call["limit"] == skill_service.MARKET_LEADERBOARD_SEARCH_LIMIT for call in calls)
+    assert all(len(category["items"]) == 6 for category in body["categories"])
+    assert all(category["items"][0]["installs"] == 90 for category in body["categories"])
+    assert "private skill body" not in first.text
+    assert "private-token" not in first.text
+
+    cached = test_client.get("/api/skills/market/leaderboards")
+    assert cached.status_code == 200, cached.text
+    assert cached.json()["cached"] is True
+    assert len(calls) == 5
+
+
+def test_market_leaderboards_expire_after_ttl_and_support_manual_refresh(
+    client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_client, _launched = client
+    monkeypatch.setenv("PGAGENT_SKILLS_SH_API_TOKEN", "test-market-token")
+    monkeypatch.setattr(skill_service, "_market_leaderboard_cache", None)
+    clock = {"value": 100.0}
+    monkeypatch.setattr(skill_service.time, "monotonic", lambda: clock["value"])
+    calls: list[dict[str, object]] = []
+
+    def fake_skills_sh(path: str, *, params: dict | None = None) -> dict:
+        assert path == "/api/v1/skills/search"
+        assert params is not None
+        calls.append(dict(params))
+        return {
+            "data": [
+                {
+                    "id": f"demo/skills/{len(calls)}",
+                    "name": "Cached Skill",
+                    "installs": 1,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(skill_service, "_skills_sh_json", fake_skills_sh)
+    initial = test_client.get("/api/skills/market/leaderboards")
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["cached"] is False
+    assert len(calls) == 5
+
+    clock["value"] += skill_service.MARKET_LEADERBOARD_TTL_SECONDS - 1
+    still_cached = test_client.get("/api/skills/market/leaderboards")
+    assert still_cached.status_code == 200, still_cached.text
+    assert still_cached.json()["cached"] is True
+    assert len(calls) == 5
+
+    clock["value"] += 2
+    expired = test_client.get("/api/skills/market/leaderboards")
+    assert expired.status_code == 200, expired.text
+    assert expired.json()["cached"] is False
+    assert len(calls) == 10
+
+    query_refreshed = test_client.get("/api/skills/market/leaderboards?refresh=true")
+    assert query_refreshed.status_code == 200, query_refreshed.text
+    assert query_refreshed.json()["cached"] is False
+    assert len(calls) == 15
+
+    refreshed = test_client.post("/api/skills/market/leaderboards/refresh")
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["cached"] is False
+    assert len(calls) == 20
+
+
+def test_market_leaderboards_are_explicitly_unavailable_without_a_market_token(
+    client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_client, _launched = client
+    monkeypatch.delenv("SKILLS_SH_API_TOKEN", raising=False)
+    monkeypatch.delenv("PGAGENT_SKILLS_SH_API_TOKEN", raising=False)
+    monkeypatch.delenv("VERCEL_OIDC_TOKEN", raising=False)
+    monkeypatch.setattr(skill_service, "_market_leaderboard_cache", None)
+    upstream_called = False
+
+    def fake_skills_sh(path: str, *, params: dict | None = None) -> dict:
+        nonlocal upstream_called
+        upstream_called = True
+        return {"data": []}
+
+    monkeypatch.setattr(skill_service, "_skills_sh_json", fake_skills_sh)
+    response = test_client.get("/api/skills/market/leaderboards")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["available"] is False
+    assert body["categories"] == []
+    assert body["cached"] is False
+    assert upstream_called is False
 
 
 def test_github_zip_is_previewed_before_confirmed_install(

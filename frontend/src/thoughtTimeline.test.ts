@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, safeToolTarget, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from './thoughtTimeline'
+import { emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, safeToolTarget, summarizeThoughtConclusion, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from './thoughtTimeline'
 
 describe('实时 Thought 时间线', () => {
   it('累计思考耗时并跟踪工具的开始与完成', () => {
@@ -37,5 +37,11 @@ describe('实时 Thought 时间线', () => {
     expect(hasVisibleCompletedThought(timeline)).toBe(true)
     expect(timeline.elapsedMs).toBe(858)
     expect(timeline.tools[0]).toMatchObject({ name: 'WebFetch', target: 'https://example.com/docs', status: 'completed' })
+  })
+
+  it('为默认收起的处理摘要提取安全、简短的结论首行', () => {
+    expect(summarizeThoughtConclusion('## 最终结论\n\n已经完成配置。')).toBe('最终结论')
+    expect(summarizeThoughtConclusion('')).toBe('任务已完成')
+    expect(summarizeThoughtConclusion('这是一个很长的结论。'.repeat(20), 16)).toHaveLength(16)
   })
 })

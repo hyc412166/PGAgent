@@ -375,6 +375,36 @@ class AgentMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class DelegatedTask(TimestampMixin, Base):
+    """A child-Agent execution owned by one parent conversation.
+
+    This deliberately has no team, lease, claim, or inter-agent-message
+    fields.  Those concerns belong to ``TeamTask`` / ``AgentMessage`` and are
+    reserved for the future multi-user collaboration feature.
+    """
+
+    __tablename__ = "delegated_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    parent_run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    parent_session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    child_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="SET NULL"), unique=True, nullable=True
+    )
+    child_agent_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="in_progress", index=True, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    result: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
 class UsageRecord(TimestampMixin, Base):
     __tablename__ = "usage_records"
 
