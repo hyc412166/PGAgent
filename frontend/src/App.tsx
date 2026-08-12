@@ -4,10 +4,8 @@ import {
   ArrowRight,
   Bot,
   BookOpen,
-  Box,
   CalendarDays,
   Check,
-  CheckCheck,
   CheckCircle2,
   ChevronRight,
   ChartNoAxesCombined,
@@ -15,7 +13,6 @@ import {
   Download,
   FolderOpen,
   Folder,
-  Copy,
   History,
   KeyRound,
   LayoutDashboard,
@@ -39,28 +36,27 @@ import {
   SquareTerminal,
   Trash2,
   Upload,
-  Users,
   Wrench,
   Workflow,
   X,
-  XCircle,
   Sun,
-  type LucideIcon,
 } from 'lucide-react'
-import { Fragment, type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { ApiError, api, apiUrl, describeError } from './api'
 import { permissionLabel, permissionOptions, toggleSelectedId } from './capabilitySelection'
 import { modelSelectionPayload, resolveEffectiveThinking, shortModelLabel, thinkingLevelLabels } from './composerSettings'
 import { fallbackMarketCategories, leaderboardRefreshDelayMs, marketCategoryDefinitions, normalizeMarketCategories } from './skillMarketCategories'
-import { buildContextUsageView } from './contextUsage'
 import { buildDraftLaunchPayload, createDraftIdempotencyKey } from './draftLaunch'
 import { availableConnectionModels, resolveEffectiveModelSettings } from './modelSettings'
 import { buildSessionNavigation, folderName, isDefaultWorkspace, projectRootForSession } from './sessionNavigation'
 import { appendAssistantDelta, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldRefreshConversationAfterApprovalDecision, visibleSessionItems, type RunStreamEvent } from './sessionStream'
-import { emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline, type ThoughtTimelineState } from './thoughtTimeline'
+import { emptyThoughtTimeline, hasVisibleCompletedThought, pickThinkingStatus, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline, type ThoughtTimelineState } from './thoughtTimeline'
 import { usageDateKey, usageDateOptions, usageDatePresetBounds, usageDateRange, usageRangeLabel, type QuickUsageDatePreset, type UsageDatePreset } from './usageDateRange'
 import { agentTemplates, type AgentTemplate } from './features/agents/templates'
+import { CapabilityMultiSelect, ContextUsageRing, EmptyState, ErrorState, Field, LoadingState, PageHeader, SlidePanel, StatusBadge } from './components/ui'
+import { statusText } from './components/status'
+import { ApprovalCard, ChildAgentPanel, CompletedThoughtTimeline, LiveAssistantMessage, MessageBubble } from './features/sessions/presentation'
 import type {
   AgentProfile,
   Approval,
@@ -71,6 +67,7 @@ import type {
   Message,
   Run,
   RunEvent,
+  RunUsage,
   Session,
   SessionContext,
   TeamTask,
@@ -199,164 +196,6 @@ function formatDate(value?: string) {
 
 function stringId(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value) : ''
-}
-
-function numberFromRecord(record: Record<string, unknown> | undefined, key: string) {
-  const value = record?.[key]
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
-}
-
-const statusText: Record<string, string> = {
-  completed: '已完成',
-  complete: '已完成',
-  running: '运行中',
-  acting: '执行中',
-  planning: '规划中',
-  preparing_context: '准备上下文',
-  awaiting_approval: '等待审批',
-  pending: '待处理',
-  approved: '已批准',
-  rejected: '已拒绝',
-  failed: '失败',
-  stopped: '已停止',
-  queued: '排队中',
-  blocked: '受阻',
-  online: '在线',
-  healthy: '正常',
-  active: '活跃',
-  idle: '空闲',
-  default: '默认',
-  todo: '待认领',
-  in_progress: '进行中',
-  review: '待验收',
-}
-
-function StatusBadge({ status = 'unknown' }: { status?: string }) {
-  const normalized = status.toLowerCase()
-  const tone = ['completed', 'complete', 'approved', 'online', 'healthy', 'active'].includes(normalized)
-    ? 'success'
-    : ['failed', 'rejected', 'blocked', 'stopped'].includes(normalized)
-      ? 'danger'
-      : ['running', 'acting', 'planning', 'preparing_context', 'in_progress'].includes(normalized)
-        ? 'active'
-        : ['awaiting_approval', 'pending', 'review'].includes(normalized)
-          ? 'warning'
-          : 'neutral'
-  return <span className={`status status-${tone}`}><i aria-hidden="true" />{statusText[normalized] ?? status}</span>
-}
-
-function PageHeader({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
-  return (
-    <header className="page-header">
-      <div>
-        <p className="eyebrow">{eyebrow}</p>
-        <h1>{title}</h1>
-        <p className="page-description">{description}</p>
-      </div>
-      {action && <div className="page-action">{action}</div>}
-    </header>
-  )
-}
-
-function EmptyState({ icon: Icon = Box, title, description, action }: { icon?: LucideIcon; title: string; description: string; action?: ReactNode }) {
-  return (
-    <div className="empty-state">
-      <div className="empty-icon"><Icon size={22} /></div>
-      <h3>{title}</h3>
-      <p>{description}</p>
-      {action}
-    </div>
-  )
-}
-
-function LoadingState({ label = '正在读取本地数据' }: { label?: string }) {
-  return <div className="loading-state"><LoaderCircle className="spin" size={18} />{label}</div>
-}
-
-function ErrorState({ message, onRetry }: { message: string; onRetry?: () => void }) {
-  return (
-    <div className="error-state" role="alert">
-      <AlertCircle size={19} />
-      <div><strong>数据暂时不可用</strong><p>{message}</p></div>
-      {onRetry && <button className="button button-quiet" onClick={onRetry}><RefreshCw size={15} />重试</button>}
-    </div>
-  )
-}
-
-function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
-  return <label className="field"><span>{label}</span>{children}{hint && <small>{hint}</small>}</label>
-}
-
-function CapabilityMultiSelect({
-  label,
-  items,
-  selectedIds,
-  loading,
-  error,
-  onRetry,
-  onToggle,
-}: {
-  label: string
-  items: Array<{ id: string; name: string; description?: string; enabled?: boolean }>
-  selectedIds: string[]
-  loading: boolean
-  error: string
-  onRetry: () => void
-  onToggle: (id: string) => void
-}) {
-  return <section className="capability-select" aria-label={label}>
-    <header><strong>{label}</strong><span>已选择 {selectedIds.length}</span></header>
-    {error ? <div className="capability-inline-state error"><AlertCircle size={13} /><span>{error}</span><button type="button" onClick={onRetry}>重试</button></div>
-      : loading ? <div className="capability-inline-state"><LoaderCircle className="spin" size={13} />正在读取…</div>
-        : items.length ? <div className="capability-options">{items.map((item) => {
-          const selected = selectedIds.includes(item.id)
-          return <button key={item.id} type="button" className={selected ? 'selected' : ''} aria-pressed={selected} disabled={item.enabled === false} onClick={() => onToggle(item.id)}>
-            <span className="capability-check">{selected && <Check size={12} />}</span>
-            <span><strong>{item.name}</strong>{item.description && <small>{item.description}</small>}</span>
-          </button>
-        })}</div>
-          : <p className="capability-empty">目录中暂无可用项目。</p>}
-  </section>
-}
-
-function ContextUsageRing({ context }: { context: SessionContext }) {
-  const view = buildContextUsageView(context)
-  return (
-    <div className={`context-usage context-${view.tone}`} tabIndex={0} role="img" aria-label={view.ariaLabel} aria-describedby="context-usage-tooltip">
-      <span className="context-ring" aria-hidden="true">
-        <svg viewBox="0 0 24 24">
-          <circle className="context-ring-track" cx="12" cy="12" r="9" pathLength="100" />
-          <circle className="context-ring-value" cx="12" cy="12" r="9" pathLength="100" strokeDasharray="100" strokeDashoffset={100 - view.percent} />
-        </svg>
-      </span>
-      <div className="context-tooltip" id="context-usage-tooltip" role="tooltip">
-        <strong>{view.roundedPercent}% 已用</strong>
-        <p>{view.detail}</p>
-        <small>{view.compressionHint}</small>
-        {context.last_compacted_at && <small>上次压缩：{formatDate(context.last_compacted_at)}</small>}
-      </div>
-    </div>
-  )
-}
-
-function SlidePanel({ title, description, onClose, children }: { title: string; description?: string; onClose: () => void; children: ReactNode }) {
-  useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [onClose])
-
-  return (
-    <div className="overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="slide-panel" role="dialog" aria-modal="true" aria-labelledby="panel-title">
-        <header>
-          <div><p className="eyebrow">PGAgent 配置</p><h2 id="panel-title">{title}</h2>{description && <p>{description}</p>}</div>
-          <button className="icon-button" onClick={onClose} aria-label="关闭"><X size={19} /></button>
-        </header>
-        {children}
-      </section>
-    </div>
-  )
 }
 
 const navigation = [
@@ -1747,160 +1586,6 @@ function SessionsPage() {
   )
 }
 
-function childTaskStatusLabel(status?: string) {
-  return statusText[(status || '').toLowerCase()] ?? status ?? '处理中'
-}
-
-function childTaskOutput(task?: DelegatedTask) {
-  const output = task?.result?.output
-  if (typeof output === 'string' && output.trim()) return output
-  const error = task?.result?.error
-  if (typeof error === 'string' && error.trim()) return error
-  return ''
-}
-
-function ChildAgentPanel({
-  tasks,
-  loading,
-  error,
-  selectedTask,
-  run,
-  events,
-  eventsLoading,
-  eventsError,
-  onClose,
-  onSelect,
-  onRetry,
-}: {
-  tasks: DelegatedTask[]
-  loading: boolean
-  error: string
-  selectedTask?: DelegatedTask
-  run?: Run
-  events: RunEvent[]
-  eventsLoading: boolean
-  eventsError: string
-  onClose: () => void
-  onSelect: (taskId: string) => void
-  onRetry: () => void
-}) {
-  const output = childTaskOutput(selectedTask)
-  const toolEvents = events.filter((event) => ['tool_started', 'tool_finished', 'tool_result'].includes(event.type || event.event_type || ''))
-  return <aside className="child-agent-panel" aria-label="子 Agent 工作详情">
-    <header className="child-panel-header"><div><span className="eyebrow">协作执行</span><strong>子 Agent</strong></div><button type="button" className="icon-button" onClick={onClose} aria-label="收起子 Agent 侧栏"><X size={16} /></button></header>
-    {error ? <ErrorState message={error} onRetry={onRetry} /> : loading && !tasks.length ? <LoadingState label="正在读取子 Agent…" /> : !tasks.length ? <EmptyState icon={Users} title="子 Agent 正在启动" description="任务创建后会显示在这里。" /> : <>
-      <div className="child-task-list" role="list" aria-label="本次调用的子 Agent">
-        {tasks.map((task) => {
-          const selected = task.id === selectedTask?.id
-          const agent = task.result?.agent
-          const agentName = agent && typeof agent === 'object' && typeof (agent as Record<string, unknown>).name === 'string'
-            ? String((agent as Record<string, unknown>).name)
-            : task.child_agent_name || '子 Agent'
-          return <button key={task.id} type="button" className={selected ? 'selected' : ''} onClick={() => onSelect(task.id)}>
-            <span className="child-task-avatar"><Bot size={14} /></span><span><strong>{agentName}</strong><small>{task.title}</small></span><StatusBadge status={task.status} />
-          </button>
-        })}
-      </div>
-      {selectedTask && <section className="child-task-detail">
-        <header><div><strong>{selectedTask.title}</strong><small>{childTaskStatusLabel(selectedTask.status)}</small></div><StatusBadge status={selectedTask.status} /></header>
-        <dl className="child-task-stats"><div><dt>步骤</dt><dd>{numberFromRecord(selectedTask.result, 'steps') ?? run?.step_count ?? run?.current_step ?? 0}</dd></div><div><dt>工具</dt><dd>{numberFromRecord(selectedTask.result, 'tool_calls') ?? run?.tool_calls ?? 0}</dd></div></dl>
-        {selectedTask.description && <section className="child-detail-block"><strong>任务</strong><p>{selectedTask.description}</p></section>}
-        {output && <section className="child-detail-block"><strong>{selectedTask.status === 'completed' ? '结果' : '状态说明'}</strong><pre>{output}</pre></section>}
-        <section className="child-detail-block child-events"><strong>工作过程</strong>{eventsError ? <p className="inline-error">{eventsError}</p> : eventsLoading ? <p>正在读取运行事件…</p> : toolEvents.length ? <ol>{toolEvents.map((event, index) => <li key={event.id || index}><span>{event.type || event.event_type}</span><small>{formatDate(event.created_at)}</small></li>)}</ol> : <p>暂未记录工具调用。</p>}</section>
-      </section>}
-    </>}
-  </aside>
-}
-
-function MessageBubble({ message }: { message: Message }) {
-  const [copied, setCopied] = useState(false)
-  const isTool = message.role === 'tool' || !!message.tool_name
-  const isDelegatedChild = message.metadata?.delegated_child === true
-  const childAgentName = typeof message.metadata?.child_agent_name === 'string'
-    ? message.metadata.child_agent_name
-    : '子 Agent'
-  const speaker = message.role === 'user'
-    ? '你'
-    : isTool
-      ? message.tool_name || '工具结果'
-      : isDelegatedChild
-        ? `${childAgentName}（子 Agent）`
-        : 'PGAgent'
-  async function copyMessage() {
-    try {
-      await navigator.clipboard.writeText(message.content || '')
-      setCopied(true)
-      window.setTimeout(() => setCopied(false), 1400)
-    } catch {
-      setCopied(false)
-    }
-  }
-  return (
-    <article className={`message ${message.role} ${isTool ? 'tool-message' : ''}`}>
-      <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <Sparkles size={16} />}</div>
-      <div className="message-body"><div className="message-meta"><strong>{speaker}</strong><time>{formatDate(message.created_at)}</time><button type="button" className="message-copy-button" aria-label={copied ? '已复制' : '复制消息'} title={copied ? '已复制' : '复制消息'} onClick={() => void copyMessage()}>{copied ? <CheckCheck size={13} /> : <Copy size={13} />}</button></div><div className="message-content">{message.content}</div>{message.status && <StatusBadge status={message.status} />}</div>
-    </article>
-  )
-}
-
-function CompletedThoughtTimeline({ runId, timeline }: { runId: string; timeline: ThoughtTimelineState }) {
-  const [expanded, setExpanded] = useState(false)
-  const duration = formatThoughtDuration(timeline.elapsedMs)
-  const hasDetails = timeline.tools.length > 0
-
-  return <article className={`completed-thought ${hasDetails && expanded ? 'expanded' : ''} ${hasDetails ? '' : 'no-details'}`}>
-    {hasDetails ? <button
-      type="button"
-      className="completed-thought-toggle"
-      aria-expanded={expanded}
-      aria-controls={`thought-details-${runId}`}
-      onClick={() => setExpanded((value) => !value)}
-    >
-      <span className="completed-thought-duration">已处理 {duration}</span>
-      <ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
-    </button> : <span className="completed-thought-duration completed-thought-static">已处理 {duration}</span>}
-    {hasDetails && expanded && <div id={`thought-details-${runId}`} className="thought-tool-list" aria-label="工具调用">{timeline.tools.map((tool) => <p key={tool.id} className={`thought-tool ${tool.status}`}><span>{tool.name.startsWith('Web') ? '⌁' : '→'}</span><strong>{tool.name}</strong>{tool.target && <code title={tool.target}>{tool.target}</code>}{tool.status === 'running' && <i aria-label="运行中" />}</p>)}</div>}
-  </article>
-}
-
-function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunState }) {
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (liveRun.thought.startedAt === null || liveRun.thought.finished) return
-    setNow(Date.now())
-    const timer = window.setInterval(() => setNow(Date.now()), 100)
-    return () => window.clearInterval(timer)
-  }, [liveRun.thought.finished, liveRun.thought.startedAt])
-  const liveThoughtMs = liveRun.thought.startedAt === null ? 0 : Math.max(0, now - liveRun.thought.startedAt)
-  const phase = liveRun.phase.includes('子 Agent')
-    ? liveRun.phase
-    : !liveRun.thought.finished && liveRun.status !== 'awaiting_approval' && liveRun.thinkingStatus
-    ? `${liveRun.thinkingStatus} ${formatLiveThinkingDuration(liveThoughtMs)}`
-    : liveRun.phase || '已完成'
-  return (
-    <article className={`message assistant live-message ${liveRun.status === 'terminal' ? 'live-message-terminal' : ''}`}>
-      <div className="message-avatar"><Sparkles size={16} /></div>
-      <div className="message-body">
-        <div className="message-meta"><strong>PGAgent</strong><span className="live-phase"><i aria-hidden="true" />{phase}</span></div>
-        {liveRun.draft && <div className="message-content">{liveRun.draft}</div>}
-        {liveRun.error && <p className="live-error">{liveRun.error}</p>}
-      </div>
-    </article>
-  )
-}
-
-function ApprovalCard({ approval, deciding, onDecision }: { approval: Approval; deciding: boolean; onDecision: (id: string, decision: 'approve' | 'reject', runId: string) => void }) {
-  const runId = stringId(approval.run_id)
-  return (
-    <article className="approval-card">
-      <header><span><ShieldCheck size={17} /></span><div><strong>需要你的批准</strong><p>Agent 请求执行有副作用的工具</p></div><StatusBadge status={approval.status || 'pending'} /></header>
-      <div className="approval-command"><span>{approval.tool_name || 'unknown_tool'}</span><pre>{JSON.stringify(approval.arguments ?? {}, null, 2)}</pre></div>
-      {approval.reason && <p className="approval-reason">理由：{approval.reason}</p>}
-      <footer><button className="button button-danger" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'reject', runId)}><XCircle size={15} />拒绝</button><button className="button button-primary" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'approve', runId)}>{deciding ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}允许本次</button></footer>
-    </article>
-  )
-}
-
 function RunsPage() {
   const runs = useApiData<Run[]>([], () => api.list<Run>('/api/runs', ['runs']), [])
   const [selected, setSelected] = useState<Run | null>(null)
@@ -1920,12 +1605,16 @@ function RunsPage() {
 
 function RunDetails({ run }: { run: Run }) {
   const events = useApiData<Run['events']>([], () => api.list<NonNullable<Run['events']>[number]>(`/api/runs/${run.id}/events`, ['events']), [run.id])
+  const usage = useApiData<RunUsage | null>(null, () => api.get<RunUsage | null>(`/api/usage/runs/${run.id}`), [run.id])
   const timeline = run.events?.length ? run.events : events.data
   return (
     <div className="run-detail">
       <div className="detail-hero"><StatusBadge status={run.status} /><strong>{statusText[run.phase || run.status || ''] ?? run.phase ?? run.status ?? '暂无阶段信息'}</strong></div>
       <dl className="detail-grid"><div><dt>执行步数</dt><dd>{run.step_count ?? run.current_step ?? 0}</dd></div><div><dt>工具调用</dt><dd>{run.tool_call_count ?? run.tool_calls ?? 0}</dd></div></dl>
-      <p className="run-usage-note"><Database size={14} />当前后端暂未提供单次运行的 Token 明细，可前往“用量统计”查看全局与按模型汇总。</p>
+      {usage.data ? <>
+        <div className="run-usage-heading"><Database size={14} /><strong>本次用量</strong><span>{usage.data.provider || '未知提供商'} · {usage.data.model_id || '未知模型'}</span></div>
+        <dl className="detail-grid run-usage-grid"><div><dt>输入 Token</dt><dd>{formatTokens(usage.data.input_tokens)}</dd></div><div><dt>输出 Token</dt><dd>{formatTokens(usage.data.output_tokens)}</dd></div><div><dt>缓存命中</dt><dd>{(usage.data.cache_hit_rate * 100).toFixed(1)}%</dd></div><div><dt>成本</dt><dd>{formatCost(usage.data.total_cost_usd)}</dd></div></dl>
+      </> : usage.initialLoading ? <p className="run-usage-note"><LoaderCircle className="spin" size={14} />正在读取本次 Token 用量…</p> : <p className="run-usage-note"><Database size={14} />本次运行没有返回可统计的 Token 明细。</p>}
       {run.stop_reason && <div className="stop-reason"><AlertCircle size={17} /><div><strong>停止原因</strong><p>{run.stop_reason}</p></div></div>}
       <h3>事件时间线</h3>
       {events.error ? <ErrorState message={events.error} onRetry={events.reload} /> : events.loading ? <LoadingState /> : timeline?.length ? <div className="timeline">{timeline.map((event, index) => <div key={event.id || index}><span /><div><strong>{event.message || event.type || event.event_type || event.phase || '运行事件'}</strong><small>{formatDate(event.created_at)}</small></div></div>)}</div> : <EmptyState icon={Activity} title="暂无事件详情" description="后端记录运行事件后会在这里展示。" />}

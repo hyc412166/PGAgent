@@ -37,6 +37,7 @@ def test_empty_usage_aggregates_are_zero(client: TestClient) -> None:
         "cache_hit_rate": 0.0,
     }
     assert client.get("/api/usage/models").json() == []
+    assert client.get("/api/usage/runs/missing-run").json() is None
 
 
 def test_usage_summary_and_model_groups(client: TestClient) -> None:
@@ -168,6 +169,22 @@ def test_usage_session_and_workspace_groups(client: TestClient) -> None:
         "avg_cost_usd": pytest.approx(0.08 / 3),
         "cache_hit_rate": pytest.approx(40 / 140),
     }]
+
+    run_usage = client.get("/api/usage/runs/run-a")
+    assert run_usage.status_code == 200
+    assert run_usage.json() == {
+        "run_id": "run-a",
+        "provider": "openrouter",
+        "model_id": "model-a",
+        "requests": 2,
+        "input_tokens": 60,
+        "output_tokens": 20,
+        "cache_creation_tokens": 20,
+        "cache_read_tokens": 20,
+        "total_tokens": 120,
+        "total_cost_usd": pytest.approx(0.06),
+        "cache_hit_rate": pytest.approx(20 / 100),
+    }
 
 
 def test_usage_group_ranges_exclude_orphan_records(client: TestClient) -> None:

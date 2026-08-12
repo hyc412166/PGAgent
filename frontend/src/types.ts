@@ -253,6 +253,20 @@ export interface Run {
   events?: RunEvent[]
 }
 
+export interface RunUsage {
+  run_id: string
+  provider?: string | null
+  model_id?: string | null
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  cache_creation_tokens: number
+  cache_read_tokens: number
+  total_tokens: number
+  total_cost_usd: number
+  cache_hit_rate: number
+}
+
 export interface Approval {
   id: string
   run_id?: string

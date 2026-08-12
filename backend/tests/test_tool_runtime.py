@@ -292,6 +292,52 @@ async def test_provider_context_overflow_compacts_once_and_retries_without_loop(
 
 
 @pytest.mark.asyncio
+async def test_threshold_semantic_compaction_rebuilds_concrete_context_bundle(tmp_path) -> None:
+    calls: list[str] = []
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        mode = str(kwargs.get("mode") or "auto")
+        calls.append(mode)
+        if mode == "compaction":
+            return ModelTurn(
+                content=(
+                    '{"objective":"preserve the task","constraints":[],"decisions":[],'
+                    '"facts":["a fact"],"evidence":[],"files_changed":[],'
+                    '"completed_work":[],"pending_work":["continue"],"errors":[],'
+                    '"tool_state":{},"approval_state":{},"next_action":"continue"}'
+                )
+            )
+        return ModelTurn(content="compacted answer")
+
+    assembler = ContextAssembler(
+        max_tokens=4_096,
+        compaction_threshold=1_800,
+        output_reserve_tokens=500,
+        safety_buffer_tokens=100,
+    )
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+        context_manager=ContextManager(max_tokens=4_096),
+        context_assembler=assembler,
+        semantic_compactor=SemanticCompactor(model_call=model_call, retain_tokens=100),
+    )
+    outcome = await runtime.run(
+        system_prompt="stable rules",
+        agent_instructions="stable instructions",
+        recent_messages=[
+            {"role": "user", "content": "important task " + ("x" * 4_000)},
+            {"role": "assistant", "content": "intermediate result " + ("y" * 4_000)},
+        ],
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.output == "compacted answer"
+    assert "compaction" in calls
+    assert any(event["type"] == "context_compaction_finished" and event.get("effective") for event in outcome.events)
+
+
+@pytest.mark.asyncio
 async def test_timeline_never_persists_write_content_or_api_key(tmp_path) -> None:
     async def model_call(**_kwargs):
         return ModelTurn(

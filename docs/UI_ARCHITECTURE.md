@@ -11,7 +11,7 @@
 
 ## 新的视觉层
 
-`frontend/src/styles/pgagent-ui.css` 是独立的 additive visual layer，避免把业务逻辑继续堆进 `App.tsx`：
+`frontend/src/styles/pgagent-ui.css` 是独立的 additive visual layer，避免把业务逻辑继续堆进 `App.tsx`。通用状态、空状态、抽屉和能力选择在 `frontend/src/components/ui.tsx`，会话消息/子 Agent/思考时间线在 `frontend/src/features/sessions/presentation.tsx`，专业 Agent 起始模板在 `frontend/src/features/agents/templates.ts`：
 
 - 以蓝紫中性色为基础，使用低透明度、细边框和轻微阴影形成磨砂玻璃层次。
 - 侧栏、页面标题、统计卡片、消息区和输入区都有独立容器，信息层级比大面积实心背景更清楚。
@@ -37,4 +37,3 @@
 ## 专业 Agent 快速模板
 
 Agent 页面提供四个可编辑起点：代码审查员、研究分析师、前端体验设计师、数据整理助手。模板只预填角色、系统指令和推荐能力，保存前仍可调整工具/Skill/模型。后端工具目录新增的三个只读开发工具会自动出现在工具选择和默认能力 API 中。
-
