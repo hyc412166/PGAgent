@@ -1,6 +1,6 @@
 # PGAgent UI 设计与交互说明
 
-这次 UI 重构参考了 Apix 的几个高价值交互模式：左侧历史导航、居中的阅读列、固定输入栏、消息内联的思考/工具轨迹，以及卡片化的资源管理。PGAgent 没有复制 Apix 的页面结构，而是把这些模式放进已有的工作区、会话、审批、Skill 和子 Agent 能力中。
+这次 UI 重构采用独立的 Penguin Coast 视觉系统：以 QQ 企鹅的黑白轮廓、红围巾与橙色喙为品牌锚点，辅以大海深蓝和冰面浅蓝。它保留 PGAgent 现有的工作区、会话、审批、Skill 和子 Agent 能力，但不依赖任何外部产品的页面风格。
 
 ## 保留的 PGAgent 能力
 
@@ -11,10 +11,10 @@
 
 ## 新的视觉层
 
-`frontend/src/styles/pgagent-ui.css` 是独立的 additive visual layer，避免把业务逻辑继续堆进 `App.tsx`。通用状态、空状态、抽屉和能力选择在 `frontend/src/components/ui.tsx`，会话消息/子 Agent/思考时间线在 `frontend/src/features/sessions/presentation.tsx`，专业 Agent 起始模板在 `frontend/src/features/agents/templates.ts`：
+`frontend/src/styles/pgagent-ui.css` 是独立的 Penguin Coast visual layer，避免把业务逻辑继续堆进 `App.tsx`。通用状态、空状态、抽屉和能力选择在 `frontend/src/components/ui.tsx`，会话消息/子 Agent/思考时间线在 `frontend/src/features/sessions/presentation.tsx`，企鹅标识在 `frontend/src/components/penguin.tsx`：
 
-- 以蓝紫中性色为基础，使用低透明度、细边框和轻微阴影形成磨砂玻璃层次。
-- 侧栏、页面标题、统计卡片、消息区和输入区都有独立容器，信息层级比大面积实心背景更清楚。
+- 以企鹅黑、围巾红、喙橙为品牌锚点，辅以海洋深蓝和冰面浅蓝；视觉层使用实心表面、细边框和克制阴影。
+- 深海色侧栏承载导航，冰色聊天区承载阅读；企鹅标识在品牌、会话标题和 Agent 消息头像中保持一致。
 - 用户消息右对齐，主 Agent 使用透明阅读流；思考和工具调用作为消息内联时间线，不额外制造黑色大卡片。
 - `.theme-dark` 与本地 `pgagent-theme` 状态配合，主题切换不会改变业务数据。
 - `prefers-reduced-motion` 会关闭过渡动画；移动端在 640px 以下将会话列表移到顶部，输入栏仍固定可见。
@@ -29,7 +29,7 @@
 
 ## 性能约束
 
-- 视觉层只使用 CSS 背景、边框和有限的 `backdrop-filter`；不引入持续运行的 canvas 或大规模阴影动画。
+- 视觉层只使用 CSS 背景、边框和克制阴影；默认不使用大面积 `backdrop-filter`，不引入持续运行的 canvas 或大规模阴影动画。
 - 会话列表和聊天阅读区各自滚动，输入栏不随历史消息增长而向下堆叠。
 - Vite API 代理默认指向后端实际端口 `8765`，可用 `VITE_API_PROXY_TARGET` 覆盖；这样开发环境不会出现页面能打开但 API 502 的隐性故障。
 - 复制消息只在悬停时显示按钮，减少静态视觉噪声；失败时不阻塞消息渲染。
