@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, func, or_, select, update
 
 from app import database as database_module
 from app.config import settings
@@ -34,17 +34,18 @@ from app.database import (
     UsageRecord,
     Workspace,
 )
-from app.runtime import AgentRuntime, ContextManager, RunOutcome, RuntimeConfig, normalize_usage
+from app.runtime import AgentRuntime, ContextManager, FilesystemArtifactStore, RunOutcome, RuntimeConfig, normalize_usage
 from app.runtime.context import estimate_tokens, message_tokens
 from app.tools import create_default_registry
 from app.tools.registry import TOOL_SCHEMAS
 from app.tools.types import ToolResult
 
 from .model_gateway import ModelConfigurationError, ProviderConfig, build_model_call
+from .completion_evaluator import build_completion_verifier
 from .run_stream import run_stream_broker
 
 
-ACTIVE_STATUSES = {"received", "preparing_context", "planning", "acting", "observing", "running"}
+ACTIVE_STATUSES = {"received", "preparing_context", "planning", "acting", "observing", "verifying", "running"}
 
 _DELEGATE_OUTPUT_LIMIT = 16_000
 _DELEGATE_MESSAGE_LIMIT = 20_000
@@ -130,6 +131,7 @@ def _context_snapshot_from_db(db: Any, session: Session) -> dict[str, Any]:
         return {
             "session_id": session.id,
             "epoch_id": epoch.id,
+            "source_sequence": int(epoch.start_sequence or 0),
             "sequence": int(epoch.end_sequence or 0),
             "summary": _json_safe(epoch.summary_json or {}),
             "task_state": _json_safe(epoch.task_state or {}),
@@ -149,6 +151,7 @@ def _context_snapshot_from_db(db: Any, session: Session) -> dict[str, Any]:
     return {
         "session_id": session.id,
         "epoch_id": checkpoint.epoch_id or checkpoint.id,
+        "source_sequence": int(checkpoint.start_sequence or 0),
         "sequence": int(checkpoint.end_sequence or 0),
         "summary": _json_safe(checkpoint.summary_json or {}),
         "task_state": _json_safe(checkpoint.task_state or {}),
@@ -193,15 +196,32 @@ def _append_runtime_transcript(db: Any, run_id: str, session_id: str, outcome: R
     existing = Counter(_chat_message_key(_message_payload(row)) for row in existing_rows)
     next_sequence = max((int(getattr(row, "sequence", 0) or 0) for row in existing_rows), default=0) + 1
     final_reply_persisted = False
-    for raw in outcome.messages:
+    runtime_messages = outcome.messages if outcome.transcript_delta is None else outcome.transcript_delta
+    for raw in runtime_messages:
         if not isinstance(raw, dict):
             continue
         role = str(raw.get("role") or "").strip().lower()
         if role == "system" or not role:
             continue
+        content = str(raw.get("content") or "")
+        if role == "tool" and content.startswith("[artifact:"):
+            closing = content.find("]")
+            artifact_id = content[len("[artifact:") : closing] if closing > 0 else ""
+            ref = next(
+                (
+                    item for item in outcome.artifact_refs
+                    if str(item.get("artifact_id") or item.get("id") or "") == artifact_id
+                ),
+                None,
+            )
+            storage_path = str((ref or {}).get("storage_key") or "")
+            if storage_path:
+                path = Path(storage_path)
+                if path.is_file():
+                    content = path.read_bytes().decode("utf-8", errors="replace")
         payload = {
             "role": role,
-            "content": str(raw.get("content") or ""),
+            "content": content,
         }
         if raw.get("name"):
             payload["name"] = str(raw["name"])
@@ -209,6 +229,40 @@ def _append_runtime_transcript(db: Any, run_id: str, session_id: str, outcome: R
             payload["tool_call_id"] = str(raw["tool_call_id"])
         if role == "assistant" and isinstance(raw.get("tool_calls"), list):
             payload["tool_calls"] = _json_safe(raw["tool_calls"])
+        if role == "tool" and payload.get("name") == "task" and payload.get("tool_call_id"):
+            existing_task_result = db.scalar(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.session_id == session_id,
+                    ChatMessage.role == "tool",
+                    ChatMessage.tool_name == "task",
+                    ChatMessage.tool_call_id == payload["tool_call_id"],
+                )
+                .order_by(ChatMessage.sequence.desc(), ChatMessage.created_at.desc())
+            )
+            if existing_task_result is not None:
+                # A delegated terminal result is a new observation, not a
+                # mutation of the placeholder row. Store it as a provider-valid
+                # assistant observation so the append-only log gains a new
+                # sequence without introducing an orphan tool result.
+                db.add(ChatMessage(
+                    session_id=session_id,
+                    role="assistant",
+                    content=(
+                        "Delegated task terminal result:\n"
+                        f"{payload['content']}"
+                    ),
+                    sequence=next_sequence,
+                    extra={
+                        "runtime_run_id": run_id,
+                        "source": "runtime_transcript",
+                        "delegated_result_revision": True,
+                        "supersedes_message_id": existing_task_result.id,
+                        "tool_call_id": payload["tool_call_id"],
+                    },
+                ))
+                next_sequence += 1
+                continue
         key = _chat_message_key(payload)
         if existing[key] > 0:
             existing[key] -= 1
@@ -255,10 +309,51 @@ def _append_runtime_transcript(db: Any, run_id: str, session_id: str, outcome: R
         ))
 
 
-def _persist_context_snapshot(db: Any, session: Session, run_id: str, outcome: RunOutcome) -> None:
+def _lock_context_source(db: Any, session: Session, outcome: RunOutcome) -> bool | None:
+    """Acquire the session write lock iff the compactor's source cursor is current."""
+
+    snapshot = dict(outcome.context_snapshot or {})
+    if not snapshot.get("epoch_id") or snapshot.get("source_sequence") is None:
+        return None
+    end_sequence = max(0, int(snapshot.get("sequence") or snapshot.get("end_sequence") or 0))
+    version = max(0, int(snapshot.get("version") or 0))
+    existing = db.scalar(select(ContextCheckpoint.id).where(
+        ContextCheckpoint.session_id == session.id,
+        ContextCheckpoint.end_sequence == end_sequence,
+        ContextCheckpoint.source_version == version,
+        ContextCheckpoint.status == "completed",
+    ))
+    if existing is not None:
+        return None
+    expected = max(0, int(snapshot.get("source_sequence") or 0))
+    maximum = (
+        select(func.coalesce(func.max(ChatMessage.sequence), 0))
+        .where(ChatMessage.session_id == session.id)
+        .scalar_subquery()
+    )
+    result = db.execute(
+        update(Session)
+        .where(Session.id == session.id, maximum == expected)
+        .values(context_tokens=Session.context_tokens)
+    )
+    return int(result.rowcount or 0) == 1
+
+
+def _persist_context_snapshot(
+    db: Any,
+    session: Session,
+    run_id: str,
+    outcome: RunOutcome,
+    *,
+    source_sequence_valid: bool | None = None,
+) -> None:
     """Promote a runtime snapshot atomically with its checkpoint/audit rows."""
 
     snapshot = dict(outcome.context_snapshot or {})
+    all_artifact_refs = [
+        *list(outcome.artifact_refs or []),
+        *list(snapshot.get("artifact_refs") or []),
+    ]
     compaction_finished = [
         event for event in outcome.events
         if event.get("type") == "context_compaction_finished"
@@ -268,6 +363,7 @@ def _persist_context_snapshot(db: Any, session: Session, run_id: str, outcome: R
         if event.get("type") == "context_compaction_failed"
     ]
     if not snapshot.get("epoch_id"):
+        _persist_artifact_refs(db, session.id, all_artifact_refs)
         if compaction_failed:
             last = compaction_failed[-1]
             db.add(CompactionAttempt(
@@ -319,9 +415,43 @@ def _persist_context_snapshot(db: Any, session: Session, run_id: str, outcome: R
         .order_by(ContextCheckpoint.created_at.desc(), ContextCheckpoint.id.desc())
     )
     if existing_checkpoint is not None:
+        _persist_artifact_refs(db, session.id, all_artifact_refs, epoch_id=existing_checkpoint.epoch_id)
         session.context_summary = json.dumps(summary, ensure_ascii=False, sort_keys=True)
         session.context_tokens = after_tokens or session.context_tokens
         return
+
+    source_sequence = snapshot.get("source_sequence")
+    checkpoint_start_sequence = max(0, int(source_sequence or 0))
+    if source_sequence is not None:
+        expected_sequence = max(0, int(source_sequence or 0))
+        current_sequence = int(db.scalar(
+            select(func.max(ChatMessage.sequence)).where(ChatMessage.session_id == session.id)
+        ) or 0)
+        source_conflict = source_sequence_valid is False
+        if source_sequence_valid is None:
+            source_conflict = current_sequence != expected_sequence
+        boundary_conflict = end_sequence > current_sequence
+        if source_conflict or boundary_conflict:
+            db.add(CompactionAttempt(
+                session_id=session.id,
+                trigger=str(last_finished.get("reason") or "threshold"),
+                phase="before_model",
+                status="conflict",
+                attempt_number=max(1, int(last_finished.get("attempts") or 1)),
+                before_tokens=before_tokens,
+                after_tokens=after_tokens,
+                source_version=max(0, version - 1),
+                target_version=version,
+                details={
+                    "run_id": run_id,
+                    "expected_source_sequence": expected_sequence,
+                    "current_sequence": current_sequence,
+                    "checkpoint_end_sequence": end_sequence,
+                },
+                finished_at=_utcnow(),
+            ))
+            _persist_artifact_refs(db, session.id, all_artifact_refs)
+            return
 
     current_active = db.scalar(
         select(ContextEpoch)
@@ -352,6 +482,7 @@ def _persist_context_snapshot(db: Any, session: Session, run_id: str, outcome: R
             },
             finished_at=_utcnow(),
         ))
+        _persist_artifact_refs(db, session.id, all_artifact_refs, epoch_id=current_active.id)
         return
 
     active_epochs = list(db.scalars(
@@ -366,7 +497,7 @@ def _persist_context_snapshot(db: Any, session: Session, run_id: str, outcome: R
         session_id=session.id,
         epoch_number=next_number,
         status="active",
-        start_sequence=0,
+        start_sequence=checkpoint_start_sequence,
         end_sequence=end_sequence,
         summary_json=summary,
         retained_messages=retained_messages,
@@ -383,7 +514,7 @@ def _persist_context_snapshot(db: Any, session: Session, run_id: str, outcome: R
     checkpoint = ContextCheckpoint(
         session_id=session.id,
         epoch_id=epoch.id,
-        start_sequence=0,
+        start_sequence=checkpoint_start_sequence,
         end_sequence=end_sequence,
         summary_json=summary,
         retained_messages=retained_messages,
@@ -399,24 +530,7 @@ def _persist_context_snapshot(db: Any, session: Session, run_id: str, outcome: R
     )
     db.add(checkpoint)
     db.flush()
-    for raw_ref in artifact_refs:
-        if not isinstance(raw_ref, dict):
-            continue
-        artifact_id = str(raw_ref.get("artifact_id") or raw_ref.get("id") or "")
-        if not artifact_id:
-            continue
-        db.add(Artifact(
-            session_id=session.id,
-            epoch_id=epoch.id,
-            kind=str(raw_ref.get("kind") or "tool_output"),
-            name=artifact_id[:255],
-            storage_path=str(raw_ref.get("storage_key") or artifact_id),
-            sha256=str(raw_ref.get("sha256") or "") or None,
-            mime_type=str(raw_ref.get("mime_type") or "text/plain"),
-            size_bytes=max(0, int(raw_ref.get("size") or 0)),
-            preview=str(raw_ref.get("preview") or ""),
-            metadata_json={"runtime_artifact_id": artifact_id},
-        ))
+    _persist_artifact_refs(db, session.id, all_artifact_refs, epoch_id=epoch.id)
 
     attempt_count = max(1, int(last_finished.get("attempts") or 1))
     for attempt_number in range(1, attempt_count + 1):
@@ -442,6 +556,46 @@ def _persist_context_snapshot(db: Any, session: Session, run_id: str, outcome: R
     session.context_summary = json.dumps(summary, ensure_ascii=False, sort_keys=True)
     session.context_tokens = after_tokens or session.context_tokens
     session.last_compacted_at = _utcnow()
+
+
+def _persist_artifact_refs(
+    db: Any,
+    session_id: str,
+    refs: list[dict[str, Any]],
+    *,
+    epoch_id: str | None = None,
+) -> None:
+    """Persist artifact metadata idempotently; bytes already live in storage_key."""
+
+    seen: set[str] = set()
+    for raw_ref in refs:
+        if not isinstance(raw_ref, dict):
+            continue
+        artifact_id = str(raw_ref.get("artifact_id") or raw_ref.get("id") or "").strip()
+        storage_path = str(raw_ref.get("storage_key") or "").strip()
+        if not artifact_id or not storage_path or storage_path in seen:
+            continue
+        seen.add(storage_path)
+        existing = db.scalar(select(Artifact).where(
+            Artifact.session_id == session_id,
+            Artifact.storage_path == storage_path,
+        ))
+        if existing is not None:
+            if epoch_id and not existing.epoch_id:
+                existing.epoch_id = epoch_id
+            continue
+        db.add(Artifact(
+            session_id=session_id,
+            epoch_id=epoch_id,
+            kind=str(raw_ref.get("kind") or "tool_output"),
+            name=artifact_id[:255],
+            storage_path=storage_path,
+            sha256=str(raw_ref.get("sha256") or "") or None,
+            mime_type=str(raw_ref.get("mime_type") or "text/plain"),
+            size_bytes=max(0, int(raw_ref.get("size") or 0)),
+            preview=str(raw_ref.get("preview") or ""),
+            metadata_json={"runtime_artifact_id": artifact_id},
+        ))
 
 
 def _prepare_session_history(db: Any, session: Session) -> list[dict[str, Any]]:
@@ -671,7 +825,8 @@ def _delegate_catalog_prompt(db: Any) -> str:
         return ""
     lines = [
         "可委派的子 Agent（仅在任务确实较复杂、专业，或用户明确要求时使用 task 工具）：",
-        "- task 必须传入下列精确 agent_id；子 Agent 的实际权限和工具会由系统再次校验。",
+        "- 单个子任务使用 task + agent_id；多个相互独立的子任务请使用 tasks 数组，系统会并行启动并在全部结束后返回结果。",
+        "- 每项任务都必须使用下列精确 agent_id；子 Agent 的实际权限和工具会由系统再次校验。",
     ]
     for child in children:
         name = _single_line(child.name, limit=120) or "未命名子 Agent"
@@ -1332,6 +1487,8 @@ class RunCoordinator:
             "context_resumed": "acting",
             "model_step_started": "acting",
             "tool_finished": "observing",
+            "completion_verification_started": "verifying",
+            "completion_verification_rejected": "acting",
         }
         deferred_stream_events = {"approval_requested", "run_completed", "run_stopped", "model_failed"}
 
@@ -1362,10 +1519,22 @@ class RunCoordinator:
 
     @staticmethod
     def _runtime_snapshot(outcome: RunOutcome) -> dict[str, Any]:
+        messages = [] if outcome.stop_reason == "acceptance_failed" else outcome.messages
+        acceptance_report = dict(outcome.acceptance_report)
+        semantic = acceptance_report.get("semantic")
+        if isinstance(semantic, Mapping):
+            # Model-authored prose may quote rejected candidates or tool
+            # evidence. Persist only the decision fields needed for audit and
+            # recovery; detailed feedback already served its in-memory retry.
+            acceptance_report["semantic"] = {
+                key: semantic[key]
+                for key in ("passed", "model_passed", "score", "threshold", "confidence")
+                if key in semantic
+            }
         return _json_safe({
             "status": outcome.status,
             "output": outcome.output,
-            "messages": outcome.messages,
+            "messages": messages,
             "events": outcome.events,
             "steps": outcome.steps,
             "tool_calls": outcome.tool_calls,
@@ -1378,6 +1547,11 @@ class RunCoordinator:
             "active_elapsed_seconds": outcome.active_elapsed_seconds,
             "runtime_binding": outcome.runtime_binding,
             "context_snapshot": outcome.context_snapshot,
+            "artifact_refs": outcome.artifact_refs,
+            "transcript_delta": outcome.transcript_delta,
+            "verification_trace": outcome.verification_trace,
+            "acceptance_report": acceptance_report,
+            "completion_verification_attempts": outcome.completion_verification_attempts,
         })
 
     @staticmethod
@@ -1398,6 +1572,17 @@ class RunCoordinator:
             active_elapsed_seconds=max(0.0, float(payload.get("active_elapsed_seconds") or 0.0)),
             runtime_binding=dict(payload.get("runtime_binding") or {}),
             context_snapshot=dict(payload.get("context_snapshot") or {}),
+            artifact_refs=[dict(item) for item in payload.get("artifact_refs") or [] if isinstance(item, dict)],
+            transcript_delta=(
+                [dict(item) for item in payload.get("transcript_delta") or [] if isinstance(item, dict)]
+                if "transcript_delta" in payload
+                else None
+            ),
+            verification_trace=[
+                dict(item) for item in payload.get("verification_trace") or [] if isinstance(item, dict)
+            ],
+            acceptance_report=dict(payload.get("acceptance_report") or {}),
+            completion_verification_attempts=max(0, int(payload.get("completion_verification_attempts") or 0)),
         )
 
     @staticmethod
@@ -1607,6 +1792,7 @@ class RunCoordinator:
                 "summary": session.context_summary if session else "",
                 "memories": [{"content": item.content, "pinned": item.pinned} for item in memories],
                 "recent_messages": messages,
+                "task_anchor": ContextManager.task_from_messages(messages),
                 "mode": "auto",
                 "workspace_root": workspace_root,
                 "provider": provider_config,
@@ -1622,6 +1808,7 @@ class RunCoordinator:
                 "allowed_tool_names": allowed_tool_names,
                 "skill_instructions": skill_instructions,
                 "todo_state": todo_state,
+                "task_state": {"todos": todo_state} if todo_state else {},
                 "max_run_seconds": runtime_max_run_seconds,
                 "session_id": session.id if session else None,
                 "context_snapshot": context_snapshot,
@@ -1651,6 +1838,9 @@ class RunCoordinator:
                 task_delegate=task_delegate,
             ),
             context_manager=ContextManager(max_tokens=settings.context_limit_tokens),
+            artifact_store=FilesystemArtifactStore(
+                settings.data_dir / "artifacts" / str(session.id if session else run.id)
+            ),
             event_sink=RunCoordinator._event_sink(run_id),
             stream_sink=RunCoordinator._stream_sink(run_id),
             config=RuntimeConfig(
@@ -1792,6 +1982,19 @@ class RunCoordinator:
         }.get(status, "delegated_child_incomplete")
         continuation_queued = False
         if status in {"completed", "failed", "stopped"} and link["parent_run_id"]:
+            # A parallel parent must resume only after every child that paused
+            # for approval has reached a terminal state.  At the point the
+            # parent is stopped for delegated approval, any remaining
+            # in-progress delegation belongs to that waiting parallel batch.
+            db.flush()
+            waiting_sibling_id = db.scalar(
+                select(DelegatedTask.id)
+                .where(
+                    DelegatedTask.parent_run_id == link["parent_run_id"],
+                    DelegatedTask.status == "in_progress",
+                )
+                .limit(1)
+            )
             parent = db.get(Run, link["parent_run_id"])
             # The parent was deliberately stopped rather than completed while
             # the child waited.  Only that exact state can be safely resumed;
@@ -1801,6 +2004,7 @@ class RunCoordinator:
                 parent is not None
                 and parent.status == "stopped"
                 and parent.stop_reason == "delegated_child_awaiting_approval"
+                and waiting_sibling_id is None
             ):
                 parent.status = "received"
                 parent.stop_reason = None
@@ -1915,11 +2119,22 @@ class RunCoordinator:
             )
 
             if run.session_id and not outcome.runtime_binding.get("delegation_version"):
+                session_for_context = db.get(Session, run.session_id)
+                source_sequence_valid = (
+                    _lock_context_source(db, session_for_context, outcome)
+                    if session_for_context is not None
+                    else None
+                )
                 _append_runtime_transcript(db, run_id, run.session_id, outcome)
                 db.flush()
-                session_for_context = db.get(Session, run.session_id)
                 if session_for_context is not None:
-                    _persist_context_snapshot(db, session_for_context, run_id, outcome)
+                    _persist_context_snapshot(
+                        db,
+                        session_for_context,
+                        run_id,
+                        outcome,
+                        source_sequence_valid=source_sequence_valid,
+                    )
 
             usage = normalize_usage(outcome.usage)
             if usage["request_count"]:
@@ -2004,6 +2219,7 @@ class RunCoordinator:
     async def _execute(self, run_id: str) -> None:
         try:
             runtime, context = self._resolve_runtime(run_id)
+            self._install_completion_verifier(runtime, context)
             outcome = await runtime.run(
                 system_prompt=context["system_prompt"],
                 agent_instructions=context["agent_instructions"],
@@ -2014,6 +2230,12 @@ class RunCoordinator:
                 mode=context["mode"],
                 thread_id=run_id,
                 context_snapshot=context.get("context_snapshot"),
+                permission_policy=context.get("permission_policy"),
+                task_state=context.get("task_state"),
+                session_id=context.get("session_id"),
+                context_sequence=int(context.get("context_sequence") or 0),
+                context_version=int(context.get("context_version") or 0),
+                prompt_cache_key_seed=context.get("prompt_cache_key_seed"),
             )
             outcome.runtime_binding = {
                 **dict(context["runtime_binding"]),
@@ -2039,7 +2261,12 @@ class RunCoordinator:
             if not prior.runtime_binding:
                 raise RuntimeError("运行快照缺少冻结配置，已拒绝在可变环境中续跑")
             runtime, context = self._resolve_runtime(run_id, runtime_binding=prior.runtime_binding)
-            outcome = await runtime.resume_after_approval(prior, thread_id=run_id)
+            self._install_completion_verifier(runtime, context)
+            outcome = await runtime.resume_after_approval(
+                prior,
+                thread_id=run_id,
+                runtime_context=context,
+            )
             outcome.runtime_binding = {
                 **dict(context["runtime_binding"]),
                 **runtime.tool_registry.runtime_state(),
@@ -2066,7 +2293,12 @@ class RunCoordinator:
             if not prior.runtime_binding:
                 raise RuntimeError("delegated child continuation is missing the frozen parent binding")
             runtime, context = self._resolve_runtime(run_id, runtime_binding=prior.runtime_binding)
-            outcome = await runtime.resume_after_delegated_child(prior, thread_id=run_id)
+            self._install_completion_verifier(runtime, context)
+            outcome = await runtime.resume_after_delegated_child(
+                prior,
+                thread_id=run_id,
+                runtime_context=context,
+            )
             outcome.runtime_binding = {
                 **dict(context["runtime_binding"]),
                 **runtime.tool_registry.runtime_state(),
@@ -2076,6 +2308,33 @@ class RunCoordinator:
             raise
         except Exception as exc:
             self._persist_failure(run_id, exc)
+
+    @staticmethod
+    def _install_completion_verifier(runtime: AgentRuntime, context: Mapping[str, Any]) -> None:
+        """Attach the main-agent-only completion gate to a resolved runtime."""
+
+        binding = context.get("runtime_binding")
+        if isinstance(binding, Mapping) and binding.get("delegation_version"):
+            # Child agents never produce the user-facing final answer. Their
+            # settled task observation is part of the parent's gated trace.
+            runtime.completion_verifier = None
+            return
+        original_task = str(context.get("task_anchor") or "").strip()
+        if not original_task:
+            raise ModelConfigurationError("主 Agent 验收器缺少原始任务锚点")
+        provider = context.get("provider")
+        if not isinstance(provider, ProviderConfig):
+            raise ModelConfigurationError("独立验收器缺少冻结的模型配置")
+        runtime.config.max_completion_verification_attempts = max(
+            1,
+            int(settings.completion_evaluation_max_attempts or 1),
+        )
+        runtime.completion_verifier = build_completion_verifier(
+            evaluator_call=build_model_call(provider),
+            original_task=original_task,
+            score_threshold=settings.completion_evaluation_score_threshold,
+            timeout_seconds=settings.completion_evaluation_timeout_seconds,
+        )
 
     @staticmethod
     def _persist_failure(run_id: str, error: BaseException) -> None:

@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     max_run_seconds: float | None = 1_800.0
     context_limit_tokens: int = 100_000
     compact_threshold_tokens: int = 90_000
+    completion_evaluation_max_attempts: int = 3
+    completion_evaluation_score_threshold: float = 0.8
+    completion_evaluation_timeout_seconds: float = 90.0
 
     @property
     def data_dir(self) -> Path:

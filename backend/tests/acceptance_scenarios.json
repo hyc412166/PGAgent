@@ -1,0 +1,58 @@
+[
+  {
+    "name": "plain_text_pass",
+    "output": "done",
+    "messages": [{"role": "assistant", "content": "done"}],
+    "declared_tool_calls": 0,
+    "expected_pass": true
+  },
+  {
+    "name": "tool_roundtrip_pass",
+    "output": "done",
+    "messages": [
+      {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+      {"role": "tool", "tool_call_id": "call-1", "name": "read", "content": "{\"tool_name\": \"read\", \"ok\": true, \"content\": \"evidence\"}"},
+      {"role": "assistant", "content": "done"}
+    ],
+    "declared_tool_calls": 1,
+    "expected_pass": true
+  },
+  {
+    "name": "orphan_result_reject",
+    "output": "done",
+    "messages": [
+      {"role": "tool", "tool_call_id": "call-1", "name": "read", "content": "{\"tool_name\": \"read\", \"ok\": true}"},
+      {"role": "assistant", "content": "done"}
+    ],
+    "declared_tool_calls": 0,
+    "expected_pass": false
+  },
+  {
+    "name": "unresolved_call_reject",
+    "output": "done",
+    "messages": [
+      {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+      {"role": "assistant", "content": "done"}
+    ],
+    "declared_tool_calls": 1,
+    "expected_pass": false
+  },
+  {
+    "name": "count_mismatch_reject",
+    "output": "done",
+    "messages": [
+      {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+      {"role": "tool", "tool_call_id": "call-1", "name": "read", "content": "{\"tool_name\": \"read\", \"ok\": true}"},
+      {"role": "assistant", "content": "done"}
+    ],
+    "declared_tool_calls": 2,
+    "expected_pass": false
+  },
+  {
+    "name": "empty_output_reject",
+    "output": "",
+    "messages": [{"role": "assistant", "content": ""}],
+    "declared_tool_calls": 0,
+    "expected_pass": false
+  }
+]

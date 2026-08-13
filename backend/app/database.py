@@ -538,54 +538,11 @@ class Memory(TimestampMixin, Base):
     extra: Mapped[dict] = mapped_column("metadata", JSON, default=dict, nullable=False)
 
 
-class TeamTask(TimestampMixin, Base):
-    __tablename__ = "team_tasks"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    team_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
-    parent_task_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("team_tasks.id", ondelete="SET NULL"), nullable=True
-    )
-    title: Mapped[str] = mapped_column(String(200), nullable=False)
-    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    priority: Mapped[str] = mapped_column(String(16), default="normal", nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="todo", index=True, nullable=False)
-    assignee_agent_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
-    )
-    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    lease_owner: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    idempotency_key: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
-    result: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-
-
-class AgentMessage(Base):
-    __tablename__ = "agent_messages"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    team_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
-    task_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("team_tasks.id", ondelete="CASCADE"), index=True, nullable=True
-    )
-    sender_agent_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    recipient_agent_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
-    message_type: Mapped[str] = mapped_column(String(40), nullable=False)
-    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
-    idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    hop_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-
-
 class DelegatedTask(TimestampMixin, Base):
     """A child-Agent execution owned by one parent conversation.
 
-    This deliberately has no team, lease, claim, or inter-agent-message
-    fields.  Those concerns belong to ``TeamTask`` / ``AgentMessage`` and are
-    reserved for the future multi-user collaboration feature.
+    It deliberately has no team, lease, claim, or inter-agent-message fields:
+    child work belongs only to its parent run and conversation.
     """
 
     __tablename__ = "delegated_tasks"
@@ -725,6 +682,17 @@ def _migrate_sqlite_columns() -> None:
                     )
 
 
+def _drop_retired_team_collaboration_tables() -> None:
+    """Remove the retired multi-user task-board storage from existing databases."""
+
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as connection:
+        # Messages reference tasks, so the dependent table must be removed first.
+        connection.exec_driver_sql('DROP TABLE IF EXISTS "agent_messages"')
+        connection.exec_driver_sql('DROP TABLE IF EXISTS "team_tasks"')
+
+
 def _default_workspace_root() -> Path:
     return PROJECT_ROOT / "data" / "workspaces" / "default"
 
@@ -809,6 +777,7 @@ def _seed_defaults() -> None:
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    _drop_retired_team_collaboration_tables()
     _migrate_sqlite_columns()
     _seed_defaults()
 

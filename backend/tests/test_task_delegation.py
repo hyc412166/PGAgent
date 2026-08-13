@@ -12,7 +12,6 @@ from app import database
 from app.api.resources import list_session_delegations
 from app.database import (
     Agent,
-    AgentMessage,
     AgentTool,
     Approval,
     Base,
@@ -22,20 +21,12 @@ from app.database import (
     Run,
     RunEvent,
     Session,
-    TeamTask,
     Workspace,
 )
 from app.runtime import RunOutcome
 from app.runtime.engine import ModelToolCall, ModelTurn
 from app.services import run_service
 from app.services.run_service import RunCoordinator
-
-
-def assert_no_legacy_collaboration_records(db: object) -> None:
-    """Delegated child work must not populate future multi-user tables."""
-
-    assert list(db.scalars(select(TeamTask))) == []  # type: ignore[attr-defined]
-    assert list(db.scalars(select(AgentMessage))) == []  # type: ignore[attr-defined]
 
 
 def test_session_delegations_include_legacy_child_run_history(
@@ -249,7 +240,6 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         assert frozen["workspace_root"] != delegated_run["child_root"]
         assert frozen["model_id"] == "child-model"
         assert frozen["allowed_tool_names"] == ["read"]
-        assert_no_legacy_collaboration_records(db)
 
 
 @pytest.mark.asyncio
@@ -267,6 +257,19 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
 
     async def parent_model(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal parent_calls
+        if kwargs.get("mode") == "evaluation":
+            return ModelTurn(content=json.dumps({
+                "passed": True,
+                "score": 1.0,
+                "summary": "delegated result and parent synthesis are present",
+                "criteria": [{
+                    "criterion": "parent synthesized the completed child result",
+                    "passed": True,
+                    "evidence": "the parent trace contains the terminal task observation",
+                }],
+                "feedback": "",
+                "confidence": 1.0,
+            }))
         parent_calls += 1
         if parent_calls == 1:
             return ModelTurn(tool_calls=[ModelToolCall(
@@ -335,7 +338,6 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
         approval.status = "approved"
         child_run.status = "received"
         db.commit()
-        assert_no_legacy_collaboration_records(db)
 
     await run_service.coordinator._resume(child_run_id)
 
@@ -349,7 +351,19 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
                 break
         await asyncio.sleep(0.01)
     else:
-        pytest.fail("the parent run did not resume after the child completed")
+        with database.SessionLocal() as db:
+            parent = db.get(Run, delegated_run["run_id"])
+            parent_events = list(db.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == delegated_run["run_id"])
+                .order_by(RunEvent.created_at.asc(), RunEvent.id.asc())
+            ))
+            pytest.fail(
+                "the parent run did not resume after the child completed; "
+                f"status={getattr(parent, 'status', None)}; "
+                f"stop_reason={getattr(parent, 'stop_reason', None)}; "
+                f"events={[(item.event_type, item.payload) for item in parent_events[-8:]]}"
+            )
 
     with database.SessionLocal() as db:
         task = db.get(DelegatedTask, task_id)
@@ -395,7 +409,6 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
         task = db.get(DelegatedTask, task_id)
         assert task is not None and task.result == result_before
         assert task.updated_at == updated_at_before
-        assert_no_legacy_collaboration_records(db)
         assert len(list(db.scalars(select(ChatMessage).where(
             ChatMessage.session_id == delegated_run["session_id"],
         )))) == visible_count_before
@@ -470,7 +483,6 @@ def test_restart_recovery_settles_active_delegated_child_and_keeps_binding(
         assert parent is not None and parent.status == "received"
         assert task.result["status"] == "stopped"
         assert task.result["binding"]["model_id"] == "child-model"
-        assert_no_legacy_collaboration_records(db)
 
 
 @pytest.mark.asyncio
@@ -494,7 +506,6 @@ async def test_child_failure_blocks_once_and_repeated_delegate_call_is_idempoten
         task = db.scalar(select(DelegatedTask))
         assert task is not None and task.status == "blocked"
         assert task.result["status"] == "failed"
-        assert_no_legacy_collaboration_records(db)
         assert len(list(db.scalars(select(RunEvent).where(
             RunEvent.run_id == delegated_run["run_id"],
             RunEvent.event_type == "delegated_child_failed",
@@ -539,4 +550,3 @@ async def test_child_timeout_is_limited_to_the_parent_remaining_budget(
     assert 0 < captured_limits[0] < 5
     with database.SessionLocal() as db:
         assert db.scalar(select(DelegatedTask)) is not None
-        assert_no_legacy_collaboration_records(db)

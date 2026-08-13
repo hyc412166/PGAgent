@@ -11,11 +11,13 @@ from app.runtime.context_service import (
     ContextAssembler,
     ContextEpoch,
     ContextSnapshot,
+    FilesystemArtifactStore,
     InMemoryArtifactStore,
     SemanticCompactor,
     VersionConflictError,
     compact_with_compare_and_swap,
     micro_compact_messages,
+    context_end_sequence,
     parse_structured_summary,
 )
 from app.runtime.context import estimate_tokens
@@ -59,6 +61,44 @@ def test_assembler_separates_stable_prefix_and_dynamic_suffix_and_has_stable_key
     assert second.dynamic_suffix[-1]["content"] == "two"
     assert first.cache_key == second.cache_key
     assert first.cache_breakpoints == (len(first.stable_prefix),)
+
+
+def test_assembler_injects_legacy_summary_memories_and_task_anchor_as_dynamic_data() -> None:
+    assembler = ContextAssembler(max_tokens=4_000, output_reserve_tokens=100, safety_buffer_tokens=100)
+    stable = assembler.stable_prefix(system_rules="safe")
+    layout = assembler.assemble(
+        stable_prefix=stable,
+        summary="legacy facts",
+        memories=[{"content": "prefer Chinese", "pinned": True}],
+        task_anchor="finish the context refactor",
+        recent_messages=[{"role": "user", "content": "finish the context refactor"}],
+    )
+
+    rendered = "\n".join(str(item.get("content") or "") for item in layout.dynamic_suffix)
+    assert "legacy facts" in rendered
+    assert "[固定] prefer Chinese" in rendered
+    assert "<user_task>" in rendered
+    assert "finish the context refactor" in rendered
+    assert all("legacy facts" not in str(item.get("content") or "") for item in layout.stable_prefix)
+
+
+def test_filesystem_artifact_store_survives_a_new_store_instance(tmp_path) -> None:
+    first = FilesystemArtifactStore(tmp_path)
+    ref = first.put("durable tool output")
+
+    assert ref.storage_key
+    assert FilesystemArtifactStore(tmp_path).get(ref.artifact_id) == b"durable tool output"
+
+
+def test_context_sequence_advances_from_epoch_boundary_not_current_database_maximum() -> None:
+    snapshot = ContextSnapshot(sequence=7)
+    tail = [
+        {"role": "user", "content": "persisted tail"},
+        {"role": "assistant", "content": "new runtime item"},
+    ]
+
+    assert context_end_sequence(snapshot, tail) == 9
+    assert context_end_sequence(None, tail) == 2
 
 
 def test_semantic_compactor_defaults_to_current_model_and_returns_epoch() -> None:

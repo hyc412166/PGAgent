@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import pytest
@@ -10,6 +11,7 @@ from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeCo
 from app.runtime.errors import APIErrorKind, call_with_retry, classify_api_error
 from app.runtime.guards import LoopGuard
 from app.tools import create_default_registry
+from app.tools.types import ToolResult
 
 
 class StatusError(RuntimeError):
@@ -72,6 +74,235 @@ def test_zero_hard_limits_allow_large_runs_but_keep_anti_loop_guards() -> None:
         assert not guard.record_progress(True).stop
     assert guard.steps == 250
     assert guard.calls == 250
+
+
+@pytest.mark.asyncio
+async def test_production_context_path_keeps_summary_memory_and_task_anchor(tmp_path) -> None:
+    observed: list[dict] = []
+
+    async def model_call(**kwargs) -> ModelTurn:
+        observed.extend(kwargs["messages"])
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+    outcome = await runtime.run(
+        system_prompt="safe",
+        summary="legacy checkpoint facts",
+        memories=[{"content": "prefer Chinese", "pinned": True}],
+        recent_messages=[{"role": "user", "content": "finish the refactor"}],
+    )
+
+    assert outcome.status == "completed"
+    rendered = "\n".join(str(item.get("content") or "") for item in observed)
+    assert "legacy checkpoint facts" in rendered
+    assert "[固定] prefer Chinese" in rendered
+    assert "<user_task>" in rendered
+    assert "finish the refactor" in rendered
+
+
+@pytest.mark.asyncio
+async def test_multiple_task_calls_are_dispatched_concurrently(tmp_path) -> None:
+    started = asyncio.Event()
+    active = 0
+    max_active = 0
+    start_count = 0
+    model_turns = 0
+
+    async def delegate(task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
+        nonlocal active, max_active, start_count
+        active += 1
+        max_active = max(max_active, active)
+        start_count += 1
+        if start_count == 2:
+            started.set()
+        await asyncio.wait_for(started.wait(), timeout=1)
+        active -= 1
+        return ToolResult("task", True, f"{agent_id}: {task}")
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal model_turns
+        model_turns += 1
+        if model_turns == 1:
+            return ModelTurn(tool_calls=[
+                ModelToolCall("task-a", "task", {"task": "research", "agent_id": "agent-a"}),
+                ModelToolCall("task-b", "task", {"task": "review", "agent_id": "agent-b"}),
+            ])
+        return ModelTurn(content="parallel results received")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=["task"],
+            permission_mode="full",
+            task_delegate=delegate,
+        ),
+    )
+    outcome = await runtime.run(system_prompt="", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert outcome.output == "parallel results received"
+    assert max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_parallel_task_turn_rejects_total_fanout_above_limit(tmp_path) -> None:
+    invoked: list[str] = []
+    model_turns = 0
+
+    async def delegate(task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
+        invoked.append(agent_id)
+        return ToolResult("task", True, task)
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal model_turns
+        model_turns += 1
+        if model_turns == 1:
+            return ModelTurn(tool_calls=[
+                ModelToolCall(f"task-{index}", "task", {
+                    "task": f"work-{index}",
+                    "agent_id": f"agent-{index}",
+                })
+                for index in range(9)
+            ])
+        tool_results = [
+            json.loads(message["content"])
+            for message in kwargs["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert len(tool_results) == 9
+        assert {result["error_code"] for result in tool_results} == {"delegate_parallel_limit"}
+        return ModelTurn(content="fanout rejected")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=["task"],
+            permission_mode="full",
+            task_delegate=delegate,
+        ),
+    )
+    outcome = await runtime.run(system_prompt="", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert outcome.output == "fanout rejected"
+    assert invoked == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_tool_turn_cannot_bypass_total_delegate_limit(tmp_path) -> None:
+    invoked: list[str] = []
+    model_turns = 0
+
+    async def delegate(task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
+        invoked.append(agent_id)
+        return ToolResult("task", True, task)
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal model_turns
+        model_turns += 1
+        if model_turns == 1:
+            return ModelTurn(tool_calls=[
+                ModelToolCall("batch-a", "task", {"tasks": [
+                    {"task": f"research-{index}", "agent_id": f"agent-a-{index}"}
+                    for index in range(5)
+                ]}),
+                ModelToolCall("read-between", "read", {"path": "missing.txt"}),
+                ModelToolCall("batch-b", "task", {"tasks": [
+                    {"task": f"review-{index}", "agent_id": f"agent-b-{index}"}
+                    for index in range(4)
+                ]}),
+            ])
+        task_results = [
+            json.loads(message["content"])
+            for message in kwargs["messages"]
+            if message.get("role") == "tool" and message.get("name") == "task"
+        ]
+        assert len(task_results) == 2
+        assert {result["error_code"] for result in task_results} == {"delegate_parallel_limit"}
+        return ModelTurn(content="mixed fanout rejected")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=["task", "read"],
+            permission_mode="full",
+            task_delegate=delegate,
+        ),
+    )
+    outcome = await runtime.run(system_prompt="", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert outcome.output == "mixed fanout rejected"
+    assert invoked == []
+
+
+@pytest.mark.asyncio
+async def test_parallel_child_approval_keeps_sibling_results_and_resumes_all(tmp_path) -> None:
+    child_a_completed = False
+    calls: list[str] = []
+    model_turns = 0
+
+    async def delegate(task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
+        calls.append(str(call_id))
+        if call_id == "task-a" and not child_a_completed:
+            return ToolResult(
+                "task",
+                False,
+                json.dumps({"status": "awaiting_approval", "child_run_id": "child-a"}),
+                error_code="delegate_child_awaiting_approval",
+                metadata={
+                    "task_id": "delegation-a",
+                    "child_run_id": "child-a",
+                    "delegated_child_awaiting_approval": True,
+                },
+            )
+        return ToolResult("task", True, f"{agent_id}: {task} completed")
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal model_turns
+        model_turns += 1
+        if model_turns == 1:
+            return ModelTurn(tool_calls=[
+                ModelToolCall("task-a", "task", {"task": "research", "agent_id": "agent-a"}),
+                ModelToolCall("task-b", "task", {"task": "review", "agent_id": "agent-b"}),
+            ])
+        tool_ids = [
+            message.get("tool_call_id")
+            for message in kwargs["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert tool_ids[-2:] == ["task-a", "task-b"]
+        return ModelTurn(content="all child results received")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=["task"],
+            permission_mode="full",
+            task_delegate=delegate,
+        ),
+    )
+    waiting = await runtime.run(system_prompt="", recent_messages=[])
+    assert waiting.status == "stopped"
+    assert waiting.stop_reason == "delegated_child_awaiting_approval"
+    assert [
+        message.get("tool_call_id")
+        for message in waiting.messages
+        if message.get("role") == "tool"
+    ] == ["task-a", "task-b"]
+
+    child_a_completed = True
+    resumed = await runtime.resume_after_delegated_child(waiting)
+    assert resumed.status == "completed"
+    assert resumed.output == "all child results received"
+    assert calls == ["task-a", "task-b", "task-a"]
 
 
 @pytest.mark.asyncio
@@ -287,6 +518,37 @@ async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> Non
     assert resumed.output == "完成"
     assert turns == 2
     assert (tmp_path / "done.txt").read_text(encoding="utf-8") == "yes"
+
+
+@pytest.mark.asyncio
+async def test_production_context_path_keeps_task_anchor_after_approval_resume(tmp_path) -> None:
+    task = "Write the approved file and keep this goal after resume."
+    turns = 0
+
+    async def model_call(**kwargs) -> ModelTurn:
+        nonlocal turns
+        turns += 1
+        anchors = [item for item in kwargs["messages"] if ContextManager.is_task_anchor(item)]
+        assert len(anchors) == 1
+        assert task in anchors[0]["content"]
+        if turns == 1:
+            return ModelTurn(tool_calls=[
+                ModelToolCall("approved-write", "write_file", {"path": "goal.txt", "content": "kept"})
+            ])
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
+    )
+    waiting = await runtime.run(
+        system_prompt="safe",
+        recent_messages=[{"role": "user", "content": task}],
+    )
+    resumed = await runtime.resume_after_approval(waiting)
+
+    assert resumed.status == "completed"
+    assert turns == 2
 
 
 @pytest.mark.asyncio

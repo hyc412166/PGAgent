@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import subprocess
 import time
 from pathlib import Path
 
+
 from app.tools.builtins import (
+    delegate_task_async,
     file_info,
     git_diff,
     git_status,
@@ -16,6 +20,71 @@ from app.tools.builtins import (
     write_file,
 )
 from app.tools.sandbox import SandboxViolation, WorkspaceSandbox
+from app.tools.types import ToolResult
+
+
+def test_task_batch_runs_child_delegates_concurrently(tmp_path: Path) -> None:
+    async def run() -> None:
+        active = 0
+        max_active = 0
+
+        async def delegate(task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+            return ToolResult(
+                "task",
+                True,
+                json.dumps({"task": task, "agent_id": agent_id, "call_id": call_id}),
+            )
+
+        result = await delegate_task_async(
+            WorkspaceSandbox(tmp_path),
+            tasks=[
+                {"task": "research", "agent_id": "agent-a"},
+                {"task": "review", "agent_id": "agent-b"},
+            ],
+            delegate=delegate,
+            call_id="parallel-batch",
+        )
+
+        payload = json.loads(result.content)
+        assert result.ok
+        assert payload["parallel"] is True
+        assert payload["child_count"] == 2
+        assert max_active == 2
+
+    asyncio.run(run())
+
+
+def test_task_batch_reports_partial_failure(tmp_path: Path) -> None:
+    async def run() -> None:
+        async def delegate(task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
+            if agent_id == "agent-b":
+                raise RuntimeError("child failed")
+            return ToolResult("task", True, json.dumps({"status": "completed", "output": task}))
+
+        result = await delegate_task_async(
+            WorkspaceSandbox(tmp_path),
+            tasks=[
+                {"task": "research", "agent_id": "agent-a"},
+                {"task": "review", "agent_id": "agent-b"},
+            ],
+            delegate=delegate,
+            call_id="mixed-batch",
+        )
+
+        payload = json.loads(result.content)
+        assert not result.ok
+        assert result.error_code == "delegate_partial_failure"
+        assert payload["status"] == "partial_failure"
+        assert payload["completed_count"] == 1
+        assert payload["failed_count"] == 1
+        assert [child["ok"] for child in payload["children"]] == [True, False]
+
+    asyncio.run(run())
 
 
 def test_sandbox_rejects_parent_and_absolute_paths(tmp_path: Path) -> None:

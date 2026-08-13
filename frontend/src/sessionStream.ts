@@ -37,6 +37,9 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'tool_call': return event.tool_name ? `正在调用 ${event.tool_name}…` : '正在调用工具…'
     case 'tool_finished':
     case 'tool_result': return '正在读取工具结果…'
+    case 'completion_verification_started': return '正在验收任务结果…'
+    case 'completion_verification_rejected': return '验收未通过，正在继续改进…'
+    case 'completion_verification_passed': return '验收通过，正在完成…'
     case 'approval_requested': return '等待你的审批'
     case 'approval_granted': return '审批已通过，继续处理…'
     case 'delegated_child_started': return '子 Agent 正在处理任务…'
@@ -72,6 +75,7 @@ export function runStatusPhase(status?: string): string {
     case 'running':
     case 'acting': return '思考中…'
     case 'observing': return '正在读取工具结果…'
+    case 'verifying': return '正在验收任务结果…'
     case 'awaiting_approval': return '等待你的审批'
     case 'completed': return '已完成'
     case 'stopped':

@@ -1,22 +1,24 @@
 # PGAgent
 
+> 主 Agent 的候选结果在发送给用户前会经过两层验收：确定性运行链路检查，以及无工具、隔离上下文中的独立 evaluator 语义验收。失败反馈会驱动主 Agent 继续修订，默认最多 3 次；未通过的候选不会写入聊天记录或发布 `run_completed`。确定性场景清单位于 `backend/tests/acceptance_scenarios.json`。
+
 PGAgent 是一个本地优先、单用户的 Agent 工作台。它参考了视频中 TWork 的产品形态，以及 Claude Code 的 harness 思路：模型在一个简洁的工具循环里动态安排工作，外层由 LangGraph 管理阶段、checkpoint、人工审批和安全停止。
 
-当前版本以“项目 + 会话”组织本地任务：可接入模型、选择本机目录作为项目、聊天执行任务、审批写文件/命令工具、统计 Token 与成本，并通过结构化任务板让多个 Agent 交换任务与结果。
+当前版本以“项目 + 会话”组织本地任务：可接入模型、选择本机目录作为项目、聊天执行任务、审批写文件/命令工具、统计 Token 与成本，并由固定主控按需调用独立上下文中的专业子 Agent。
 
 ## 已实现功能
 
-- 总览、项目与会话、子 Agent、运行记录、团队任务、用量统计、模型设置七个主要界面。
+- 总览、项目与会话、子 Agent、运行记录、用量统计、模型设置六个主要界面。
 - 左侧会话栏按项目组织。项目是一个受沙箱保护的本地目录；默认工作区中的一次性任务显示在“任务”区。
 - 点击“新建对话”只创建浏览器内草稿；首次发送通过单个原子、幂等请求以首条内容生成标题并写入项目、会话、消息和运行记录。网络中断后使用同一草稿重试只会返回原会话与原运行，不会重复调用模型。
-- 所有会话由固定的“PGAgent 主控”处理意图识别、任务分析/编排、结果汇总与下一步决策。用户创建且启用的 Agent 均为可复用子 Agent；主控可通过 `task` 将一个明确子任务交给精确 Agent ID，并接收真实的结构化子运行结果。
+- 所有会话由固定的“PGAgent 主控”处理意图识别、任务分析/编排、结果汇总与下一步决策。用户创建且启用的 Agent 均为可复用子 Agent；主控可通过 `task` 将一个或多个明确子任务交给精确 Agent ID，并接收真实的结构化子运行结果。相互独立的子任务会并行执行。
 - 会话输入区可直接切换模型和思考强度，并显示当前上下文 Token 占用。
 - OpenAI 兼容中转站、OpenRouter、DeepSeek 等连接；填写 Base URL 与 API Key 后自动请求 `/models`，也支持手动模型 ID。
 - `off / auto / low / medium / high / xhigh` 思考强度，调用时由 provider adapter 映射。
 - 主控的运行时工具为 `bash/read/write/edit/glob/grep/webfetch/websearch/task/todowrite/question/skill/git_status/git_diff/file_info`；每次运行只把当前 Agent 已选择的工具暴露给模型，并把该列表冻结到运行快照。后三个开发工具是受边界限制的只读能力，分别用于查看 Git 状态、Git 差异和文件元数据。
 - `bash` 只运行工作区 cwd 中的 allowlist 命令，绝不启动 shell；`read/write/edit/glob/grep` 始终受工作区真实路径、符号链接和 Junction 边界保护。
 - `webfetch` 仅访问公开 HTTP(S) 地址，拒绝私网/回环地址、环境代理、自动重定向和超大响应；`websearch` 使用公开 DuckDuckGo HTML，服务不可用时明确报错而不编造结果。
-- `todowrite` 保存结构化待办并随运行快照恢复；`question` 会将本轮安全结束为一条澄清消息，等待用户下一条回复；`task` 会创建幂等任务、结构化 Agent 消息和独立子运行，完成后返回子 Agent、Run、状态、计数和输出摘要，不会假称已委派。
+- `todowrite` 保存结构化待办并随运行快照恢复；`question` 会将本轮安全结束为一条澄清消息，等待用户下一条回复；`task` 会创建会话级幂等委派记录和独立子运行，完成后返回子 Agent、Run、状态、计数和输出摘要，不会假称已委派。
 - 可导入本地 `SKILL.md` 文件夹到受管理的 `data/skills/`；Skill 的文件只会被复制和解析元数据，不会在导入、预览或关联 Agent/会话时执行。运行时只允许加载本会话选择的 Skill 文字指令，绝不自动执行其中的脚本。
 - 权限模式：`ask` 对写入、命令、委派和联网均请求批准；`smart` 自动允许受限的只读/公网读取，写入、命令和委派请求批准；`full` 跳过批准，但不会绕过工作区、命令 allowlist 或 SSRF 防护。批准后从持久化快照精确恢复。
 - 不限制任务的总执行步数和总工具调用次数；连续 3 次相同调用或连续 4 步无进展仍会安全停止。
@@ -25,7 +27,7 @@ PGAgent 是一个本地优先、单用户的 Agent 工作台。它参考了视�
 - 单个会话上下文预算为 100k Token，达到 90k 时自动压缩；会话、工作区、全局三级记忆继续分层保存。
 - 用量页统计请求数、输入/输出/缓存 Token、缓存命中率、估算成本以及逐模型明细；无法识别价格的模型成本显示为 0。
 - 运行记录详情会在有 provider 用量回报时展示本次运行的输入/输出 Token、缓存命中率和成本；没有回报时明确标记为不可统计，不把汇总数据冒充单次数据。
-- 多 Agent 任务使用 SQLite 任务板、CAS 版本、lease、幂等键、TTL、hop 上限以及 pending/delivered/ack 消息状态。
+- 子 Agent 委派记录归属于父会话和父运行；子运行使用独立上下文，主控仅接收受限的结构化结果。
 - UI 视觉层采用独立的磨砂玻璃样式文件，支持浅色/深色主题、居中阅读列、固定输入栏、消息内联时间线和四个专业 Agent 快速模板；设计取舍与响应式约束见 `docs/UI_ARCHITECTURE.md`。
 
 ## 运行环境
@@ -52,7 +54,7 @@ API Key 不写入 SQLite，保存到 Windows Credential Manager；数据库只�
 
 ## 数据目录
 
-- `data/pgagent.db`：工作区、Agent、会话、消息、运行、事件、审批、记忆、模型连接、Token 用量以及多 Agent 任务/通信。
+- `data/pgagent.db`：工作区、Agent、会话、消息、运行、事件、审批、记忆、模型连接、Token 用量以及子 Agent 委派记录。
 - `data/langgraph_checkpoints.db`：LangGraph checkpoint。
 - `data/workspaces/default/`：一次性任务的默认工作区；也可以在会话页项目区或草稿输入框中通过原生目录窗口选择其他本地目录。
 - `data/skills/{slug}/`：通过 API 导入并由 PGAgent 管理的 Skill 文件副本。原始本地目录不会被修改；GitHub/skills.sh 来源必须先预览文件清单，再以 `confirm=true` 明确复制。
@@ -93,7 +95,7 @@ E:\anaconda3\envs\agent_dock\python.exe -m uvicorn app.main:app --app-dir backen
 ## 第一版边界
 
 - 单机单用户，不包含登录、云端部署和远程执行节点。
-- 多 Agent 第一版提供固定主控、子 Agent 配置、可靠的任务板与消息通信协议，以及单层、受权限边界约束的 `task` 子 Agent 委派。子 Agent 的工具和 Skill 配置已生效；更丰富的并行编排、人工验收和子任务 UI 会在后续版本加入。
+- 多 Agent 提供固定主控、子 Agent 配置和单层、受权限边界约束的 `task` 子 Agent 委派。相互独立的任务支持并行 fan-out，单次最多 8 个子任务；子 Agent 的工具和 Skill 配置已生效，且禁止递归委派。
 - 模型能力由提供商决定。部分中转站不支持工具调用或思考强度参数，PGAgent 会尽量丢弃不支持的可选参数，但无法替代提供商能力。
 - 同步 SDK 调用超时后结果会被丢弃，但 Python 无法强杀已进入第三方库的线程；PGAgent 默认使用 LiteLLM 异步调用避免这一问题。
 

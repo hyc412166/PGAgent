@@ -20,7 +20,6 @@ import {
   Menu,
   MessageSquare,
   Moon,
-  Network,
   PanelRightClose,
   PanelRightOpen,
   PanelLeftClose,
@@ -73,7 +72,6 @@ import type {
   RunUsage,
   Session,
   SessionContext,
-  TeamTask,
   ThinkingLevel,
   UsageBreakdownItem,
   UsageSession,
@@ -127,6 +125,9 @@ const runStreamEventNames = [
   'tool_call',
   'tool_finished',
   'tool_result',
+  'completion_verification_started',
+  'completion_verification_rejected',
+  'completion_verification_passed',
   'approval_requested',
   'approval_granted',
   'delegated_child_started',
@@ -141,7 +142,7 @@ const runStreamEventNames = [
   'integration_failed',
 ] as const
 
-const activeRunStatuses = new Set(['received', 'running', 'preparing_context', 'planning', 'acting', 'observing', 'awaiting_approval'])
+const activeRunStatuses = new Set(['received', 'running', 'preparing_context', 'planning', 'acting', 'observing', 'verifying', 'awaiting_approval'])
 
 const ComposerTextArea = forwardRef<ComposerTextAreaHandle, { disabled: boolean; resetKey: string; placeholder: string; onHasValueChange: (hasValue: boolean) => void }>(function ComposerTextArea({ disabled, resetKey, placeholder, onHasValueChange }, ref) {
   const [value, setValue] = useState('')
@@ -230,7 +231,7 @@ function stringId(value: unknown) {
 
 const navigation = [
   { path: '/dashboard', label: '总览', icon: LayoutDashboard },
-  { path: '/agents', label: 'Agent', icon: Bot },
+  { path: '/agents', label: 'Agent 小队', icon: Bot },
   { path: '/skills', label: '技能库', icon: BookOpen },
   { path: '/sessions', label: '会话', icon: MessageSquare },
   { path: '/runs', label: '运行记录', icon: History },
@@ -254,6 +255,7 @@ function AppShell() {
   useEffect(() => setMobileOpen(false), [location.pathname])
   useEffect(() => {
     document.documentElement.style.colorScheme = theme
+    document.documentElement.dataset.theme = theme
     try { window.localStorage.setItem('pgagent-theme', theme) } catch { /* local storage is optional */ }
   }, [theme])
 
@@ -264,7 +266,7 @@ function AppShell() {
       <aside className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
           <div className="brand">
             <div className="brand-mark"><PenguinMark size={27} /></div>
-            <div className="brand-copy"><strong>PGAgent</strong><span>Local Workbench</span></div>
+            <div className="brand-copy"><strong>PGAgent</strong><span>企鹅工作台</span></div>
             <button
               className="theme-toggle icon-button"
               type="button"
@@ -279,13 +281,13 @@ function AppShell() {
             </button>
           </div>
         <nav aria-label="主导航">
-          <p className="nav-label">工作台</p>
+          <p className="nav-label">企鹅工作台</p>
           {navigation.slice(0, 6).map(({ path, label, icon: Icon }) => (
             <NavLink key={path} to={path} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={collapsed ? label : undefined}>
               <Icon size={18} /><span>{label}</span>
             </NavLink>
           ))}
-          <p className="nav-label nav-label-spaced">协作与系统</p>
+          <p className="nav-label nav-label-spaced">系统舱</p>
           {navigation.slice(6).map(({ path, label, icon: Icon }) => (
             <NavLink key={path} to={path} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={collapsed ? label : undefined}>
               <Icon size={18} /><span>{label}</span>
@@ -295,7 +297,7 @@ function AppShell() {
         <div className="sidebar-footer">
           <div className={`service-pill ${health.error ? 'offline' : ''}`} title={health.error || '本地服务已连接'}>
             <i />
-            <div><strong>{health.error ? '服务未连接' : health.loading ? '正在检测' : '本地服务正常'}</strong><span>{health.data?.version ? `v${health.data.version}` : '127.0.0.1'}</span></div>
+            <div><strong>{health.error ? '服务未连接' : health.loading ? '正在检测' : '本地服务在线'}</strong><span>{health.data?.version ? `v${health.data.version}` : '127.0.0.1'}</span></div>
           </div>
         </div>
       </aside>
@@ -332,7 +334,7 @@ function DashboardPage() {
 
   return (
     <div className="page">
-      <PageHeader eyebrow="今天的工作状态" title="总览" description="从一个清晰的入口查看 Agent、运行与需要你处理的事项。" action={<button className="button button-primary" onClick={() => navigate('/sessions')}><Play size={16} />开始新任务</button>} />
+      <PageHeader eyebrow="今日冰面" title="工作台总览" description="Agent 状态、最近运行和待确认事项，都在这里一眼看清。" action={<button className="button button-primary" onClick={() => navigate('/sessions')}><Play size={16} />开始新任务</button>} />
       {dashboard.error && <ErrorState message={dashboard.error} onRetry={dashboard.reload} />}
       <section className="stat-grid" aria-label="关键指标">
         {stats.map(({ label, value, detail, icon: Icon, tone }) => (
@@ -344,7 +346,7 @@ function DashboardPage() {
       </section>
       <div className="dashboard-grid">
         <section className="card activity-card">
-          <div className="card-heading"><div><p className="eyebrow">RUN STREAM</p><h2>最近运行</h2></div><button className="text-button" onClick={() => navigate('/runs')}>查看全部<ArrowRight size={15} /></button></div>
+          <div className="card-heading"><div><p className="eyebrow">最近足迹</p><h2>最近运行</h2></div><button className="text-button" onClick={() => navigate('/runs')}>查看全部<ArrowRight size={15} /></button></div>
           {recentRuns.error ? <ErrorState message={recentRuns.error} onRetry={recentRuns.reload} /> : dashboard.loading || recentRuns.loading ? <LoadingState /> : displayedRuns.length ? (
             <div className="run-list">
               {displayedRuns.slice(0, 5).map((run) => <RunRow key={run.id} run={run} onClick={() => navigate('/runs')} />)}
@@ -352,7 +354,7 @@ function DashboardPage() {
           ) : <EmptyState icon={Workflow} title="还没有运行记录" description="创建工作区和 Agent 后，发起第一条任务。" action={<button className="button button-secondary" onClick={() => navigate('/sessions')}>前往会话</button>} />}
         </section>
         <aside className="card attention-card">
-          <div className="card-heading"><div><p className="eyebrow">HUMAN IN THE LOOP</p><h2>等待你处理</h2></div><span className="number-chip">{approvals.data.length}</span></div>
+          <div className="card-heading"><div><p className="eyebrow">待确认</p><h2>等待你处理</h2></div><span className="number-chip">{approvals.data.length}</span></div>
           {approvals.error ? <ErrorState message={approvals.error} onRetry={approvals.reload} /> : approvals.loading ? <LoadingState /> : approvals.data.length ? (
             <div className="approval-compact-list">
               {approvals.data.slice(0, 4).map((approval) => (
@@ -388,7 +390,6 @@ function RunRow({ run, onClick }: { run: Run; onClick?: () => void }) {
 
 function AgentsPage() {
   const agents = useApiData<AgentProfile[]>([], () => api.list<AgentProfile>('/api/agents', ['agents']), [])
-  const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
   const tools = useApiData<ToolCatalogItem[]>([], () => api.list<ToolCatalogItem>('/api/tools', ['tools']), [])
   const skills = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
   const [panelOpen, setPanelOpen] = useState(false)
@@ -400,6 +401,10 @@ function AgentsPage() {
   const [formError, setFormError] = useState('')
   const [template, setTemplate] = useState<AgentTemplate | null>(null)
   const childAgents = agents.data.filter((agent) => !agent.is_default)
+
+  function closeAgentPanel() {
+    setPanelOpen(false)
+  }
 
   function openAgentPanel(agent?: AgentProfile) {
     if (agent?.is_default) return
@@ -427,15 +432,15 @@ function AgentsPage() {
     try {
       const payload = {
         name: form.get('name'), description: form.get('description'), system_prompt: form.get('system_prompt'),
-        model_connection_id: form.get('connection_id') || null,
-        model_id: form.get('model') || null,
-        thinking_level: form.get('thinking_level'),
+        model_connection_id: null,
+        model_id: null,
+        thinking_level: 'auto',
         tool_ids: selectedToolIds,
         skill_ids: selectedSkillIds,
       }
       if (editing) await api.patch(`/api/agents/${editing.id}`, payload)
       else await api.post('/api/agents', payload)
-      setPanelOpen(false); setEditing(null); setTemplate(null); await agents.reload()
+      setPanelOpen(false); await agents.reload()
     } catch (error) { setFormError(describeError(error)) } finally { setSaving(false) }
   }
 
@@ -448,9 +453,9 @@ function AgentsPage() {
 
   return (
     <div className="page">
-      <PageHeader eyebrow="REUSABLE INTELLIGENCE" title="子 Agent" description="创建可复用的专业子 Agent，为不同任务配置角色、系统指令与模型偏好。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />
+      <PageHeader eyebrow="企鹅小队" title="小队成员" description="给每只企鹅分配清晰的角色和能力，让协作轻巧又可靠。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />
       <section className="agent-starter-strip" aria-label="专业 Agent 模板">
-        <div className="agent-starter-copy"><span className="eyebrow">QUICK START</span><strong>从一个清晰的角色开始</strong><p>模板只会预填角色和能力，保存前仍可逐项调整。</p></div>
+        <div className="agent-starter-copy"><span className="eyebrow">快速组队</span><strong>挑一只合适的企鹅</strong><p>模板只会预填角色和能力，保存前仍可逐项调整。</p></div>
         <div className="agent-template-list">
           {agentTemplates.map((item) => <button type="button" key={item.id} className={`agent-template-card template-${item.accent}`} onClick={() => openTemplatePanel(item)}>
             <span className="agent-template-icon"><Bot size={16} /></span><span><strong>{item.name}</strong><small>{item.description}</small></span><ChevronRight size={15} />
@@ -464,25 +469,23 @@ function AgentsPage() {
             <article className="entity-card agent-card" key={agent.id}>
               <div className="agent-head"><div className="agent-avatar"><Bot size={22} /></div><div className="agent-card-actions"><StatusBadge status={agent.status || 'idle'} /><button className="icon-button" aria-label={`编辑 ${agent.name}`} title="编辑子 Agent" onClick={() => openAgentPanel(agent)}><Pencil size={15} /></button><button className="icon-button danger-icon" aria-label={`删除 ${agent.name}`} disabled={deletingId === agent.id} title="删除子 Agent" onClick={() => void deleteAgent(agent)}>{deletingId === agent.id ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}</button></div></div>
               <h2>{agent.name}</h2><p className="agent-role">{agent.role || '通用执行子 Agent'}</p><p>{agent.description || '暂无角色说明'}</p>
-              <div className="agent-meta"><span><Sparkles size={14} />{agent.model || agent.model_id || '继承默认模型'}</span><span><Wrench size={14} />{agent.tool_ids?.length ?? 0} 工具 · {agent.skill_ids?.length ?? 0} Skill</span></div>
-              <footer><span>{formatDate(agent.created_at)}</span><span>{`思考：${agent.thinking_level || 'auto'}`}</span></footer>
+              <div className="agent-meta"><span><Wrench size={14} />{agent.tool_ids?.length ?? 0} 工具 · {agent.skill_ids?.length ?? 0} Skill</span></div>
+              <footer><span>{formatDate(agent.created_at)}</span></footer>
             </article>
           ))}
         </section>
-      ) : <EmptyState icon={Bot} title="创建你的第一个子 Agent" description="定义专业角色、系统指令、模型与可用能力；主 Agent 会在复杂、专业或你明确要求时委派匹配的子 Agent。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />}
-      {panelOpen && <SlidePanel title={editing ? '编辑子 Agent' : template ? `使用「${template.name}」模板` : '创建子 Agent'} description="配置角色、模型以及允许这个子 Agent 使用的工具和 Skill。主 Agent 会在需要时将任务委派给匹配的子 Agent。" onClose={() => { setPanelOpen(false); setEditing(null); setTemplate(null) }}>
+      ) : <EmptyState icon={Bot} title="创建你的第一个子 Agent" description="定义专业角色、系统指令与可用能力；主 Agent 会在复杂、专业或你明确要求时委派匹配的子 Agent。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />}
+      <SlidePanel open={panelOpen} title={editing ? '编辑子 Agent' : template ? `使用「${template.name}」模板` : '创建子 Agent'} description="配置角色以及允许这个子 Agent 使用的工具和 Skill。模型与推理强度由主 Agent 统一管理。" onClose={closeAgentPanel} onExited={() => { setEditing(null); setTemplate(null) }}>
         <form className="panel-form" onSubmit={saveAgent} key={editing?.id || 'new-agent'}>
           <Field label="名称"><input name="name" required placeholder="例如：代码协作者" autoFocus defaultValue={editing?.name || template?.name || ''} /></Field>
           <Field label="简介"><input name="description" placeholder="简要描述擅长处理的任务" defaultValue={editing?.description || template?.description || ''} /></Field>
           <Field label="系统指令"><textarea name="system_prompt" rows={6} placeholder="说明工作原则、输出风格和边界……" defaultValue={editing?.system_prompt || template?.systemPrompt || ''} /></Field>
-          <div className="form-row"><Field label="模型连接"><select name="connection_id" defaultValue={editing?.model_connection_id || editing?.connection_id || ''}><option value="">使用默认连接</option>{connections.data.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="模型 ID"><input name="model" placeholder="例如：deepseek-chat" defaultValue={editing?.model_id || editing?.model || ''} /></Field></div>
-          <Field label="思考强度"><select name="thinking_level" defaultValue={editing?.thinking_level || 'auto'}><option value="off">关闭</option><option value="auto">自动</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option></select></Field>
           <CapabilityMultiSelect label="工具" items={tools.data.map((item) => ({ ...item, name: item.label || item.name }))} selectedIds={selectedToolIds} loading={tools.loading} error={tools.error} onRetry={() => void tools.reload()} onToggle={(id) => setSelectedToolIds((current) => toggleSelectedId(current, id))} />
           <CapabilityMultiSelect label="Skill" items={skills.data} selectedIds={selectedSkillIds} loading={skills.loading} error={skills.error} onRetry={() => void skills.reload()} onToggle={(id) => setSelectedSkillIds((current) => toggleSelectedId(current, id))} />
           {formError && <p className="form-error" role="alert">{formError}</p>}
-          <div className="form-actions"><button type="button" className="button button-secondary" onClick={() => { setPanelOpen(false); setEditing(null); setTemplate(null) }}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}{editing ? '保存修改' : '创建'}</button></div>
+          <div className="form-actions"><button type="button" className="button button-secondary" onClick={closeAgentPanel}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}{editing ? '保存修改' : '创建'}</button></div>
         </form>
-      </SlidePanel>}
+      </SlidePanel>
     </div>
   )
 }
@@ -651,7 +654,7 @@ function SkillsPage() {
   }
 
   return <div className="page skills-page">
-    <PageHeader eyebrow="CAPABILITY LIBRARY" title="技能库" description="管理已安装的 Skill，或从本地文件夹与在线市场添加新能力。" action={<button className="button button-primary" disabled={importing} onClick={() => void importLocalSkill()}>{importing ? <LoaderCircle className="spin" size={15} /> : <Upload size={15} />}导入本地 Skill</button>} />
+    <PageHeader eyebrow="能力冰库" title="技能库" description="整理已安装的 Skill，或从本地文件夹与在线市场补充新能力。" action={<button className="button button-primary" disabled={importing} onClick={() => void importLocalSkill()}>{importing ? <LoaderCircle className="spin" size={15} /> : <Upload size={15} />}导入本地 Skill</button>} />
     {actionError && <p className="form-error page-form-error" role="alert">{actionError}</p>}
     <section className="skills-section">
       <div className="skills-section-heading"><div><h2>已安装</h2><p>这里只显示后端实际返回的 Skill。</p></div><span>{installed.data.length}</span></div>
@@ -1330,34 +1333,39 @@ function SessionsPage() {
     if (!anchoringHistory && !stickToBottomRef.current) return
     let frame = 0
     let settleFrame = 0
+    let observedElement: HTMLDivElement | null = null
+    const finishHistoryAnchor = () => {
+      const element = messagesRef.current
+      const historyReady = historyHydration.sessionId === activeId
+        && historyHydration.complete
+        && messages.data.ownerSessionId === activeId
+        && runs.data.ownerSessionId === activeId
+        && !messages.loading
+        && !runs.loading
+      const distanceFromBottom = element
+        ? Math.max(0, element.scrollHeight - element.scrollTop - element.clientHeight)
+        : Number.POSITIVE_INFINITY
+      if (anchoringHistory && historyReady && distanceFromBottom === 0 && historyScrollSessionRef.current === activeId) {
+        historyScrollSessionRef.current = ''
+        stickToBottomRef.current = true
+      }
+    }
     const scrollToLatest = () => {
       const element = messagesRef.current
       if (!element) return
       // Restore the original distance-aware browser animation. The browser
       // chooses duration and velocity from the remaining distance; later
       // hydration updates simply retarget the same smooth scroll.
-      element.scrollTop = element.scrollHeight
-      settleFrame = window.requestAnimationFrame(() => {
-        const settledElement = messagesRef.current
-        const historyReady = historyHydration.sessionId === activeId
-          && historyHydration.complete
-          && messages.data.ownerSessionId === activeId
-          && runs.data.ownerSessionId === activeId
-          && !messages.loading
-          && !runs.loading
-        const reachedBottom = settledElement
-          ? settledElement.scrollHeight - settledElement.scrollTop - settledElement.clientHeight <= 1
-          : false
-        if (anchoringHistory && historyReady && reachedBottom && historyScrollSessionRef.current === activeId) {
-          historyScrollSessionRef.current = ''
-          stickToBottomRef.current = true
-        }
-      })
+      observedElement = element
+      element.addEventListener('scrollend', finishHistoryAnchor)
+      element.scrollTo({ top: element.scrollHeight })
+      settleFrame = window.requestAnimationFrame(finishHistoryAnchor)
     }
     frame = window.requestAnimationFrame(scrollToLatest)
     return () => {
       window.cancelAnimationFrame(frame)
       if (settleFrame) window.cancelAnimationFrame(settleFrame)
+      observedElement?.removeEventListener('scrollend', finishHistoryAnchor)
     }
   }, [activeId, childPanelOpen, completedThoughtLayoutVersion, historyHydration.complete, historyHydration.sessionId, historyOpenVersion, messages.data.ownerSessionId, messages.loading, liveRun.draft, liveRun.phase, runs.data.ownerSessionId, runs.loading, visibleApprovals.length, visibleMessages.length])
 
@@ -1504,8 +1512,6 @@ function SessionsPage() {
   const selectedThinkingValue = settingsSession?.thinking_level && settingsSession.thinking_level !== 'auto' ? settingsSession.thinking_level : 'auto'
   const modelButtonLabel = shortModelLabel(effectiveModel)
   const thinkingOptions: Array<{ value: ThinkingLevel; label: string; hint?: string }> = [
-    { value: 'auto', label: '自动 / 继承', hint: `当前：${thinkingLevelLabels[effectiveThinking]}` },
-    { value: 'off', label: '关闭' },
     { value: 'low', label: '低' },
     { value: 'medium', label: '中' },
     { value: 'high', label: '高' },
@@ -1535,7 +1541,7 @@ function SessionsPage() {
   const dependencyErrors = [agents.error, workspaces.error, connections.error].filter(Boolean)
   return (
     <div className="page page-chat">
-      <div className="chat-shell">
+      <div className={`chat-shell ${childPanelOpen ? 'child-panel-open' : ''}`}>
           <aside className="session-list project-session-sidebar" onScroll={() => setProjectHoverCard(null)}>
             <section className="draft-tree-section">
               <button type="button" className="new-draft-button" disabled={sending} onClick={beginDraft}><Plus size={14} />新建对话</button>
@@ -1587,7 +1593,7 @@ function SessionsPage() {
                       && runs.data.ownerSessionId === activeId
                       && !messages.loading
                       && !runs.loading
-                    if (historyReady && distanceFromBottom <= 1) {
+                    if (historyReady && distanceFromBottom === 0) {
                       historyScrollSessionRef.current = ''
                       stickToBottomRef.current = true
                     }
@@ -1617,8 +1623,8 @@ function SessionsPage() {
                 <div className="composer-toolbar">
                   <div className="composer-left-actions">
                     <div className="session-capability-picker" ref={addMenuRef}>
-                      <button type="button" className="composer-tool-button composer-plus-button" aria-label="添加能力" aria-haspopup="menu" aria-expanded={addMenuOpen} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setAddMenuOpen((open) => !open); setSkillSubmenuOpen(false); setPermissionMenuOpen(false) }}>
-                        {capabilitySaving ? <LoaderCircle className="spin" size={14} /> : <Plus size={15} />}
+                      <button type="button" className="composer-tool-button composer-plus-button" aria-label="添加能力" aria-haspopup="menu" aria-expanded={addMenuOpen} aria-busy={capabilitySaving} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setAddMenuOpen((open) => !open); setSkillSubmenuOpen(false); setPermissionMenuOpen(false) }}>
+                        <Plus size={15} />
                         {!!selectedSessionSkillIds.length && <b>{selectedSessionSkillIds.length}</b>}
                       </button>
                       {addMenuOpen && <div className="capability-popover capability-level-two" role="menu" aria-label="添加能力">
@@ -1643,7 +1649,6 @@ function SessionsPage() {
                     </div>
                   </div>
                   <div className="composer-actions">
-                    {draftActive ? <ContextUsageRing context={emptyDraftContext} /> : context.error ? <button type="button" className="context-state context-error" aria-label="上下文占用读取失败，点击重试" title={context.error} onClick={() => void context.reload()}><AlertCircle size={15} /></button> : context.loading || !context.data ? <span className="context-state" role="status" aria-label="正在读取上下文占用"><LoaderCircle className="spin" size={15} /></span> : <ContextUsageRing context={context.data} />}
                     <div className="session-settings-picker" ref={settingsMenuRef} title={settingsLocked ? '当前运行结束或审批完成后才能切换模型和思考强度' : undefined}>
                       <button
                         ref={settingsTriggerRef}
@@ -1652,10 +1657,10 @@ function SessionsPage() {
                         aria-label={`当前模型 ${modelButtonLabel}，思考强度 ${thinkingLevelLabels[effectiveThinking]}。点击更改`}
                         aria-haspopup="menu"
                         aria-expanded={settingsMenuOpen}
+                        aria-busy={settingsSaving}
                         disabled={settingsSaving || settingsLocked || sending}
                         onClick={() => { setSettingsMenuOpen((open) => !open); setSettingsSubmenu(null) }}
                       >
-                        {settingsSaving && <LoaderCircle className="spin settings-spinner" size={13} />}
                         <span>{modelButtonLabel}</span><strong>{thinkingLevelLabels[effectiveThinking]}</strong><ChevronRight size={12} aria-hidden="true" />
                       </button>
                       {settingsMenuOpen && <div className="session-settings-popover" role="menu" aria-label="模型和思考设置">
@@ -1682,13 +1687,15 @@ function SessionsPage() {
                         </div>}
                       </div>}
                     </div>
+                    {draftActive ? <ContextUsageRing context={emptyDraftContext} /> : context.error ? <button type="button" className="context-state context-error" aria-label="上下文占用读取失败，点击重试" title={context.error} onClick={() => void context.reload()}><AlertCircle size={15} /></button> : context.loading || !context.data ? <span className="context-state" role="status" aria-label="正在读取上下文占用"><LoaderCircle className="spin" size={15} /></span> : <ContextUsageRing context={context.data} />}
                     <button className="send-button" aria-label="发送" disabled={sending || settingsSaving || capabilitySaving || settingsLocked || !composerHasValue}>{sending ? <LoaderCircle className="spin" /> : <Send />}</button>
                   </div>
                 </div>
               </form>
             </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={beginDraft}>新建对话</button>} />}
           </section>
-          {childPanelOpen && <ChildAgentPanel
+          <ChildAgentPanel
+            open={childPanelOpen}
             tasks={visibleChildTasks}
             loading={childTasks.loading}
             error={childTasks.error}
@@ -1700,7 +1707,7 @@ function SessionsPage() {
             onClose={() => setChildPanelOpen(false)}
             onSelect={setSelectedChildTaskId}
             onRetry={() => { void childTasks.reload(); void childTaskEvents.reload() }}
-          />}
+          />
       </div>
       {projectHoverCard && createPortal(
         <div className="project-hover-card" id="project-hover-card" role="tooltip" style={{ left: projectHoverCard.left, top: projectHoverCard.top }}>
@@ -1721,7 +1728,7 @@ function RunsPage() {
   const filtered = filter === 'all' ? runs.data : runs.data.filter((run) => run.status === filter)
   return (
     <div className="page">
-      <PageHeader eyebrow="OBSERVABILITY" title="运行记录" description="每一次计划、工具调用、重试和停止原因都保留可追溯记录。" action={<button className="button button-secondary" onClick={runs.reload}><RefreshCw size={15} />刷新</button>} />
+      <PageHeader eyebrow="行动足迹" title="运行记录" description="每一次计划、工具调用、重试和停止原因都保留可追溯记录。" action={<button className="button button-secondary" onClick={runs.reload}><RefreshCw size={15} />刷新</button>} />
       <div className="filter-bar" role="group" aria-label="运行状态筛选">{[['all', '全部'], ['running', '运行中'], ['completed', '已完成'], ['failed', '失败'], ['stopped', '已停止']].map(([value, label]) => <button key={value} className={filter === value ? 'active' : ''} onClick={() => setFilter(value)}>{label}</button>)}</div>
       {runs.error ? <ErrorState message={runs.error} onRetry={runs.reload} /> : runs.loading ? <LoadingState /> : filtered.length ? (
         <section className="card run-table-card"><div className="table-head"><span>任务</span><span>状态</span><span>步数 / 工具</span><span>更新时间</span></div>{filtered.map((run) => <RunRow key={run.id} run={run} onClick={() => setSelected(run)} />)}</section>
@@ -1818,7 +1825,7 @@ function UsagePage() {
   ]
   return (
     <div className="page usage-page">
-      <PageHeader eyebrow="TOKEN & COST" title="用量统计" description="按时间范围查看模型、对话与项目的 Token、缓存和成本。" action={<button className="button button-secondary" onClick={reloadUsage}><RefreshCw size={15} />刷新</button>} />
+      <PageHeader eyebrow="能量账本" title="用量统计" description="按时间范围查看模型、对话与项目的 Token、缓存和成本。" action={<button className="button button-secondary" onClick={reloadUsage}><RefreshCw size={15} />刷新</button>} />
       <section className="usage-date-filter card" aria-label="用量日期范围">
         <div className="usage-date-filter-head"><div><CalendarDays size={16} /><span>统计日期</span></div><small>{usageRangeLabel(startDate, endDate, datePreset)}</small></div>
         <div className="usage-date-presets" role="group" aria-label="快捷日期范围">{usageDateOptions.map(({ id, label }) => <button key={id} type="button" className={datePreset === id ? 'active' : ''} onClick={() => setPreset(id)}>{label}</button>)}</div>
@@ -1854,36 +1861,6 @@ function UsageBreakdown({ title, eyebrow, emptyDescription, data, initialLoading
   </section>
 }
 
-// Reserved for the future multi-user collaboration feature. It is intentionally
-// not routed or shown in navigation during the current release.
-export function TeamsPage() {
-  const tasks = useApiData<TeamTask[]>([], () => api.list<TeamTask>('/api/teams/tasks', ['tasks']), [])
-  const agents = useApiData<AgentProfile[]>([], () => api.list<AgentProfile>('/api/agents', ['agents']), [])
-  const [panelOpen, setPanelOpen] = useState(false)
-  const [saving, setSaving] = useState(false)
-  const [formError, setFormError] = useState('')
-  const assignableAgents = agents.data.filter((agent) => !agent.is_default)
-
-  async function createTask(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); const form = new FormData(event.currentTarget); setSaving(true); setFormError('')
-    try { await api.post('/api/teams/tasks', { title: form.get('title'), description: form.get('description'), priority: form.get('priority'), assignee_agent_id: form.get('assignee_agent_id') || undefined }); setPanelOpen(false); await tasks.reload() }
-    catch (error) { setFormError(describeError(error)) } finally { setSaving(false) }
-  }
-  const columns = [{ key: 'todo', label: '待认领' }, { key: 'in_progress', label: '进行中' }, { key: 'review', label: '待验收' }, { key: 'completed', label: '已完成' }]
-  return (
-    <div className="page">
-      <PageHeader eyebrow="MULTI-AGENT COORDINATION" title="团队任务" description="SQLite 任务板是唯一事实源；Agent 通过结构化信封和租约安全协作。" action={<button className="button button-primary" onClick={() => setPanelOpen(true)}><Plus size={16} />创建任务</button>} />
-      <div className="team-principles"><div><Network size={18} /><span><strong>结构化通信</strong><small>任务、进度、产物与验收消息持久化</small></span></div><div><KeyRound size={18} /><span><strong>租约 + CAS</strong><small>避免两个 Worker 同时认领同一任务</small></span></div><div><ShieldCheck size={18} /><span><strong>独立上下文</strong><small>Lead 只接收结论与产物引用</small></span></div></div>
-      {tasks.error ? <ErrorState message={tasks.error} onRetry={tasks.reload} /> : tasks.loading ? <LoadingState /> : (
-        <section className="kanban">
-          {columns.map((column) => { const columnTasks = tasks.data.filter((task) => (task.status || 'todo') === column.key); return <div className="kanban-column" key={column.key}><header><span>{column.label}</span><b>{columnTasks.length}</b></header><div className="kanban-list">{columnTasks.map((task) => <article className="task-card" key={task.id}><div className="task-priority">{task.priority || 'normal'}</div><h3>{task.title}</h3><p>{task.description || '暂无任务说明'}</p><footer><span><Bot size={14} />{task.assignee_name || '尚未指派'}</span><small>v{task.version ?? 1}</small></footer></article>)}{!columnTasks.length && <div className="column-empty">暂无任务</div>}</div></div> })}
-        </section>
-      )}
-      {panelOpen && <SlidePanel title="创建团队任务" description="任务将写入持久化任务板，供 Lead 或 Worker 认领。" onClose={() => setPanelOpen(false)}><form className="panel-form" onSubmit={createTask}><Field label="任务标题"><input name="title" required placeholder="清晰描述可独立交付的子任务" autoFocus /></Field><Field label="任务说明"><textarea name="description" rows={5} placeholder="包含输入、约束和验收标准" /></Field><div className="form-row"><Field label="优先级"><select name="priority" defaultValue="normal"><option value="low">低</option><option value="normal">普通</option><option value="high">高</option></select></Field><Field label="指派子 Agent"><select name="assignee_agent_id"><option value="">暂不指派</option>{assignableAgents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></Field></div>{formError && <p className="form-error">{formError}</p>}<div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setPanelOpen(false)}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}创建</button></div></form></SlidePanel>}
-    </div>
-  )
-}
-
 function ModelsPage() {
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
   const [panelOpen, setPanelOpen] = useState(false)
@@ -1915,7 +1892,7 @@ function ModelsPage() {
 
   return (
     <div className="page">
-      <PageHeader eyebrow="MODEL GATEWAY" title="模型设置" description="只需 Base URL 与 API Key；PGAgent 会发现模型并统一思考强度。" action={<button className="button button-primary" onClick={() => setPanelOpen(true)}><Plus size={16} />添加连接</button>} />
+      <PageHeader eyebrow="模型舱" title="模型设置" description="配置 Base URL 与 API Key，PGAgent 会发现模型并统一思考强度。" action={<button className="button button-primary" onClick={() => setPanelOpen(true)}><Plus size={16} />添加连接</button>} />
       <div className="security-note"><KeyRound size={19} /><div><strong>密钥不会明文保存到 SQLite</strong><p>API Key 进入 Windows 凭据存储，数据库仅保留引用和末尾提示。</p></div></div>
       {connections.error ? <ErrorState message={connections.error} onRetry={connections.reload} /> : connections.loading ? <LoadingState /> : connections.data.length ? (
         <section className="connection-list">

@@ -103,14 +103,29 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "task": {
-        "description": "把一个明确子任务委派给已启用的子 Agent。必须使用当前子 Agent 列表中的 agent_id；子 Agent 只能使用它自身被勾选且不超过当前会话权限的工具，且不能再次委派。",
+        "description": "把一个或多个相互独立的子任务并行委派给已启用的子 Agent。单任务使用 task+agent_id；多个任务使用 tasks 数组，系统会并行启动并在全部结束后返回结构化结果。子 Agent 只能使用它自身被勾选且不超过当前会话权限的工具，且不能再次委派。",
         "parameters": {
             "type": "object",
             "properties": {
                 "task": {"type": "string"},
                 "agent_id": {"type": "string"},
+                "tasks": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task": {"type": "string"},
+                            "agent_id": {"type": "string"},
+                        },
+                        "required": ["task", "agent_id"],
+                    },
+                },
             },
-            "required": ["task", "agent_id"],
+            "oneOf": [
+                {"required": ["task", "agent_id"]},
+                {"required": ["tasks"]},
+            ],
         },
     },
     "todowrite": {
@@ -456,12 +471,11 @@ class ToolRegistry:
         kwargs = dict(arguments or {})
         # Reject malformed calls before an approval UI is created for a task
         # that cannot possibly be dispatched.
-        request = str(kwargs.get("task") or "").strip()
-        target = str(kwargs.get("agent_id") or "").strip()
-        if not request or len(request) > 8_000:
-            return ToolResult(name, False, "task 不能为空或过长", error_code="invalid_task")
-        if not target or len(target) > 80:
-            return ToolResult(name, False, "必须提供有效的子 Agent ID", error_code="invalid_delegate_agent")
+        _, validation_error_code, validation_error = builtins.normalize_delegate_requests(
+            kwargs.get("task"), kwargs.get("agent_id"), kwargs.get("tasks")
+        )
+        if validation_error_code and validation_error:
+            return ToolResult(name, False, validation_error, error_code=validation_error_code)
         if self._task_delegate is None:
             return self._rename_result(function(self.sandbox, **kwargs), name)
         decision = assess_tool_call(

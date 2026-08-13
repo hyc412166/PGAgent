@@ -59,6 +59,7 @@ function childTaskOutput(task?: DelegatedTask) {
 }
 
 export const ChildAgentPanel = memo(function ChildAgentPanel({
+  open,
   tasks,
   loading,
   error,
@@ -71,6 +72,7 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
   onSelect,
   onRetry,
 }: {
+  open: boolean
   tasks: DelegatedTask[]
   loading: boolean
   error: string
@@ -85,7 +87,7 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
 }) {
   const output = childTaskOutput(selectedTask)
   const toolEvents = events.filter((event) => ['tool_started', 'tool_finished', 'tool_result'].includes(event.type || event.event_type || ''))
-  return <aside className="child-agent-panel" aria-label="子 Agent 工作详情">
+  return <aside className={`child-agent-panel ${open ? 'is-open' : 'is-closed'}`} aria-label="子 Agent 工作详情" aria-hidden={!open} inert={!open}>
     <header className="child-panel-header"><div><span className="eyebrow">协作执行</span><strong>子 Agent</strong></div><button type="button" className="icon-button" onClick={onClose} aria-label="收起子 Agent 侧栏"><X size={16} /></button></header>
     {error ? <ErrorState message={error} onRetry={onRetry} /> : loading && !tasks.length ? <LoadingState label="正在读取子 Agent…" /> : !tasks.length ? <EmptyState icon={Users} title="子 Agent 正在启动" description="任务创建后会显示在这里。" /> : <>
       <div className="child-task-list" role="list" aria-label="本次调用的子 Agent">
@@ -137,7 +139,14 @@ export const MessageBubble = memo(function MessageBubble({ message }: { message:
   return (
     <article className={`message ${message.role} ${isTool ? 'tool-message' : ''}`}>
       <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <PenguinMark size={21} />}</div>
-      <div className="message-body"><div className="message-meta"><strong>{speaker}</strong><time>{formatUiDate(message.created_at)}</time><button type="button" className="message-copy-button" aria-label={copied ? '已复制' : '复制消息'} title={copied ? '已复制' : '复制消息'} onClick={() => void copyMessage()}>{copied ? <CheckCheck size={13} /> : <Copy size={13} />}</button></div><div className="message-content">{message.content}</div>{message.status && <StatusBadge status={message.status} />}</div>
+      <div className="message-body">
+        <div className="message-meta"><strong>{speaker}</strong><time>{formatUiDate(message.created_at)}</time></div>
+        <div className="message-content">{message.content}</div>
+        {message.status && <StatusBadge status={message.status} />}
+        <div className="message-actions">
+          <button type="button" className="message-copy-button" aria-label={copied ? '已复制' : '复制消息'} title={copied ? '已复制' : '复制消息'} onClick={() => void copyMessage()}>{copied ? <CheckCheck size={11} /> : <Copy size={11} />}</button>
+        </div>
+      </div>
     </article>
   )
 })
@@ -160,7 +169,7 @@ export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun
   useEffect(() => {
     if (liveRun.thought.startedAt === null || liveRun.thought.finished) return
     setNow(Date.now())
-    const timer = window.setInterval(() => setNow(Date.now()), 250)
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
     return () => window.clearInterval(timer)
   }, [liveRun.thought.finished, liveRun.thought.startedAt])
   const liveThoughtMs = liveRun.thought.startedAt === null ? 0 : Math.max(0, now - liveRun.thought.startedAt)

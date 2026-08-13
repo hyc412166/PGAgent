@@ -60,14 +60,45 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
         "agent_tools",
         "agent_skills",
         "session_skills",
-        "team_tasks",
-        "agent_messages",
         "usage_records",
         "context_epochs",
         "context_checkpoints",
         "artifacts",
         "compaction_attempts",
     }.issubset(tables)
+    assert "team_tasks" not in tables
+    assert "agent_messages" not in tables
+
+
+def test_init_removes_retired_team_collaboration_tables(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{(tmp_path / 'retired-team.db').as_posix()}")
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE team_tasks (id VARCHAR(36) PRIMARY KEY, title TEXT NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE agent_messages ("
+            "id VARCHAR(36) PRIMARY KEY, "
+            "task_id VARCHAR(36) REFERENCES team_tasks(id) ON DELETE CASCADE"
+            ")"
+        )
+        connection.exec_driver_sql("INSERT INTO team_tasks (id, title) VALUES ('old', 'old task')")
+        connection.exec_driver_sql("INSERT INTO agent_messages (id, task_id) VALUES ('msg', 'old')")
+
+    init_db()
+
+    tables = set(inspect(database.engine).get_table_names())
+    assert "team_tasks" not in tables
+    assert "agent_messages" not in tables
+    assert "delegated_tasks" in tables
+
+
+def test_retired_team_collaboration_routes_are_absent(client: TestClient) -> None:
+    assert client.get("/api/teams/tasks").status_code == 404
+    assert client.post("/api/teams/tasks", json={"title": "retired"}).status_code == 404
+    assert client.get("/api/teams/messages").status_code == 404
+    paths = client.get("/openapi.json").json()["paths"]
+    assert not [path for path in paths if path.startswith("/api/teams")]
 
 
 def test_context_persistence_models_round_trip_and_cascade(tmp_path: Path) -> None:
@@ -661,67 +692,3 @@ def test_deleting_session_cascades_messages(client: TestClient) -> None:
     )
     assert client.delete(f"/api/sessions/{session['id']}").status_code == 204
     assert client.get(f"/api/sessions/{session['id']}/messages").status_code == 404
-
-
-def test_team_task_claim_uses_version_and_lease(client: TestClient) -> None:
-    agent = client.post("/api/agents", json={"name": "Worker"}).json()
-    task_response = client.post(
-        "/api/teams/tasks",
-        json={"title": "Implement worker", "priority": "high", "idempotency_key": "task-once"},
-    )
-    assert task_response.status_code == 201
-    task = task_response.json()
-    assert task["status"] == "todo"
-    duplicate = client.post(
-        "/api/teams/tasks",
-        json={"title": "Ignored duplicate body", "idempotency_key": "task-once"},
-    )
-    assert duplicate.json()["id"] == task["id"]
-
-    claimed = client.post(
-        f"/api/teams/tasks/{task['id']}/claim",
-        json={
-            "agent_id": agent["id"],
-            "lease_owner": "process-1",
-            "expected_version": task["version"],
-            "lease_seconds": 60,
-        },
-    )
-    assert claimed.status_code == 200
-    assert claimed.json()["status"] == "in_progress"
-    assert claimed.json()["version"] == task["version"] + 1
-
-    stale_claim = client.post(
-        f"/api/teams/tasks/{task['id']}/claim",
-        json={
-            "agent_id": agent["id"],
-            "lease_owner": "process-2",
-            "expected_version": task["version"],
-        },
-    )
-    assert stale_claim.status_code == 409
-
-    stale_update = client.patch(
-        f"/api/teams/tasks/{task['id']}",
-        json={"status": "review", "expected_version": task["version"]},
-    )
-    assert stale_update.status_code == 409
-
-
-def test_agent_messages_are_idempotent_and_acknowledgeable(client: TestClient) -> None:
-    payload = {
-        "message_type": "PROGRESS",
-        "payload": {"percent": 50},
-        "idempotency_key": "progress-once",
-    }
-    first = client.post("/api/teams/messages", json=payload)
-    second = client.post("/api/teams/messages", json=payload)
-    assert first.status_code == 201
-    assert second.status_code == 201
-    assert first.json()["id"] == second.json()["id"]
-    delivered = client.post(f"/api/teams/messages/{first.json()['id']}/deliver")
-    assert delivered.status_code == 200
-    assert delivered.json()["status"] == "delivered"
-    ack = client.post(f"/api/teams/messages/{first.json()['id']}/ack")
-    assert ack.status_code == 200
-    assert ack.json()["status"] == "acknowledged"

@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
-from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import (
     Agent,
-    AgentMessage,
     Approval,
     ChatMessage,
     DelegatedTask,
@@ -24,7 +22,6 @@ from app.database import (
     Run,
     RunEvent,
     Session as ChatSession,
-    TeamTask,
     Workspace,
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
@@ -33,8 +30,6 @@ from app.database import (
 )
 from app.schemas import (
     AgentCreate,
-    AgentMessageCreate,
-    AgentMessageRead,
     AgentRead,
     AgentUpdate,
     ApprovalRead,
@@ -53,10 +48,6 @@ from app.schemas import (
     SessionCreate,
     SessionRead,
     SessionUpdate,
-    TeamTaskClaim,
-    TeamTaskCreate,
-    TeamTaskRead,
-    TeamTaskUpdate,
     WorkspaceCreate,
     WorkspaceRead,
     WorkspaceUpdate,
@@ -812,205 +803,3 @@ def clear_memories(
     db.execute(query)
     _commit(db)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-# Multi-agent task board and structured communication ------------------------
-
-
-@router.get("/teams/tasks", response_model=list[TeamTaskRead])
-def list_team_tasks(
-    team_id: str | None = None,
-    task_status: str | None = Query(default=None, alias="status"),
-    assignee_agent_id: str | None = None,
-    db: Session = Depends(get_db),
-) -> list[TeamTask]:
-    query = select(TeamTask)
-    if team_id:
-        query = query.where(TeamTask.team_id == team_id)
-    if task_status:
-        query = query.where(TeamTask.status == task_status)
-    if assignee_agent_id:
-        query = query.where(TeamTask.assignee_agent_id == assignee_agent_id)
-    return list(db.scalars(query.order_by(TeamTask.updated_at.desc())))
-
-
-@router.post("/teams/tasks", response_model=TeamTaskRead, status_code=status.HTTP_201_CREATED)
-def create_team_task(payload: TeamTaskCreate, db: Session = Depends(get_db)) -> TeamTask:
-    if payload.idempotency_key:
-        existing = db.scalar(
-            select(TeamTask).where(TeamTask.idempotency_key == payload.idempotency_key)
-        )
-        if existing is not None:
-            return existing
-    item = TeamTask(**payload.model_dump())
-    db.add(item)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        if payload.idempotency_key:
-            existing = db.scalar(
-                select(TeamTask).where(TeamTask.idempotency_key == payload.idempotency_key)
-            )
-            if existing is not None:
-                return existing
-        raise HTTPException(status_code=409, detail="Team task could not be created") from exc
-    db.refresh(item)
-    return item
-
-
-@router.get("/teams/tasks/{task_id}", response_model=TeamTaskRead)
-def get_team_task(task_id: str, db: Session = Depends(get_db)) -> TeamTask:
-    return _require(db, TeamTask, task_id, "Team task")
-
-
-@router.patch("/teams/tasks/{task_id}", response_model=TeamTaskRead)
-def update_team_task(
-    task_id: str, payload: TeamTaskUpdate, db: Session = Depends(get_db)
-) -> TeamTask:
-    if payload.expected_version is not None:
-        values = payload.model_dump(exclude_unset=True, exclude={"expected_version"})
-        values.update(version=payload.expected_version + 1, updated_at=datetime.now(timezone.utc))
-        result = db.execute(
-            update(TeamTask)
-            .where(TeamTask.id == task_id, TeamTask.version == payload.expected_version)
-            .values(**values)
-        )
-        if result.rowcount != 1:
-            db.rollback()
-            if db.get(TeamTask, task_id) is None:
-                raise HTTPException(status_code=404, detail="Team task not found")
-            raise HTTPException(status_code=409, detail="Task version changed; reload before updating")
-        db.commit()
-        return _require(db, TeamTask, task_id, "Team task")
-
-    item = _require(db, TeamTask, task_id, "Team task")
-    _apply(item, payload)
-    item.version += 1
-    _commit(db)
-    db.refresh(item)
-    return item
-
-
-@router.post("/teams/tasks/{task_id}/claim", response_model=TeamTaskRead)
-def claim_team_task(
-    task_id: str, payload: TeamTaskClaim, db: Session = Depends(get_db)
-) -> TeamTask:
-    now = datetime.now(timezone.utc)
-    expires = now + timedelta(seconds=payload.lease_seconds)
-    statement = (
-        update(TeamTask)
-        .where(
-            TeamTask.id == task_id,
-            TeamTask.version == payload.expected_version,
-            TeamTask.status.in_(("todo", "blocked", "in_progress")),
-            or_(
-                TeamTask.lease_owner.is_(None),
-                TeamTask.lease_owner == payload.lease_owner,
-                TeamTask.lease_expires_at < now,
-            ),
-        )
-        .values(
-            assignee_agent_id=payload.agent_id,
-            lease_owner=payload.lease_owner,
-            lease_expires_at=expires,
-            status="in_progress",
-            version=payload.expected_version + 1,
-            updated_at=now,
-        )
-    )
-    result = db.execute(statement)
-    if result.rowcount != 1:
-        db.rollback()
-        if db.get(TeamTask, task_id) is None:
-            raise HTTPException(status_code=404, detail="Team task not found")
-        raise HTTPException(status_code=409, detail="Task is already claimed or its version changed")
-    db.commit()
-    return _require(db, TeamTask, task_id, "Team task")
-
-
-@router.delete("/teams/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_team_task(task_id: str, db: Session = Depends(get_db)) -> Response:
-    db.delete(_require(db, TeamTask, task_id, "Team task"))
-    _commit(db)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-@router.get("/teams/messages", response_model=list[AgentMessageRead])
-def list_agent_messages(
-    team_id: str | None = None,
-    task_id: str | None = None,
-    recipient_agent_id: str | None = None,
-    message_status: str | None = Query(default=None, alias="status"),
-    include_expired: bool = False,
-    db: Session = Depends(get_db),
-) -> list[AgentMessage]:
-    query = select(AgentMessage)
-    if team_id:
-        query = query.where(AgentMessage.team_id == team_id)
-    if task_id:
-        query = query.where(AgentMessage.task_id == task_id)
-    if recipient_agent_id:
-        query = query.where(AgentMessage.recipient_agent_id == recipient_agent_id)
-    if message_status:
-        query = query.where(AgentMessage.status == message_status)
-    if not include_expired:
-        now = datetime.now(timezone.utc)
-        query = query.where(or_(AgentMessage.expires_at.is_(None), AgentMessage.expires_at > now))
-    return list(db.scalars(query.order_by(AgentMessage.created_at.asc())))
-
-
-@router.post("/teams/messages", response_model=AgentMessageRead, status_code=status.HTTP_201_CREATED)
-def create_agent_message(
-    payload: AgentMessageCreate, db: Session = Depends(get_db)
-) -> AgentMessage:
-    idempotency_key = payload.idempotency_key or f"message:{uuid4()}"
-    existing = db.scalar(
-        select(AgentMessage).where(AgentMessage.idempotency_key == idempotency_key)
-    )
-    if existing is not None:
-        return existing
-    data = payload.model_dump(exclude={"idempotency_key"})
-    item = AgentMessage(idempotency_key=idempotency_key, **data)
-    db.add(item)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        existing = db.scalar(
-            select(AgentMessage).where(AgentMessage.idempotency_key == idempotency_key)
-        )
-        if existing is not None:
-            return existing
-        raise HTTPException(status_code=409, detail="Related task or agent does not exist") from exc
-    db.refresh(item)
-    return item
-
-
-@router.post("/teams/messages/{message_id}/deliver", response_model=AgentMessageRead)
-def deliver_agent_message(message_id: str, db: Session = Depends(get_db)) -> AgentMessage:
-    item = _require(db, AgentMessage, message_id, "Agent message")
-    now = datetime.now(timezone.utc)
-    expires_at = item.expires_at
-    if expires_at is not None:
-        # SQLite can return a naive value even for timezone=True columns.
-        comparable_expiry = expires_at.replace(tzinfo=timezone.utc) if expires_at.tzinfo is None else expires_at
-        if comparable_expiry <= now:
-            item.status = "expired"
-            _commit(db)
-            raise HTTPException(status_code=410, detail="Agent message has expired")
-    if item.status == "pending":
-        item.status = "delivered"
-        _commit(db)
-        db.refresh(item)
-    return item
-
-
-@router.post("/teams/messages/{message_id}/ack", response_model=AgentMessageRead)
-def acknowledge_agent_message(message_id: str, db: Session = Depends(get_db)) -> AgentMessage:
-    item = _require(db, AgentMessage, message_id, "Agent message")
-    item.status = "acknowledged"
-    item.acknowledged_at = datetime.now(timezone.utc)
-    _commit(db)
-    db.refresh(item)
-    return item
