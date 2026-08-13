@@ -10,6 +10,7 @@ from .context_service import (
     ContextAssembler,
     ContextEpoch,
     ContextSnapshot,
+    FilesystemArtifactStore,
     InMemoryArtifactStore,
     MicroCompactResult,
     PromptLayout,
@@ -18,11 +19,18 @@ from .context_service import (
     SummaryParseError,
     VersionConflictError,
     compact_with_compare_and_swap,
+    context_end_sequence,
     micro_compact_messages,
     normalize_summary,
     parse_structured_summary,
 )
 from .engine import AgentRuntime, ModelToolCall, ModelTurn, RunOutcome, RuntimeConfig, empty_usage, merge_usage, normalize_usage
+from .acceptance import (
+    CompletionDecision,
+    DeterministicAcceptanceReport,
+    DeterministicCheck,
+    verify_deterministic_completion,
+)
 from .errors import APIErrorKind, classify_api_error, call_with_retry
 from .guards import GuardDecision, LoopGuard
 
@@ -30,6 +38,7 @@ __all__ = [
     "APIErrorKind",
     "AgentRuntime",
     "ContextBundle",
+    "CompletionDecision",
     "ContextManager",
     "ArtifactRef",
     "ArtifactStore",
@@ -39,6 +48,7 @@ __all__ = [
     "ContextAssembler",
     "ContextEpoch",
     "ContextSnapshot",
+    "FilesystemArtifactStore",
     "InMemoryArtifactStore",
     "MicroCompactResult",
     "PromptLayout",
@@ -47,11 +57,14 @@ __all__ = [
     "SummaryParseError",
     "VersionConflictError",
     "compact_with_compare_and_swap",
+    "context_end_sequence",
     "micro_compact_messages",
     "normalize_summary",
     "parse_structured_summary",
     "DEFAULT_COMPACT_THRESHOLD_TOKENS",
     "DEFAULT_CONTEXT_LIMIT_TOKENS",
+    "DeterministicAcceptanceReport",
+    "DeterministicCheck",
     "GuardDecision",
     "LoopGuard",
     "ModelToolCall",
@@ -61,6 +74,7 @@ __all__ = [
     "empty_usage",
     "merge_usage",
     "normalize_usage",
+    "verify_deterministic_completion",
     "call_with_retry",
     "classify_api_error",
 ]

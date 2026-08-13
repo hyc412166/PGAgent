@@ -570,54 +570,6 @@ class DashboardRead(BaseModel):
     model_connections: int
 
 
-TaskStatus = Literal["todo", "in_progress", "review", "completed", "blocked"]
-
-
-class TeamTaskCreate(BaseModel):
-    title: str = Field(min_length=1, max_length=200)
-    description: str = ""
-    team_id: str = "default"
-    parent_task_id: str | None = None
-    assignee_agent_id: str | None = None
-    priority: Literal["low", "normal", "high"] = "normal"
-    idempotency_key: str | None = None
-
-
-class TeamTaskUpdate(BaseModel):
-    title: str | None = Field(default=None, min_length=1, max_length=200)
-    description: str | None = None
-    status: TaskStatus | None = None
-    assignee_agent_id: str | None = None
-    priority: Literal["low", "normal", "high"] | None = None
-    result: dict[str, Any] | None = None
-    expected_version: int | None = Field(default=None, ge=1)
-
-
-class TeamTaskClaim(BaseModel):
-    agent_id: str
-    lease_owner: str
-    expected_version: int = Field(ge=1)
-    lease_seconds: int = Field(default=300, ge=10, le=3600)
-
-
-class TeamTaskRead(ORMModel):
-    id: str
-    team_id: str
-    parent_task_id: str | None
-    title: str
-    description: str
-    priority: str
-    status: str
-    assignee_agent_id: str | None
-    version: int
-    lease_owner: str | None
-    lease_expires_at: datetime | None
-    idempotency_key: str | None
-    result: dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
-
-
 class DelegatedTaskRead(ORMModel):
     """Read-only child-Agent delegation state for a conversation."""
 
@@ -632,43 +584,3 @@ class DelegatedTaskRead(ORMModel):
     result: dict[str, Any]
     created_at: datetime
     updated_at: datetime
-
-
-AgentMessageType = Literal[
-    "TASK_ASSIGNED",
-    "PLAN_SUBMITTED",
-    "PROGRESS",
-    "ARTIFACT_READY",
-    "BLOCKED",
-    "REVIEW_REQUESTED",
-    "REVIEW_RESULT",
-    "TASK_COMPLETED",
-]
-
-
-class AgentMessageCreate(BaseModel):
-    team_id: str = "default"
-    task_id: str | None = None
-    sender_agent_id: str | None = None
-    recipient_agent_id: str | None = None
-    message_type: AgentMessageType
-    payload: dict[str, Any] = Field(default_factory=dict)
-    idempotency_key: str | None = None
-    hop_count: int = Field(default=0, ge=0, le=8)
-    expires_at: datetime | None = None
-
-
-class AgentMessageRead(ORMModel):
-    id: str
-    team_id: str
-    task_id: str | None
-    sender_agent_id: str | None
-    recipient_agent_id: str | None
-    message_type: str
-    payload: dict[str, Any]
-    status: str
-    idempotency_key: str
-    hop_count: int
-    expires_at: datetime | None
-    acknowledged_at: datetime | None
-    created_at: datetime

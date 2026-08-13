@@ -7,9 +7,10 @@ import {
   X,
   type LucideIcon,
 } from 'lucide-react'
-import { useEffect, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode, type TransitionEvent } from 'react'
 import { buildContextUsageView } from '../contextUsage'
 import type { SessionContext } from '../types'
+import { PenguinMark } from './penguin'
 import { statusText } from './status'
 
 export function StatusBadge({ status = 'unknown' }: { status?: string }) {
@@ -18,7 +19,7 @@ export function StatusBadge({ status = 'unknown' }: { status?: string }) {
     ? 'success'
     : ['failed', 'rejected', 'blocked', 'stopped'].includes(normalized)
       ? 'danger'
-      : ['running', 'acting', 'planning', 'preparing_context', 'in_progress'].includes(normalized)
+      : ['running', 'acting', 'planning', 'preparing_context', 'verifying', 'in_progress'].includes(normalized)
         ? 'active'
         : ['awaiting_approval', 'pending', 'review'].includes(normalized)
           ? 'warning'
@@ -29,12 +30,15 @@ export function StatusBadge({ status = 'unknown' }: { status?: string }) {
 export function PageHeader({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
   return (
     <header className="page-header">
-      <div>
+      <div className="page-heading-copy">
         <p className="eyebrow">{eyebrow}</p>
         <h1>{title}</h1>
         <p className="page-description">{description}</p>
       </div>
-      {action && <div className="page-action">{action}</div>}
+      <div className="page-header-side">
+        <span className="page-mascot" aria-hidden="true"><PenguinMark size={46} /></span>
+        {action && <div className="page-action">{action}</div>}
+      </div>
     </header>
   )
 }
@@ -132,18 +136,34 @@ export function ContextUsageRing({ context }: { context: SessionContext }) {
   )
 }
 
-export function SlidePanel({ title, description, onClose, children }: { title: string; description?: string; onClose: () => void; children: ReactNode }) {
+export function SlidePanel({ title, description, open = true, onClose, onExited, children }: { title: string; description?: string; open?: boolean; onClose: () => void; onExited?: () => void; children: ReactNode }) {
+  const [rendered, setRendered] = useState(open)
+
   useEffect(() => {
+    if (open) setRendered(true)
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
     const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
     window.addEventListener('keydown', closeOnEscape)
     return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [onClose])
+  }, [onClose, open])
+
+  if (!rendered) return null
+
+  function finishClosing(event: TransitionEvent<HTMLDivElement>) {
+    const target = event.target as HTMLElement
+    if (open || event.propertyName !== 'transform' || !target.classList.contains('slide-panel')) return
+    setRendered(false)
+    onExited?.()
+  }
 
   return (
-    <div className="overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div className={`overlay motion-panel ${open ? 'is-open' : 'is-closed'}`} role="presentation" aria-hidden={!open} onTransitionEnd={finishClosing} onMouseDown={(event) => open && event.target === event.currentTarget && onClose()}>
       <section className="slide-panel" role="dialog" aria-modal="true" aria-labelledby="panel-title">
         <header>
-          <div><p className="eyebrow">PGAgent 配置</p><h2 id="panel-title">{title}</h2>{description && <p>{description}</p>}</div>
+          <div><p className="eyebrow">企鹅配置舱</p><h2 id="panel-title">{title}</h2>{description && <p>{description}</p>}</div>
           <button className="icon-button" onClick={onClose} aria-label="关闭"><X size={19} /></button>
         </header>
         {children}

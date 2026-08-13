@@ -5,6 +5,7 @@ export const statusText: Record<string, string> = {
   acting: '执行中',
   planning: '规划中',
   preparing_context: '准备上下文',
+  verifying: '验收中',
   awaiting_approval: '等待审批',
   pending: '待处理',
   approved: '已批准',

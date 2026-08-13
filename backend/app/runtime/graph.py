@@ -21,8 +21,13 @@ class RunGraphState(TypedDict, total=False):
     usage: dict[str, Any]
     context: dict[str, Any]
     context_snapshot: dict[str, Any]
+    context_artifact_refs: list[dict[str, Any]]
+    transcript_delta: list[dict[str, Any]]
+    verification_trace: list[dict[str, Any]]
     compaction_count: int
     context_overflow_retries: int
+    completion_verification_attempts: int
+    acceptance_report: dict[str, Any]
     prompt_cache_key: str
 
 

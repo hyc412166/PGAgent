@@ -297,27 +297,10 @@ export interface Connection {
   created_at?: string
 }
 
-export interface TeamTask {
-  id: string
-  title: string
-  description?: string
-  status?: string
-  assignee_agent_id?: string
-  assignee_name?: string
-  priority?: string
-  version?: number
-  lease_expires_at?: string
-  result?: ApiRecord
-  created_at?: string
-  updated_at?: string
-}
-
 /**
  * A child-agent delegation belonging to one conversation.
  *
- * This is deliberately separate from TeamTask: TeamTask is reserved for the
- * future multi-user collaboration board, while delegations are runtime
- * records owned by a parent run/session.
+ * Delegations are runtime records owned by a parent run/session.
  */
 export interface DelegatedTask {
   id: string

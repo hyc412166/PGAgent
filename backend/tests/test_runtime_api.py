@@ -22,8 +22,6 @@ from app.database import (
     Run,
     RunEvent,
     Session,
-    TeamTask,
-    AgentMessage,
     Workspace,
     configure_database,
     init_db,
@@ -316,8 +314,6 @@ def test_rejecting_delegated_child_approval_settles_its_delegation_and_parent_au
         assert task.result["binding"]["allowed_tool_names"] == ["read"]
         parent = db.get(Run, parent_run_id)
         assert parent is not None and parent.status == "received"
-        assert list(db.scalars(select(TeamTask))) == []
-        assert list(db.scalars(select(AgentMessage))) == []
         assert db.scalar(select(RunEvent).where(
             RunEvent.run_id == parent_run_id,
             RunEvent.event_type == "delegated_child_stopped",

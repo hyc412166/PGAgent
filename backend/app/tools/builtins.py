@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import fnmatch
 import html
+import asyncio
 import inspect
 import ipaddress
+import json
 import os
 import re
 import shlex
@@ -43,6 +45,10 @@ DEFAULT_COMMAND_ALLOWLIST = frozenset(
 )
 
 _DANGEROUS_SHELL_TOKENS = ("&&", "||", ";", "|", ">", "<", "`", "$(")
+
+# A coordinator must be able to fan out, but a malformed model response must
+# not be able to create an unbounded number of child runs in one turn.
+MAX_PARALLEL_DELEGATED_TASKS = 8
 MAX_WEB_RESPONSE_BYTES = 1_000_000
 MAX_WEB_TEXT_CHARS = 100_000
 MAX_SKILL_INSTRUCTION_CHARS = 40_000
@@ -762,11 +768,52 @@ def ask_question(
     )
 
 
+def normalize_delegate_requests(
+    task: object = "",
+    agent_id: object = "",
+    tasks: object = None,
+) -> tuple[list[tuple[str, str]], str | None, str | None]:
+    """Normalize one task call or an explicit parallel task batch."""
+
+    if tasks is not None:
+        if str(task or "").strip() or str(agent_id or "").strip():
+            return [], "invalid_task", "task 和 tasks 不能同时提供"
+        if not isinstance(tasks, (list, tuple)) or not tasks:
+            return [], "invalid_task", "tasks 必须是非空数组"
+        if len(tasks) > MAX_PARALLEL_DELEGATED_TASKS:
+            return [], "delegate_parallel_limit", f"单次最多并行委派 {MAX_PARALLEL_DELEGATED_TASKS} 个子 Agent 任务"
+        normalized: list[tuple[str, str]] = []
+        for item in tasks:
+            if not isinstance(item, Mapping):
+                return [], "invalid_task", "tasks 中每一项必须是对象"
+            request = str(item.get("task") or "").strip()
+            target = str(item.get("agent_id") or "").strip()
+            if not request or len(request) > 8_000:
+                return [], "invalid_task", "tasks 中的 task 不能为空或过长"
+            if not target or len(target) > 80:
+                return [], "invalid_delegate_agent", "tasks 中每一项都必须提供有效的子 Agent ID"
+            normalized.append((request, target))
+        return normalized, None, None
+
+    request = str(task or "").strip()
+    if not request or len(request) > 8_000:
+        return [], "invalid_task", "task 不能为空或过长"
+    target = str(agent_id or "").strip()
+    if not target or len(target) > 80:
+        return [], "invalid_delegate_agent", "必须提供有效的子 Agent ID"
+    return [(request, target)], None, None
+
+
+def _invalid_delegate_result(code: str, message: str) -> ToolResult:
+    return ToolResult("task", False, message, error_code=code)
+
+
 def delegate_task(
     _sandbox: WorkspaceSandbox,
-    task: str,
+    task: str = "",
     *,
     agent_id: str = "",
+    tasks: object = None,
     delegate: Callable[..., ToolResult | Awaitable[ToolResult]] | None = None,
 ) -> ToolResult:
     """Synchronous compatibility path for a real, injected task delegate.
@@ -777,12 +824,9 @@ def delegate_task(
     never tries to start a nested event loop.
     """
 
-    request = str(task or "").strip()
-    if not request or len(request) > 8_000:
-        return ToolResult("task", False, "task 不能为空或过长", error_code="invalid_task")
-    target = str(agent_id or "").strip()
-    if not target or len(target) > 80:
-        return ToolResult("task", False, "必须提供有效的子 Agent ID", error_code="invalid_delegate_agent")
+    requests, error_code, error = normalize_delegate_requests(task, agent_id, tasks)
+    if error_code and error:
+        return _invalid_delegate_result(error_code, error)
     if delegate is None:
         return ToolResult(
             "task",
@@ -791,6 +835,14 @@ def delegate_task(
             error_code="delegated_task_unavailable",
         )
     try:
+        if len(requests) > 1:
+            return ToolResult(
+                "task",
+                False,
+                "批量子 Agent 委派只能在运行时异步通道中执行",
+                error_code="async_delegate_requires_runtime",
+            )
+        request, target = requests[0]
         result = _call_task_delegate(delegate, request, target, call_id=None)
         if inspect.isawaitable(result):
             # Do not create a second event loop from a synchronous tool call.
@@ -846,25 +898,23 @@ def _call_task_delegate(
 
 async def delegate_task_async(
     _sandbox: WorkspaceSandbox,
-    task: str,
+    task: str = "",
     *,
     agent_id: str = "",
+    tasks: object = None,
     delegate: Callable[..., ToolResult | Awaitable[ToolResult]] | None = None,
     call_id: str | None = None,
 ) -> ToolResult:
-    """Run an injected child-Agent delegate without pretending it is local.
+    """Run one or several injected child-Agent delegates concurrently.
 
     Validation is shared with the synchronous tool.  A failed delegate is
     converted into a normal tool result so the parent loop's existing repeat
     and no-progress guards remain responsible for recovery.
     """
 
-    request = str(task or "").strip()
-    if not request or len(request) > 8_000:
-        return ToolResult("task", False, "task 不能为空或过长", error_code="invalid_task")
-    target = str(agent_id or "").strip()
-    if not target or len(target) > 80:
-        return ToolResult("task", False, "必须提供有效的子 Agent ID", error_code="invalid_delegate_agent")
+    requests, error_code, error = normalize_delegate_requests(task, agent_id, tasks)
+    if error_code and error:
+        return _invalid_delegate_result(error_code, error)
     if delegate is None:
         return ToolResult(
             "task",
@@ -873,12 +923,79 @@ async def delegate_task_async(
             error_code="delegated_task_unavailable",
         )
     try:
-        result = _call_task_delegate(delegate, request, target, call_id=call_id)
-        if inspect.isawaitable(result):
-            result = await result
-        if isinstance(result, ToolResult):
-            return result
-        return ToolResult("task", False, "子 Agent 委派器返回了无效结果", error_code="delegate_error")
+        async def invoke(index: int, request: str, target: str) -> ToolResult:
+            child_call_id = f"{call_id}:{index}" if call_id and len(requests) > 1 else call_id
+            result = _call_task_delegate(delegate, request, target, call_id=child_call_id)
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, ToolResult):
+                return result
+            return ToolResult("task", False, "子 Agent 委派器返回了无效结果", error_code="delegate_error")
+
+        results = await asyncio.gather(
+            *(invoke(index, request, target) for index, (request, target) in enumerate(requests)),
+            return_exceptions=True,
+        )
+        normalized_results: list[ToolResult] = []
+        for result in results:
+            if isinstance(result, ToolResult):
+                normalized_results.append(result)
+            else:
+                normalized_results.append(
+                    ToolResult("task", False, f"子 Agent 委派失败: {type(result).__name__}", error_code="delegate_error")
+                )
+        if len(normalized_results) == 1:
+            return normalized_results[0]
+
+        children: list[dict[str, Any]] = []
+        for result in normalized_results:
+            try:
+                child_payload = json.loads(result.content)
+            except (TypeError, json.JSONDecodeError):
+                child_payload = result.to_dict()
+            child = child_payload if isinstance(child_payload, dict) else result.to_dict()
+            child.setdefault("ok", result.ok)
+            child.setdefault("error_code", result.error_code)
+            children.append(child)
+        waiting = any(
+            bool(result.metadata.get("delegated_child_awaiting_approval"))
+            for result in normalized_results
+        )
+        succeeded = sum(1 for result in normalized_results if result.ok)
+        if waiting:
+            aggregate_status = "awaiting_approval"
+            aggregate_error_code = "delegate_child_awaiting_approval"
+        elif succeeded == len(normalized_results):
+            aggregate_status = "completed"
+            aggregate_error_code = None
+        elif succeeded:
+            aggregate_status = "partial_failure"
+            aggregate_error_code = "delegate_partial_failure"
+        else:
+            aggregate_status = "failed"
+            aggregate_error_code = "delegate_batch_failed"
+        aggregate = {
+            "status": aggregate_status,
+            "parallel": True,
+            "child_count": len(children),
+            "completed_count": succeeded,
+            "failed_count": len(children) - succeeded,
+            "children": children,
+        }
+        return ToolResult(
+            "task",
+            all(result.ok for result in normalized_results),
+            json.dumps(aggregate, ensure_ascii=False, separators=(",", ":")),
+            changed=any(result.changed for result in normalized_results),
+            error_code=aggregate_error_code,
+            metadata={
+                "status": aggregate["status"],
+                "parallel": True,
+                "child_count": len(children),
+                "children": [dict(result.metadata) for result in normalized_results],
+                "delegated_child_awaiting_approval": waiting,
+            },
+        )
     except Exception as exc:
         return ToolResult("task", False, f"子 Agent 委派失败: {type(exc).__name__}", error_code="delegate_error")
 

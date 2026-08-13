@@ -185,7 +185,6 @@ def test_todo_skill_and_task_behavior_is_honest(tmp_path) -> None:
     assert not task.ok
     assert task.error_code == "delegated_task_unavailable"
 
-
 @pytest.mark.asyncio
 async def test_task_delegate_is_not_started_until_parent_approval(tmp_path) -> None:
     invoked: list[tuple[str, str, str | None]] = []
@@ -202,6 +201,13 @@ async def test_task_delegate_is_not_started_until_parent_approval(tmp_path) -> N
         permission_mode="ask",
         task_delegate=delegate,
     )
+    invalid_target = await registry.execute_async(
+        "task",
+        {"task": "inspect", "agent_id": ""},
+    )
+    assert invalid_target.error_code == "invalid_delegate_agent"
+    assert invoked == []
+
     pending = await registry.execute_async(
         "task",
         {"task": "inspect", "agent_id": "child-1"},
@@ -222,7 +228,7 @@ async def test_task_delegate_is_not_started_until_parent_approval(tmp_path) -> N
 
 
 @pytest.mark.asyncio
-async def test_question_finishes_the_current_run_and_emits_timeline_events(tmp_path) -> None:
+async def test_question_stops_for_input_without_claiming_completion(tmp_path) -> None:
     async def model_call(**_kwargs):
         return ModelTurn(tool_calls=[ModelToolCall("question-1", "question", {"question": "目标文件是哪一个？"})])
 
@@ -232,12 +238,13 @@ async def test_question_finishes_the_current_run_and_emits_timeline_events(tmp_p
     )
     outcome = await runtime.run(system_prompt="", recent_messages=[])
 
-    assert outcome.status == "completed"
+    assert outcome.status == "stopped"
+    assert outcome.stop_reason == "needs_user_input"
     assert outcome.output == "我需要先确认：目标文件是哪一个？"
     assert [event["type"] for event in outcome.events][-3:] == [
         "tool_finished",
         "user_question_requested",
-        "run_completed",
+        "run_stopped",
     ]
     started = next(event for event in outcome.events if event["type"] == "model_step_started")
     tool_started = next(event for event in outcome.events if event["type"] == "tool_started")
@@ -294,6 +301,7 @@ async def test_provider_context_overflow_compacts_once_and_retries_without_loop(
 @pytest.mark.asyncio
 async def test_threshold_semantic_compaction_rebuilds_concrete_context_bundle(tmp_path) -> None:
     calls: list[str] = []
+    model_messages: list[dict] = []
 
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         mode = str(kwargs.get("mode") or "auto")
@@ -307,6 +315,7 @@ async def test_threshold_semantic_compaction_rebuilds_concrete_context_bundle(tm
                     '"tool_state":{},"approval_state":{},"next_action":"continue"}'
                 )
             )
+        model_messages.extend(kwargs["messages"])
         return ModelTurn(content="compacted answer")
 
     assembler = ContextAssembler(
@@ -325,6 +334,7 @@ async def test_threshold_semantic_compaction_rebuilds_concrete_context_bundle(tm
     outcome = await runtime.run(
         system_prompt="stable rules",
         agent_instructions="stable instructions",
+        memories=[{"content": "keep this memory", "pinned": True}],
         recent_messages=[
             {"role": "user", "content": "important task " + ("x" * 4_000)},
             {"role": "assistant", "content": "intermediate result " + ("y" * 4_000)},
@@ -334,6 +344,10 @@ async def test_threshold_semantic_compaction_rebuilds_concrete_context_bundle(tm
     assert outcome.status == "completed"
     assert outcome.output == "compacted answer"
     assert "compaction" in calls
+    rendered = "\n".join(str(item.get("content") or "") for item in model_messages)
+    assert "[固定] keep this memory" in rendered
+    assert "<user_task>" in rendered
+    assert "important task" in rendered
     assert any(event["type"] == "context_compaction_finished" and event.get("effective") for event in outcome.events)
 
 

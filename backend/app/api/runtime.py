@@ -485,7 +485,7 @@ async def decide_and_resume(
     if payload.decision == "reject":
         # A delegated child is linked to the parent session for approval
         # visibility.  Rejection must settle the child task in this same
-        # transaction; otherwise the task board would remain falsely active.
+        # transaction; otherwise the delegation record would remain falsely active.
         db.refresh(run)
         parent_bridge_event = coordinator.reconcile_delegated_child_terminal(
             db,

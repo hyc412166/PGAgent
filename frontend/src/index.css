@@ -1,32 +1,32 @@
 :root {
-  font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  color: #2b2927;
-  background: #f6f4ef;
+  font-family: ui-rounded, "Arial Rounded MT Bold", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  color: #12324a;
+  background: #eaf8fd;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  --bg: #f6f4ef;
-  --surface: #fffefa;
-  --surface-soft: #faf8f3;
-  --surface-deep: #f1eee7;
-  --ink: #242220;
-  --muted: #716d67;
-  --muted-2: #98928a;
-  --line: #e7e2d9;
-  --line-strong: #dcd5ca;
-  --orange: #ed6d35;
-  --orange-dark: #cf5221;
-  --orange-soft: #fff0e7;
+  --bg: #eaf8fd;
+  --surface: #fbfeff;
+  --surface-soft: #f1fbff;
+  --surface-deep: #dff3fa;
+  --ink: #12324a;
+  --muted: #46687c;
+  --muted-2: #5b7989;
+  --line: #cce4ed;
+  --line-strong: #add2df;
+  --orange: #e94f5e;
+  --orange-dark: #c93e4c;
+  --orange-soft: #ffe9ec;
   --green: #26815f;
   --green-soft: #e8f5ee;
-  --yellow: #a76c12;
-  --yellow-soft: #fff4dc;
-  --red: #bb4b41;
-  --red-soft: #fcecea;
-  --violet: #7252a4;
-  --violet-soft: #f0ebf8;
-  --shadow-sm: 0 1px 2px rgb(47 39 30 / 4%), 0 6px 18px rgb(47 39 30 / 4%);
-  --shadow-md: 0 18px 50px rgb(47 39 30 / 12%);
+  --yellow: #b87913;
+  --yellow-soft: #fff3d6;
+  --red: #c93e4c;
+  --red-soft: #ffe9ec;
+  --violet: #317aa2;
+  --violet-soft: #e3f4fb;
+  --shadow-sm: 0 5px 16px rgb(20 76 105 / 7%);
+  --shadow-md: 0 20px 48px rgb(7 49 73 / 16%);
 }
 
 * { box-sizing: border-box; }
@@ -37,6 +37,6 @@ button { color: inherit; }
 button:not(:disabled), select:not(:disabled) { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .55; }
 button, a, input, textarea, select { -webkit-tap-highlight-color: transparent; }
-:focus-visible { outline: 3px solid rgb(237 109 53 / 24%); outline-offset: 2px; }
-::selection { color: var(--ink); background: #ffd6bf; }
+:focus-visible { outline: 3px solid rgb(233 79 94 / 25%); outline-offset: 2px; }
+::selection { color: var(--ink); background: #ffdce1; }
 #root { min-height: 100vh; }
