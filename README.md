@@ -97,4 +97,4 @@ E:\anaconda3\envs\agent_dock\python.exe -m uvicorn app.main:app --app-dir backen
 - 模型能力由提供商决定。部分中转站不支持工具调用或思考强度参数，PGAgent 会尽量丢弃不支持的可选参数，但无法替代提供商能力。
 - 同步 SDK 调用超时后结果会被丢弃，但 Python 无法强杀已进入第三方库的线程；PGAgent 默认使用 LiteLLM 异步调用避免这一问题。
 
-更多运行时设计细节见 `docs/ARCHITECTURE.md`，UI 设计与 Apix 对比见 `docs/UI_ARCHITECTURE.md`。
+更多运行时设计细节见 `docs/ARCHITECTURE.md`，企鹅主题 UI 设计与交互约束见 `docs/UI_ARCHITECTURE.md`。

@@ -5,7 +5,6 @@ import {
   Copy,
   LoaderCircle,
   ShieldCheck,
-  Sparkles,
   SquareTerminal,
   Users,
   X,
@@ -13,10 +12,12 @@ import {
   CheckCircle2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { memo } from 'react'
 import { formatLiveThinkingDuration, formatThoughtDuration, type ThoughtTimelineState } from '../../thoughtTimeline'
 import type { Approval, DelegatedTask, Message, Run, RunEvent } from '../../types'
 import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../components/ui'
 import { statusText } from '../../components/status'
+import { PenguinMark } from '../../components/penguin'
 
 export type LiveRunView = {
   runId: string
@@ -57,7 +58,7 @@ function childTaskOutput(task?: DelegatedTask) {
   return ''
 }
 
-export function ChildAgentPanel({
+export const ChildAgentPanel = memo(function ChildAgentPanel({
   tasks,
   loading,
   error,
@@ -108,9 +109,9 @@ export function ChildAgentPanel({
       </section>}
     </>}
   </aside>
-}
+})
 
-export function MessageBubble({ message }: { message: Message }) {
+export const MessageBubble = memo(function MessageBubble({ message }: { message: Message }) {
   const [copied, setCopied] = useState(false)
   const isTool = message.role === 'tool' || !!message.tool_name
   const isDelegatedChild = message.metadata?.delegated_child === true
@@ -135,13 +136,13 @@ export function MessageBubble({ message }: { message: Message }) {
   }
   return (
     <article className={`message ${message.role} ${isTool ? 'tool-message' : ''}`}>
-      <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <Sparkles size={16} />}</div>
+      <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <PenguinMark size={21} />}</div>
       <div className="message-body"><div className="message-meta"><strong>{speaker}</strong><time>{formatUiDate(message.created_at)}</time><button type="button" className="message-copy-button" aria-label={copied ? '已复制' : '复制消息'} title={copied ? '已复制' : '复制消息'} onClick={() => void copyMessage()}>{copied ? <CheckCheck size={13} /> : <Copy size={13} />}</button></div><div className="message-content">{message.content}</div>{message.status && <StatusBadge status={message.status} />}</div>
     </article>
   )
-}
+})
 
-export function CompletedThoughtTimeline({ runId, timeline }: { runId: string; timeline: ThoughtTimelineState }) {
+export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({ runId, timeline }: { runId: string; timeline: ThoughtTimelineState }) {
   const [expanded, setExpanded] = useState(false)
   const duration = formatThoughtDuration(timeline.elapsedMs)
   const hasDetails = timeline.tools.length > 0
@@ -152,14 +153,14 @@ export function CompletedThoughtTimeline({ runId, timeline }: { runId: string; t
     </button> : <span className="completed-thought-duration completed-thought-static">已处理 {duration}</span>}
     {hasDetails && expanded && <div id={`thought-details-${runId}`} className="thought-tool-list" aria-label="工具调用">{timeline.tools.map((tool) => <p key={tool.id} className={`thought-tool ${tool.status}`}><span>{tool.name.startsWith('Web') ? '⌁' : '→'}</span><strong>{tool.name}</strong>{tool.target && <code title={tool.target}>{tool.target}</code>}{tool.status === 'running' && <i aria-label="运行中" />}</p>)}</div>}
   </article>
-}
+})
 
-export function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunView }) {
+export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunView }) {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     if (liveRun.thought.startedAt === null || liveRun.thought.finished) return
     setNow(Date.now())
-    const timer = window.setInterval(() => setNow(Date.now()), 100)
+    const timer = window.setInterval(() => setNow(Date.now()), 250)
     return () => window.clearInterval(timer)
   }, [liveRun.thought.finished, liveRun.thought.startedAt])
   const liveThoughtMs = liveRun.thought.startedAt === null ? 0 : Math.max(0, now - liveRun.thought.startedAt)
@@ -170,13 +171,13 @@ export function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunView }) {
       : liveRun.phase || '已完成'
   return (
     <article className={`message assistant live-message ${liveRun.status === 'terminal' ? 'live-message-terminal' : ''}`}>
-      <div className="message-avatar"><Sparkles size={16} /></div>
+      <div className="message-avatar"><PenguinMark size={21} /></div>
       <div className="message-body"><div className="message-meta"><strong>PGAgent</strong><span className="live-phase"><i aria-hidden="true" />{phase}</span></div>{liveRun.draft && <div className="message-content">{liveRun.draft}</div>}{liveRun.error && <p className="live-error">{liveRun.error}</p>}</div>
     </article>
   )
-}
+})
 
-export function ApprovalCard({ approval, deciding, onDecision }: { approval: Approval; deciding: boolean; onDecision: (id: string, decision: 'approve' | 'reject', runId: string) => void }) {
+export const ApprovalCard = memo(function ApprovalCard({ approval, deciding, onDecision }: { approval: Approval; deciding: boolean; onDecision: (id: string, decision: 'approve' | 'reject', runId: string) => void }) {
   const runId = typeof approval.run_id === 'string' || typeof approval.run_id === 'number' ? String(approval.run_id) : ''
   return (
     <article className="approval-card">
@@ -186,4 +187,4 @@ export function ApprovalCard({ approval, deciding, onDecision }: { approval: App
       <footer><button className="button button-danger" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'reject', runId)}><XCircle size={15} />拒绝</button><button className="button button-primary" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'approve', runId)}>{deciding ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}允许本次</button></footer>
     </article>
   )
-}
+})

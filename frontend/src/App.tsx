@@ -41,7 +41,7 @@ import {
   X,
   Sun,
 } from 'lucide-react'
-import { Fragment, type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, forwardRef, type FormEvent, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { ApiError, api, apiUrl, describeError } from './api'
 import { permissionLabel, permissionOptions, toggleSelectedId } from './capabilitySelection'
@@ -55,6 +55,7 @@ import { emptyThoughtTimeline, hasVisibleCompletedThought, pickThinkingStatus, t
 import { usageDateKey, usageDateOptions, usageDatePresetBounds, usageDateRange, usageRangeLabel, type QuickUsageDatePreset, type UsageDatePreset } from './usageDateRange'
 import { agentTemplates, type AgentTemplate } from './features/agents/templates'
 import { CapabilityMultiSelect, ContextUsageRing, EmptyState, ErrorState, Field, LoadingState, PageHeader, SlidePanel, StatusBadge } from './components/ui'
+import { PenguinMark } from './components/penguin'
 import { statusText } from './components/status'
 import { ApprovalCard, ChildAgentPanel, CompletedThoughtTimeline, LiveAssistantMessage, MessageBubble } from './features/sessions/presentation'
 import type {
@@ -98,6 +99,7 @@ type LiveRunState = { runId: string; phase: string; draft: string; status: 'idle
 type OwnedSessionMessages = { ownerSessionId: string; items: Message[] }
 type DraftSessionSettings = { model_connection_id: string | null; model_id: string | null; thinking_level: ThinkingLevel; skill_ids: string[]; permission_mode: PermissionMode }
 type DraftLaunchResponse = { session: Session; run: Run; workspace?: Workspace }
+type ComposerTextAreaHandle = { getValue: () => string; clear: () => void }
 
 const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'auto', skill_ids: [], permission_mode: 'smart' }
 const emptyDraftContext: SessionContext = { used_tokens: 0, limit_tokens: 100_000, compact_threshold_tokens: 90_000, percent: 0 }
@@ -134,6 +136,28 @@ const runStreamEventNames = [
 ] as const
 
 const activeRunStatuses = new Set(['received', 'running', 'preparing_context', 'planning', 'acting', 'observing', 'awaiting_approval'])
+
+const ComposerTextArea = forwardRef<ComposerTextAreaHandle, { disabled: boolean; resetKey: string; placeholder: string; onHasValueChange: (hasValue: boolean) => void }>(function ComposerTextArea({ disabled, resetKey, placeholder, onHasValueChange }, ref) {
+  const [value, setValue] = useState('')
+  const hasValueRef = useRef(false)
+  const updateValue = useCallback((nextValue: string) => {
+    setValue(nextValue)
+    const nextHasValue = Boolean(nextValue.trim())
+    if (nextHasValue !== hasValueRef.current) {
+      hasValueRef.current = nextHasValue
+      onHasValueChange(nextHasValue)
+    }
+  }, [onHasValueChange])
+  useImperativeHandle(ref, () => ({ getValue: () => value, clear: () => updateValue('') }), [value, updateValue])
+  useEffect(() => {
+    setValue('')
+    if (hasValueRef.current) {
+      hasValueRef.current = false
+      onHasValueChange(false)
+    }
+  }, [resetKey, onHasValueChange])
+  return <textarea aria-label="给 Agent 发送消息" value={value} disabled={disabled} onChange={(event) => updateValue(event.target.value)} placeholder={placeholder} rows={2} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} />
+})
 
 function useApiData<T>(initial: T, loader: () => Promise<T>, deps: readonly unknown[] = []) {
   const [state, setState] = useState<LoadState<T>>({ data: initial, loading: true, error: '' })
@@ -223,6 +247,7 @@ function AppShell() {
 
   useEffect(() => setMobileOpen(false), [location.pathname])
   useEffect(() => {
+    document.documentElement.style.colorScheme = theme
     try { window.localStorage.setItem('pgagent-theme', theme) } catch { /* local storage is optional */ }
   }, [theme])
 
@@ -232,7 +257,7 @@ function AppShell() {
       {mobileOpen && <button className="mobile-backdrop" aria-label="关闭导航" onClick={() => setMobileOpen(false)} />}
       <aside className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
           <div className="brand">
-            <div className="brand-mark" aria-hidden="true"><Sparkles size={20} /></div>
+            <div className="brand-mark"><PenguinMark size={27} /></div>
             <div className="brand-copy"><strong>PGAgent</strong><span>Local Workbench</span></div>
             <button
               className="theme-toggle icon-button"
@@ -695,7 +720,7 @@ function SessionsPage() {
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
   const skills = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
   const [activeId, setActiveId] = useState('')
-  const [composer, setComposer] = useState('')
+  const [composerHasValue, setComposerHasValue] = useState(false)
   const [sending, setSending] = useState(false)
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false)
@@ -731,6 +756,7 @@ function SessionsPage() {
   const seenStreamEventsRef = useRef<{ runId: string; eventIds: Set<string> }>({ runId: '', eventIds: new Set() })
   const runStartMessageCountRef = useRef(0)
   const messagesRef = useRef<HTMLDivElement>(null)
+  const composerInputRef = useRef<ComposerTextAreaHandle>(null)
   const activeIdRef = useRef('')
   const stickToBottomRef = useRef(true)
   const terminalSyncVersionRef = useRef(0)
@@ -927,7 +953,6 @@ function SessionsPage() {
     const selectedProjectId = selectedProjectRoot ? activeSession?.workspace_id : ''
     draftVersionRef.current += 1
     setActionError('')
-    setComposer('')
     setDraftRootPath(selectedProjectRoot)
     setDraftSettings(emptyDraftSettings)
     setLiveRun(emptyLiveRun())
@@ -941,7 +966,6 @@ function SessionsPage() {
     if (draftActive && sendingRef.current) return
     if (draftActive) {
       clearDraftState()
-      setComposer('')
     }
     setActionError('')
     setActiveId(sessionId)
@@ -1247,7 +1271,7 @@ function SessionsPage() {
 
   async function sendMessage(event: FormEvent) {
     event.preventDefault()
-    const content = composer.trim()
+    const content = composerInputRef.current?.getValue().trim() || ''
     if (sendingRef.current || (!activeId && !draftActive) || !content || settingsSaving || capabilitySaving || settingsLocked) return
     sendingRef.current = true
     setSending(true); setActionError('')
@@ -1270,7 +1294,7 @@ function SessionsPage() {
         const runId = stringId(launched.run?.id)
         if (!sessionId || !runId) throw new Error('草稿启动响应缺少会话或运行标识。')
         pendingDraftRunRef.current = { sessionId, runId }
-        setComposer('')
+        composerInputRef.current?.clear()
         clearDraftState()
         setActiveId(sessionId)
         void sessions.refresh()
@@ -1280,7 +1304,7 @@ function SessionsPage() {
 
       const targetSessionId = activeId
       const launched = await api.post<Run>(`/api/sessions/${targetSessionId}/run`, { content })
-      setComposer('')
+      composerInputRef.current?.clear()
       void messages.refresh()
       void runs.refresh()
       void context.refresh()
@@ -1458,7 +1482,7 @@ function SessionsPage() {
           <section className={`conversation ${childPanelOpen ? 'with-child-panel' : ''}`}>
             <header className="conversation-header">
               <div className="conversation-heading">
-                <div className="conversation-agent-mark"><Sparkles size={16} /></div>
+                <div className="conversation-agent-mark"><PenguinMark size={22} /></div>
                 <div><span className="conversation-kicker">PGAgent · {activeWorkspace?.name || 'Default Workspace'}</span><strong>{activeSession?.title || (draftActive ? '新任务草稿' : '选择一个会话')}</strong></div>
               </div>
               <div className="conversation-header-meta">
@@ -1493,7 +1517,7 @@ function SessionsPage() {
                   <button type="button" className="draft-project-button" disabled={pickingDraftProject || sending} onClick={() => void selectDraftProject()}>{pickingDraftProject ? <LoaderCircle className="spin" size={13} /> : <FolderOpen size={13} />}选择项目</button>
                   {draftRootPath && <span className="draft-folder-pill" title={draftRootPath}><Folder size={12} /><span>{folderName(draftRootPath)}</span><button type="button" aria-label="清除所选项目" disabled={sending} onClick={clearDraftProject}><X size={11} /></button></span>}
                 </div>}
-                <textarea aria-label="给 Agent 发送消息" value={composer} disabled={draftActive && sending} onChange={(event) => setComposer(event.target.value)} placeholder={draftActive ? '描述你想完成的任务……' : '告诉 PGAgent 你想完成什么……'} rows={2} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} />
+                <ComposerTextArea ref={composerInputRef} disabled={draftActive && sending} resetKey={`${activeId}:${draftActive}`} placeholder={draftActive ? '描述你想完成的任务……' : '告诉 PGAgent 你想完成什么……'} onHasValueChange={setComposerHasValue} />
                 <div className="composer-toolbar">
                   <div className="composer-left-actions">
                     <div className="session-capability-picker" ref={addMenuRef}>
@@ -1547,7 +1571,7 @@ function SessionsPage() {
                           <button type="button" role="menuitemradio" aria-checked={selectedModelValue === ''} className={selectedModelValue === '' ? 'selected' : ''} onClick={() => selectModel('')}>
                             <span><strong>自动</strong><small>{automaticModel || '默认模型'}{automaticSessionConnection?.name ? ` · ${automaticSessionConnection.name}` : ''}</small></span>{selectedModelValue === '' && <Check size={14} aria-hidden="true" />}
                           </button>
-                          {modelOptions.map((option) => <button key={option.value} type="button" role="menuitemradio" aria-checked={selectedModelValue === option.value} className={selectedModelValue === option.value ? 'selected' : ''} onClick={() => selectModel(option.value)}>
+                          {modelOptions.map((option, index) => <button key={`${option.value}:${index}`} type="button" role="menuitemradio" aria-checked={selectedModelValue === option.value} className={selectedModelValue === option.value ? 'selected' : ''} onClick={() => selectModel(option.value)}>
                             <span><strong>{option.label}</strong><small>{option.connection}</small></span>{selectedModelValue === option.value && <Check size={14} aria-hidden="true" />}
                           </button>)}
                         </div>}
@@ -1562,7 +1586,7 @@ function SessionsPage() {
                         </div>}
                       </div>}
                     </div>
-                    <button className="send-button" aria-label="发送" disabled={sending || settingsSaving || capabilitySaving || settingsLocked || !composer.trim()}>{sending ? <LoaderCircle className="spin" /> : <Send />}</button>
+                    <button className="send-button" aria-label="发送" disabled={sending || settingsSaving || capabilitySaving || settingsLocked || !composerHasValue}>{sending ? <LoaderCircle className="spin" /> : <Send />}</button>
                   </div>
                 </div>
               </form>
@@ -1795,7 +1819,7 @@ function ModelsPage() {
             <article className="connection-card" key={connection.id}>
               <header><div className="provider-icon"><Sparkles size={20} /></div><div><h2>{connection.name}</h2><p>{connection.provider || 'OpenAI Compatible'}</p></div><StatusBadge status={connection.status || 'unknown'} /></header>
               <dl><div><dt>Base URL</dt><dd>{connection.base_url || '—'}</dd></div><div><dt>API Key</dt><dd>{connection.api_key_hint || '已安全保存'}</dd></div><div><dt>默认模型</dt><dd>{connection.default_model || '尚未选择'}</dd></div></dl>
-              <div className="model-block"><div className="model-block-head"><strong>可用模型</strong><button className="button button-quiet" onClick={() => discover(connection)} disabled={discovering === connection.id}>{discovering === connection.id ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}发现模型</button></div>{(connection.models || connection.discovered_models || connection.manual_models)?.length ? <div className="model-tags">{(connection.models || [...(connection.discovered_models || []), ...(connection.manual_models || [])]).map((model) => <span className={model === connection.default_model ? 'selected' : ''} key={model}>{model}</span>)}</div> : <p className="muted">尚未获取模型列表，可点击发现或使用手动模型 ID。</p>}</div>
+              <div className="model-block"><div className="model-block-head"><strong>可用模型</strong><button className="button button-quiet" onClick={() => discover(connection)} disabled={discovering === connection.id}>{discovering === connection.id ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}发现模型</button></div>{(connection.models || connection.discovered_models || connection.manual_models)?.length ? <div className="model-tags">{(connection.models || [...(connection.discovered_models || []), ...(connection.manual_models || [])]).map((model, index) => <span className={model === connection.default_model ? 'selected' : ''} key={`${connection.id}:${model}:${index}`}>{model}</span>)}</div> : <p className="muted">尚未获取模型列表，可点击发现或使用手动模型 ID。</p>}</div>
               <div className="thinking-row"><div><strong>思考强度</strong><small>不同提供商会映射到各自支持的参数</small></div><select aria-label={`${connection.name} 思考强度`} value={connection.thinking_level || 'auto'} onChange={(event) => void updateThinking(connection, event.target.value)}><option value="off">关闭</option><option value="auto">自动</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option></select></div>
               {(discoveryError[connection.id] || connection.last_error) && <p className="inline-error"><AlertCircle size={14} />{discoveryError[connection.id] || connection.last_error}</p>}
             </article>
