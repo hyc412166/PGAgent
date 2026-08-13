@@ -584,7 +584,7 @@ select:focus-visible {
   background: var(--violet-soft);
 }
 
-.project-tooltip {
+.project-hover-card {
   border-color: var(--line);
   border-radius: 12px;
   background: var(--surface);
@@ -592,41 +592,8 @@ select:focus-visible {
 }
 
 .conversation {
+  position: relative;
   background: var(--surface);
-}
-
-.conversation-header {
-  min-height: 68px;
-  padding-inline: 28px;
-  border-bottom-color: var(--line);
-  background: var(--surface);
-}
-
-.conversation-agent-mark {
-  width: 37px;
-  height: 37px;
-  border: 1px solid rgb(45 138 178 / 24%);
-  border-radius: 13px 13px 13px 8px;
-  color: var(--penguin);
-  background: var(--ice);
-}
-
-.conversation-kicker {
-  color: var(--muted-2);
-}
-
-.conversation-heading strong {
-  color: var(--ocean-900);
-}
-
-.conversation-model-pill {
-  border-color: var(--line);
-  color: var(--muted);
-  background: var(--surface-soft);
-}
-
-.conversation-model-pill b {
-  color: var(--ocean-700);
 }
 
 .child-panel-toggle {
@@ -640,8 +607,32 @@ select:focus-visible {
   background: var(--ice);
 }
 
+.conversation-side-toggle {
+  position: absolute;
+  z-index: 8;
+  top: 12px;
+  right: 14px;
+  width: 30px;
+  height: 30px;
+  border-radius: 11px;
+  color: var(--ocean-700);
+  background: rgb(247 252 254 / 94%);
+  box-shadow: 0 5px 15px rgb(15 68 92 / 10%);
+}
+
+.conversation-side-toggle[aria-expanded="true"] {
+  color: var(--scarf);
+  border-color: rgb(255 109 119 / 28%);
+  background: var(--red-soft);
+}
+
+.conversation-side-toggle:focus-visible {
+  outline: 0;
+  box-shadow: 0 0 0 3px rgb(45 138 178 / 16%), 0 5px 15px rgb(15 68 92 / 10%);
+}
+
 .messages {
-  padding: 28px clamp(18px, 5vw, 96px) 25px;
+  padding: 54px clamp(18px, 5vw, 96px) 25px;
   scroll-behavior: smooth;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
@@ -661,8 +652,6 @@ select:focus-visible {
   grid-template-columns: 34px minmax(0, 1fr);
   gap: 11px;
   margin-bottom: 27px;
-  content-visibility: auto;
-  contain-intrinsic-size: 1px 80px;
 }
 
 .message-avatar {
@@ -702,6 +691,29 @@ select:focus-visible {
   font-size: 8px;
 }
 
+.message-copy-button {
+  width: 22px;
+  height: 22px;
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  margin-left: 1px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted-2);
+  background: transparent;
+  transition: color .14s ease, border-color .14s ease, background .14s ease;
+}
+
+.message-copy-button:focus-visible {
+  color: var(--ocean-700);
+  border-color: var(--ocean-500);
+  outline: 0;
+  background: var(--violet-soft);
+  box-shadow: 0 0 0 3px rgb(45 138 178 / 14%);
+}
+
 .message-content {
   color: var(--ink);
   font-size: 12px;
@@ -729,6 +741,7 @@ select:focus-visible {
 
 .message-copy-button:hover {
   color: var(--ocean-700);
+  border-color: rgb(45 138 178 / 35%);
   background: var(--violet-soft);
 }
 
@@ -805,6 +818,12 @@ select:focus-visible {
   color: var(--ink);
 }
 
+.composer textarea:focus,
+.composer textarea:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
 .composer textarea::placeholder {
   color: var(--muted-2);
 }
@@ -864,7 +883,7 @@ select:focus-visible {
 .capability-popover,
 .session-settings-popover,
 .session-settings-submenu,
-.project-tooltip {
+.project-hover-card {
   border-color: var(--line);
   border-radius: 15px;
   color: var(--ink);
@@ -1004,6 +1023,40 @@ select:focus-visible {
   padding-inline: 9px;
 }
 
+@media (min-width: 861px) {
+  /* In the compact rail, keep the reopen control in normal layout below the
+   * penguin mark. This avoids overlap with the first navigation item and
+   * makes the control read as part of the rail instead of a floating patch. */
+  .app-shell.sidebar-collapsed .brand {
+    z-index: 3;
+    min-height: auto;
+    flex-direction: column;
+    gap: 7px;
+    padding: 0 0 13px;
+  }
+
+  .app-shell.sidebar-collapsed .collapse-button {
+    position: static;
+    width: 30px;
+    height: 30px;
+    border: 1px solid rgb(215 244 255 / 26%);
+    border-radius: 999px;
+    color: #d7eef5;
+    background: linear-gradient(145deg, rgb(235 250 255 / 16%), rgb(125 201 229 / 8%));
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 12%), 0 6px 14px rgb(0 35 55 / 18%);
+    transform: none;
+  }
+
+  .app-shell.sidebar-collapsed .collapse-button:hover,
+  .app-shell.sidebar-collapsed .collapse-button:focus-visible {
+    color: #fff;
+    border-color: rgb(215 244 255 / 38%);
+    outline: 0;
+    background: linear-gradient(145deg, rgb(235 250 255 / 24%), rgb(125 201 229 / 14%));
+    box-shadow: 0 0 0 3px rgb(116 204 236 / 12%), 0 7px 16px rgb(0 35 55 / 24%);
+  }
+}
+
 @media (max-width: 1180px) {
   .page {
     padding-inline: 34px;
@@ -1024,6 +1077,40 @@ select:focus-visible {
 }
 
 @media (max-width: 860px) {
+  /* The narrow layout uses the mobile drawer instead of the desktop icon
+   * rail. Keep the desktop collapse state from shrinking/cropping that drawer
+   * so the menu can always be opened again from the mobile menu button. */
+  .app-shell.sidebar-collapsed {
+    grid-template-columns: 1fr;
+  }
+
+  .app-shell.sidebar-collapsed .sidebar {
+    width: min(286px, 84vw);
+    padding-inline: 12px;
+  }
+
+  .app-shell.sidebar-collapsed .brand {
+    z-index: 1;
+  }
+
+  /* On narrow screens the persistent mobile-menu button owns navigation;
+   * there is no separate desktop rail to collapse. Keep the theme control
+   * available and remove the redundant drawer toggle. */
+  .app-shell.sidebar-collapsed .theme-toggle {
+    display: grid;
+  }
+
+  .app-shell.sidebar-collapsed .collapse-button {
+    display: none;
+  }
+
+  .app-shell.sidebar-collapsed .brand-copy,
+  .app-shell.sidebar-collapsed .nav-label,
+  .app-shell.sidebar-collapsed .nav-item span,
+  .app-shell.sidebar-collapsed .service-pill div {
+    display: flex;
+  }
+
   .sidebar {
     inset: 10px auto 10px 10px;
     border-radius: 21px;
@@ -1042,14 +1129,6 @@ select:focus-visible {
   .chat-shell:has(.child-agent-panel) {
     grid-template-columns: 190px minmax(0, 1fr);
     border-radius: 22px;
-  }
-
-  .conversation-header {
-    padding-inline: 18px;
-  }
-
-  .conversation-model-pill {
-    display: none;
   }
 
   .messages {
@@ -1094,18 +1173,8 @@ select:focus-visible {
     border-bottom: 1px solid var(--line);
   }
 
-  .conversation-header {
-    min-height: 60px;
-    padding-inline: 14px;
-  }
-
-  .conversation-agent-mark {
-    width: 31px;
-    height: 31px;
-  }
-
   .messages {
-    padding: 18px 12px 14px;
+    padding: 50px 12px 14px;
   }
 
   .message {

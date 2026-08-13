@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from app import database
+from app.api.resources import list_session_delegations
 from app.database import (
     Agent,
     AgentMessage,
@@ -35,6 +36,58 @@ def assert_no_legacy_collaboration_records(db: object) -> None:
 
     assert list(db.scalars(select(TeamTask))) == []  # type: ignore[attr-defined]
     assert list(db.scalars(select(AgentMessage))) == []  # type: ignore[attr-defined]
+
+
+def test_session_delegations_include_legacy_child_run_history(
+    delegated_run: dict[str, str],
+) -> None:
+    """Pre-dedicated-table child runs must remain visible in the side panel."""
+
+    with database.SessionLocal() as db:
+        child_run = Run(
+            session_id=delegated_run["session_id"],
+            workspace_id=db.get(Run, delegated_run["run_id"]).workspace_id,
+            agent_id=delegated_run["child_id"],
+            status="completed",
+            current_step=3,
+            tool_calls=4,
+        )
+        db.add(child_run)
+        db.flush()
+        db.add_all([
+            RunEvent(
+                run_id=child_run.id,
+                event_type="delegation_link",
+                payload={
+                    "team_task_id": "legacy-task-id",
+                    "parent_run_id": delegated_run["run_id"],
+                    "parent_session_id": delegated_run["session_id"],
+                },
+            ),
+            RunEvent(
+                run_id=child_run.id,
+                event_type="runtime_snapshot",
+                payload={
+                    "output": "legacy child result",
+                    "messages": [
+                        {"role": "system", "content": "child instructions"},
+                        {"role": "user", "content": "Inspect the old task history."},
+                    ],
+                },
+            ),
+        ])
+        db.commit()
+
+        rows = list_session_delegations(delegated_run["session_id"], db)
+
+        assert len(rows) == 1
+        assert rows[0].id == "legacy-task-id"
+        assert rows[0].child_run_id == child_run.id
+        assert rows[0].child_agent_id == delegated_run["child_id"]
+        assert rows[0].description == "Inspect the old task history."
+        assert rows[0].result["output"] == "legacy child result"
+        assert rows[0].result["steps"] == 3
+        assert rows[0].result["tool_calls"] == 4
 
 
 @pytest.fixture()
