@@ -24,6 +24,7 @@ import {
   PanelRightClose,
   PanelRightOpen,
   PanelLeftClose,
+  PanelLeftOpen,
   Play,
   Pencil,
   Plus,
@@ -41,7 +42,8 @@ import {
   X,
   Sun,
 } from 'lucide-react'
-import { Fragment, forwardRef, type FormEvent, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
+import { Fragment, forwardRef, type FormEvent, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { ApiError, api, apiUrl, describeError } from './api'
 import { permissionLabel, permissionOptions, toggleSelectedId } from './capabilitySelection'
@@ -97,12 +99,16 @@ import './styles/pgagent-ui.css'
 type LoadState<T> = { data: T; loading: boolean; error: string }
 type LiveRunState = { runId: string; phase: string; draft: string; status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'; error: string; thought: ThoughtTimelineState; thinkingStatus: string }
 type OwnedSessionMessages = { ownerSessionId: string; items: Message[] }
+type OwnedSessionRuns = { ownerSessionId: string; items: Run[] }
+type OwnedSessionDelegations = { ownerSessionId: string; items: DelegatedTask[] }
+type ProjectHoverCard = { id: string; name: string; path: string; conversationCount: number; left: number; top: number }
 type DraftSessionSettings = { model_connection_id: string | null; model_id: string | null; thinking_level: ThinkingLevel; skill_ids: string[]; permission_mode: PermissionMode }
 type DraftLaunchResponse = { session: Session; run: Run; workspace?: Workspace }
 type ComposerTextAreaHandle = { getValue: () => string; clear: () => void }
 
 const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'auto', skill_ids: [], permission_mode: 'smart' }
 const emptyDraftContext: SessionContext = { used_tokens: 0, limit_tokens: 100_000, compact_threshold_tokens: 90_000, percent: 0 }
+const noDelegatedTasks: DelegatedTask[] = []
 
 function emptyLiveRun(): LiveRunState {
   return { runId: '', phase: '', draft: '', status: 'idle', error: '', thought: emptyThoughtTimeline, thinkingStatus: '' }
@@ -268,8 +274,8 @@ function AppShell() {
             >
               {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
             </button>
-            <button className="collapse-button" onClick={() => setCollapsed((value) => !value)} aria-label={collapsed ? '展开导航' : '收起导航'}>
-              <PanelLeftClose size={17} />
+            <button className="collapse-button" type="button" onClick={() => setCollapsed((value) => !value)} aria-label={collapsed ? '展开导航' : '收起导航'} title={collapsed ? '展开工作台' : '收起工作台'}>
+              {collapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
             </button>
           </div>
         <nav aria-label="主导航">
@@ -744,6 +750,7 @@ function SessionsPage() {
   const [addingProject, setAddingProject] = useState(false)
   const [pickingDraftProject, setPickingDraftProject] = useState(false)
   const [projectError, setProjectError] = useState('')
+  const [projectHoverCard, setProjectHoverCard] = useState<ProjectHoverCard | null>(null)
   const [completedThoughtsByRun, setCompletedThoughtsByRun] = useState<Record<string, ThoughtTimelineState>>({})
   const [childPanelOpen, setChildPanelOpen] = useState(false)
   const [selectedChildTaskId, setSelectedChildTaskId] = useState('')
@@ -759,12 +766,15 @@ function SessionsPage() {
   const composerInputRef = useRef<ComposerTextAreaHandle>(null)
   const activeIdRef = useRef('')
   const stickToBottomRef = useRef(true)
+  const historyScrollSessionRef = useRef('')
   const terminalSyncVersionRef = useRef(0)
   const pendingDraftRunRef = useRef<{ sessionId: string; runId: string } | null>(null)
   const draftIdempotencyKeyRef = useRef('')
   const draftVersionRef = useRef(0)
   const sendingRef = useRef(false)
   const loadedThoughtRunIdsRef = useRef(new Set<string>())
+  const [historyHydration, setHistoryHydration] = useState({ sessionId: '', complete: false })
+  const [historyOpenVersion, setHistoryOpenVersion] = useState(0)
   activeIdRef.current = activeId
   const liveRunRef = useRef(liveRun)
   liveRunRef.current = liveRun
@@ -821,7 +831,7 @@ function SessionsPage() {
   useEffect(() => {
     setSettingsMenuOpen(false); setSettingsSubmenu(null)
     setAddMenuOpen(false); setSkillSubmenuOpen(false); setPermissionMenuOpen(false)
-    setChildPanelOpen(false); setSelectedChildTaskId('')
+    setSelectedChildTaskId('')
   }, [activeId])
 
   const messages = useApiData<OwnedSessionMessages>(
@@ -831,16 +841,25 @@ function SessionsPage() {
       : { ownerSessionId: '', items: [] },
     [activeId],
   )
-  const runs = useApiData<Run[]>([], () => activeId ? api.list<Run>(`/api/runs?session_id=${encodeURIComponent(activeId)}`, ['runs']) : Promise.resolve([]), [activeId])
-  const childTasks = useApiData<DelegatedTask[]>([], async () => {
-    if (!activeId) return []
-    return api.list<DelegatedTask>(`/api/sessions/${encodeURIComponent(activeId)}/delegations`, ['delegations'])
+  const runs = useApiData<OwnedSessionRuns>(
+    { ownerSessionId: '', items: [] },
+    async () => activeId
+      ? { ownerSessionId: activeId, items: await api.list<Run>(`/api/runs?session_id=${encodeURIComponent(activeId)}`, ['runs']) }
+      : { ownerSessionId: '', items: [] },
+    [activeId],
+  )
+  const childTasks = useApiData<OwnedSessionDelegations>({ ownerSessionId: '', items: [] }, async () => {
+    if (!activeId) return { ownerSessionId: '', items: [] }
+    return {
+      ownerSessionId: activeId,
+      items: await api.list<DelegatedTask>(`/api/sessions/${encodeURIComponent(activeId)}/delegations`, ['delegations']),
+    }
   }, [activeId])
   const context = useApiData<SessionContext | null>(null, () => activeId ? api.get<SessionContext>(`/api/sessions/${activeId}/context`) : Promise.resolve(null), [activeId])
   const activeSession = sessions.data.find((item) => stringId(item.id) === activeId)
   const activeAgent = agents.data.find((item) => item.id === activeSession?.agent_id)
-  const activeWorkspace = workspaces.data.find((item) => item.id === activeSession?.workspace_id)
-  const sessionRuns = runs.data.filter((item) => !item.session_id || item.session_id === activeId)
+  const sessionRuns = visibleSessionItems(runs.data.ownerSessionId, activeId, runs.data.items)
+    .filter((item) => !item.session_id || item.session_id === activeId)
   const awaitingApprovalRunIds = sessionRuns
     .filter((item) => item.status === 'awaiting_approval')
     .map((item) => item.id)
@@ -856,14 +875,17 @@ function SessionsPage() {
   // those rows too; the source of truth is now the child side panel.
   const visibleMessages = visibleSessionItems(messages.data.ownerSessionId, activeId, messages.data.items)
     .filter((message) => message.metadata?.delegated_child !== true)
+  const completedThoughtLayoutVersion = Object.entries(completedThoughtsByRun)
+    .map(([runId, timeline]) => `${runId}:${timeline.elapsedMs}:${timeline.tools.length}`)
+    .join('|')
+  const visibleChildTasks = childTasks.data.ownerSessionId === activeId ? childTasks.data.items : noDelegatedTasks
   const sessionNavigation = buildSessionNavigation(workspaces.data, sessions.data)
-  const activeChildTask = childTasks.data.find((task) => task.id === selectedChildTaskId) ?? childTasks.data[0]
+  const activeChildTask = visibleChildTasks.find((task) => task.id === selectedChildTaskId) ?? visibleChildTasks[0]
   const childTaskRunId = stringId(activeChildTask?.child_run_id) || stringId(activeChildTask?.result?.child_run_id)
   const childTaskRun = childTaskRunId ? sessionRuns.find((run) => run.id === childTaskRunId) : undefined
   const childTaskEvents = useApiData<RunEvent[]>([], () => childTaskRunId
     ? api.list<RunEvent>(`/api/runs/${encodeURIComponent(childTaskRunId)}/events`, ['events'])
     : Promise.resolve([]), [childTaskRunId])
-  const hasChildActivity = childTasks.data.length > 0 || liveRun.phase.includes('子 Agent')
   const approvals = useApiData<Approval[]>([], async () => {
     const runIds = approvalRunIdsKey ? approvalRunIdsKey.split(',').filter(Boolean) : []
     if (!runIds.length) return []
@@ -887,36 +909,52 @@ function SessionsPage() {
     setCompletedThoughtsByRun((current) => current[liveRun.runId] === liveRun.thought ? current : { ...current, [liveRun.runId]: liveRun.thought })
   }, [liveRun.runId, liveRun.status, liveRun.thought])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setCompletedThoughtsByRun({})
     loadedThoughtRunIdsRef.current = new Set()
+    historyScrollSessionRef.current = activeId
+    stickToBottomRef.current = true
+    setHistoryHydration({ sessionId: activeId, complete: false })
   }, [activeId])
 
   useEffect(() => {
-    if (!childTasks.data.length) {
+    if (!visibleChildTasks.length) {
       setSelectedChildTaskId('')
       return
     }
-    if (!childTasks.data.some((task) => task.id === selectedChildTaskId)) {
-      setSelectedChildTaskId(childTasks.data[0].id)
+    if (!visibleChildTasks.some((task) => task.id === selectedChildTaskId)) {
+      setSelectedChildTaskId(visibleChildTasks[0].id)
     }
-  }, [childTasks.data, selectedChildTaskId])
+  }, [selectedChildTaskId, visibleChildTasks])
 
   useEffect(() => {
-    if (!activeId) return
+    if (!activeId || runs.loading || runs.data.ownerSessionId !== activeId) return
     let cancelled = false
-    const finishedRuns = runs.data.filter((run) => (!run.session_id || run.session_id === activeId) && isTerminalRunStatus(run.status))
-    for (const run of finishedRuns) {
-      if (loadedThoughtRunIdsRef.current.has(run.id)) continue
+    const finishedRuns = runs.data.items.filter((run) => (!run.session_id || run.session_id === activeId) && isTerminalRunStatus(run.status))
+    const runsToHydrate = finishedRuns.filter((run) => !loadedThoughtRunIdsRef.current.has(run.id))
+    if (!runsToHydrate.length) {
+      setHistoryHydration((current) => current.sessionId === activeId && current.complete
+        ? current
+        : { sessionId: activeId, complete: true })
+      return
+    }
+    setHistoryHydration({ sessionId: activeId, complete: false })
+    const requests = runsToHydrate.map(async (run) => {
       loadedThoughtRunIdsRef.current.add(run.id)
-      void api.list<RunEvent>(`/api/runs/${encodeURIComponent(run.id)}/events`, ['events']).then((events) => {
+      try {
+        const events = await api.list<RunEvent>(`/api/runs/${encodeURIComponent(run.id)}/events`, ['events'])
         if (cancelled || activeIdRef.current !== activeId) return
         const timeline = timelineFromRunEvents(events.map((event) => ({ ...event, type: event.type || event.event_type || '' })))
         if (hasVisibleCompletedThought(timeline)) setCompletedThoughtsByRun((current) => ({ ...current, [run.id]: timeline }))
-      }).catch(() => { loadedThoughtRunIdsRef.current.delete(run.id) })
-    }
+      } catch {
+        loadedThoughtRunIdsRef.current.delete(run.id)
+      }
+    })
+    void Promise.all(requests).then(() => {
+      if (!cancelled && activeIdRef.current === activeId) setHistoryHydration({ sessionId: activeId, complete: true })
+    })
     return () => { cancelled = true }
-  }, [activeId, runs.data])
+  }, [activeId, runs.data.items, runs.data.ownerSessionId, runs.loading])
   useEffect(() => {
     if (settingsLocked || sending) {
       setSettingsMenuOpen(false)
@@ -968,6 +1006,9 @@ function SessionsPage() {
       clearDraftState()
     }
     setActionError('')
+    stickToBottomRef.current = true
+    historyScrollSessionRef.current = sessionId
+    setHistoryOpenVersion((version) => version + 1)
     setActiveId(sessionId)
   }
 
@@ -977,6 +1018,25 @@ function SessionsPage() {
       if (next.has(workspaceId)) next.delete(workspaceId)
       else next.add(workspaceId)
       return next
+    })
+  }
+
+  function showProjectHoverCard(
+    event: React.MouseEvent<HTMLButtonElement> | React.FocusEvent<HTMLButtonElement>,
+    workspace: Workspace,
+    conversationCount: number,
+    path: string,
+  ) {
+    const rect = event.currentTarget.getBoundingClientRect()
+    const cardWidth = 280
+    const cardHeight = 118
+    setProjectHoverCard({
+      id: workspace.id,
+      name: workspace.name,
+      path,
+      conversationCount,
+      left: Math.min(rect.right + 10, window.innerWidth - cardWidth - 12),
+      top: Math.max(12, Math.min(rect.top - 4, window.innerHeight - cardHeight - 12)),
     })
   }
 
@@ -1111,7 +1171,9 @@ function SessionsPage() {
           run = await api.get<Run>(`/api/runs/${encodeURIComponent(runId)}`)
         } catch {
           const latestRuns = await refreshRuns()
-          run = latestRuns?.find((item) => item.id === runId)
+          run = latestRuns?.ownerSessionId === sessionId
+            ? latestRuns.items.find((item) => item.id === runId)
+            : undefined
         }
         if (!run || streamRunIdRef.current !== runId || activeIdRef.current !== sessionId) return
         const status = run.status || ''
@@ -1260,14 +1322,44 @@ function SessionsPage() {
     startRunStream(activeRun.id, activeId)
   }, [activeId, activeRun?.id, activeRun?.status, liveRun.status, messages.loading, startRunStream, visibleMessages])
 
+  // A newly opened history stays pinned until both messages and persisted
+  // thought/tool timelines have hydrated. Programmatic layout scroll events
+  // must not cancel that initial anchor.
   useEffect(() => {
-    if (!stickToBottomRef.current) return
-    const frame = window.requestAnimationFrame(() => {
+    const anchoringHistory = Boolean(activeId) && historyScrollSessionRef.current === activeId
+    if (!anchoringHistory && !stickToBottomRef.current) return
+    let frame = 0
+    let settleFrame = 0
+    const scrollToLatest = () => {
       const element = messagesRef.current
-      if (element) element.scrollTop = element.scrollHeight
-    })
-    return () => window.cancelAnimationFrame(frame)
-  }, [liveRun.draft, liveRun.phase, visibleApprovals.length, visibleMessages.length])
+      if (!element) return
+      // Restore the original distance-aware browser animation. The browser
+      // chooses duration and velocity from the remaining distance; later
+      // hydration updates simply retarget the same smooth scroll.
+      element.scrollTop = element.scrollHeight
+      settleFrame = window.requestAnimationFrame(() => {
+        const settledElement = messagesRef.current
+        const historyReady = historyHydration.sessionId === activeId
+          && historyHydration.complete
+          && messages.data.ownerSessionId === activeId
+          && runs.data.ownerSessionId === activeId
+          && !messages.loading
+          && !runs.loading
+        const reachedBottom = settledElement
+          ? settledElement.scrollHeight - settledElement.scrollTop - settledElement.clientHeight <= 1
+          : false
+        if (anchoringHistory && historyReady && reachedBottom && historyScrollSessionRef.current === activeId) {
+          historyScrollSessionRef.current = ''
+          stickToBottomRef.current = true
+        }
+      })
+    }
+    frame = window.requestAnimationFrame(scrollToLatest)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      if (settleFrame) window.cancelAnimationFrame(settleFrame)
+    }
+  }, [activeId, childPanelOpen, completedThoughtLayoutVersion, historyHydration.complete, historyHydration.sessionId, historyOpenVersion, messages.data.ownerSessionId, messages.loading, liveRun.draft, liveRun.phase, runs.data.ownerSessionId, runs.loading, visibleApprovals.length, visibleMessages.length])
 
   async function sendMessage(event: FormEvent) {
     event.preventDefault()
@@ -1444,7 +1536,7 @@ function SessionsPage() {
   return (
     <div className="page page-chat">
       <div className="chat-shell">
-          <aside className="session-list project-session-sidebar">
+          <aside className="session-list project-session-sidebar" onScroll={() => setProjectHoverCard(null)}>
             <section className="draft-tree-section">
               <button type="button" className="new-draft-button" disabled={sending} onClick={beginDraft}><Plus size={14} />新建对话</button>
             </section>
@@ -1455,11 +1547,10 @@ function SessionsPage() {
                 const expanded = expandedWorkspaceIds.has(workspace.id)
                 const path = workspace.root_path || workspace.path || '未提供路径'
                 return <div className={`project-node ${expanded ? 'expanded' : ''}`} key={workspace.id}>
-                  <div className="project-row-wrap">
-                    <button type="button" className="project-row" aria-expanded={expanded} title={`${projectSessions.length} 个对话\n${path}`} onClick={() => toggleProject(workspace.id)}>
+                  <div className="project-row-wrap" onMouseLeave={() => setProjectHoverCard((current) => current?.id === workspace.id ? null : current)}>
+                    <button type="button" className="project-row" aria-expanded={expanded} aria-describedby={projectHoverCard?.id === workspace.id ? 'project-hover-card' : undefined} onMouseEnter={(event) => showProjectHoverCard(event, workspace, projectSessions.length, path)} onFocus={(event) => showProjectHoverCard(event, workspace, projectSessions.length, path)} onBlur={() => setProjectHoverCard((current) => current?.id === workspace.id ? null : current)} onClick={() => toggleProject(workspace.id)}>
                       <ChevronRight className="project-chevron" size={13} /><Folder size={15} /><span>{workspace.name}</span>
                     </button>
-                    <div className="project-tooltip" role="tooltip"><strong>{projectSessions.length} 个对话</strong><span>{path}</span></div>
                   </div>
                   {expanded && <div className="project-children">
                     {projectSessions.length ? projectSessions.map((session) => <button type="button" key={session.id} className={`tree-session-item ${activeId === stringId(session.id) && !draftActive ? 'active' : ''}`} disabled={draftActive && sending} onClick={() => openExistingSession(stringId(session.id))}><MessageSquare size={13} /><span>{session.title || '未命名对话'}</span></button>) : <p className="tree-empty">暂无对话</p>}
@@ -1480,16 +1571,7 @@ function SessionsPage() {
             {sessions.loading && !sessions.data.length && <LoadingState />}
           </aside>
           <section className={`conversation ${childPanelOpen ? 'with-child-panel' : ''}`}>
-            <header className="conversation-header">
-              <div className="conversation-heading">
-                <div className="conversation-agent-mark"><PenguinMark size={22} /></div>
-                <div><span className="conversation-kicker">PGAgent · {activeWorkspace?.name || 'Default Workspace'}</span><strong>{activeSession?.title || (draftActive ? '新任务草稿' : '选择一个会话')}</strong></div>
-              </div>
-              <div className="conversation-header-meta">
-                {activeSession && <span className="conversation-model-pill"><span>{modelButtonLabel}</span><b>{thinkingLevelLabels[effectiveThinking]}</b></span>}
-                {hasChildActivity && <button type="button" className="child-panel-toggle" aria-label={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} title={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} aria-expanded={childPanelOpen} onClick={() => setChildPanelOpen((open) => !open)}>{childPanelOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}</button>}
-              </div>
-            </header>
+            {(activeSession || draftActive) && <button type="button" className="child-panel-toggle conversation-side-toggle" aria-label={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} title={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} aria-expanded={childPanelOpen} onClick={() => setChildPanelOpen((open) => !open)}>{childPanelOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}</button>}
             {activeSession || draftActive ? <>
               <div
                 className="messages"
@@ -1497,7 +1579,21 @@ function SessionsPage() {
                 aria-live="polite"
                 onScroll={(event) => {
                   const element = event.currentTarget
-                  stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
+                  const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight
+                  if (activeId && historyScrollSessionRef.current === activeId) {
+                    const historyReady = historyHydration.sessionId === activeId
+                      && historyHydration.complete
+                      && messages.data.ownerSessionId === activeId
+                      && runs.data.ownerSessionId === activeId
+                      && !messages.loading
+                      && !runs.loading
+                    if (historyReady && distanceFromBottom <= 1) {
+                      historyScrollSessionRef.current = ''
+                      stickToBottomRef.current = true
+                    }
+                    return
+                  }
+                  stickToBottomRef.current = distanceFromBottom < 80
                 }}
               >
                 {draftActive ? liveRun.status === 'idle' && <EmptyState icon={MessageSquare} title="开始一次新任务" description="直接描述目标；需要处理本地文件时，可以在输入框中选择一个项目文件夹。" /> : messages.error && !visibleMessages.length ? <ErrorState message={messages.error} onRetry={messages.reload} /> : messages.loading && !visibleMessages.length ? <LoadingState /> : visibleMessages.length ? visibleMessages.map((message) => {
@@ -1593,7 +1689,7 @@ function SessionsPage() {
             </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={beginDraft}>新建对话</button>} />}
           </section>
           {childPanelOpen && <ChildAgentPanel
-            tasks={childTasks.data}
+            tasks={visibleChildTasks}
             loading={childTasks.loading}
             error={childTasks.error}
             selectedTask={activeChildTask}
@@ -1606,6 +1702,14 @@ function SessionsPage() {
             onRetry={() => { void childTasks.reload(); void childTaskEvents.reload() }}
           />}
       </div>
+      {projectHoverCard && createPortal(
+        <div className="project-hover-card" id="project-hover-card" role="tooltip" style={{ left: projectHoverCard.left, top: projectHoverCard.top }}>
+          <div className="project-hover-card-row project-hover-card-title"><Folder size={14} /><strong>{projectHoverCard.name}</strong></div>
+          <div className="project-hover-card-row"><MessageSquare size={14} /><span>{projectHoverCard.conversationCount} 个对话</span></div>
+          <div className="project-hover-card-row project-hover-card-path"><Folder size={14} /><span>{projectHoverCard.path}</span></div>
+        </div>,
+        document.body,
+      )}
     </div>
   )
 }

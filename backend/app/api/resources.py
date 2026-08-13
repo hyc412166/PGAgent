@@ -504,15 +504,89 @@ def get_session(session_id: str, db: Session = Depends(get_db)) -> ChatSession:
 def list_session_delegations(
     session_id: str,
     db: Session = Depends(get_db),
-) -> list[DelegatedTask]:
-    """Return child-Agent work for one conversation, never team-board work."""
+) -> list[DelegatedTaskRead]:
+    """Return child-Agent work, including records created before the dedicated table.
+
+    Older PGAgent builds persisted a child run and its ``delegation_link``
+    event but did not create a ``delegated_tasks`` row.  Those runs are still
+    valid history, so reconstruct a read-only view instead of making the UI
+    silently lose them.  Team-board rows remain deliberately excluded.
+    """
 
     _require(db, ChatSession, session_id, "Session")
-    return list(db.scalars(
+    persisted = list(db.scalars(
         select(DelegatedTask)
         .where(DelegatedTask.parent_session_id == session_id)
         .order_by(DelegatedTask.updated_at.desc(), DelegatedTask.created_at.desc())
     ))
+    items = [DelegatedTaskRead.model_validate(item) for item in persisted]
+    known_task_ids = {item.id for item in items}
+    known_child_run_ids = {item.child_run_id for item in items if item.child_run_id}
+
+    legacy_rows = db.execute(
+        select(RunEvent, Run, Agent)
+        .join(Run, Run.id == RunEvent.run_id)
+        .outerjoin(Agent, Agent.id == Run.agent_id)
+        .where(
+            Run.session_id == session_id,
+            RunEvent.event_type == "delegation_link",
+        )
+        .order_by(RunEvent.created_at.desc())
+    ).all()
+    for link_event, child_run, child_agent in legacy_rows:
+        link = link_event.payload if isinstance(link_event.payload, dict) else {}
+        task_id = str(link.get("delegation_id") or link.get("team_task_id") or link_event.id)
+        if task_id in known_task_ids or child_run.id in known_child_run_ids:
+            continue
+
+        snapshot = db.scalar(
+            select(RunEvent)
+            .where(RunEvent.run_id == child_run.id, RunEvent.event_type == "runtime_snapshot")
+            .order_by(RunEvent.created_at.desc())
+        )
+        snapshot_payload = snapshot.payload if snapshot and isinstance(snapshot.payload, dict) else {}
+        messages = snapshot_payload.get("messages")
+        description = ""
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict) or message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    description = content.strip()
+                    break
+        title = description.replace("\n", " ").strip()[:80] or "历史子 Agent 任务"
+        output = snapshot_payload.get("output")
+        result: dict[str, Any] = {
+            "legacy": True,
+            "child_run_id": child_run.id,
+            "steps": child_run.current_step,
+            "tool_calls": child_run.tool_calls,
+            "agent": {
+                "id": child_run.agent_id or "",
+                "name": child_agent.name if child_agent is not None else "子 Agent",
+            },
+        }
+        if isinstance(output, str) and output.strip():
+            result["output"] = output
+        if child_run.error_message:
+            result["error"] = child_run.error_message
+
+        items.append(DelegatedTaskRead(
+            id=task_id,
+            parent_run_id=str(link.get("parent_run_id") or child_run.id),
+            parent_session_id=session_id,
+            child_run_id=child_run.id,
+            child_agent_id=child_run.agent_id,
+            title=title,
+            description=description,
+            status=child_run.status,
+            result=result,
+            created_at=child_run.started_at,
+            updated_at=child_run.finished_at or link_event.created_at,
+        ))
+
+    return sorted(items, key=lambda item: item.updated_at, reverse=True)
 
 
 @router.patch("/sessions/{session_id}", response_model=SessionRead)
