@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { buildDraftLaunchPayload, createDraftIdempotencyKey } from './draftLaunch'
+import { buildDraftLaunchPayload, createDraftIdempotencyKey, createTurnIdempotencyKey } from './draftLaunch'
 
 describe('临时草稿原子启动', () => {
   it('为一个草稿生成可复用的稳定幂等键', () => {
     const key = createDraftIdempotencyKey(() => 'fixed-uuid')
     expect(key).toBe('draft-fixed-uuid')
+    expect(createTurnIdempotencyKey(() => 'fixed-turn')).toBe('turn-fixed-turn')
     expect(buildDraftLaunchPayload(key, '  分析   当前项目  ', '', {
       model_connection_id: null,
       model_id: null,

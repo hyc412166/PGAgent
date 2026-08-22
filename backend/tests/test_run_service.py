@@ -12,11 +12,11 @@ from app.database import (
     Agent,
     Approval,
     Artifact,
-    ContextCheckpoint,
-    ContextEpoch,
-    CompactionAttempt,
+    ConversationCompaction,
     Base,
     ChatMessage,
+    ConversationTurn,
+    DelegatedTask,
     ModelConnection,
     Run,
     RunEvent,
@@ -26,8 +26,7 @@ from app.database import (
 )
 from app.runtime import RunOutcome
 from app.services.run_service import RunCoordinator, _prepare_session_history
-from app.services.model_gateway import ModelConfigurationError
-from app.runtime import AgentRuntime
+from app.runtime import AgentRuntime, decide_deterministic_completion
 from app.tools import create_default_registry
 
 
@@ -82,12 +81,41 @@ def seeded_run(tmp_path: Path) -> tuple[str, str]:
     Base.metadata.drop_all(bind=database.engine)
 
 
+@pytest.fixture()
+def accepted_run(tmp_path: Path) -> tuple[str, str]:
+    """A legacy-shaped accepted user turn without the new delivery linkage."""
+
+    database.configure_database(f"sqlite:///{(tmp_path / 'accepted-run.db').as_posix()}")
+    database.init_db()
+    with database.SessionLocal() as db:
+        workspace = Workspace(name="Demo", root_path=str(tmp_path / "workspace"))
+        db.add(workspace)
+        db.flush()
+        agent = Agent(name="Builder", workspace_id=workspace.id)
+        db.add(agent)
+        db.flush()
+        session = Session(title="Chat", workspace_id=workspace.id, agent_id=agent.id)
+        db.add(session)
+        db.flush()
+        db.add(ChatMessage(session_id=session.id, role="user", content="完成这个任务", sequence=1))
+        run = Run(session_id=session.id, workspace_id=workspace.id, agent_id=agent.id)
+        db.add(run)
+        db.commit()
+        ids = (run.id, session.id)
+    yield ids
+    Base.metadata.drop_all(bind=database.engine)
+
+
 def test_completed_outcome_persists_snapshot_and_assistant_message(seeded_run: tuple[str, str]) -> None:
     run_id, session_id = seeded_run
     outcome = RunOutcome(
         status="completed",
         output="任务完成",
-        messages=[{"role": "assistant", "content": "任务完成"}],
+        messages=[{
+            "role": "assistant",
+            "content": "任务完成",
+            "reasoning_content": "verified the requested files and tests",
+        }],
         events=[{"type": "run_completed"}],
         steps=2,
         tool_calls=1,
@@ -99,19 +127,267 @@ def test_completed_outcome_persists_snapshot_and_assistant_message(seeded_run: t
         run = db.get(Run, run_id)
         assert run is not None and run.status == "completed"
         assert run.current_step == 2 and run.tool_calls == 1
-        message = db.scalar(select(ChatMessage).where(ChatMessage.session_id == session_id))
+        message = db.scalar(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+        ))
         assert message is not None and message.content == "任务完成"
+        assert message.provider_payload == {
+            "reasoning_content": "verified the requested files and tests"
+        }
+        session_row = db.get(Session, session_id)
+        assert session_row is not None
+        prepared = _prepare_session_history(db, session_row)
+        assert prepared[-1]["reasoning_content"] == "verified the requested files and tests"
+        session = db.get(Session, session_id)
+        assert session is not None and session.context_tokens > 0
         snapshot = db.scalar(select(RunEvent).where(RunEvent.run_id == run_id, RunEvent.event_type == "runtime_snapshot"))
         assert snapshot is not None and snapshot.payload["guard_snapshot"]["calls"] == 1
 
 
-def test_main_agent_completion_gate_fails_closed_without_task_anchor(tmp_path: Path) -> None:
+def test_terminal_stop_without_model_output_still_persists_one_user_reply(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+    outcome = RunOutcome(
+        status="stopped",
+        output=None,
+        messages=[],
+        transcript_delta=[],
+        events=[{"type": "run_stopped", "code": "acceptance_failed"}],
+        steps=3,
+        tool_calls=0,
+        stop_reason="acceptance_failed",
+        error="candidate did not meet acceptance criteria",
+    )
+
+    RunCoordinator._persist_outcome(run_id, outcome)
+    RunCoordinator._persist_outcome(run_id, outcome)
+
+    with database.SessionLocal() as db:
+        replies = list(db.scalars(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+        )))
+        assert len(replies) == 1
+        assert replies[0].extra["run_id"] == run_id
+        assert replies[0].extra["error_code"] == "acceptance_failed"
+        assert replies[0].extra["trace_id"]
+        assert "追踪号" in replies[0].content
+
+
+def test_completed_empty_output_is_failed_and_receives_deterministic_reply(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="   ",
+        messages=[],
+        transcript_delta=[],
+        events=[{"type": "run_completed"}],
+        steps=1,
+        tool_calls=0,
+    ))
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.status == "failed"
+        assert run.error_code == "empty_model_output"
+        reply = db.scalar(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+        ))
+        assert reply is not None
+        assert "没有返回可用内容" in reply.content
+
+
+def test_integration_failure_reply_is_traceable_idempotent_and_sanitized(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+
+    RunCoordinator._persist_failure(run_id, RuntimeError("private-provider-payload"))
+    RunCoordinator._persist_failure(run_id, RuntimeError("private-provider-payload"))
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.status == "failed"
+        assert "private-provider-payload" not in str(run.error_message)
+        replies = list(db.scalars(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+        )))
+        assert len(replies) == 1
+        assert "private-provider-payload" not in replies[0].content
+        assert "追踪号" in replies[0].content
+
+
+def test_parent_failure_fallback_summarizes_mixed_delegated_results(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+    with database.SessionLocal() as db:
+        db.add_all([
+            DelegatedTask(
+                parent_run_id=run_id,
+                parent_session_id=session_id,
+                title="添加背景音乐",
+                description="",
+                status="completed",
+                idempotency_key="delivery-task-a",
+                result={"status": "completed", "workspace_changed": True},
+            ),
+            DelegatedTask(
+                parent_run_id=run_id,
+                parent_session_id=session_id,
+                title="添加动态音效",
+                description="",
+                status="blocked",
+                idempotency_key="delivery-task-b",
+                result={"status": "failed", "error_code": "tool_error"},
+            ),
+        ])
+        db.commit()
+
+    RunCoordinator._persist_failure(run_id, RuntimeError("parent synthesis failed"))
+
+    with database.SessionLocal() as db:
+        reply = db.scalar(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+        ))
+        assert reply is not None
+        assert "添加背景音乐：已完成" in reply.content
+        assert "添加动态音效：未完成" in reply.content
+        assert "部分修改" in reply.content
+        turn = db.get(ConversationTurn, reply.turn_id)
+        assert turn is not None and turn.execution_status == "partial_failure"
+
+
+def test_reconciler_repairs_legacy_terminal_run_without_reply(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None
+        run.status = "failed"
+        run.error_code = "model_timeout"
+        run.error_message = "模型服务响应超时。"
+        run.finished_at = datetime.now(timezone.utc)
+        db.commit()
+
+    # The periodic watchdog checks only linked pending turns; startup performs
+    # the one-time legacy adoption scan.
+    assert RunCoordinator.reconcile_terminal_deliveries(include_legacy=False) == 0
+    assert RunCoordinator.reconcile_terminal_deliveries() == 1
+    assert RunCoordinator.reconcile_terminal_deliveries() == 0
+
+    with database.SessionLocal() as db:
+        replies = list(db.scalars(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+        )))
+        assert len(replies) == 1
+        assert "模型服务响应超时" in replies[0].content
+
+
+def test_watchdog_settles_an_accepted_orphaned_root_run(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+    coordinator = RunCoordinator()
+
+    assert coordinator.reconcile_orphaned_runs(grace_seconds=0) == [run_id]
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.status == "failed"
+        assert run.error_code == "coordinator_orphaned"
+        reply = db.scalar(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+        ))
+        assert reply is not None and "失去运行进程" in reply.content
+
+
+def test_restart_recovery_persists_exactly_one_terminal_reply(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+
+    assert RunCoordinator.reconcile_interrupted_runs() == []
+    assert RunCoordinator.reconcile_interrupted_runs() == []
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.status == "stopped"
+        assert run.stop_reason == "interrupted_restart"
+        turn = db.get(ConversationTurn, run.turn_id)
+        assert turn is not None and turn.reply_status == "delivered"
+        replies = list(db.scalars(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.terminal_for_turn_id == turn.id,
+        )))
+        assert len(replies) == 1
+        assert replies[0].extra["error_code"] == "interrupted_restart"
+        assert "执行期间重启" in replies[0].content
+
+
+@pytest.mark.parametrize(
+    ("status", "output", "stop_reason"),
+    [
+        ("completed", "已完成", None),
+        ("failed", None, None),
+        ("stopped", None, "user_interrupted"),
+    ],
+)
+def test_every_terminal_root_turn_has_one_delivered_terminal_message(
+    accepted_run: tuple[str, str],
+    status: str,
+    output: str | None,
+    stop_reason: str | None,
+) -> None:
+    run_id, _session_id = accepted_run
+    outcome = RunOutcome(
+        status=status,
+        output=output,
+        messages=[{"role": "assistant", "content": output}] if output else [],
+        transcript_delta=[],
+        events=[{"type": f"run_{status}"}],
+        steps=1,
+        tool_calls=0,
+        stop_reason=stop_reason,
+        error="terminal test failure" if status != "completed" else None,
+    )
+
+    RunCoordinator._persist_outcome(run_id, outcome)
+    RunCoordinator._persist_outcome(run_id, outcome)
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.turn_id is not None
+        turn = db.get(ConversationTurn, run.turn_id)
+        assert turn is not None
+        assert turn.execution_status == status
+        assert turn.reply_status == "delivered"
+        assert turn.finished_at is not None
+        replies = list(db.scalars(select(ChatMessage).where(
+            ChatMessage.terminal_for_turn_id == turn.id,
+        )))
+        assert len(replies) == 1
+        assert replies[0].turn_id == turn.id
+
+
+def test_main_agent_installs_deterministic_gate_without_model_or_task_anchor(tmp_path: Path) -> None:
     runtime = AgentRuntime(
         model_call=lambda **_kwargs: None,
         tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
     )
-    with pytest.raises(ModelConfigurationError, match="任务锚点"):
-        RunCoordinator._install_completion_verifier(runtime, {"runtime_binding": {}})
+    RunCoordinator._install_completion_verifier(runtime, {"runtime_binding": {}})
+    assert runtime.completion_verifier is decide_deterministic_completion
 
 
 def test_rejected_candidates_are_not_persisted_as_chat_messages(seeded_run: tuple[str, str]) -> None:
@@ -130,7 +406,7 @@ def test_rejected_candidates_are_not_persisted_as_chat_messages(seeded_run: tupl
         tool_calls=0,
         stop_reason="acceptance_failed",
         error="candidate did not meet acceptance criteria",
-        acceptance_report={"stage": "complete", "semantic": {"passed": False}},
+        acceptance_report={"stage": "deterministic", "passed": False},
         completion_verification_attempts=3,
     )
     RunCoordinator._persist_outcome(run_id, outcome)
@@ -142,13 +418,13 @@ def test_rejected_candidates_are_not_persisted_as_chat_messages(seeded_run: tupl
             RunEvent.event_type == "runtime_snapshot",
         ))
         assert snapshot is not None
-        assert snapshot.payload["acceptance_report"]["semantic"]["passed"] is False
+        assert snapshot.payload["acceptance_report"]["passed"] is False
         assert snapshot.payload["completion_verification_attempts"] == 3
         assert snapshot.payload["messages"] == []
         assert "unsupported candidate" not in str(snapshot.payload)
 
 
-def test_context_epoch_is_promoted_and_transcript_tail_is_loaded(
+def test_single_compaction_is_persisted_and_transcript_tail_is_loaded(
     seeded_run: tuple[str, str],
 ) -> None:
     run_id, session_id = seeded_run
@@ -178,15 +454,21 @@ def test_context_epoch_is_promoted_and_transcript_tail_is_loaded(
         }],
         steps=1,
         tool_calls=0,
-        context_snapshot={
-            "epoch_id": "runtime-epoch",
+        compaction_state={
+            "schema": "claude_compaction_v1",
+            "base_sequence": 1,
+            "source_delta_count": 0,
             "source_sequence": 1,
-            "sequence": 1,
-            "summary": {"objective": "old request", "completed_work": ["answered"]},
-            "task_state": {"status": "done"},
-            "retained_messages": [{"role": "user", "content": "old request"}],
+            "active_request": "old request",
+            "todo_state": [],
+            "summary": "request was answered",
+            "messages": [{
+                "role": "user",
+                "content": "<compacted-context>request was answered</compacted-context>",
+            }],
+            "transcript_artifact": {},
             "artifact_refs": [],
-            "version": 1,
+            "removed_message_count": 1,
         },
     )
     RunCoordinator._persist_outcome(run_id, outcome)
@@ -194,13 +476,14 @@ def test_context_epoch_is_promoted_and_transcript_tail_is_loaded(
     with database.SessionLocal() as db:
         session = db.get(Session, session_id)
         assert session is not None
-        assert db.query(ContextEpoch).filter_by(session_id=session_id, status="active").count() == 1
-        assert db.query(ContextCheckpoint).filter_by(session_id=session_id, status="completed").count() == 1
-        assert db.query(CompactionAttempt).filter_by(session_id=session_id).count() == 1
-        assert _prepare_session_history(db, session) == [{"role": "assistant", "content": "new answer"}]
+        assert db.query(ConversationCompaction).filter_by(session_id=session_id).count() == 1
+        assert _prepare_session_history(db, session) == [
+            {"role": "user", "content": "<compacted-context>request was answered</compacted-context>"},
+            {"role": "assistant", "content": "new answer"},
+        ]
 
 
-def test_context_snapshot_persists_artifact_metadata(seeded_run: tuple[str, str], tmp_path: Path) -> None:
+def test_context_artifact_metadata_is_persisted(seeded_run: tuple[str, str], tmp_path: Path) -> None:
     run_id, session_id = seeded_run
     artifact_path = tmp_path / "artifact.txt"
     artifact_path.write_text("full output", encoding="utf-8")
@@ -228,7 +511,7 @@ def test_context_snapshot_persists_artifact_metadata(seeded_run: tuple[str, str]
         assert artifact.metadata_json["runtime_artifact_id"] == "artifact-test"
 
 
-def test_snapshot_is_rejected_when_transcript_changed_during_compaction(
+def test_compaction_is_rejected_when_transcript_changed_during_model_call(
     seeded_run: tuple[str, str],
 ) -> None:
     run_id, session_id = seeded_run
@@ -250,18 +533,20 @@ def test_snapshot_is_rejected_when_transcript_changed_during_compaction(
         }],
         steps=1,
         tool_calls=0,
-        context_snapshot={
-            "epoch_id": "stale-runtime",
+        compaction_state={
+            "schema": "claude_compaction_v1",
+            "base_sequence": 1,
+            "source_delta_count": 0,
             "source_sequence": 1,
-            "sequence": 1,
-            "version": 1,
-            "summary": {"objective": "stale"},
+            "active_request": "stale",
+            "summary": "stale",
+            "messages": [{"role": "user", "content": "<compacted-context>stale</compacted-context>"}],
         },
     ))
 
     with database.SessionLocal() as db:
-        assert db.query(ContextEpoch).filter_by(session_id=session_id, status="active").count() == 0
-        assert db.query(CompactionAttempt).filter_by(session_id=session_id, status="conflict").count() == 1
+        assert db.query(ConversationCompaction).filter_by(session_id=session_id).count() == 0
+        assert db.query(RunEvent).filter_by(run_id=run_id, event_type="context_compaction_conflict").count() == 1
 
 
 def test_transcript_delta_is_persisted_when_provider_messages_were_compacted(
@@ -359,18 +644,17 @@ def test_delegated_terminal_result_appends_revision_without_mutating_placeholder
         assert [row.sequence for row in rows] == [1, 2, 3, 4]
 
 
-def test_older_context_snapshot_cannot_overwrite_newer_epoch(
+def test_older_compaction_cannot_overwrite_newer_replacement(
     seeded_run: tuple[str, str],
 ) -> None:
     run_id, session_id = seeded_run
     with database.SessionLocal() as db:
-        db.add(ContextEpoch(
+        db.add(ConversationCompaction(
             session_id=session_id,
-            epoch_number=1,
-            status="active",
-            end_sequence=5,
-            version=3,
-            summary_json={"objective": "new"},
+            source_sequence=5,
+            active_request="new",
+            summary="new",
+            continuation_messages=[{"role": "user", "content": "<compacted-context>new</compacted-context>"}],
         ))
         db.commit()
     RunCoordinator._persist_outcome(run_id, RunOutcome(
@@ -387,20 +671,22 @@ def test_older_context_snapshot_cannot_overwrite_newer_epoch(
         }],
         steps=1,
         tool_calls=0,
-        context_snapshot={
-            "epoch_id": "stale",
-            "sequence": 2,
-            "version": 2,
-            "summary": {"objective": "stale"},
+        compaction_state={
+            "schema": "claude_compaction_v1",
+            "base_sequence": 0,
+            "source_delta_count": 1,
+            "source_sequence": 1,
+            "active_request": "stale",
+            "summary": "stale",
+            "messages": [{"role": "user", "content": "<compacted-context>stale</compacted-context>"}],
         },
     ))
     with database.SessionLocal() as db:
-        active = db.scalar(select(ContextEpoch).where(
-            ContextEpoch.session_id == session_id,
-            ContextEpoch.status == "active",
-        ))
-        assert active is not None and active.summary_json["objective"] == "new"
-        assert db.query(CompactionAttempt).filter_by(session_id=session_id, status="conflict").count() == 1
+        rows = list(db.scalars(select(ConversationCompaction).where(
+            ConversationCompaction.session_id == session_id,
+        )))
+        assert len(rows) == 1 and rows[0].summary == "new"
+        assert db.query(RunEvent).filter_by(run_id=run_id, event_type="context_compaction_conflict").count() == 1
 
 
 def test_awaiting_outcome_creates_exact_pending_approval(seeded_run: tuple[str, str]) -> None:
@@ -547,7 +833,7 @@ def test_usage_is_upserted_as_absolute_run_aggregate(seeded_run: tuple[str, str]
         assert record.model_connection_id == connection_id
 
 
-def test_history_compacts_at_90k_and_updates_session_metadata(seeded_run: tuple[str, str]) -> None:
+def test_history_loader_never_compacts_or_drops_messages(seeded_run: tuple[str, str]) -> None:
     _run_id, session_id = seeded_run
     with database.SessionLocal() as db:
         session = db.get(Session, session_id)
@@ -565,13 +851,15 @@ def test_history_compacts_at_90k_and_updates_session_metadata(seeded_run: tuple[
         recent = _prepare_session_history(db, session)
         db.commit()
 
-        assert recent == [{"role": "user", "content": "keep latest"}]
-        assert session.context_summary
-        assert session.context_tokens < 90_000
-        assert session.last_compacted_at == old.created_at
+        assert recent == [
+            {"role": "user", "content": "界" * 45_100},
+            {"role": "user", "content": "keep latest"},
+        ]
+        assert session.context_tokens >= 90_000
+        assert db.query(ConversationCompaction).filter_by(session_id=session_id).count() == 0
 
 
-def test_compaction_never_splits_messages_with_the_same_timestamp(
+def test_history_loader_orders_same_timestamp_messages_without_splitting(
     seeded_run: tuple[str, str],
 ) -> None:
     _run_id, session_id = seeded_run
@@ -596,7 +884,43 @@ def test_compaction_never_splits_messages_with_the_same_timestamp(
         db.flush()
         recent = _prepare_session_history(db, session)
         assert len(recent) == 2
-        assert session.last_compacted_at is None
+        assert db.query(ConversationCompaction).filter_by(session_id=session_id).count() == 0
+
+
+def test_history_uses_sequence_when_tool_messages_share_a_timestamp(
+    seeded_run: tuple[str, str],
+) -> None:
+    _run_id, session_id = seeded_run
+    shared_time = datetime.now(timezone.utc)
+    with database.SessionLocal() as db:
+        session = db.get(Session, session_id)
+        assert session is not None
+        db.add_all([
+            ChatMessage(
+                id="ffffffff-ffff-ffff-ffff-ffffffffffff",
+                session_id=session_id,
+                role="assistant",
+                content="",
+                extra={"tool_calls": [{"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}]},
+                sequence=1,
+                created_at=shared_time,
+            ),
+            ChatMessage(
+                id="00000000-0000-0000-0000-000000000000",
+                session_id=session_id,
+                role="tool",
+                content="result",
+                tool_call_id="call-1",
+                sequence=2,
+                created_at=shared_time,
+            ),
+        ])
+        db.flush()
+
+        history = _prepare_session_history(db, session)
+
+    assert [item["role"] for item in history] == ["assistant", "tool"]
+    assert history[1]["tool_call_id"] == "call-1"
 
 
 def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settings(

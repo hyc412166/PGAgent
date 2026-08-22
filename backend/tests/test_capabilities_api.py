@@ -81,6 +81,7 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
         "bash",
         "read",
         "write",
+        "delete",
         "edit",
         "glob",
         "grep",
@@ -98,6 +99,8 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
     assert by_id["read"]["risk_level"] == "low"
     assert by_id["write"]["risk_level"] == "adaptive"
     assert by_id["write"]["requires_approval"] is False
+    assert by_id["delete"]["runtime_tool_id"] == "delete"
+    assert by_id["delete"]["requires_approval"] is True
     assert by_id["git_diff"]["risk_level"] == "low"
     assert by_id["file_info"]["availability"] == "available"
     assert {"availability", "enabled", "is_builtin"}.issubset(by_id["skill"])
@@ -229,6 +232,121 @@ def test_market_status_does_not_pretend_an_unauthenticated_skills_sh_search_work
     assert browse_response.status_code == 200
     assert browse_response.json()["available"] is False
     assert browse_response.json()["items"] == []
+
+
+def test_skills_sh_retries_once_with_a_refreshed_vercel_oidc_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SKILLS_SH_API_TOKEN", raising=False)
+    monkeypatch.delenv("PGAGENT_SKILLS_SH_API_TOKEN", raising=False)
+    monkeypatch.setenv("VERCEL_OIDC_TOKEN", "expired-token")
+    authorizations: list[str] = []
+
+    def fake_get(_url: str, **kwargs: object) -> skill_service.httpx.Response:
+        headers = kwargs["headers"]
+        assert isinstance(headers, dict)
+        authorizations.append(str(headers["Authorization"]))
+        if len(authorizations) == 1:
+            return skill_service.httpx.Response(401)
+        return skill_service.httpx.Response(200, json={"data": []})
+
+    def fake_refresh(*, failed_token: str | None = None) -> str:
+        assert failed_token == "expired-token"
+        monkeypatch.setenv("VERCEL_OIDC_TOKEN", "fresh-token")
+        return "fresh-token"
+
+    monkeypatch.setattr(skill_service.httpx, "get", fake_get)
+    monkeypatch.setattr(skill_service, "_refresh_vercel_oidc_token", fake_refresh)
+
+    assert skill_service._skills_sh_json("/api/v1/skills") == {"data": []}
+    assert authorizations == ["Bearer expired-token", "Bearer fresh-token"]
+
+
+def test_vercel_oidc_refresh_runs_the_bounded_script_and_updates_process_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment_file = tmp_path / ".env.local"
+    monkeypatch.setattr(skill_service, "LOCAL_ENV_FILE", environment_file)
+    monkeypatch.setenv("VERCEL_OIDC_TOKEN", "expired-token")
+    calls: list[dict[str, object]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> skill_service.subprocess.CompletedProcess[str]:
+        calls.append({"command": command, **kwargs})
+        environment_file.write_text("VERCEL_OIDC_TOKEN=fresh-token\n", encoding="utf-8")
+        return skill_service.subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(skill_service.subprocess, "run", fake_run)
+
+    assert skill_service._refresh_vercel_oidc_token(failed_token="expired-token") == "fresh-token"
+    assert calls[0]["timeout"] == 90
+    assert calls[0]["capture_output"] is True
+    assert calls[0]["check"] is False
+    assert calls[0]["command"][-1] == str(skill_service.SKILL_TOKEN_REFRESH_SCRIPT)
+    assert skill_service.os.environ["VERCEL_OIDC_TOKEN"] == "fresh-token"
+
+
+def test_vercel_oidc_refresh_reports_timeout_without_exposing_subprocess_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VERCEL_OIDC_TOKEN", "expired-token")
+
+    def fake_run(_command: list[str], **_kwargs: object) -> None:
+        raise skill_service.subprocess.TimeoutExpired("powershell.exe", 90, output="secret-output")
+
+    monkeypatch.setattr(skill_service.subprocess, "run", fake_run)
+
+    with pytest.raises(skill_service.HTTPException, match="could not be started") as exc_info:
+        skill_service._refresh_vercel_oidc_token(failed_token="expired-token")
+    assert "secret-output" not in str(exc_info.value.detail)
+
+
+def test_skills_sh_stops_after_one_failed_oidc_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SKILLS_SH_API_TOKEN", raising=False)
+    monkeypatch.delenv("PGAGENT_SKILLS_SH_API_TOKEN", raising=False)
+    monkeypatch.setenv("VERCEL_OIDC_TOKEN", "expired-token")
+    requests = 0
+    refreshes = 0
+
+    def fake_get(_url: str, **_kwargs: object) -> skill_service.httpx.Response:
+        nonlocal requests
+        requests += 1
+        return skill_service.httpx.Response(401)
+
+    def fake_refresh(*, failed_token: str | None = None) -> str:
+        nonlocal refreshes
+        assert failed_token == "expired-token"
+        refreshes += 1
+        return "fresh-but-rejected-token"
+
+    monkeypatch.setattr(skill_service.httpx, "get", fake_get)
+    monkeypatch.setattr(skill_service, "_refresh_vercel_oidc_token", fake_refresh)
+
+    with pytest.raises(skill_service.HTTPException, match="rejected the configured marketplace token"):
+        skill_service._skills_sh_json("/api/v1/skills")
+    assert requests == 2
+    assert refreshes == 1
+
+
+def test_skills_sh_does_not_replace_an_explicit_static_market_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SKILLS_SH_API_TOKEN", "explicit-token")
+    refresh_called = False
+
+    def fake_get(_url: str, **_kwargs: object) -> skill_service.httpx.Response:
+        return skill_service.httpx.Response(401)
+
+    def fake_refresh(*, failed_token: str | None = None) -> str:
+        nonlocal refresh_called
+        refresh_called = True
+        return "unexpected-token"
+
+    monkeypatch.setattr(skill_service.httpx, "get", fake_get)
+    monkeypatch.setattr(skill_service, "_refresh_vercel_oidc_token", fake_refresh)
+
+    with pytest.raises(skill_service.HTTPException, match="rejected the configured marketplace token"):
+        skill_service._skills_sh_json("/api/v1/skills")
+    assert refresh_called is False
 
 
 def test_market_browse_normalizes_leaderboard_views_without_exposing_file_contents(

@@ -1,85 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import json
-
-import pytest
 
 from app.runtime.context_service import (
-    ArtifactRef,
-    CompactionGuard,
     ContextAssembler,
-    ContextEpoch,
-    ContextSnapshot,
+    ConversationCompactor,
     FilesystemArtifactStore,
     InMemoryArtifactStore,
-    SemanticCompactor,
-    VersionConflictError,
-    compact_with_compare_and_swap,
-    micro_compact_messages,
-    context_end_sequence,
-    parse_structured_summary,
+    ToolOutputBudgeter,
+    atomic_message_groups,
+    retain_recent_atomic_tail,
 )
-from app.runtime.context import estimate_tokens
-
-
-def test_micro_compact_stores_old_tool_output_and_keeps_latest() -> None:
-    store = InMemoryArtifactStore()
-    messages = [
-        {"role": "user", "content": "inspect"},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "one"}]},
-        {"role": "tool", "tool_call_id": "one", "content": "x" * 10_000},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "two"}]},
-        {"role": "tool", "tool_call_id": "two", "content": "y" * 10_000},
-    ]
-    result = micro_compact_messages(messages, artifact_store=store, keep_recent_tool_results=1)
-    assert result.compacted_count == 1
-    assert result.artifact_refs
-    assert "artifact:" in result.messages[2]["content"]
-    assert result.messages[-1]["content"] == "y" * 10_000
-    assert store.get(result.artifact_refs[0].artifact_id)
-
-
-def test_summary_parser_accepts_fenced_json_and_normalizes_fields() -> None:
-    summary = parse_structured_summary(
-        "```json\n{" + '"objective":"ship","facts":"one","tool_state":{"ok":true}' + "}\n```",
-        strict=True,
-    )
-    assert summary["objective"] == "ship"
-    assert summary["facts"] == ["one"]
-    assert summary["tool_state"] == {"ok": True}
-    assert summary["pending_work"] == []
-
-
-def test_assembler_separates_stable_prefix_and_dynamic_suffix_and_has_stable_key() -> None:
-    assembler = ContextAssembler(max_tokens=2_000, output_reserve_tokens=100, safety_buffer_tokens=100)
-    stable = assembler.stable_prefix(system_rules="safe", workspace_rules="repo")
-    first = assembler.assemble(stable_prefix=stable, recent_messages=[{"role": "user", "content": "one"}])
-    second = assembler.assemble(stable_prefix=stable, recent_messages=[{"role": "user", "content": "two"}])
-    assert [item["content"] for item in first.stable_prefix] == ["## System rules\nsafe", "## Workspace rules\nrepo"]
-    assert first.dynamic_suffix[-1]["content"] == "one"
-    assert second.dynamic_suffix[-1]["content"] == "two"
-    assert first.cache_key == second.cache_key
-    assert first.cache_breakpoints == (len(first.stable_prefix),)
-
-
-def test_assembler_injects_legacy_summary_memories_and_task_anchor_as_dynamic_data() -> None:
-    assembler = ContextAssembler(max_tokens=4_000, output_reserve_tokens=100, safety_buffer_tokens=100)
-    stable = assembler.stable_prefix(system_rules="safe")
-    layout = assembler.assemble(
-        stable_prefix=stable,
-        summary="legacy facts",
-        memories=[{"content": "prefer Chinese", "pinned": True}],
-        task_anchor="finish the context refactor",
-        recent_messages=[{"role": "user", "content": "finish the context refactor"}],
-    )
-
-    rendered = "\n".join(str(item.get("content") or "") for item in layout.dynamic_suffix)
-    assert "legacy facts" in rendered
-    assert "[固定] prefer Chinese" in rendered
-    assert "<user_task>" in rendered
-    assert "finish the context refactor" in rendered
-    assert all("legacy facts" not in str(item.get("content") or "") for item in layout.stable_prefix)
 
 
 def test_filesystem_artifact_store_survives_a_new_store_instance(tmp_path) -> None:
@@ -90,96 +21,142 @@ def test_filesystem_artifact_store_survives_a_new_store_instance(tmp_path) -> No
     assert FilesystemArtifactStore(tmp_path).get(ref.artifact_id) == b"durable tool output"
 
 
-def test_context_sequence_advances_from_epoch_boundary_not_current_database_maximum() -> None:
-    snapshot = ContextSnapshot(sequence=7)
-    tail = [
-        {"role": "user", "content": "persisted tail"},
-        {"role": "assistant", "content": "new runtime item"},
+def test_large_tool_output_is_externalized_before_first_model_exposure() -> None:
+    store = InMemoryArtifactStore()
+    budgeter = ToolOutputBudgeter(store, max_chars=256, preview_chars=64)
+
+    prepared = budgeter.prepare(
+        tool_call_id="call-1",
+        tool_name="read_file",
+        output="x" * 1_000,
+    )
+
+    assert prepared.artifact_ref is not None
+    assert f"artifact:{prepared.artifact_ref.artifact_id}" in prepared.content
+    assert len(prepared.content) < 1_000
+    assert store.get(prepared.artifact_ref.artifact_id) == b"x" * 1_000
+
+
+def test_small_tool_output_remains_verbatim_without_artifact() -> None:
+    budgeter = ToolOutputBudgeter(InMemoryArtifactStore(), max_chars=256, preview_chars=64)
+
+    prepared = budgeter.prepare(tool_call_id="call-1", tool_name="read_file", output="hello")
+
+    assert prepared.content == "hello"
+    assert prepared.artifact_ref is None
+
+
+def test_assembler_has_stable_cache_namespace_and_append_only_transcript() -> None:
+    assembler = ContextAssembler(max_tokens=4_000, output_reserve_tokens=100, safety_buffer_tokens=100)
+    stable = assembler.stable_prefix(system_rules="safe", workspace_rules="repo")
+    first_transcript = [{"role": "user", "content": "one"}]
+    second_transcript = [*first_transcript, {"role": "assistant", "content": "done"}]
+
+    first = assembler.assemble(stable_prefix=stable, transcript=first_transcript)
+    second = assembler.assemble(stable_prefix=stable, transcript=second_transcript)
+
+    assert first.cache_key == second.cache_key
+    assert second.messages[: len(first.messages)] == first.messages
+    assert second.transcript == second_transcript
+    assert second.truncated is False
+
+
+def test_assembler_reports_compaction_without_mutating_seen_messages() -> None:
+    assembler = ContextAssembler(
+        max_tokens=400,
+        output_reserve_tokens=50,
+        safety_buffer_tokens=50,
+        compaction_threshold_tokens=256,
+    )
+    transcript = [{"role": "user", "content": "x" * 2_000}]
+
+    layout = assembler.assemble(stable_prefix=[], transcript=transcript)
+
+    assert layout.requires_compaction is True
+    assert layout.transcript == transcript
+
+
+def test_atomic_groups_keep_complete_parallel_tool_batch() -> None:
+    messages = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "one", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "two", "function": {"name": "glob_search", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "one", "content": "a"},
+        {"role": "tool", "tool_call_id": "two", "content": "b"},
+        {"role": "assistant", "content": "done"},
     ]
 
-    assert context_end_sequence(snapshot, tail) == 9
-    assert context_end_sequence(None, tail) == 2
+    groups = atomic_message_groups(messages)
+
+    assert [len(group) for group in groups] == [1, 3, 1]
+    removed, tail = retain_recent_atomic_tail(messages, preserve_recent_messages=2)
+    assert tail[0]["role"] == "assistant"
+    assert tail[0].get("tool_calls")
+    assert [item.get("tool_call_id") for item in tail[1:3]] == ["one", "two"]
+    assert removed == [messages[0]]
 
 
-def test_semantic_compactor_defaults_to_current_model_and_returns_epoch() -> None:
+def test_corrupt_tool_groups_are_not_retained_as_provider_history() -> None:
+    corrupt = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "one", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "different", "content": "bad"},
+    ]
+
+    assert atomic_message_groups(corrupt) == []
+
+
+def test_compactor_keeps_exact_request_and_todos_outside_model_summary() -> None:
     calls: list[dict] = []
 
     async def model_call(**kwargs):
         calls.append(kwargs)
-        return {
-            "choices": [{
-                "message": {
-                    "content": json.dumps({
-                        "objective": "ship feature",
-                        "completed_work": ["implemented"],
-                        "pending_work": ["test"],
-                    })
-                }
-            }],
-        }
+        return {"choices": [{"message": {"content": "Earlier files were inspected."}}]}
 
     result = asyncio.run(
-        SemanticCompactor(model_call=model_call, retain_tokens=100).compact(
-            [{"role": "user", "content": "ship feature"}, {"role": "assistant", "content": "implemented"}],
+        ConversationCompactor(model_call=model_call, preserve_recent_messages=1).compact(
+            [
+                {"role": "user", "content": "build the exact feature"},
+                {"role": "assistant", "content": "old progress " + ("x" * 4_000)},
+                {"role": "assistant", "content": "latest progress"},
+            ],
             session_id="s1",
-            sequence=2,
+            active_request="build the exact feature",
+            todo_state=[{"id": "1", "content": "test", "status": "in_progress"}],
         )
     )
+
     assert calls and calls[0]["tools"] == []
     assert calls[0]["mode"] == "compaction"
-    assert result.used_model is True
-    assert result.epoch is not None
-    assert result.epoch.session_id == "s1"
-    assert result.summary["pending_work"] == ["test"]
-    # This tiny transcript is already smaller than the semantic summary, so
-    # the no-progress guard keeps the active epoch lossless.
-    assert result.after_tokens >= result.before_tokens
-    assert result.ineffective is True
+    continuation = result.messages[0]["content"]
+    assert "<active-request>build the exact feature</active-request>" in continuation
+    assert '"status":"in_progress"' in continuation
+    assert "Earlier files were inspected." in continuation
+    assert result.messages[-1]["content"] == "latest progress"
+    assert result.removed_message_count == 2
+    assert result.ineffective is False
 
 
-def test_semantic_compactor_uses_local_fallback_when_model_is_unavailable() -> None:
+def test_compactor_fallback_still_preserves_exact_continuation_state() -> None:
+    async def unavailable(**_kwargs):
+        raise RuntimeError("offline")
+
     result = asyncio.run(
-        SemanticCompactor(retain_tokens=20).compact(
-            [{"role": "user", "content": "do this"}, {"role": "tool", "content": "failed to read"}],
+        ConversationCompactor(model_call=unavailable, preserve_recent_messages=0).compact(
+            [{"role": "user", "content": "do this"}, {"role": "assistant", "content": "x" * 4_000}],
+            active_request="do this",
+            todo_state=[{"id": "1", "status": "pending"}],
         )
     )
+
     assert result.fallback is True
-    assert result.summary["objective"] == "do this"
-    assert result.summary["errors"]
-
-
-def test_compaction_guard_stops_after_ineffective_attempts() -> None:
-    guard = CompactionGuard(max_attempts=2, min_reduction_ratio=0.1)
-    assert guard.can_attempt()
-    effective, _ = guard.evaluate(100, 100)
-    assert not effective
-
-
-def test_epoch_and_snapshot_are_round_trippable() -> None:
-    epoch = ContextEpoch(
-        session_id="s",
-        end_sequence=8,
-        summary={"objective": "x"},
-        retained_messages=[{"role": "user", "content": "x"}],
-        artifact_refs=[ArtifactRef(artifact_id="a")],
-    )
-    restored = ContextEpoch.from_dict(epoch.to_dict())
-    snapshot = ContextSnapshot.from_epoch(restored)
-    assert snapshot.to_dict()["session_id"] == "s"
-    assert snapshot.messages == [{"role": "user", "content": "x"}]
-    assert snapshot.artifact_refs[0].artifact_id == "a"
-
-
-def test_compare_and_swap_rejects_new_transcript_version() -> None:
-    async def run() -> None:
-        compactor = SemanticCompactor(retain_tokens=20)
-        with pytest.raises(VersionConflictError):
-            await compact_with_compare_and_swap(
-                compactor,
-                [{"role": "user", "content": "x"}],
-                expected_version=1,
-                current_version=lambda: 2,
-                commit=lambda _result: None,
-            )
-
-    asyncio.run(run())
+    assert "<active-request>do this</active-request>" in result.messages[0]["content"]
+    assert '"status":"pending"' in result.messages[0]["content"]

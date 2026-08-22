@@ -49,19 +49,61 @@ SIDE_EFFECT_OR_NETWORK_TOOLS: Final[frozenset[str]] = frozenset(
         "write",
         "write_file",
         "edit",
+        "delete",
         "bash",
         "run_command",
         "task",
+        "Agent",
         "webfetch",
         "websearch",
+        "WebFetch",
+        "WebSearch",
+        "edit_file",
+        "NotebookEdit",
+        "PowerShell",
+        "REPL",
+        "RemoteTrigger",
+        "MCP",
+        "MemoryWrite",
+        "TodoWrite",
+        "todowrite",
+        "Config",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "TaskCreate",
+        "RunTaskPacket",
+        "TaskStop",
+        "TaskUpdate",
+        "task_create",
+        "task_update",
+        "claim_task",
+        "background_run",
+        "spawn_teammate",
+        "send_message",
+        "read_inbox",
+        "broadcast",
+        "shutdown_request",
+        "plan_approval",
+        "TeamCreate",
+        "TeamDelete",
+        "WorkerCreate",
+        "WorkerObserve",
+        "WorkerResolveTrust",
+        "WorkerSendPrompt",
+        "WorkerRestart",
+        "WorkerTerminate",
+        "WorkerObserveCompletion",
+        "CronCreate",
+        "CronDelete",
     }
 )
 
 # Kept as a public compatibility name for callers that previously imported it.
 HIGH_IMPACT_TOOLS: Final[frozenset[str]] = SIDE_EFFECT_OR_NETWORK_TOOLS
-NETWORK_TOOLS: Final[frozenset[str]] = frozenset({"webfetch", "websearch"})
-FILE_WRITE_TOOLS: Final[frozenset[str]] = frozenset({"write", "write_file", "edit"})
-COMMAND_TOOLS: Final[frozenset[str]] = frozenset({"bash", "run_command"})
+NETWORK_TOOLS: Final[frozenset[str]] = frozenset({"webfetch", "websearch", "WebFetch", "WebSearch", "RemoteTrigger", "MCP"})
+FILE_WRITE_TOOLS: Final[frozenset[str]] = frozenset({"write", "write_file", "edit", "edit_file"})
+FILE_DELETE_TOOLS: Final[frozenset[str]] = frozenset({"delete"})
+COMMAND_TOOLS: Final[frozenset[str]] = frozenset({"bash", "run_command", "PowerShell", "REPL", "background_run"})
 
 _SENSITIVE_FILE_NAMES: Final[frozenset[str]] = frozenset(
     {
@@ -244,7 +286,7 @@ def _write_decision(
     if path_risk:
         return _approval(f"{path_risk}，智能审批需要你确认这次文件修改。")
 
-    if tool_name == "edit":
+    if tool_name in {"edit", "edit_file"}:
         old_string = arguments.get("old_string")
         new_string = arguments.get("new_string")
         if not isinstance(old_string, str) or not isinstance(new_string, str):
@@ -345,12 +387,16 @@ def _smart_decision(
     arguments: Mapping[str, object],
     workspace_root: str | Path | None,
 ) -> ToolRiskDecision:
+    if tool_name in FILE_DELETE_TOOLS:
+        return _approval("删除文件是不可逆操作，智能审批需要你确认。")
     if tool_name in FILE_WRITE_TOOLS:
         return _write_decision(tool_name, arguments, workspace_root)
     if tool_name in COMMAND_TOOLS:
         return _command_decision(arguments)
-    # Delegation itself does not bypass this policy: each child receives the
-    # same permission mode and independently gates its own tool calls.
+    if tool_name in SIDE_EFFECT_OR_NETWORK_TOOLS:
+        return _approval(
+            "该高级工具会修改持久状态、调用子 Agent 或访问外部网络，智能审批需要你确认。"
+        )
     return _allow()
 
 

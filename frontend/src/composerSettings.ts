@@ -15,9 +15,9 @@ export function resolveEffectiveThinking(
   connectionLevel?: string | null,
 ): ThinkingLevel {
   for (const level of [sessionLevel, agentLevel, connectionLevel]) {
-    if (level && level !== 'auto' && level in thinkingLevelLabels) return level as ThinkingLevel
+    if (level && ['low', 'medium', 'high', 'xhigh'].includes(level)) return level as ThinkingLevel
   }
-  return 'auto'
+  return 'medium'
 }
 
 export function shortModelLabel(model?: string | null, maxLength = 24): string {

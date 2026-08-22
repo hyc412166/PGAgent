@@ -14,16 +14,13 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from .context import ContextBundle, ContextManager, message_tokens
+from .context import ContextManager, message_tokens
 from .acceptance import CompletionDecision
 from .context_service import (
     ArtifactStore,
     ContextAssembler,
-    ContextSnapshot,
+    ConversationCompactor,
     InMemoryArtifactStore,
-    PromptLayout,
-    SemanticCompactor,
-    context_end_sequence,
 )
 from .errors import APIErrorKind, call_with_retry
 from .graph import RunGraphState, build_outer_graph
@@ -58,6 +55,21 @@ _SECRET_ARGUMENT_MARKERS = (
     "old_string",
     "new_string",
 )
+
+
+def _safe_event_text(value: Any, limit: int = 320) -> str:
+    """Bound model-authored status text before it enters the public event log."""
+
+    text = str(value or "").replace("\x00", "")
+    text = " ".join(text.split())
+    return text[:limit]
+
+
+def _safe_thought_text(value: Any, limit: int = 20_000) -> str:
+    """Keep readable model reasoning for the user's private run timeline."""
+
+    text = str(value or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    return text[:limit]
 
 
 def safe_tool_argument_summary(tool_name: str, arguments: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -274,6 +286,7 @@ class ModelToolCall:
 @dataclass(slots=True)
 class ModelTurn:
     content: str = ""
+    reasoning_content: str = ""
     tool_calls: list[ModelToolCall] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
 
@@ -288,10 +301,19 @@ class ModelTurn:
             else:
                 raise TypeError("model_call 必须返回 ModelTurn、mapping 或支持 model_dump 的对象")
 
-        raw: Mapping[str, Any] = response
+        response_payload: Mapping[str, Any] = response
+        raw: Mapping[str, Any] = response_payload
         if raw.get("choices"):
             raw = raw["choices"][0].get("message", {})
         content = raw.get("content") or ""
+        reasoning = next(
+            (
+                raw.get(key)
+                for key in ("reasoning_content", "reasoning", "thinking")
+                if isinstance(raw.get(key), str)
+            ),
+            "",
+        )
         calls: list[ModelToolCall] = []
         for index, item in enumerate(raw.get("tool_calls") or []):
             function = item.get("function", item)
@@ -300,7 +322,9 @@ class ModelTurn:
                 try:
                     arguments = json.loads(arguments)
                 except json.JSONDecodeError:
-                    arguments = {"_raw": arguments}
+                    arguments = {"_invalid_json": True, "_argument_chars": len(arguments)}
+            if not isinstance(arguments, Mapping):
+                arguments = {"_invalid_json": True, "_argument_chars": 0}
             calls.append(
                 ModelToolCall(
                     id=str(item.get("id") or f"call-{index + 1}"),
@@ -308,7 +332,12 @@ class ModelTurn:
                     arguments=dict(arguments or {}),
                 )
             )
-        return cls(content=str(content), tool_calls=calls, usage=dict(response.get("usage") or {}))
+        return cls(
+            content=str(content),
+            reasoning_content=str(reasoning or ""),
+            tool_calls=calls,
+            usage=dict(response_payload.get("usage") or {}),
+        )
 
 
 @dataclass(slots=True)
@@ -351,7 +380,7 @@ class RunOutcome:
     usage: dict[str, Any] = field(default_factory=empty_usage)
     active_elapsed_seconds: float = 0.0
     runtime_binding: dict[str, Any] = field(default_factory=dict)
-    context_snapshot: dict[str, Any] = field(default_factory=dict)
+    compaction_state: dict[str, Any] = field(default_factory=dict)
     artifact_refs: list[dict[str, Any]] = field(default_factory=list)
     # None means a legacy/manual outcome that did not provide an incremental
     # transcript; [] explicitly means there is nothing safe to persist.
@@ -383,7 +412,7 @@ class AgentRuntime:
         checkpointer: Any | None = None,
         clock: Callable[[], float] = time.monotonic,
         context_assembler: ContextAssembler | None = None,
-        semantic_compactor: SemanticCompactor | None = None,
+        conversation_compactor: ConversationCompactor | None = None,
         artifact_store: ArtifactStore | None = None,
         completion_verifier: CompletionVerifier | None = None,
     ) -> None:
@@ -398,11 +427,16 @@ class AgentRuntime:
                 "on_delta" in model_signature.parameters
                 or accepts_var_kwargs
             )
+            self._model_accepts_thought_delta = (
+                "on_thought_delta" in model_signature.parameters
+                or accepts_var_kwargs
+            )
             self._model_accepts_prompt_cache_key = (
                 "prompt_cache_key" in model_signature.parameters or accepts_var_kwargs
             )
         except (TypeError, ValueError):
             self._model_accepts_delta = False
+            self._model_accepts_thought_delta = False
             self._model_accepts_prompt_cache_key = False
         self.tool_registry = tool_registry
         self.context_manager = context_manager or ContextManager()
@@ -419,10 +453,10 @@ class AgentRuntime:
             safety_buffer_tokens=self.config.context_safety_buffer_tokens,
             artifact_store=artifact_store,
         )
-        # By default semantic compaction uses the current conversation model.
+        # Full compaction uses the current conversation model by default.
         # It receives ``mode=compaction`` and an empty tool list, so no tool can
         # be executed during summarisation.
-        self.semantic_compactor = semantic_compactor or SemanticCompactor(
+        self.conversation_compactor = conversation_compactor or ConversationCompactor(
             model_call=self.model_call,
             retain_tokens=self.config.context_compaction_retain_tokens,
             artifact_store=artifact_store,
@@ -474,6 +508,29 @@ class AgentRuntime:
         normalized = " ".join(content.split())
         return hashlib.sha256(f"{tool_name}\0{normalized}".encode("utf-8")).hexdigest()
 
+    def _prepare_tool_result_message(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        result: ToolResult,
+        artifact_refs: Sequence[Mapping[str, Any]],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        prepared = self.context_assembler.tool_output_budgeter.prepare(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            output=json.dumps(result.to_dict(), ensure_ascii=False),
+        )
+        refs = [dict(item) for item in artifact_refs]
+        if prepared.artifact_ref is not None:
+            refs.append(prepared.artifact_ref.to_dict())
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "content": prepared.content,
+        }, refs
+
     @staticmethod
     def _stop_state(state: RunGraphState, decision: GuardDecision) -> RunGraphState:
         return {
@@ -509,9 +566,6 @@ class AgentRuntime:
         recent_messages: Sequence[Mapping[str, Any]],
         agent_instructions: str | None = None,
         workspace_rules: str | None = None,
-        summary: str | None = None,
-        memories: Sequence[str | Mapping[str, Any]] = (),
-        tool_results: Sequence[Mapping[str, Any]] = (),
         mode: str = "auto",
         thread_id: str | None = None,
         prepared_messages: Sequence[Mapping[str, Any]] | None = None,
@@ -520,15 +574,11 @@ class AgentRuntime:
         prior_usage: Mapping[str, Any] | None = None,
         prior_seen_observations: Sequence[str] = (),
         prior_active_elapsed_seconds: float = 0.0,
-        context_snapshot: Mapping[str, Any] | None = None,
+        compaction_state: Mapping[str, Any] | None = None,
         permission_policy: str | None = None,
-        task_state: Mapping[str, Any] | None = None,
         session_id: str | None = None,
         context_sequence: int = 0,
-        context_version: int = 0,
-        prompt_cache_key_seed: str | None = None,
         artifact_refs: Sequence[Mapping[str, Any]] = (),
-        task_anchor: str | None = None,
         transcript_delta: Sequence[Mapping[str, Any]] = (),
         prior_verification_trace: Sequence[Mapping[str, Any]] = (),
         prior_completion_verification_attempts: int = 0,
@@ -572,104 +622,37 @@ class AgentRuntime:
                 extra_messages=[{"role": "system", "content": render_instructions(context)}],
             )
 
-        def messages_after_snapshot(
-            dynamic: Sequence[Mapping[str, Any]],
-            snapshot: ContextSnapshot | None,
-        ) -> list[dict[str, Any]]:
-            """Remove the retained checkpoint tail before appending new turns."""
+        def split_prompt(messages: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            stable: list[dict[str, Any]] = []
+            transcript: list[dict[str, Any]] = []
+            in_transcript = False
+            for raw in messages:
+                message = dict(raw)
+                if not in_transcript and message.get("role") == "system":
+                    stable.append(message)
+                else:
+                    in_transcript = True
+                    transcript.append(message)
+            return stable, transcript
 
-            if snapshot is None or not snapshot.retained_messages:
-                return [dict(item) for item in dynamic]
-            retained = [dict(item) for item in snapshot.retained_messages]
-            if len(dynamic) < len(retained):
-                return [dict(item) for item in dynamic]
-            for index, item in enumerate(retained):
-                if json.dumps(dict(dynamic[index]), ensure_ascii=False, sort_keys=True, default=str) != json.dumps(item, ensure_ascii=False, sort_keys=True, default=str):
-                    return [dict(entry) for entry in dynamic]
-            return [dict(item) for item in dynamic[len(retained):]]
+        def active_request_from(
+            messages: Sequence[Mapping[str, Any]],
+            fallback: str | None = None,
+        ) -> str:
+            for message in reversed(messages):
+                if message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                text = content.strip()
+                if not text or text.startswith("<compacted-context>") or text.startswith("[内部验收反馈"):
+                    continue
+                return text
+            return str(fallback or "").strip()
 
-        async def prepare_node(state: RunGraphState) -> RunGraphState:
-            if state.get("messages"):
-                anchored_messages = self.context_manager.ensure_task_anchor(
-                    state["messages"],
-                    task=state.get("context", {}).get("task_anchor"),
-                )
-                events = await self._publish(
-                    state,
-                    "context_resumed",
-                    estimated_tokens=None,
-                    task_anchor_preserved=self.context_manager.has_task_anchor(anchored_messages),
-                )
-                return {
-                    **state,
-                    "status": "acting",
-                    "messages": anchored_messages,
-                    "events": events,
-                }
-            context = state["context"]
-            instructions = context.get("agent_instructions")
-            auto_rule = "根据任务复杂度自行决定是否先在内部规划；简单任务可直接执行。"
-            instructions = f"{instructions}\n{auto_rule}" if instructions else auto_rule
-            skill_catalog = self.tool_registry.skill_catalog_prompt
-            if skill_catalog:
-                instructions = f"{instructions}\n{skill_catalog}"
-            # The legacy builder remains useful for tiny custom test budgets
-            # and old snapshots. Production sessions use the new checkpoint
-            # assembler so the stable rules stay byte-for-byte at the front.
-            use_context_service = self.context_manager.max_tokens >= 4_096
-            snapshot_payload = state.get("context_snapshot") or context.get("context_snapshot")
-            snapshot: ContextSnapshot | None = None
-            active_artifact_refs = [dict(item) for item in state.get("context_artifact_refs", [])]
-            if use_context_service:
-                stable_prefix = ContextAssembler.stable_prefix(
-                    system_rules=context["system_prompt"],
-                    workspace_rules=context.get("workspace_rules"),
-                    permission_policy=context.get("permission_policy"),
-                    extra_messages=[{"role": "system", "content": instructions}],
-                )
-                snapshot = (
-                    ContextSnapshot.from_dict(snapshot_payload)
-                    if isinstance(snapshot_payload, Mapping) and snapshot_payload.get("epoch_id")
-                    else None
-                )
-                layout = self.context_assembler.assemble(
-                    stable_prefix=stable_prefix,
-                    snapshot=snapshot,
-                    summary=context.get("summary"),
-                    memories=context.get("memories", []),
-                    task_anchor=context.get("task_anchor"),
-                    task_state=context.get("task_state"),
-                    recent_messages=[
-                        *list(context.get("recent_messages", [])),
-                        *list(context.get("tool_results", [])),
-                    ],
-                    artifact_refs=state.get("context_artifact_refs", []),
-                    cache_key=context.get("prompt_cache_key_seed"),
-                    max_tokens=self.context_assembler.input_budget,
-                )
-                bundle = ContextBundle(
-                    messages=layout.messages,
-                    estimated_tokens=layout.estimated_tokens,
-                    omitted_messages=0,
-                    truncated=layout.truncated,
-                )
-                active_artifact_refs = [ref.to_dict() for ref in layout.artifact_refs]
-            else:
-                bundle = self.context_manager.build(
-                    system_prompt=context["system_prompt"],
-                    agent_instructions=instructions,
-                    workspace_rules=context.get("workspace_rules"),
-                    summary=context.get("summary"),
-                    memories=context.get("memories", []),
-                    recent_messages=context.get("recent_messages", []),
-                    tool_results=context.get("tool_results", []),
-                    task_anchor=context.get("task_anchor"),
-                )
-            # Keep the provider-facing prompt cache prefix stable: all leading
-            # system messages are fixed, while the conversation/checkpoint is
-            # the dynamic suffix.  Small unit-test budgets intentionally stay
-            # on the legacy assembler because no output reserve can fit.
-            prompt_cache_key = str(context.get("prompt_cache_key") or "")
+        def cache_namespace(stable: Sequence[Mapping[str, Any]]) -> str:
+            stable_key = self.context_assembler.assemble(stable_prefix=stable).cache_key
             tool_fingerprint = hashlib.sha256(
                 json.dumps(
                     self.tool_registry.schemas,
@@ -678,132 +661,164 @@ class AgentRuntime:
                     separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest()[:24]
-            stable_messages = stable_prefix if use_context_service else [
-                item for item in bundle.messages if item.get("role") == "system"
-            ]
-            if not prompt_cache_key:
-                cache_layout = self.context_assembler.assemble(
-                    stable_prefix=stable_messages,
-                    recent_messages=[item for item in bundle.messages if item.get("role") != "system"],
-                    max_tokens=max(self.context_manager.max_tokens, 256),
-                    micro_compact=False,
+            return f"{stable_key}:tools-{tool_fingerprint}"
+
+        async def compact_state(
+            state: RunGraphState,
+            *,
+            reason: str,
+            phase: str,
+        ) -> RunGraphState:
+            stable, transcript = split_prompt(state.get("messages", []))
+            if not transcript:
+                return state
+            before_tokens = sum(message_tokens(item) for item in state.get("messages", []))
+            started = await self._publish(
+                state,
+                "context_compaction_started",
+                reason=reason,
+                phase=phase,
+                before_tokens=before_tokens,
+                model="current_session_model",
+            )
+            context = state.get("context") or {}
+            previous_compaction = state.get("compaction_state") or {}
+            active_request = active_request_from(
+                transcript,
+                previous_compaction.get("active_request") or context.get("current_user_message"),
+            )
+            try:
+                result = await self.conversation_compactor.compact(
+                    transcript,
+                    session_id=str(context.get("session_id") or ""),
+                    active_request=active_request,
+                    todo_state=self.tool_registry.runtime_state().get("todo_state", []),
+                    reason=reason,
+                    artifact_refs=state.get("context_artifact_refs", []),
                 )
-                prompt_cache_key = f"{cache_layout.cache_key}:tools-{tool_fingerprint}"
-            elif ":tools-" not in prompt_cache_key:
-                prompt_cache_key = f"{prompt_cache_key}:tools-{tool_fingerprint}"
-            compaction_count = int(state.get("compaction_count", 0) or 0)
-            # Semantic compaction is performed before a provider turn, never
-            # while a tool is executing.  The active conversation model is used
-            # by SemanticCompactor by default; tools are disabled there.
-            if (
-                bundle.estimated_tokens >= self.semantic_compactor.retain_tokens
-                and bundle.estimated_tokens >= self.context_assembler.compaction_threshold
-                and compaction_count < self.config.max_compactions_per_run
-                and len(bundle.messages) > 2
-            ):
-                compaction_started = await self._publish(
+                effective = not result.ineffective and result.removed_message_count > 0
+                compacted_messages = [*stable, *result.messages] if effective else [dict(item) for item in state.get("messages", [])]
+                compaction_state = {
+                    "schema": "claude_compaction_v1",
+                    "summary": result.summary,
+                    "messages": result.messages,
+                    "active_request": active_request,
+                    "todo_state": self.tool_registry.runtime_state().get("todo_state", []),
+                    "transcript_artifact": result.transcript_artifact.to_dict(),
+                    "artifact_refs": [ref.to_dict() for ref in result.artifact_refs],
+                    "base_sequence": int(context.get("context_sequence") or 0),
+                    "source_delta_count": len(state.get("transcript_delta", [])),
+                    "source_sequence": int(context.get("context_sequence") or 0) + len(state.get("transcript_delta", [])),
+                    "removed_message_count": result.removed_message_count,
+                    "before_tokens": result.before_tokens,
+                    "after_tokens": result.after_tokens,
+                    "reason": reason,
+                    "used_model": result.used_model,
+                    "fallback": result.fallback,
+                }
+                updated = {
+                    **state,
+                    "messages": compacted_messages,
+                    "compaction_state": compaction_state if effective else dict(state.get("compaction_state") or {}),
+                    "context_artifact_refs": [ref.to_dict() for ref in result.artifact_refs],
+                    "compaction_count": int(state.get("compaction_count", 0) or 0) + int(effective),
+                }
+                updated["events"] = await self._publish(
+                    {**updated, "events": started},
+                    "context_compaction_finished",
+                    reason=reason,
+                    phase=phase,
+                    before_tokens=result.before_tokens,
+                    after_tokens=result.after_tokens,
+                    used_model=result.used_model,
+                    fallback=result.fallback,
+                    effective=effective,
+                    attempts=len(result.attempts),
+                    compaction_state=updated.get("compaction_state") or {},
+                )
+                return updated
+            except Exception as exc:
+                failed = {**state, "events": started}
+                failed["events"] = await self._publish(
+                    failed,
+                    "context_compaction_failed",
+                    reason=reason,
+                    phase=phase,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                return failed
+
+        async def prepare_node(state: RunGraphState) -> RunGraphState:
+            if state.get("messages"):
+                events = await self._publish(
                     state,
-                    "context_compaction_started",
-                    reason="threshold",
-                    phase="before_model",
-                    before_tokens=bundle.estimated_tokens,
-                    model="current_session_model",
+                    "context_resumed",
+                    estimated_tokens=sum(message_tokens(item) for item in state.get("messages", [])),
                 )
-                try:
-                    semantic_messages = [
-                        item for item in bundle.messages if item.get("role") != "system"
-                    ]
-                    active_summary = (
-                        snapshot.summary
-                        if snapshot is not None
-                        else context.get("summary")
-                    )
-                    active_task_state = (
-                        snapshot.task_state
-                        if snapshot is not None
-                        else context.get("task_state")
-                    )
-                    result = await self.semantic_compactor.compact(
-                        semantic_messages,
-                        session_id=str(context.get("session_id") or ""),
-                        sequence=context_end_sequence(
-                            snapshot,
-                            [
-                                *list(context.get("recent_messages", [])),
-                                *list(context.get("tool_results", [])),
-                            ],
-                        ),
-                        existing_summary=active_summary if isinstance(active_summary, Mapping) else None,
-                        task_state=active_task_state if isinstance(active_task_state, Mapping) else None,
-                        reason="threshold",
-                        artifact_refs=active_artifact_refs,
-                        source_sequence=int(context.get("context_sequence") or 0),
-                        version=int(context.get("context_version") or 0),
-                    )
-                    if result.epoch is not None and not result.ineffective:
-                        snapshot_payload = result.epoch.to_dict()
-                        snapshot = ContextSnapshot.from_epoch(result.epoch)
-                        compacted_layout = self.context_assembler.assemble(
-                            stable_prefix=stable_messages,
-                            snapshot=snapshot,
-                            memories=context.get("memories", []),
-                            task_anchor=context.get("task_anchor"),
-                            max_tokens=self.context_assembler.input_budget,
-                            micro_compact=False,
-                            cache_key=prompt_cache_key,
-                        )
-                        # Keep the concrete bundle type.  ``bundle`` is a
-                        # ContextBundle in both the legacy and checkpoint
-                        # paths; constructing its dynamic runtime type would
-                        # fail exactly when a real semantic compaction fires.
-                        bundle = ContextBundle(
-                            messages=compacted_layout.messages,
-                            estimated_tokens=compacted_layout.estimated_tokens,
-                            omitted_messages=0,
-                            truncated=compacted_layout.truncated,
-                        )
-                        compaction_count += 1
-                        snapshot_payload = result.epoch.to_dict()
-                        active_artifact_refs = [ref.to_dict() for ref in result.artifact_refs]
-                    events = await self._publish(
-                        {**state, "events": compaction_started},
-                        "context_compaction_finished",
-                        reason="threshold",
-                        before_tokens=result.before_tokens,
-                        after_tokens=result.after_tokens,
-                        used_model=result.used_model,
-                        fallback=result.fallback,
-                        effective=not result.ineffective,
-                        attempts=len(result.attempts),
-                        context_snapshot=snapshot_payload,
-                    )
-                except Exception as exc:  # compaction must not destroy a run
-                    events = await self._publish(
-                        {**state, "events": compaction_started},
-                        "context_compaction_failed",
-                        error_type=type(exc).__name__,
-                        error=str(exc),
-                    )
-                    state = {**state, "events": events}
-                else:
-                    state = {**state, "events": events}
+                return {
+                    **state,
+                    "status": "acting",
+                    "events": events,
+                }
+            context = state["context"]
+            repaired_recent, protocol_repair = self.context_manager.repair_provider_messages(
+                context.get("recent_messages", [])
+            )
+            if int(protocol_repair.get("removed_messages") or 0) > 0:
+                context = {**context, "recent_messages": repaired_recent}
+                state = {**state, "context": context}
+                state["events"] = await self._publish(
+                    state,
+                    "context_protocol_repaired",
+                    phase="prepare",
+                    removed_messages=protocol_repair["removed_messages"],
+                    affected_call_ids=protocol_repair["affected_call_ids"],
+                    affected_call_count=len(protocol_repair["affected_call_ids"]),
+                )
+            instructions = context.get("agent_instructions")
+            auto_rule = "根据任务复杂度自行决定是否先在内部规划；简单任务可直接执行。"
+            instructions = f"{instructions}\n{auto_rule}" if instructions else auto_rule
+            skill_catalog = self.tool_registry.skill_catalog_prompt
+            if skill_catalog:
+                instructions = f"{instructions}\n{skill_catalog}"
+            stable_prefix = ContextAssembler.stable_prefix(
+                system_rules=context["system_prompt"],
+                workspace_rules=context.get("workspace_rules"),
+                permission_policy=context.get("permission_policy"),
+                extra_messages=[{"role": "system", "content": instructions}],
+            )
+            transcript = list(context.get("recent_messages", []))
+            layout = self.context_assembler.assemble(
+                stable_prefix=stable_prefix,
+                transcript=transcript,
+            )
+            prompt_cache_key = cache_namespace(stable_prefix)
+            state = {
+                **state,
+                "messages": layout.messages,
+                "prompt_cache_key": prompt_cache_key,
+                "context_artifact_refs": [dict(item) for item in state.get("context_artifact_refs", [])],
+            }
+            if (
+                layout.requires_compaction
+                and int(state.get("compaction_count", 0) or 0) < self.config.max_compactions_per_run
+                and len(transcript) > 2
+            ):
+                state = await compact_state(state, reason="threshold", phase="before_model")
+            estimated_tokens = sum(message_tokens(item) for item in state.get("messages", []))
             events = await self._publish(
                 state,
                 "context_prepared",
-                estimated_tokens=bundle.estimated_tokens,
-                omitted_messages=bundle.omitted_messages,
-                task_anchor_preserved=self.context_manager.has_task_anchor(bundle.messages),
+                estimated_tokens=estimated_tokens,
+                omitted_messages=0,
                 prompt_cache_key=prompt_cache_key,
-                context_epoch=(snapshot_payload or {}).get("epoch_id") if isinstance(snapshot_payload, Mapping) else None,
+                context_protocol="claude_append_only_v1",
             )
             return {
                 **state,
                 "status": "acting",
-                "messages": bundle.messages,
                 "events": events,
-                "context_snapshot": dict(snapshot_payload or {}),
-                "context_artifact_refs": active_artifact_refs,
-                "compaction_count": compaction_count,
                 "prompt_cache_key": prompt_cache_key,
             }
 
@@ -824,6 +839,20 @@ class AgentRuntime:
                 stopped["events"] = await self._publish(stopped, "run_stopped", code=step_decision.code, reason=step_decision.reason)
                 return stopped
 
+            repaired_messages, protocol_repair = self.context_manager.repair_provider_messages(
+                state.get("messages", [])
+            )
+            if int(protocol_repair.get("removed_messages") or 0) > 0:
+                state = {**state, "messages": repaired_messages}
+                state["events"] = await self._publish(
+                    state,
+                    "context_protocol_repaired",
+                    phase="before_model",
+                    removed_messages=protocol_repair["removed_messages"],
+                    affected_call_ids=protocol_repair["affected_call_ids"],
+                    affected_call_count=len(protocol_repair["affected_call_ids"]),
+                )
+
             thought_started_at = self.clock()
             events = await self._publish(
                 state,
@@ -834,115 +863,18 @@ class AgentRuntime:
             )
             state = {**state, "events": events}
 
-            if self.context_manager.max_tokens >= 4_096:
-                runtime_context = state.get("context") or {}
-                stable = render_stable_prefix(runtime_context)
-                raw_snapshot = state.get("context_snapshot") or runtime_context.get("context_snapshot") or {}
-                active_snapshot = (
-                    ContextSnapshot.from_dict(raw_snapshot)
-                    if isinstance(raw_snapshot, Mapping) and raw_snapshot.get("epoch_id")
-                    else None
-                )
-                dynamic_messages = [
-                    dict(item) for item in state.get("messages", [])
-                    if item.get("role") != "system"
-                ]
-                recent_messages = messages_after_snapshot(dynamic_messages, active_snapshot)
-                layout = self.context_assembler.assemble(
-                    stable_prefix=stable,
-                    snapshot=active_snapshot,
-                    summary=runtime_context.get("summary"),
-                    memories=runtime_context.get("memories", []),
-                    task_anchor=runtime_context.get("task_anchor"),
-                    task_state=runtime_context.get("task_state"),
-                    recent_messages=recent_messages,
-                    artifact_refs=state.get("context_artifact_refs", []),
-                    max_tokens=self.context_assembler.input_budget,
-                    micro_compact=True,
-                    cache_key=state.get("prompt_cache_key"),
-                )
-                state = {
-                    **state,
-                    "messages": layout.messages,
-                    "context_artifact_refs": [ref.to_dict() for ref in layout.artifact_refs],
-                }
-                compaction_count = int(state.get("compaction_count", 0) or 0)
-                if (
-                    layout.estimated_tokens >= self.context_assembler.compaction_threshold
-                    and compaction_count < self.config.max_compactions_per_run
-                    and dynamic_messages
-                ):
-                    started = await self._publish(
-                        state,
-                        "context_compaction_started",
-                        reason="threshold",
-                        phase="before_model",
-                        before_tokens=layout.estimated_tokens,
-                        model="current_session_model",
-                    )
-                    try:
-                        result = await self.semantic_compactor.compact(
-                            dynamic_messages,
-                            session_id=str(runtime_context.get("session_id") or ""),
-                            sequence=context_end_sequence(active_snapshot, recent_messages),
-                            existing_summary=(active_snapshot.summary if active_snapshot is not None else None),
-                            task_state=(active_snapshot.task_state if active_snapshot is not None else runtime_context.get("task_state")),
-                            reason="threshold",
-                            artifact_refs=layout.artifact_refs,
-                            source_sequence=int(runtime_context.get("context_sequence") or 0),
-                            version=int(active_snapshot.version if active_snapshot is not None else runtime_context.get("context_version") or 0),
-                        )
-                        if result.epoch is not None and not result.ineffective:
-                            promoted_snapshot = ContextSnapshot.from_epoch(result.epoch)
-                            compacted_layout = self.context_assembler.assemble(
-                                stable_prefix=stable,
-                                snapshot=promoted_snapshot,
-                                memories=runtime_context.get("memories", []),
-                                task_anchor=runtime_context.get("task_anchor"),
-                                recent_messages=[],
-                                max_tokens=self.context_assembler.input_budget,
-                                micro_compact=False,
-                                cache_key=state.get("prompt_cache_key"),
-                            )
-                            state = {
-                                **state,
-                                "messages": compacted_layout.messages,
-                                "context_snapshot": promoted_snapshot.to_dict(),
-                                "context_artifact_refs": [ref.to_dict() for ref in result.artifact_refs],
-                                "compaction_count": compaction_count + 1,
-                            }
-                        state["events"] = await self._publish(
-                            {**state, "events": started},
-                            "context_compaction_finished",
-                            reason="threshold",
-                            phase="before_model",
-                            before_tokens=result.before_tokens,
-                            after_tokens=result.after_tokens,
-                            used_model=result.used_model,
-                            fallback=result.fallback,
-                            effective=not result.ineffective,
-                            attempts=len(result.attempts),
-                            context_snapshot=state.get("context_snapshot") or {},
-                        )
-                    except Exception as exc:  # compaction must not strand the turn
-                        state["events"] = await self._publish(
-                            {**state, "events": started},
-                            "context_compaction_failed",
-                            reason="threshold",
-                            phase="before_model",
-                            error_type=type(exc).__name__,
-                            error=str(exc),
-                        )
-            else:
-                trimmed_messages, omitted = self.context_manager.trim_runtime_messages(state.get("messages", []))
-                if omitted:
-                    state = {**state, "messages": trimmed_messages}
-                    state["events"] = await self._publish(
-                        state,
-                        "context_compacted",
-                        omitted_messages=omitted,
-                        task_anchor_preserved=self.context_manager.has_task_anchor(trimmed_messages),
-                    )
+            current_tokens = sum(message_tokens(item) for item in state.get("messages", []))
+            forced_reason = str(state.get("force_compaction_reason") or "").strip()
+            if forced_reason:
+                state = {**state, "force_compaction_reason": ""}
+                if int(state.get("compaction_count", 0) or 0) < self.config.max_compactions_per_run:
+                    state = await compact_state(state, reason=forced_reason, phase="before_model")
+                current_tokens = sum(message_tokens(item) for item in state.get("messages", []))
+            if (
+                current_tokens >= self.context_assembler.compaction_threshold
+                and int(state.get("compaction_count", 0) or 0) < self.config.max_compactions_per_run
+            ):
+                state = await compact_state(state, reason="threshold", phase="before_model")
 
             async def retry_event(attempt: int, delay: float, kind: APIErrorKind, error: BaseException) -> None:
                 state["events"] = await self._publish(
@@ -955,120 +887,27 @@ class AgentRuntime:
                 )
 
             async def recover_from_context_overflow(current_state: RunGraphState) -> RunGraphState | None:
-                """Compact once after a provider overflow, then rebuild the same turn."""
+                """Perform one full transcript compaction after provider overflow."""
 
-                if self.context_manager.max_tokens < 4_096:
-                    return None
                 if int(current_state.get("context_overflow_retries", 0) or 0) >= 1:
                     return None
-                context = current_state.get("context") or {}
-                raw_snapshot = current_state.get("context_snapshot") or context.get("context_snapshot") or {}
-                snapshot = (
-                    ContextSnapshot.from_dict(raw_snapshot)
-                    if isinstance(raw_snapshot, Mapping) and raw_snapshot.get("epoch_id")
-                    else None
-                )
-                dynamic = [
-                    item for item in current_state.get("messages", [])
-                    if item.get("role") != "system"
-                ]
-                if not dynamic:
+                _, transcript = split_prompt(current_state.get("messages", []))
+                if not transcript:
                     return None
-                started = await self._publish(
+                old_tokens = sum(message_tokens(item) for item in current_state.get("messages", []))
+                compacted = await compact_state(
                     current_state,
-                    "context_compaction_started",
                     reason="provider_context_overflow",
                     phase="after_provider_overflow",
-                    before_tokens=sum(message_tokens(item) for item in current_state.get("messages", [])),
-                    model="current_session_model",
                 )
-                try:
-                    stable = render_stable_prefix(context)
-                    old_tokens = sum(message_tokens(item) for item in current_state.get("messages", []))
-                    # The initial pre-turn semantic pass is the normal path.
-                    # For an actual provider overflow, use a deterministic,
-                    # single-shot emergency view: preserve stable rules and the
-                    # newest complete dynamic item, never replaying a tool call.
-                    # This path is deliberately model-free so a second model
-                    # failure cannot create an overflow/compaction loop.
-                    retained_dynamic = dynamic[-1:]
-                    if retained_dynamic and retained_dynamic[0].get("role") == "tool":
-                        for candidate in reversed(dynamic[:-1]):
-                            if candidate.get("role") == "assistant" and candidate.get("tool_calls"):
-                                retained_dynamic = [candidate, dynamic[-1]]
-                                break
-                    target_budget = max(256, min(self.context_assembler.input_budget, old_tokens // 2 or 256))
-                    layout = self.context_assembler.assemble(
-                        stable_prefix=stable,
-                        snapshot=None,
-                        summary=context.get("summary"),
-                        memories=context.get("memories", []),
-                        task_anchor=context.get("task_anchor"),
-                        task_state=context.get("task_state"),
-                        recent_messages=retained_dynamic,
-                        artifact_refs=current_state.get("context_artifact_refs", []),
-                        max_tokens=target_budget,
-                        micro_compact=True,
-                        cache_key=current_state.get("prompt_cache_key"),
-                    )
-                    if layout.estimated_tokens >= old_tokens:
-                        # A provider may have a smaller hard limit than our
-                        # estimate. Keep only the stable prefix plus a bounded
-                        # final user message, fitting each message explicitly.
-                        minimal: list[dict[str, Any]] = []
-                        emergency_budget = max(64, old_tokens // 2)
-                        remaining = emergency_budget
-                        for item in [*stable[:1], *retained_dynamic[-1:]]:
-                            fitted, _ = self.context_manager._fit_message(item, remaining)
-                            if fitted is None:
-                                continue
-                            minimal.append(fitted)
-                            remaining -= message_tokens(fitted)
-                        if sum(message_tokens(item) for item in minimal) < old_tokens:
-                            layout = PromptLayout(
-                                stable_prefix=[item for item in minimal if item.get("role") == "system"],
-                                dynamic_suffix=[item for item in minimal if item.get("role") != "system"],
-                                cache_key=layout.cache_key,
-                                cache_breakpoints=(sum(1 for item in minimal if item.get("role") == "system"),),
-                                estimated_tokens=sum(message_tokens(item) for item in minimal),
-                                truncated=True,
-                            )
-                    if layout.estimated_tokens >= old_tokens:
-                        return None
-                    finished = await self._publish(
-                        {**current_state, "events": started},
-                        "context_compaction_finished",
-                        reason="provider_context_overflow",
-                        before_tokens=sum(message_tokens(item) for item in current_state.get("messages", [])),
-                        after_tokens=layout.estimated_tokens,
-                        used_model=False,
-                        fallback=True,
-                        effective=True,
-                        attempts=0,
-                        context_snapshot=current_state.get("context_snapshot") or {},
-                        fallback_error="provider_overflow_emergency_trim",
-                    )
-                    return {
-                        **current_state,
-                        "messages": layout.messages,
-                        "context_snapshot": dict(current_state.get("context_snapshot") or {}),
-                        "context_artifact_refs": [ref.to_dict() for ref in layout.artifact_refs],
-                        "events": finished,
-                        "compaction_count": int(current_state.get("compaction_count", 0) or 0) + 1,
-                        "context_overflow_retries": 1,
-                    }
-                except Exception as exc:  # overflow recovery is best effort
-                    failed = await self._publish(
-                        {**current_state, "events": started},
-                        "context_compaction_failed",
-                        reason="provider_context_overflow",
-                        error_type=type(exc).__name__,
-                        error=str(exc),
-                    )
-                    return {**current_state, "events": failed}
+                new_tokens = sum(message_tokens(item) for item in compacted.get("messages", []))
+                if new_tokens >= old_tokens:
+                    return None
+                return {**compacted, "context_overflow_retries": 1}
 
             try:
                 buffered_candidate_deltas: list[str] = []
+                streamed_thought_deltas: list[str] = []
 
                 async def model_attempt() -> Any:
                     buffered_candidate_deltas.clear()
@@ -1083,6 +922,17 @@ class AgentRuntime:
                             step=guard.steps,
                         )
 
+                    async def on_thought_delta(delta: str) -> None:
+                        safe_delta = _safe_thought_text(delta)
+                        if not safe_delta:
+                            return
+                        streamed_thought_deltas.append(safe_delta)
+                        await self._publish_transient(
+                            "thought_delta",
+                            delta=safe_delta,
+                            step=guard.steps,
+                        )
+
                     kwargs = {
                         "messages": state.get("messages", []),
                         "tools": self.tool_registry.schemas,
@@ -1090,6 +940,8 @@ class AgentRuntime:
                     }
                     if self._model_accepts_delta:
                         kwargs["on_delta"] = on_delta
+                    if self._model_accepts_thought_delta:
+                        kwargs["on_thought_delta"] = on_thought_delta
                     if self._model_accepts_prompt_cache_key:
                         kwargs["prompt_cache_key"] = state.get("prompt_cache_key")
                     is_async_call = inspect.iscoroutinefunction(self.model_call)
@@ -1174,6 +1026,15 @@ class AgentRuntime:
                 return failed
 
             state = {**state, "usage": merge_usage(state.get("usage"), turn.usage)}
+            if streamed_thought_deltas:
+                state["events"] = await self._publish(
+                    state,
+                    "thought_summary",
+                    summary=_safe_thought_text("".join(streamed_thought_deltas)),
+                    phase="model",
+                    step=guard.steps,
+                    complete=True,
+                )
             time_decision = self._run_time_decision(active_elapsed_base, active_started_at)
             if time_decision.stop:
                 stopped = self._stop_state(state, time_decision)
@@ -1185,6 +1046,11 @@ class AgentRuntime:
                 )
                 return stopped
             assistant_message: dict[str, Any] = {"role": "assistant", "content": turn.content}
+            if turn.reasoning_content:
+                # DeepSeek reasoning models require their exact prior chain in
+                # every following request. Omitting it makes LiteLLM inject a
+                # blank placeholder and mutates the append-only transcript.
+                assistant_message["reasoning_content"] = turn.reasoning_content
             if turn.tool_calls:
                 assistant_message["tool_calls"] = [
                     {
@@ -1195,6 +1061,16 @@ class AgentRuntime:
                     for call in turn.tool_calls
                 ]
             messages = [*state.get("messages", []), assistant_message]
+            if turn.tool_calls and turn.content.strip():
+                # This is the model's visible pre-tool progress text, not a
+                # provider reasoning field.  Keep it bounded and expose it as
+                # a safe activity summary so it does not become a chat bubble.
+                state["events"] = await self._publish(
+                    {**state, "messages": messages},
+                    "thought_summary",
+                    summary=_safe_event_text(turn.content, 480),
+                    phase="model",
+                )
             if not turn.tool_calls:
                 if self.completion_verifier is not None:
                     attempt = int(state.get("completion_verification_attempts") or 0) + 1
@@ -1244,6 +1120,10 @@ class AgentRuntime:
                         event_type,
                         attempt=attempt,
                         accepted=decision.accepted,
+                        # Keep a short, single-line explanation visible to a
+                        # human reviewer.  Full verifier reports remain in
+                        # the private run snapshot and are never sent to UI.
+                        failure_reason=_safe_event_text(decision.reason) if not decision.accepted else "",
                     )
                     if not decision.accepted:
                         limit = max(1, int(self.config.max_completion_verification_attempts or 1))
@@ -1278,7 +1158,7 @@ class AgentRuntime:
                             "role": "user",
                             "content": (
                                 "[内部验收反馈，不是新的用户请求]\n"
-                                "独立验收器拒绝了上一版候选答复。不要直接重复原答案；请根据以下反馈继续检查、"
+                                "确定性验收拒绝了上一版候选答复。不要直接重复原答案；请根据以下反馈继续检查、"
                                 "补充证据、修复问题后重新提交候选结果。\n"
                                 f"验收反馈：{str(decision.reason or '未达到验收标准')[:8_000]}"
                             ),
@@ -1295,7 +1175,7 @@ class AgentRuntime:
                 }
                 if self.completion_verifier is not None and turn.content:
                     # Candidate text was buffered while the provider streamed.
-                    # Publish it only after both acceptance layers pass.
+                    # Publish it only after deterministic acceptance passes.
                     await self._publish_transient(
                         "assistant_delta",
                         delta=turn.content,
@@ -1336,27 +1216,36 @@ class AgentRuntime:
             parallel_child_waits: list[ToolResult] = []
             turn_delegate_count = 0
             for call in turn.tool_calls:
-                if call.name != "task":
+                if call.name not in {"task", "Agent"}:
                     continue
+                if call.name == "Agent":
+                    task_value = call.arguments.get("prompt")
+                    agent_value = call.arguments.get("subagent_type") or call.arguments.get("name")
+                    tasks_value = None
+                else:
+                    task_value = call.arguments.get("task")
+                    agent_value = call.arguments.get("agent_id")
+                    tasks_value = call.arguments.get("tasks")
                 requests, _, _ = normalize_delegate_requests(
-                    call.arguments.get("task"),
-                    call.arguments.get("agent_id"),
-                    call.arguments.get("tasks"),
+                    task_value,
+                    agent_value,
+                    tasks_value,
                 )
                 turn_delegate_count += len(requests)
             turn_delegate_limit_exceeded = turn_delegate_count > MAX_PARALLEL_DELEGATED_TASKS
-            # A provider may return several independent task calls in one
-            # turn.  Dispatch those calls together; ordinary tools remain in
-            # their existing ordered path because they may depend on one
-            # another's workspace changes.
-            parallel_task_turn = (
-                self.tool_registry.permission_mode != "ask"
-                and len(turn.tool_calls) > 1
-                and all(
-                call.name == "task" for call in turn.tool_calls
-                )
+            # Parallelize only an all-read-only batch, or an all-task batch in
+            # a non-interactive permission mode. Mixed/mutating batches stay
+            # ordered because later calls may depend on earlier side effects.
+            all_task_calls = len(turn.tool_calls) > 1 and all(
+                call.name in {"task", "Agent"} for call in turn.tool_calls
             )
-            if parallel_task_turn:
+            parallel_tool_turn = (
+                self.tool_registry.can_execute_batch_in_parallel(
+                    call.name for call in turn.tool_calls
+                )
+                or (self.tool_registry.permission_mode != "ask" and all_task_calls)
+            )
+            if parallel_tool_turn:
                 for call in turn.tool_calls:
                     time_decision = self._run_time_decision(active_elapsed_base, active_started_at)
                     if time_decision.stop:
@@ -1393,7 +1282,7 @@ class AgentRuntime:
                 if turn_delegate_limit_exceeded:
                     parallel_results = [
                         ToolResult(
-                            "task",
+                            _call.name,
                             False,
                             f"同一轮最多并行委派 {MAX_PARALLEL_DELEGATED_TASKS} 个子 Agent 任务",
                             error_code="delegate_parallel_limit",
@@ -1415,12 +1304,12 @@ class AgentRuntime:
                     )
                     parallel_results = [
                         result if isinstance(result, ToolResult) else ToolResult(
-                        "task",
-                        False,
-                        f"工具执行失败: {type(result).__name__}",
-                        error_code="tool_error",
+                            call.name,
+                            False,
+                            f"工具执行失败: {type(result).__name__}",
+                            error_code="tool_error",
                         )
-                        for result in raw_parallel_results
+                        for call, result in zip(turn.tool_calls, raw_parallel_results, strict=True)
                     ]
             for call_index, call in enumerate(turn.tool_calls):
                 if parallel_results is None:
@@ -1453,9 +1342,9 @@ class AgentRuntime:
 
                     # Approval is never inferred from a model-controlled call id. The
                     # only grant path is resume_after_approval's persisted exact call.
-                    if call.name == "task" and turn_delegate_limit_exceeded:
+                    if call.name in {"task", "Agent"} and turn_delegate_limit_exceeded:
                         result = ToolResult(
-                            "task",
+                            call.name,
                             False,
                             f"同一轮最多并行委派 {MAX_PARALLEL_DELEGATED_TASKS} 个子 Agent 任务",
                             error_code="delegate_parallel_limit",
@@ -1520,19 +1409,23 @@ class AgentRuntime:
                         return stopped
                     return waiting
 
-                result_dict = result.to_dict()
-                tool_message = {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "name": call.name,
-                    "content": json.dumps(result_dict, ensure_ascii=False),
-                }
+                tool_message, artifact_refs = self._prepare_tool_result_message(
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    result=result,
+                    artifact_refs=state.get("context_artifact_refs", []),
+                )
                 messages.append(tool_message)
                 state = {
                     **state,
                     "transcript_delta": [*state.get("transcript_delta", []), dict(tool_message)],
                     "verification_trace": [*state.get("verification_trace", []), dict(tool_message)],
+                    "context_artifact_refs": artifact_refs,
                 }
+                if result.metadata.get("force_compaction"):
+                    state["force_compaction_reason"] = str(
+                        result.metadata.get("reason") or "model_requested"
+                    )
                 fingerprint = self._observation_fingerprint(call.name, result.content)
                 observation_is_new = fingerprint not in seen_set
                 if observation_is_new:
@@ -1662,6 +1555,14 @@ class AgentRuntime:
         )
         initial: RunGraphState = {
             "status": "received",
+            # Explicitly reset per-turn ephemeral fields when LangGraph
+            # resumes the same thread.  A previous approval checkpoint must
+            # not leak its pending call/error into the newly approved turn.
+            "output": None,
+            "error": None,
+            "stop_reason": None,
+            "pending_approval": None,
+            "current_made_progress": False,
             "mode": mode,
             "messages": [dict(item) for item in (prepared_messages or [])],
             "events": [dict(item) for item in prior_events] if prior_events is not None else [{"type": "run_received", "mode": mode}],
@@ -1671,20 +1572,13 @@ class AgentRuntime:
                 "system_prompt": system_prompt,
                 "agent_instructions": agent_instructions,
                 "workspace_rules": workspace_rules,
-                "summary": summary,
-                "memories": list(memories),
                 "recent_messages": [dict(item) for item in recent_messages],
-                "tool_results": [dict(item) for item in tool_results],
-                "task_anchor": task_anchor or self.context_manager.task_from_messages(recent_messages),
-                "context_snapshot": dict(context_snapshot or {}),
+                "compaction_state": dict(compaction_state or {}),
                 "permission_policy": permission_policy,
-                "task_state": dict(task_state or {}),
                 "session_id": session_id,
                 "context_sequence": max(0, int(context_sequence or 0)),
-                "context_version": max(0, int(context_version or 0)),
-                "prompt_cache_key_seed": prompt_cache_key_seed,
             },
-            "context_snapshot": dict(context_snapshot or {}),
+            "compaction_state": dict(compaction_state or {}),
             "context_artifact_refs": [dict(item) for item in artifact_refs],
             "transcript_delta": [dict(item) for item in transcript_delta],
             "verification_trace": [dict(item) for item in prior_verification_trace],
@@ -1711,7 +1605,7 @@ class AgentRuntime:
             guard_snapshot=guard.snapshot(),
             usage=normalize_usage(final.get("usage")),
             active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-            context_snapshot=dict(final.get("context_snapshot") or {}),
+            compaction_state=dict(final.get("compaction_state") or {}),
             artifact_refs=[dict(item) for item in final.get("context_artifact_refs", [])],
             transcript_delta=[dict(item) for item in final.get("transcript_delta", [])],
             verification_trace=[dict(item) for item in final.get("verification_trace", [])],
@@ -1740,6 +1634,7 @@ class AgentRuntime:
         pending = prior.pending_approval
         resume_transcript_delta: list[dict[str, Any]] = []
         resume_verification_trace = [dict(item) for item in prior.verification_trace]
+        resume_artifact_refs = [dict(item) for item in prior.artifact_refs]
         call_id = str(pending.get("id", ""))
         tool_name = str(pending.get("tool_name", ""))
         arguments = dict(pending.get("arguments") or {})
@@ -1783,8 +1678,8 @@ class AgentRuntime:
                 guard_snapshot=restored.snapshot(),
                 usage=normalize_usage(prior.usage),
                 active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-                context_snapshot=dict(prior.context_snapshot),
-                artifact_refs=[dict(item) for item in prior.artifact_refs],
+                compaction_state=dict(prior.compaction_state),
+                artifact_refs=[dict(item) for item in resume_artifact_refs],
                 transcript_delta=[dict(item) for item in resume_transcript_delta],
                 verification_trace=[dict(item) for item in resume_verification_trace],
                 acceptance_report=dict(prior.acceptance_report),
@@ -1822,12 +1717,12 @@ class AgentRuntime:
             approved=True,
             call_id=call_id,
         )
-        approved_tool_message = {
-            "role": "tool",
-            "tool_call_id": call_id,
-            "name": tool_name,
-            "content": json.dumps(result.to_dict(), ensure_ascii=False),
-        }
+        approved_tool_message, resume_artifact_refs = self._prepare_tool_result_message(
+            tool_call_id=call_id,
+            tool_name=tool_name,
+            result=result,
+            artifact_refs=resume_artifact_refs,
+        )
         messages = [*prior.messages, approved_tool_message]
         resume_transcript_delta.append(dict(approved_tool_message))
         resume_verification_trace.append(dict(approved_tool_message))
@@ -1868,8 +1763,8 @@ class AgentRuntime:
                 guard_snapshot=restored.snapshot(),
                 usage=normalize_usage(prior.usage),
                 active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-                context_snapshot=dict(prior.context_snapshot),
-                artifact_refs=[dict(item) for item in prior.artifact_refs],
+                compaction_state=dict(prior.compaction_state),
+                artifact_refs=[dict(item) for item in resume_artifact_refs],
                 transcript_delta=[dict(item) for item in resume_transcript_delta],
                 verification_trace=[dict(item) for item in resume_verification_trace],
                 acceptance_report=dict(prior.acceptance_report),
@@ -1920,8 +1815,8 @@ class AgentRuntime:
                     guard_snapshot=restored.snapshot(),
                     usage=normalize_usage(prior.usage),
                     active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-                    context_snapshot=dict(prior.context_snapshot),
-                    artifact_refs=[dict(item) for item in prior.artifact_refs],
+                    compaction_state=dict(prior.compaction_state),
+                    artifact_refs=[dict(item) for item in resume_artifact_refs],
                     transcript_delta=[dict(item) for item in resume_transcript_delta],
                     verification_trace=[dict(item) for item in resume_verification_trace],
                     acceptance_report=dict(prior.acceptance_report),
@@ -1988,20 +1883,20 @@ class AgentRuntime:
                     guard_snapshot=restored.snapshot(),
                     usage=normalize_usage(prior.usage),
                     active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-                    context_snapshot=dict(prior.context_snapshot),
-                    artifact_refs=[dict(item) for item in prior.artifact_refs],
+                    compaction_state=dict(prior.compaction_state),
+                    artifact_refs=[dict(item) for item in resume_artifact_refs],
                     transcript_delta=[dict(item) for item in resume_transcript_delta],
                     verification_trace=[dict(item) for item in resume_verification_trace],
                     acceptance_report=dict(prior.acceptance_report),
                     completion_verification_attempts=prior.completion_verification_attempts,
                 )
 
-            remaining_tool_message = {
-                "role": "tool",
-                "tool_call_id": call.id,
-                "name": call.name,
-                "content": json.dumps(remaining_result.to_dict(), ensure_ascii=False),
-            }
+            remaining_tool_message, resume_artifact_refs = self._prepare_tool_result_message(
+                tool_call_id=call.id,
+                tool_name=call.name,
+                result=remaining_result,
+                artifact_refs=resume_artifact_refs,
+            )
             messages.append(remaining_tool_message)
             resume_transcript_delta.append(dict(remaining_tool_message))
             resume_verification_trace.append(dict(remaining_tool_message))
@@ -2049,8 +1944,8 @@ class AgentRuntime:
                     guard_snapshot=restored.snapshot(),
                     usage=normalize_usage(prior.usage),
                     active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-                    context_snapshot=dict(prior.context_snapshot),
-                    artifact_refs=[dict(item) for item in prior.artifact_refs],
+                    compaction_state=dict(prior.compaction_state),
+                    artifact_refs=[dict(item) for item in resume_artifact_refs],
                     transcript_delta=[dict(item) for item in resume_transcript_delta],
                     verification_trace=[dict(item) for item in resume_verification_trace],
                     acceptance_report=dict(prior.acceptance_report),
@@ -2087,8 +1982,8 @@ class AgentRuntime:
                     guard_snapshot=restored.snapshot(),
                     usage=normalize_usage(prior.usage),
                     active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-                    context_snapshot=dict(prior.context_snapshot),
-                    artifact_refs=[dict(item) for item in prior.artifact_refs],
+                    compaction_state=dict(prior.compaction_state),
+                    artifact_refs=[dict(item) for item in resume_artifact_refs],
                     transcript_delta=[dict(item) for item in resume_transcript_delta],
                     verification_trace=[dict(item) for item in resume_verification_trace],
                     acceptance_report=dict(prior.acceptance_report),
@@ -2119,8 +2014,8 @@ class AgentRuntime:
                 guard_snapshot=restored.snapshot(),
                 usage=normalize_usage(prior.usage),
                 active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-                context_snapshot=dict(prior.context_snapshot),
-                artifact_refs=[dict(item) for item in prior.artifact_refs],
+                compaction_state=dict(prior.compaction_state),
+                artifact_refs=[dict(item) for item in resume_artifact_refs],
                 transcript_delta=[dict(item) for item in resume_transcript_delta],
                 verification_trace=[dict(item) for item in resume_verification_trace],
                 acceptance_report=dict(prior.acceptance_report),
@@ -2131,8 +2026,6 @@ class AgentRuntime:
             system_prompt=str(resumed_context.get("system_prompt") or ""),
             agent_instructions=resumed_context.get("agent_instructions"),
             workspace_rules=resumed_context.get("workspace_rules"),
-            summary=resumed_context.get("summary"),
-            memories=resumed_context.get("memories", []),
             recent_messages=[],
             mode=prior.mode,
             thread_id=thread_id,
@@ -2142,28 +2035,21 @@ class AgentRuntime:
             prior_usage=prior.usage,
             prior_seen_observations=seen,
             prior_active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-            context_snapshot=prior.context_snapshot,
+            compaction_state=prior.compaction_state,
             permission_policy=resumed_context.get("permission_policy"),
-            task_state=resumed_context.get("task_state"),
             session_id=resumed_context.get("session_id"),
             context_sequence=int(resumed_context.get("context_sequence") or 0),
-            context_version=int(resumed_context.get("context_version") or 0),
-            prompt_cache_key_seed=resumed_context.get("prompt_cache_key_seed"),
-            artifact_refs=prior.artifact_refs,
+            artifact_refs=resume_artifact_refs,
             transcript_delta=resume_transcript_delta,
             prior_verification_trace=resume_verification_trace,
             prior_completion_verification_attempts=prior.completion_verification_attempts,
             prior_acceptance_report=prior.acceptance_report,
-            task_anchor=(
-                str(resumed_context.get("task_anchor") or "").strip()
-                or self.context_manager.task_from_messages(prior.messages)
-            ),
         )
 
     @staticmethod
     def _delegated_task_calls_from_messages(
         messages: Sequence[Mapping[str, Any]],
-    ) -> list[tuple[int, str, dict[str, Any]]]:
+    ) -> list[tuple[int, str, str, dict[str, Any]]]:
         """Locate every parent ``task`` call still paused for a child.
 
         All parallel sibling results are persisted before a parent pauses.
@@ -2173,10 +2059,11 @@ class AgentRuntime:
         different task from a later model turn.
         """
 
-        paused: list[tuple[int, str, dict[str, Any]]] = []
+        paused: list[tuple[int, str, str, dict[str, Any]]] = []
         for tool_index, tool_message in enumerate(messages):
             tool_message = messages[tool_index]
-            if tool_message.get("role") != "tool" or tool_message.get("name") != "task":
+            tool_name = str(tool_message.get("name") or "")
+            if tool_message.get("role") != "tool" or tool_name not in {"task", "Agent"}:
                 continue
             try:
                 tool_payload = json.loads(str(tool_message.get("content") or "{}"))
@@ -2198,7 +2085,7 @@ class AgentRuntime:
                     function = raw_call.get("function")
                     if not isinstance(function, Mapping):
                         continue
-                    if str(raw_call.get("id") or "") != call_id or function.get("name") != "task":
+                    if str(raw_call.get("id") or "") != call_id or function.get("name") != tool_name:
                         continue
                     raw_arguments = function.get("arguments") or {}
                     if isinstance(raw_arguments, str):
@@ -2208,7 +2095,7 @@ class AgentRuntime:
                             raise ValueError("delegated task arguments are not valid JSON") from exc
                     if not isinstance(raw_arguments, Mapping):
                         raise ValueError("delegated task arguments must be an object")
-                    paused.append((tool_index, call_id, dict(raw_arguments)))
+                    paused.append((tool_index, call_id, tool_name, dict(raw_arguments)))
                     break
                 else:
                     continue
@@ -2280,7 +2167,7 @@ class AgentRuntime:
                 guard_snapshot=restored.snapshot(),
                 usage=normalize_usage(prior.usage),
                 active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-                context_snapshot=dict(prior.context_snapshot),
+                compaction_state=dict(prior.compaction_state),
                 artifact_refs=[dict(item) for item in prior.artifact_refs],
                 transcript_delta=prior.transcript_delta,
                 verification_trace=[dict(item) for item in prior.verification_trace],
@@ -2292,12 +2179,13 @@ class AgentRuntime:
         events = list(prior.events)
         delegated_transcript_delta: list[dict[str, Any]] = []
         delegated_verification_trace = [dict(item) for item in prior.verification_trace]
+        delegated_artifact_refs = [dict(item) for item in prior.artifact_refs]
         still_waiting: list[dict[str, str]] = []
-        for tool_index, call_id, arguments in paused_calls:
+        for _tool_index, call_id, tool_name, arguments in paused_calls:
             events = await self._publish(
                 {"events": events},
                 "delegated_child_continuation_started",
-                tool_name="task",
+                tool_name=tool_name,
                 tool_call_id=call_id,
                 elapsed_ms=elapsed_ms(),
             )
@@ -2306,7 +2194,7 @@ class AgentRuntime:
             # exact task already passed parent approval, and the idempotent
             # delegate returns the persisted child state for this call id.
             result = await self.tool_registry.execute_async(
-                "task",
+                tool_name,
                 arguments,
                 approved=True,
                 call_id=call_id,
@@ -2314,7 +2202,7 @@ class AgentRuntime:
             events = await self._publish(
                 {"events": events},
                 "tool_finished",
-                tool_name="task",
+                tool_name=tool_name,
                 tool_call_id=call_id,
                 ok=result.ok,
                 changed=result.changed,
@@ -2323,25 +2211,29 @@ class AgentRuntime:
                 duration_ms=round((self.clock() - tool_started_at) * 1000),
                 elapsed_ms=elapsed_ms(),
             )
-            terminal_tool_message = {
-                "role": "tool",
-                "tool_call_id": call_id,
-                "name": "task",
-                "content": json.dumps(result.to_dict(), ensure_ascii=False),
+            prepared = self.context_assembler.tool_output_budgeter.prepare(
+                tool_call_id=call_id,
+                tool_name=tool_name,
+                output=json.dumps(result.to_dict(), ensure_ascii=False),
+            )
+            if prepared.artifact_ref is not None:
+                delegated_artifact_refs.append(prepared.artifact_ref.to_dict())
+            # The earlier assistant/tool pair was already provider-visible.
+            # Never replace that cached result or append a duplicate result for
+            # the same call id. A normal user-role observation carries the
+            # terminal child update while preserving the entire old prefix.
+            terminal_update = {
+                "role": "user",
+                "content": (
+                    "<delegated-task-update>\n"
+                    f"tool_call_id: {call_id}\n"
+                    f"{prepared.content}\n"
+                    "</delegated-task-update>"
+                ),
             }
-            messages[tool_index] = terminal_tool_message
-            delegated_transcript_delta.append(dict(terminal_tool_message))
-            replaced_trace_result = False
-            for trace_index, trace_message in enumerate(delegated_verification_trace):
-                if (
-                    trace_message.get("role") == "tool"
-                    and str(trace_message.get("tool_call_id") or "") == call_id
-                ):
-                    delegated_verification_trace[trace_index] = dict(terminal_tool_message)
-                    replaced_trace_result = True
-                    break
-            if not replaced_trace_result:
-                delegated_verification_trace.append(dict(terminal_tool_message))
+            messages.append(terminal_update)
+            delegated_transcript_delta.append(dict(terminal_update))
+            delegated_verification_trace.append(dict(terminal_update))
             if result.metadata.get("delegated_child_awaiting_approval"):
                 still_waiting.append({
                     "child_run_id": str(result.metadata.get("child_run_id") or ""),
@@ -2372,8 +2264,8 @@ class AgentRuntime:
                 guard_snapshot=restored.snapshot(),
                 usage=normalize_usage(prior.usage),
                 active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-                context_snapshot=dict(prior.context_snapshot),
-                artifact_refs=[dict(item) for item in prior.artifact_refs],
+                compaction_state=dict(prior.compaction_state),
+                artifact_refs=[dict(item) for item in delegated_artifact_refs],
                 transcript_delta=delegated_transcript_delta,
                 verification_trace=delegated_verification_trace,
                 acceptance_report=dict(prior.acceptance_report),
@@ -2384,8 +2276,6 @@ class AgentRuntime:
             system_prompt=str(resumed_context.get("system_prompt") or ""),
             agent_instructions=resumed_context.get("agent_instructions"),
             workspace_rules=resumed_context.get("workspace_rules"),
-            summary=resumed_context.get("summary"),
-            memories=resumed_context.get("memories", []),
             recent_messages=[],
             mode=prior.mode,
             thread_id=thread_id,
@@ -2394,20 +2284,13 @@ class AgentRuntime:
             guard_snapshot=restored.snapshot(),
             prior_usage=prior.usage,
             prior_active_elapsed_seconds=self._active_elapsed(active_elapsed_base, active_started_at),
-            context_snapshot=prior.context_snapshot,
+            compaction_state=prior.compaction_state,
             permission_policy=resumed_context.get("permission_policy"),
-            task_state=resumed_context.get("task_state"),
             session_id=resumed_context.get("session_id"),
             context_sequence=int(resumed_context.get("context_sequence") or 0),
-            context_version=int(resumed_context.get("context_version") or 0),
-            prompt_cache_key_seed=resumed_context.get("prompt_cache_key_seed"),
-            artifact_refs=prior.artifact_refs,
+            artifact_refs=delegated_artifact_refs,
             transcript_delta=delegated_transcript_delta,
             prior_verification_trace=delegated_verification_trace,
             prior_completion_verification_attempts=prior.completion_verification_attempts,
             prior_acceptance_report=prior.acceptance_report,
-            task_anchor=(
-                str(resumed_context.get("task_anchor") or "").strip()
-                or self.context_manager.task_from_messages(prior.messages)
-            ),
         )

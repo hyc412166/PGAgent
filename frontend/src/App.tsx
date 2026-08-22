@@ -2,6 +2,7 @@ import {
   Activity,
   AlertCircle,
   ArrowRight,
+  ArrowUp,
   Bot,
   BookOpen,
   CalendarDays,
@@ -29,12 +30,13 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Send,
   Settings2,
   ShieldCheck,
+  Square,
   Sparkles,
   SquareTerminal,
   Trash2,
+  Type,
   Upload,
   Wrench,
   Workflow,
@@ -48,11 +50,12 @@ import { ApiError, api, apiUrl, describeError } from './api'
 import { permissionLabel, permissionOptions, toggleSelectedId } from './capabilitySelection'
 import { modelSelectionPayload, resolveEffectiveThinking, shortModelLabel, thinkingLevelLabels } from './composerSettings'
 import { fallbackMarketCategories, leaderboardRefreshDelayMs, marketCategoryDefinitions, normalizeMarketCategories } from './skillMarketCategories'
-import { buildDraftLaunchPayload, createDraftIdempotencyKey } from './draftLaunch'
+import { buildDraftLaunchPayload, createDraftIdempotencyKey, createTurnIdempotencyKey } from './draftLaunch'
 import { availableConnectionModels, resolveEffectiveModelSettings } from './modelSettings'
 import { buildSessionNavigation, folderName, isDefaultWorkspace, projectRootForSession } from './sessionNavigation'
-import { appendAssistantDelta, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldRefreshConversationAfterApprovalDecision, visibleSessionItems, type RunStreamEvent } from './sessionStream'
+import { appendAssistantDelta, hasPersistedRunReply, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems, type RunStreamEvent } from './sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, pickThinkingStatus, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline, type ThoughtTimelineState } from './thoughtTimeline'
+import { ThoughtHydrationRegistry, type ThoughtHydrationToken } from './thoughtHydration'
 import { usageDateKey, usageDateOptions, usageDatePresetBounds, usageDateRange, usageRangeLabel, type QuickUsageDatePreset, type UsageDatePreset } from './usageDateRange'
 import { agentTemplates, type AgentTemplate } from './features/agents/templates'
 import { CapabilityMultiSelect, ContextUsageRing, EmptyState, ErrorState, Field, LoadingState, PageHeader, SlidePanel, StatusBadge } from './components/ui'
@@ -102,9 +105,9 @@ type OwnedSessionDelegations = { ownerSessionId: string; items: DelegatedTask[] 
 type ProjectHoverCard = { id: string; name: string; path: string; conversationCount: number; left: number; top: number }
 type DraftSessionSettings = { model_connection_id: string | null; model_id: string | null; thinking_level: ThinkingLevel; skill_ids: string[]; permission_mode: PermissionMode }
 type DraftLaunchResponse = { session: Session; run: Run; workspace?: Workspace }
-type ComposerTextAreaHandle = { getValue: () => string; clear: () => void }
+type ComposerTextAreaHandle = { getValue: () => string; clear: () => void; setValue: (value: string) => void; focus: () => void }
 
-const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'auto', skill_ids: [], permission_mode: 'smart' }
+const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'medium', skill_ids: [], permission_mode: 'smart' }
 const emptyDraftContext: SessionContext = { used_tokens: 0, limit_tokens: 100_000, compact_threshold_tokens: 90_000, percent: 0 }
 const noDelegatedTasks: DelegatedTask[] = []
 
@@ -118,8 +121,16 @@ const runStreamEventNames = [
   'context_prepared',
   'context_resumed',
   'context_compacted',
+  'context_compaction_started',
+  'context_compaction_finished',
+  'context_compaction_failed',
   'model_step_started',
   'model_retry',
+  'progress',
+  'agent_progress',
+  'thought_summary',
+  'thought_delta',
+  'activity_update',
   'assistant_delta',
   'tool_started',
   'tool_call',
@@ -137,6 +148,7 @@ const runStreamEventNames = [
   'delegated_child_stopped',
   'delegated_child_failed',
   'run_completed',
+  'run_interrupted',
   'run_stopped',
   'model_failed',
   'integration_failed',
@@ -146,6 +158,7 @@ const activeRunStatuses = new Set(['received', 'running', 'preparing_context', '
 
 const ComposerTextArea = forwardRef<ComposerTextAreaHandle, { disabled: boolean; resetKey: string; placeholder: string; onHasValueChange: (hasValue: boolean) => void }>(function ComposerTextArea({ disabled, resetKey, placeholder, onHasValueChange }, ref) {
   const [value, setValue] = useState('')
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
   const hasValueRef = useRef(false)
   const updateValue = useCallback((nextValue: string) => {
     setValue(nextValue)
@@ -155,7 +168,7 @@ const ComposerTextArea = forwardRef<ComposerTextAreaHandle, { disabled: boolean;
       onHasValueChange(nextHasValue)
     }
   }, [onHasValueChange])
-  useImperativeHandle(ref, () => ({ getValue: () => value, clear: () => updateValue('') }), [value, updateValue])
+  useImperativeHandle(ref, () => ({ getValue: () => value, clear: () => updateValue(''), setValue: updateValue, focus: () => textareaRef.current?.focus() }), [value, updateValue])
   useEffect(() => {
     setValue('')
     if (hasValueRef.current) {
@@ -163,7 +176,7 @@ const ComposerTextArea = forwardRef<ComposerTextAreaHandle, { disabled: boolean;
       onHasValueChange(false)
     }
   }, [resetKey, onHasValueChange])
-  return <textarea aria-label="给 Agent 发送消息" value={value} disabled={disabled} onChange={(event) => updateValue(event.target.value)} placeholder={placeholder} rows={2} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} />
+  return <textarea ref={textareaRef} aria-label="给 Agent 发送消息" value={value} disabled={disabled} onChange={(event) => updateValue(event.target.value)} placeholder={placeholder} rows={2} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} />
 })
 
 function useApiData<T>(initial: T, loader: () => Promise<T>, deps: readonly unknown[] = []) {
@@ -171,6 +184,12 @@ function useApiData<T>(initial: T, loader: () => Promise<T>, deps: readonly unkn
   const requestId = useRef(0)
   const hasLoaded = useRef(false)
   const isInitialLoad = !hasLoaded.current
+  const setExternalState = useCallback((next: LoadState<T>) => {
+    // Manual event-driven updates (for example an approval SSE) invalidate
+    // older loader responses so a slower request cannot roll the UI back.
+    requestId.current += 1
+    setState(next)
+  }, [])
 
   const reload = useCallback(async () => {
     const currentRequest = ++requestId.current
@@ -210,7 +229,7 @@ function useApiData<T>(initial: T, loader: () => Promise<T>, deps: readonly unkn
     return () => { requestId.current += 1 }
   }, [reload])
 
-  return { ...state, initialLoading: state.loading && isInitialLoad, refreshing: state.loading && !isInitialLoad, reload, refresh, setState }
+  return { ...state, initialLoading: state.loading && isInitialLoad, refreshing: state.loading && !isInitialLoad, reload, refresh, setState: setExternalState }
 }
 
 function formatDate(value?: string) {
@@ -237,7 +256,22 @@ const navigation = [
   { path: '/runs', label: '运行记录', icon: History },
   { path: '/usage', label: '用量统计', icon: ChartNoAxesCombined },
   { path: '/settings/models', label: '模型设置', icon: Settings2 },
+  { path: '/settings/appearance', label: '界面设置', icon: Type },
 ]
+
+const fontScaleMin = 0.85
+const fontScaleMax = 1.25
+
+function loadFontScale() {
+  try {
+    const stored = window.localStorage.getItem('pgagent-font-scale')
+    if (stored === null) return 1
+    const saved = Number(stored)
+    return Number.isFinite(saved) ? Math.min(fontScaleMax, Math.max(fontScaleMin, saved)) : 1
+  } catch {
+    return 1
+  }
+}
 
 function AppShell() {
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -249,6 +283,7 @@ function AppShell() {
       return 'light'
     }
   })
+  const [fontScale, setFontScale] = useState(loadFontScale)
   const location = useLocation()
   const health = useApiData<Health | null>(null, () => api.get<Health>('/api/health'), [])
 
@@ -258,6 +293,10 @@ function AppShell() {
     document.documentElement.dataset.theme = theme
     try { window.localStorage.setItem('pgagent-theme', theme) } catch { /* local storage is optional */ }
   }, [theme])
+  useLayoutEffect(() => {
+    document.documentElement.style.fontSize = `${16 * fontScale}px`
+    try { window.localStorage.setItem('pgagent-font-scale', String(fontScale)) } catch { /* local storage is optional */ }
+  }, [fontScale])
 
   return (
     <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''} theme-${theme}`}>
@@ -311,6 +350,7 @@ function AppShell() {
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/usage" element={<UsagePage />} />
           <Route path="/settings/models" element={<ModelsPage />} />
+          <Route path="/settings/appearance" element={<AppearanceSettingsPage fontScale={fontScale} onFontScaleChange={setFontScale} />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
       </main>
@@ -731,6 +771,9 @@ function SessionsPage() {
   const [activeId, setActiveId] = useState('')
   const [composerHasValue, setComposerHasValue] = useState(false)
   const [sending, setSending] = useState(false)
+  const [stoppingRunId, setStoppingRunId] = useState('')
+  const [deletingSessionId, setDeletingSessionId] = useState('')
+  const [interruptedRunId, setInterruptedRunId] = useState('')
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false)
   const [settingsSubmenu, setSettingsSubmenu] = useState<'model' | 'thinking' | null>(null)
@@ -757,6 +800,7 @@ function SessionsPage() {
   const [completedThoughtsByRun, setCompletedThoughtsByRun] = useState<Record<string, ThoughtTimelineState>>({})
   const [childPanelOpen, setChildPanelOpen] = useState(false)
   const [selectedChildTaskId, setSelectedChildTaskId] = useState('')
+  const childPanelAutoOpenedRef = useRef(false)
   const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRun)
   const eventSourceRef = useRef<EventSource | null>(null)
   const fallbackTimerRef = useRef<number | null>(null)
@@ -764,7 +808,6 @@ function SessionsPage() {
   const streamErrorCountRef = useRef(0)
   const streamRunIdRef = useRef('')
   const seenStreamEventsRef = useRef<{ runId: string; eventIds: Set<string> }>({ runId: '', eventIds: new Set() })
-  const runStartMessageCountRef = useRef(0)
   const messagesRef = useRef<HTMLDivElement>(null)
   const composerInputRef = useRef<ComposerTextAreaHandle>(null)
   const activeIdRef = useRef('')
@@ -773,9 +816,11 @@ function SessionsPage() {
   const terminalSyncVersionRef = useRef(0)
   const pendingDraftRunRef = useRef<{ sessionId: string; runId: string } | null>(null)
   const draftIdempotencyKeyRef = useRef('')
+  const pendingSessionSendRef = useRef<{ sessionId: string; content: string; key: string } | null>(null)
   const draftVersionRef = useRef(0)
   const sendingRef = useRef(false)
-  const loadedThoughtRunIdsRef = useRef(new Set<string>())
+  const lastSubmittedContentRef = useRef('')
+  const thoughtHydrationRegistryRef = useRef(new ThoughtHydrationRegistry())
   const [historyHydration, setHistoryHydration] = useState({ sessionId: '', complete: false })
   const [historyOpenVersion, setHistoryOpenVersion] = useState(0)
   activeIdRef.current = activeId
@@ -874,12 +919,64 @@ function SessionsPage() {
     ?? sessionRuns.find((item) => activeRunStatuses.has(item.status || ''))
     ?? sessionRuns[0]
   const activeRunId = activeRun?.id || ''
+  // `sending` only covers the initial launch request. Once the request has
+  // returned, the run is still active while its SSE stream/fallback polling
+  // is working. Keep the composer action bound to that run so users can
+  // interrupt the model at any point instead of seeing a disabled send icon.
+  const liveRunIsActive = Boolean(
+    liveRun.runId
+      && (
+        ['connecting', 'live', 'fallback', 'awaiting_approval'].includes(liveRun.status)
+        || (
+          sessionRuns.some((item) => item.id === liveRun.runId
+            && item.status === 'stopped'
+            && item.stop_reason === 'delegated_child_awaiting_approval')
+        )
+      ),
+  )
+  const activeRunIsInterruptible = Boolean(
+    liveRun.status !== 'terminal'
+      && activeRunId
+      && activeRunStatuses.has(activeRun?.status || ''),
+  )
+  const interruptibleRunId = liveRunIsActive ? liveRun.runId : activeRunIsInterruptible ? activeRunId : ''
+  const canInterrupt = Boolean(interruptibleRunId)
+  const canEditInterrupted = Boolean(
+    interruptedRunId
+      && liveRun.runId === interruptedRunId
+      && liveRun.status === 'terminal'
+      && lastSubmittedContentRef.current.trim(),
+  )
   // Legacy versions wrote raw child responses into the chat transcript. Hide
   // those rows too; the source of truth is now the child side panel.
   const visibleMessages = visibleSessionItems(messages.data.ownerSessionId, activeId, messages.data.items)
     .filter((message) => message.metadata?.delegated_child !== true)
+    // Runtime tool turns and delegated terminal observations are durable
+    // provider/checkpoint transcript, not user-facing chat bubbles.  They are
+    // rendered through the activity timeline and child-agent side panel.
+    .filter((message) => message.role !== 'tool')
+    .filter((message) => message.metadata?.runtime_run_id == null)
+    .filter((message) => message.metadata?.delegated_result_revision !== true)
+    .filter((message) => !(message.role === 'assistant' && Array.isArray(message.metadata?.tool_calls)))
+  const repliedRunIds = new Set(visibleMessages.flatMap((message) => {
+    if (message.role !== 'assistant') return []
+    const runId = stringId(message.metadata?.run_id)
+    return runId ? [runId] : []
+  }))
+  const historyMessageRunIds = [...repliedRunIds].join('|')
+  const stoppedNoticeHistoryReady = Boolean(activeId)
+    && messages.data.ownerSessionId === activeId
+    && runs.data.ownerSessionId === activeId
+    && !messages.loading
+    && !runs.loading
+    && !messages.error
+    && !runs.error
+  const stoppedRunNotices = sessionRuns
+    .filter((run) => shouldShowStoppedRunNotice(run, repliedRunIds, stoppedNoticeHistoryReady))
+    .slice()
+    .reverse()
   const completedThoughtLayoutVersion = Object.entries(completedThoughtsByRun)
-    .map(([runId, timeline]) => `${runId}:${timeline.elapsedMs}:${timeline.tools.length}`)
+    .map(([runId, timeline]) => `${runId}:${timeline.elapsedMs}:${timeline.tools.length}:${timeline.items?.length ?? 0}`)
     .join('|')
   const visibleChildTasks = childTasks.data.ownerSessionId === activeId ? childTasks.data.items : noDelegatedTasks
   const sessionNavigation = buildSessionNavigation(workspaces.data, sessions.data)
@@ -898,12 +995,15 @@ function SessionsPage() {
     )))
     return groups.flat()
   }, [approvalRunIdsKey])
-  const visibleApprovals = approvals.data.filter((approval) => awaitingApprovalRunIds.includes(stringId(approval.run_id)))
+  const visibleApprovals = approvals.data.filter((approval) => (
+    awaitingApprovalRunIds.includes(stringId(approval.run_id))
+      || (liveRun.status === 'awaiting_approval' && stringId(approval.run_id) === liveRun.runId)
+  ))
   const refreshMessages = messages.refresh
   const refreshRuns = runs.refresh
   const refreshChildTasks = childTasks.refresh
   const refreshContext = context.refresh
-  const setMessagesState = messages.setState
+  const setRunsState = runs.setState
   const setApprovalsState = approvals.setState
   const settingsLocked = activeRunStatuses.has(activeRun?.status || '') || !['idle', 'terminal'].includes(liveRun.status)
 
@@ -914,7 +1014,8 @@ function SessionsPage() {
 
   useLayoutEffect(() => {
     setCompletedThoughtsByRun({})
-    loadedThoughtRunIdsRef.current = new Set()
+    setInterruptedRunId('')
+    thoughtHydrationRegistryRef.current.reset()
     historyScrollSessionRef.current = activeId
     stickToBottomRef.current = true
     setHistoryHydration({ sessionId: activeId, complete: false })
@@ -922,8 +1023,16 @@ function SessionsPage() {
 
   useEffect(() => {
     if (!visibleChildTasks.length) {
+      childPanelAutoOpenedRef.current = false
       setSelectedChildTaskId('')
       return
+    }
+    // Opening a history entry with delegated work should reveal its side
+    // panel once.  A later manual close is respected until the session has no
+    // child tasks (or the user switches sessions).
+    if (!childPanelAutoOpenedRef.current) {
+      childPanelAutoOpenedRef.current = true
+      setChildPanelOpen(true)
     }
     if (!visibleChildTasks.some((task) => task.id === selectedChildTaskId)) {
       setSelectedChildTaskId(visibleChildTasks[0].id)
@@ -933,8 +1042,17 @@ function SessionsPage() {
   useEffect(() => {
     if (!activeId || runs.loading || runs.data.ownerSessionId !== activeId) return
     let cancelled = false
-    const finishedRuns = runs.data.items.filter((run) => (!run.session_id || run.session_id === activeId) && isTerminalRunStatus(run.status))
-    const runsToHydrate = finishedRuns.filter((run) => !loadedThoughtRunIdsRef.current.has(run.id))
+    const finishedRunIds = new Set(
+      runs.data.items
+        .filter((run) => (!run.session_id || run.session_id === activeId) && isTerminalRunStatus(run.status))
+        .map((run) => run.id),
+    )
+    // Messages are the authoritative history index. `/api/runs` is bounded,
+    // so relying only on that list would lose thought timelines in long
+    // sessions once the run count exceeds its page limit.
+    for (const runId of historyMessageRunIds.split('|')) if (runId) finishedRunIds.add(runId)
+    const registry = thoughtHydrationRegistryRef.current
+    const runsToHydrate = [...finishedRunIds].filter((runId) => registry.shouldLoad(runId))
     if (!runsToHydrate.length) {
       setHistoryHydration((current) => current.sessionId === activeId && current.complete
         ? current
@@ -942,22 +1060,29 @@ function SessionsPage() {
       return
     }
     setHistoryHydration({ sessionId: activeId, complete: false })
-    const requests = runsToHydrate.map(async (run) => {
-      loadedThoughtRunIdsRef.current.add(run.id)
+    const activeRequests: Array<{ runId: string; token: ThoughtHydrationToken }> = []
+    const requests = runsToHydrate.map(async (runId) => {
+      const token = registry.begin(runId)
+      if (!token) return
+      activeRequests.push({ runId, token })
       try {
-        const events = await api.list<RunEvent>(`/api/runs/${encodeURIComponent(run.id)}/events`, ['events'])
+        const events = await api.list<RunEvent>(`/api/runs/${encodeURIComponent(runId)}/events`, ['events'])
         if (cancelled || activeIdRef.current !== activeId) return
         const timeline = timelineFromRunEvents(events.map((event) => ({ ...event, type: event.type || event.event_type || '' })))
-        if (hasVisibleCompletedThought(timeline)) setCompletedThoughtsByRun((current) => ({ ...current, [run.id]: timeline }))
+        if (!registry.complete(runId, token)) return
+        if (hasVisibleCompletedThought(timeline)) setCompletedThoughtsByRun((current) => ({ ...current, [runId]: timeline }))
       } catch {
-        loadedThoughtRunIdsRef.current.delete(run.id)
+        registry.cancel(runId, token)
       }
     })
     void Promise.all(requests).then(() => {
       if (!cancelled && activeIdRef.current === activeId) setHistoryHydration({ sessionId: activeId, complete: true })
     })
-    return () => { cancelled = true }
-  }, [activeId, runs.data.items, runs.data.ownerSessionId, runs.loading])
+    return () => {
+      cancelled = true
+      for (const request of activeRequests) registry.cancel(request.runId, request.token)
+    }
+  }, [activeId, historyMessageRunIds, runs.data.items, runs.data.ownerSessionId, runs.loading])
   useEffect(() => {
     if (settingsLocked || sending) {
       setSettingsMenuOpen(false)
@@ -967,10 +1092,6 @@ function SessionsPage() {
       setPermissionMenuOpen(false)
     }
   }, [sending, settingsLocked])
-
-  useEffect(() => {
-    setMessagesState({ data: { ownerSessionId: activeId, items: [] }, loading: true, error: '' })
-  }, [activeId, setMessagesState])
 
   useEffect(() => {
     if (draftActive) return
@@ -1102,23 +1223,69 @@ function SessionsPage() {
       )))
       if (activeIdRef.current !== sessionId) return undefined
       const data = groups.flat()
+      // The approval rows and the run status must advance together.  Without
+      // this state update, visibleApprovals still filters against the previous
+      // run list until the user changes tabs.
+      setRunsState({ data: { ownerSessionId: sessionId, items: latestRuns }, loading: false, error: '' })
       setApprovalsState({ data, loading: false, error: '' })
       return data
     } catch {
       return undefined
     }
-  }, [setApprovalsState])
+  }, [setApprovalsState, setRunsState])
 
   const syncTerminalRun = useCallback(async (runId: string, event?: RunStreamEvent, sessionId = activeIdRef.current) => {
     const syncVersion = ++terminalSyncVersionRef.current
     closeRunTransport()
+    let resolvedEvent = event
+    // When SSE was unavailable, the polling fallback only knows the terminal
+    // Run status. Recover the persisted interruption payload so a stopped run
+    // still exposes its partial draft for the edit action.
+    if (event?.type === 'run_state' && event.status === 'stopped' && !event.partial_output) {
+      try {
+        const persistedEvents = await api.list<RunEvent>(`/api/runs/${encodeURIComponent(runId)}/events`, ['events'])
+        const interruption = [...persistedEvents].reverse().find((item) => {
+          const type = item.type || item.event_type
+          return type === 'run_interrupted'
+            && typeof item.payload?.partial_output === 'string'
+        })
+        const payload = interruption?.payload
+        if (payload && typeof payload.partial_output === 'string') {
+          resolvedEvent = { ...event, partial_output: payload.partial_output, partial_thought: payload.partial_thought }
+        }
+      } catch {
+        // The regular Run status/message refresh below remains authoritative.
+      }
+    }
+    const stoppedTerminal = resolvedEvent?.type === 'run_interrupted' || resolvedEvent?.type === 'run_stopped'
+      || (resolvedEvent?.type === 'run_state' && resolvedEvent.status === 'stopped')
+    const userInterruptedTerminal = stoppedTerminal && (
+      resolvedEvent?.type === 'run_interrupted'
+        ? ['user_interrupted', 'parent_user_interrupted'].includes(String(resolvedEvent?.reason || ''))
+        : ['user_interrupted', 'parent_user_interrupted'].includes(String(resolvedEvent?.code || resolvedEvent?.stop_reason || resolvedEvent?.reason || ''))
+    )
+    if (isTerminalRunStreamEvent(resolvedEvent || { type: '' })) {
+      setInterruptedRunId((current) => (
+        userInterruptedTerminal ? runId : current === runId ? '' : current
+      ))
+    }
+    const terminalThought = resolvedEvent
+      ? updateThoughtTimeline(liveRunRef.current.thought, resolvedEvent)
+      : liveRunRef.current.thought
+    if (runId && hasVisibleCompletedThought(terminalThought)) {
+      // Commit the live timeline at the terminal boundary itself. This avoids
+      // depending on a later React effect that can be overtaken by the next
+      // turn or a session navigation.
+      setCompletedThoughtsByRun((current) => ({ ...current, [runId]: terminalThought }))
+    }
     setLiveRun((previous) => ({
       ...previous,
       runId,
-      phase: event ? runStreamPhase(event) : previous.phase,
+      phase: resolvedEvent ? runStreamPhase(resolvedEvent) : previous.phase,
       status: 'terminal',
-      error: event?.error ? String(event.error) : previous.error,
-      thought: event ? updateThoughtTimeline(previous.thought, event) : previous.thought,
+      error: resolvedEvent?.error ? String(resolvedEvent.error) : previous.error,
+      draft: resolvedEvent ? appendAssistantDelta(previous.draft, resolvedEvent) : previous.draft,
+      thought: resolvedEvent ? updateThoughtTimeline(previous.thought, resolvedEvent) : previous.thought,
     }))
 
     let refreshedMessages: OwnedSessionMessages | undefined
@@ -1126,23 +1293,22 @@ function SessionsPage() {
       if (delay > 220) await new Promise((resolve) => window.setTimeout(resolve, delay))
       if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
       refreshedMessages = await refreshMessages()
-      const assistantCount = refreshedMessages?.ownerSessionId === sessionId
-        ? refreshedMessages.items.filter((message) => message.role === 'assistant').length
-        : 0
-      if (assistantCount > runStartMessageCountRef.current) break
+      const hasReply = refreshedMessages?.ownerSessionId === sessionId
+        && hasPersistedRunReply(refreshedMessages.items, runId)
+      if (hasReply) break
     }
     if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
 
     await Promise.all([refreshRuns(), refreshContext(), refreshChildTasks(), refreshApprovalsForSession(sessionId)])
     if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
 
-    const assistantCount = refreshedMessages?.ownerSessionId === sessionId
-      ? refreshedMessages.items.filter((message) => message.role === 'assistant').length
-      : 0
-    const hasPersistedReply = assistantCount > runStartMessageCountRef.current
+    const hasPersistedReply = Boolean(
+      refreshedMessages?.ownerSessionId === sessionId
+      && hasPersistedRunReply(refreshedMessages.items, runId),
+    )
     const hasDraft = Boolean(liveRunRef.current.runId === runId && liveRunRef.current.draft)
-    if (event?.error) setActionError(`运行失败：${String(event.error)}`)
-    if (hasPersistedReply || !hasDraft) {
+    if (resolvedEvent?.error) setActionError(`运行失败：${String(resolvedEvent.error)}`)
+    if (hasPersistedReply || (!hasDraft && !userInterruptedTerminal)) {
       setLiveRun(emptyLiveRun())
     }
   }, [closeRunTransport, refreshApprovalsForSession, refreshChildTasks, refreshContext, refreshMessages, refreshRuns])
@@ -1190,7 +1356,7 @@ function SessionsPage() {
         void refreshRuns()
         if (status === 'awaiting_approval') void refreshApprovalsForSession(sessionId)
         if (isTerminalRunStatus(status)) {
-          await syncTerminalRun(runId, { type: 'run_state', status, terminal: true, error: status === 'failed' ? run.stop_reason : undefined, reason: run.stop_reason }, sessionId)
+          await syncTerminalRun(runId, { type: 'run_state', status, terminal: true, error: status === 'failed' ? (run.error_message || run.stop_reason) : undefined, reason: run.stop_reason }, sessionId)
         }
       } finally {
         polling = false
@@ -1262,7 +1428,12 @@ function SessionsPage() {
         ...previous,
         runId,
         phase: runStreamPhase(parsed),
-        draft: appendAssistantDelta(previous.draft, parsed),
+        // Text received before a tool call is model progress, not the final
+        // answer.  Move it to the safe thought summary and clear the live
+        // answer draft as soon as the tool turn actually starts.
+        draft: parsed.type === 'tool_started' || parsed.type === 'tool_call'
+          ? ''
+          : appendAssistantDelta(previous.draft, parsed),
         status: terminal ? 'terminal' : waitingApproval ? 'awaiting_approval' : 'live',
         error: parsed.error ? String(parsed.error) : previous.error,
         thought: updateThoughtTimeline(previous.thought, parsed),
@@ -1297,6 +1468,7 @@ function SessionsPage() {
 
   useEffect(() => {
     closeRunTransport()
+    if (pendingSessionSendRef.current?.sessionId !== activeId) pendingSessionSendRef.current = null
     terminalSyncVersionRef.current += 1
     seenStreamEventsRef.current = { runId: '', eventIds: new Set() }
     setLiveRun(emptyLiveRun())
@@ -1311,7 +1483,6 @@ function SessionsPage() {
     const pending = pendingDraftRunRef.current
     if (!pending || pending.sessionId !== activeId) return
     pendingDraftRunRef.current = null
-    runStartMessageCountRef.current = visibleMessages.filter((message) => message.role === 'assistant').length
     startRunStream(pending.runId, pending.sessionId)
     void refreshMessages()
     void refreshRuns()
@@ -1321,7 +1492,6 @@ function SessionsPage() {
   useEffect(() => {
     if (!activeId || messages.loading || !activeRun?.id || !activeRunStatuses.has(activeRun.status || '') || liveRun.status === 'terminal') return
     if (streamRunIdRef.current === activeRun.id) return
-    runStartMessageCountRef.current = visibleMessages.filter((message) => message.role === 'assistant').length
     startRunStream(activeRun.id, activeId)
   }, [activeId, activeRun?.id, activeRun?.status, liveRun.status, messages.loading, startRunStream, visibleMessages])
 
@@ -1330,22 +1500,23 @@ function SessionsPage() {
   // must not cancel that initial anchor.
   useEffect(() => {
     const anchoringHistory = Boolean(activeId) && historyScrollSessionRef.current === activeId
-    if (!anchoringHistory && !stickToBottomRef.current) return
+    const historyReady = historyHydration.sessionId === activeId
+      && historyHydration.complete
+      && messages.data.ownerSessionId === activeId
+      && runs.data.ownerSessionId === activeId
+      && !messages.loading
+      && !runs.loading
+    if (!shouldStartHistoryScroll(anchoringHistory, historyReady, stickToBottomRef.current)) return
+    let prepareFrame = 0
     let frame = 0
     let settleFrame = 0
     let observedElement: HTMLDivElement | null = null
     const finishHistoryAnchor = () => {
       const element = messagesRef.current
-      const historyReady = historyHydration.sessionId === activeId
-        && historyHydration.complete
-        && messages.data.ownerSessionId === activeId
-        && runs.data.ownerSessionId === activeId
-        && !messages.loading
-        && !runs.loading
       const distanceFromBottom = element
         ? Math.max(0, element.scrollHeight - element.scrollTop - element.clientHeight)
         : Number.POSITIVE_INFINITY
-      if (anchoringHistory && historyReady && distanceFromBottom === 0 && historyScrollSessionRef.current === activeId) {
+      if (anchoringHistory && historyReady && distanceFromBottom <= 1 && historyScrollSessionRef.current === activeId) {
         historyScrollSessionRef.current = ''
         stickToBottomRef.current = true
       }
@@ -1361,8 +1532,14 @@ function SessionsPage() {
       element.scrollTo({ top: element.scrollHeight })
       settleFrame = window.requestAnimationFrame(finishHistoryAnchor)
     }
-    frame = window.requestAnimationFrame(scrollToLatest)
+    // Wait for two browser layout passes after React has committed the fully
+    // hydrated history. This changes only when scrolling starts; the existing
+    // CSS smooth-scroll curve and browser-selected velocity stay untouched.
+    prepareFrame = window.requestAnimationFrame(() => {
+      frame = window.requestAnimationFrame(scrollToLatest)
+    })
     return () => {
+      window.cancelAnimationFrame(prepareFrame)
       window.cancelAnimationFrame(frame)
       if (settleFrame) window.cancelAnimationFrame(settleFrame)
       observedElement?.removeEventListener('scrollend', finishHistoryAnchor)
@@ -1375,8 +1552,8 @@ function SessionsPage() {
     if (sendingRef.current || (!activeId && !draftActive) || !content || settingsSaving || capabilitySaving || settingsLocked) return
     sendingRef.current = true
     setSending(true); setActionError('')
+    lastSubmittedContentRef.current = content
     stickToBottomRef.current = true
-    runStartMessageCountRef.current = visibleMessages.filter((message) => message.role === 'assistant').length
     setLiveRun({ ...emptyLiveRun(), phase: '思考中…', status: 'connecting', thought: { ...emptyThoughtTimeline, startedAt: Date.now() }, thinkingStatus: pickThinkingStatus() })
     try {
       if (draftActive) {
@@ -1393,6 +1570,7 @@ function SessionsPage() {
         const sessionId = stringId(launched.session?.id)
         const runId = stringId(launched.run?.id)
         if (!sessionId || !runId) throw new Error('草稿启动响应缺少会话或运行标识。')
+        setInterruptedRunId('')
         pendingDraftRunRef.current = { sessionId, runId }
         composerInputRef.current?.clear()
         clearDraftState()
@@ -1403,7 +1581,17 @@ function SessionsPage() {
       }
 
       const targetSessionId = activeId
-      const launched = await api.post<Run>(`/api/sessions/${targetSessionId}/run`, { content })
+      const pendingSend = pendingSessionSendRef.current
+      const idempotencyKey = pendingSend?.sessionId === targetSessionId && pendingSend.content === content
+        ? pendingSend.key
+        : createTurnIdempotencyKey()
+      pendingSessionSendRef.current = { sessionId: targetSessionId, content, key: idempotencyKey }
+      const launched = await api.post<Run>(`/api/sessions/${targetSessionId}/run`, {
+        content,
+        idempotency_key: idempotencyKey,
+      })
+      pendingSessionSendRef.current = null
+      setInterruptedRunId('')
       composerInputRef.current?.clear()
       void messages.refresh()
       void runs.refresh()
@@ -1412,10 +1600,55 @@ function SessionsPage() {
     } catch (error) {
       setLiveRun(emptyLiveRun())
       setActionError(describeError(error))
+      if (!draftActive && activeId) {
+        // The request may have committed before the transport failed. Reload
+        // durable state so an accepted turn never remains a bare user bubble.
+        void Promise.all([messages.refresh(), runs.refresh(), context.refresh()])
+      }
     } finally {
       sendingRef.current = false
       setSending(false)
     }
+  }
+
+  async function stopActiveRun() {
+    const runId = interruptibleRunId || streamRunIdRef.current
+    if (!runId || stoppingRunId) return
+    setStoppingRunId(runId)
+    setInterruptedRunId(runId)
+    setActionError('')
+    setLiveRun((previous) => (
+      previous.runId === runId
+        ? { ...previous, phase: '正在停止当前任务…', error: '' }
+        : previous
+    ))
+    try {
+      await api.post(`/api/runs/${encodeURIComponent(runId)}/stop`, { reason: 'user_interrupted' })
+      // The server publishes `run_stopped` on the existing stream. Keep the
+      // transport open so the partial assistant draft and terminal timeline
+      // can be reconciled by the normal sync path.
+      void refreshRuns()
+    } catch (error) {
+      setInterruptedRunId('')
+      if (activeIdRef.current === activeId) setActionError(describeError(error))
+      setLiveRun((previous) => (
+        previous.runId === runId
+          ? { ...previous, phase: previous.phase || '处理中…' }
+          : previous
+      ))
+    } finally {
+      setStoppingRunId('')
+    }
+  }
+
+  function editInterruptedPrompt() {
+    const content = lastSubmittedContentRef.current.trim()
+    if (!content || !canEditInterrupted) return
+    composerInputRef.current?.setValue(content)
+    setInterruptedRunId('')
+    setLiveRun(emptyLiveRun())
+    setActionError('')
+    window.requestAnimationFrame(() => composerInputRef.current?.focus?.())
   }
 
   async function decideApproval(id: string, decision: 'approve' | 'reject', approvalRunId: string) {
@@ -1481,6 +1714,39 @@ function SessionsPage() {
     catch (error) { setActionError(describeError(error)) } finally { setCapabilitySaving(false) }
   }
 
+  async function deleteConversation(session: Session) {
+    const sessionId = stringId(session.id)
+    if (!sessionId || deletingSessionId || (sessionId === activeId && sendingRef.current)) return
+    const title = session.title || '未命名对话'
+    if (!window.confirm(`确定删除“${title}”吗？该对话的消息、运行记录和用量明细将一并删除，且无法恢复。`)) return
+    setDeletingSessionId(sessionId)
+    setActionError('')
+    try {
+      await api.delete<void>(`/api/sessions/${encodeURIComponent(sessionId)}`)
+      const latest = await sessions.refresh()
+      if (sessionId === activeIdRef.current) {
+        closeRunTransport()
+        terminalSyncVersionRef.current += 1
+        setLiveRun(emptyLiveRun())
+        setCompletedThoughtsByRun({})
+        setActiveId(latest?.[0] ? stringId(latest[0].id) : '')
+      }
+    } catch (error) {
+      setActionError(describeError(error))
+    } finally {
+      setDeletingSessionId('')
+    }
+  }
+
+  function renderSessionTreeItem(session: Session, extraClass = '') {
+    const sessionId = stringId(session.id)
+    const deleting = deletingSessionId === sessionId
+    return <div className="tree-session-row" key={session.id}>
+      <button type="button" className={`tree-session-item ${extraClass} ${activeId === sessionId && !draftActive ? 'active' : ''}`} disabled={(draftActive && sending) || deleting} onClick={() => openExistingSession(sessionId)}><MessageSquare size={13} /><span>{session.title || '未命名对话'}</span></button>
+      <button type="button" className="tree-session-delete" aria-label={`删除对话 ${session.title || '未命名对话'}`} title="删除对话" disabled={deleting || (activeId === sessionId && sending)} onClick={() => void deleteConversation(session)}>{deleting ? <LoaderCircle className="spin" size={12} /> : <Trash2 size={12} />}</button>
+    </div>
+  }
+
   const selectedSessionSkillIds = draftActive ? draftSettings.skill_ids : activeSession?.skill_ids ?? []
   const selectedPermissionMode: PermissionMode = draftActive ? draftSettings.permission_mode : activeSession?.permission_mode ?? 'smart'
 
@@ -1502,14 +1768,12 @@ function SessionsPage() {
   const effectiveSettings = resolveEffectiveModelSettings(connections.data, settingsSession, activeAgent)
   const effectiveConnection = effectiveSettings.connection
   const effectiveModel = effectiveSettings.model
-  const automaticSessionConnection = effectiveSettings.automaticConnection
-  const automaticModel = effectiveSettings.automaticModel
   const effectiveThinking = resolveEffectiveThinking(settingsSession?.thinking_level, activeAgent?.thinking_level, effectiveConnection?.thinking_level)
   const modelOptions = connections.data.filter((connection) => connection.enabled !== false).flatMap((connection) => {
     return availableConnectionModels(connection).map((model) => ({ value: `${connection.id}::${model}`, label: model, connection: connection.name }))
   })
   const selectedModelValue = effectiveSettings.selectedValue
-  const selectedThinkingValue = settingsSession?.thinking_level && settingsSession.thinking_level !== 'auto' ? settingsSession.thinking_level : 'auto'
+  const selectedThinkingValue = effectiveThinking
   const modelButtonLabel = shortModelLabel(effectiveModel)
   const thinkingOptions: Array<{ value: ThinkingLevel; label: string; hint?: string }> = [
     { value: 'low', label: '低' },
@@ -1559,7 +1823,7 @@ function SessionsPage() {
                     </button>
                   </div>
                   {expanded && <div className="project-children">
-                    {projectSessions.length ? projectSessions.map((session) => <button type="button" key={session.id} className={`tree-session-item ${activeId === stringId(session.id) && !draftActive ? 'active' : ''}`} disabled={draftActive && sending} onClick={() => openExistingSession(stringId(session.id))}><MessageSquare size={13} /><span>{session.title || '未命名对话'}</span></button>) : <p className="tree-empty">暂无对话</p>}
+                    {projectSessions.length ? projectSessions.map((session) => renderSessionTreeItem(session)) : <p className="tree-empty">暂无对话</p>}
                   </div>}
                 </div>
               })}
@@ -1568,7 +1832,7 @@ function SessionsPage() {
 
             <section className="task-tree-section">
               <header className="sidebar-section-heading"><strong>任务</strong></header>
-              {sessionNavigation.tasks.map((session) => <button type="button" key={session.id} className={`tree-session-item task-session-item ${activeId === stringId(session.id) && !draftActive ? 'active' : ''}`} disabled={draftActive && sending} onClick={() => openExistingSession(stringId(session.id))}><MessageSquare size={13} /><span>{session.title || '未命名对话'}</span></button>)}
+              {sessionNavigation.tasks.map((session) => renderSessionTreeItem(session, 'task-session-item'))}
               {!draftActive && !sessionNavigation.tasks.length && !sessions.loading && <p className="tree-empty">暂无一次性任务</p>}
             </section>
 
@@ -1608,7 +1872,16 @@ function SessionsPage() {
                   return <Fragment key={message.id}>{completedThought && <CompletedThoughtTimeline runId={messageRunId} timeline={completedThought} />}<MessageBubble message={message} /></Fragment>
                 }) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
                 {!draftActive && messages.error && !!visibleMessages.length && <p className="inline-error" role="alert">消息同步失败：{messages.error}</p>}
-                {liveRun.status !== 'idle' && !completedThoughtsByRun[liveRun.runId] && <LiveAssistantMessage liveRun={liveRun} />}
+                {!draftActive && stoppedRunNotices.map((run) => <div key={`run-notice:${run.id}`} className="stopped-run-notice" role="status"><AlertCircle size={16} /><div><strong>{run.status === 'failed' ? '本次运行失败，未生成最终回复' : '本次运行已停止，未生成最终回复'}</strong><p>{run.error_message || run.stop_reason || 'Agent 未能继续执行，请调整指令后重试。'}</p></div></div>)}
+                {liveRun.status !== 'idle'
+                  && (!completedThoughtsByRun[liveRun.runId] || (canEditInterrupted && liveRun.runId === interruptedRunId))
+                  && <LiveAssistantMessage liveRun={liveRun} />}
+                {canEditInterrupted && <div className="interrupted-run-actions">
+                  <button type="button" className="interrupted-edit-button" onClick={editInterruptedPrompt}>
+                    <Pencil size={12} />重新编辑本次输入
+                  </button>
+                  <span>已保留当前部分输出，重新发送前不会写入新的上下文。</span>
+                </div>}
                 {!draftActive && approvals.error && <ErrorState message={`审批状态读取失败：${approvals.error}`} onRetry={approvals.reload} />}
                 {!draftActive && approvals.loading && activeRunId && !visibleApprovals.length && liveRun.status === 'awaiting_approval' && <LoadingState label="正在读取审批状态" />}
                 {!draftActive && visibleApprovals.map((approval) => <ApprovalCard key={approval.id} approval={approval} deciding={decidingApproval === approval.id} onDecision={decideApproval} />)}
@@ -1669,9 +1942,6 @@ function SessionsPage() {
                         </button>
                         {settingsSubmenu === 'model' && <div className="session-settings-submenu" ref={modelSubmenuRef} role="menu" aria-label="选择模型">
                           <p>模型</p>
-                          <button type="button" role="menuitemradio" aria-checked={selectedModelValue === ''} className={selectedModelValue === '' ? 'selected' : ''} onClick={() => selectModel('')}>
-                            <span><strong>自动</strong><small>{automaticModel || '默认模型'}{automaticSessionConnection?.name ? ` · ${automaticSessionConnection.name}` : ''}</small></span>{selectedModelValue === '' && <Check size={14} aria-hidden="true" />}
-                          </button>
                           {modelOptions.map((option, index) => <button key={`${option.value}:${index}`} type="button" role="menuitemradio" aria-checked={selectedModelValue === option.value} className={selectedModelValue === option.value ? 'selected' : ''} onClick={() => selectModel(option.value)}>
                             <span><strong>{option.label}</strong><small>{option.connection}</small></span>{selectedModelValue === option.value && <Check size={14} aria-hidden="true" />}
                           </button>)}
@@ -1688,7 +1958,21 @@ function SessionsPage() {
                       </div>}
                     </div>
                     {draftActive ? <ContextUsageRing context={emptyDraftContext} /> : context.error ? <button type="button" className="context-state context-error" aria-label="上下文占用读取失败，点击重试" title={context.error} onClick={() => void context.reload()}><AlertCircle size={15} /></button> : context.loading || !context.data ? <span className="context-state" role="status" aria-label="正在读取上下文占用"><LoaderCircle className="spin" size={15} /></span> : <ContextUsageRing context={context.data} />}
-                    <button className="send-button" aria-label="发送" disabled={sending || settingsSaving || capabilitySaving || settingsLocked || !composerHasValue}>{sending ? <LoaderCircle className="spin" /> : <Send />}</button>
+                    <button
+                      type={canInterrupt ? 'button' : 'submit'}
+                      className={`send-button ${canInterrupt ? 'is-stop' : ''}`}
+                      aria-label={canInterrupt ? '中断当前任务' : '发送'}
+                      title={canInterrupt ? '中断当前任务' : '发送'}
+                      aria-busy={Boolean(stoppingRunId)}
+                      disabled={canInterrupt
+                        ? Boolean(stoppingRunId)
+                        : sending || settingsSaving || capabilitySaving || settingsLocked || !composerHasValue}
+                      onClick={canInterrupt ? () => void stopActiveRun() : undefined}
+                    >
+                      {canInterrupt
+                        ? stoppingRunId ? <LoaderCircle className="spin" size={14} /> : <Square className="send-stop-icon" size={12} strokeWidth={3} fill="currentColor" />
+                        : <ArrowUp className="send-arrow-icon" size={16} strokeWidth={2.4} />}
+                    </button>
                   </div>
                 </div>
               </form>
@@ -1861,6 +2145,25 @@ function UsageBreakdown({ title, eyebrow, emptyDescription, data, initialLoading
   </section>
 }
 
+function AppearanceSettingsPage({ fontScale, onFontScaleChange }: { fontScale: number; onFontScaleChange: (value: number) => void }) {
+  const percentage = Math.round(fontScale * 100)
+  const presets = [90, 100, 110, 120]
+  return (
+    <div className="page appearance-settings-page">
+      <PageHeader eyebrow="冰面观感" title="界面设置" description="调整整个工作台的文字大小，修改会立即应用并自动保存。" />
+      <section className="appearance-settings-card card">
+        <header><span className="appearance-settings-icon"><Type size={20} /></span><div><h2>全局字体大小</h2><p>对导航、对话、卡片和设置页面中的文字统一缩放。</p></div><output>{percentage}%</output></header>
+        <div className="font-scale-preview" aria-hidden="true"><small>实时预览</small><strong>呆萌企鹅准备出发</strong><p>文字会变大或变小，控件和图标仍保持原来的紧凑尺寸。</p></div>
+        <div className="font-scale-control">
+          <div className="font-scale-labels"><span>较小</span><span>标准</span><span>较大</span></div>
+          <input type="range" min={85} max={125} step={5} value={percentage} aria-label={`全局字体大小 ${percentage}%`} onChange={(event) => onFontScaleChange(Number(event.target.value) / 100)} />
+          <div className="font-scale-presets" aria-label="字体大小快捷选项">{presets.map((value) => <button key={value} type="button" className={percentage === value ? 'active' : ''} onClick={() => onFontScaleChange(value / 100)}>{value}%</button>)}</div>
+        </div>
+      </section>
+    </div>
+  )
+}
+
 function ModelsPage() {
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
   const [panelOpen, setPanelOpen] = useState(false)
@@ -1901,13 +2204,13 @@ function ModelsPage() {
               <header><div className="provider-icon"><Sparkles size={20} /></div><div><h2>{connection.name}</h2><p>{connection.provider || 'OpenAI Compatible'}</p></div><StatusBadge status={connection.status || 'unknown'} /></header>
               <dl><div><dt>Base URL</dt><dd>{connection.base_url || '—'}</dd></div><div><dt>API Key</dt><dd>{connection.api_key_hint || '已安全保存'}</dd></div><div><dt>默认模型</dt><dd>{connection.default_model || '尚未选择'}</dd></div></dl>
               <div className="model-block"><div className="model-block-head"><strong>可用模型</strong><button className="button button-quiet" onClick={() => discover(connection)} disabled={discovering === connection.id}>{discovering === connection.id ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}发现模型</button></div>{(connection.models || connection.discovered_models || connection.manual_models)?.length ? <div className="model-tags">{(connection.models || [...(connection.discovered_models || []), ...(connection.manual_models || [])]).map((model, index) => <span className={model === connection.default_model ? 'selected' : ''} key={`${connection.id}:${model}:${index}`}>{model}</span>)}</div> : <p className="muted">尚未获取模型列表，可点击发现或使用手动模型 ID。</p>}</div>
-              <div className="thinking-row"><div><strong>思考强度</strong><small>不同提供商会映射到各自支持的参数</small></div><select aria-label={`${connection.name} 思考强度`} value={connection.thinking_level || 'auto'} onChange={(event) => void updateThinking(connection, event.target.value)}><option value="off">关闭</option><option value="auto">自动</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option></select></div>
+              <div className="thinking-row"><div><strong>思考强度</strong><small>不同提供商会映射到各自支持的参数</small></div><select aria-label={`${connection.name} 思考强度`} value={resolveEffectiveThinking(connection.thinking_level)} onChange={(event) => void updateThinking(connection, event.target.value)}><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option></select></div>
               {(discoveryError[connection.id] || connection.last_error) && <p className="inline-error"><AlertCircle size={14} />{discoveryError[connection.id] || connection.last_error}</p>}
             </article>
           ))}
         </section>
       ) : <EmptyState icon={Sparkles} title="添加模型连接" description="支持 OpenRouter、DeepSeek 和大多数 OpenAI 兼容中转服务。" action={<button className="button button-primary" onClick={() => setPanelOpen(true)}><Plus size={16} />添加连接</button>} />}
-      {panelOpen && <SlidePanel title="添加模型连接" description="保存后会尝试请求 /models；失败时仍可使用手动模型 ID。" onClose={() => setPanelOpen(false)}><form className="panel-form" onSubmit={createConnection} autoComplete="off"><div className="form-row"><Field label="连接名称"><input name="name" required placeholder="例如：DeepSeek" autoFocus /></Field><Field label="提供商"><select name="provider" defaultValue="openai_compatible"><option value="openai_compatible">OpenAI 兼容</option><option value="openrouter">OpenRouter</option><option value="deepseek">DeepSeek</option></select></Field></div><Field label="Base URL"><input name="base_url" type="url" required placeholder="https://api.example.com/v1" /></Field><Field label="API Key" hint="只发送给你填写的 Base URL，并写入系统凭据存储"><input name="api_key" type="password" required placeholder="sk-…" autoComplete="new-password" /></Field><div className="form-row"><Field label="手动模型 ID" hint="当 /models 不可用时使用"><input name="default_model" placeholder="例如：deepseek-chat" /></Field><Field label="思考强度"><select name="thinking_level" defaultValue="auto"><option value="off">关闭</option><option value="auto">自动</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option></select></Field></div>{formError && <p className="form-error" role="alert">{formError}</p>}<div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setPanelOpen(false)}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}保存并检测</button></div></form></SlidePanel>}
+      {panelOpen && <SlidePanel title="添加模型连接" description="保存后会尝试请求 /models；失败时仍可使用手动模型 ID。" onClose={() => setPanelOpen(false)}><form className="panel-form" onSubmit={createConnection} autoComplete="off"><div className="form-row"><Field label="连接名称"><input name="name" required placeholder="例如：DeepSeek" autoFocus /></Field><Field label="提供商"><select name="provider" defaultValue="openai_compatible"><option value="openai_compatible">OpenAI 兼容</option><option value="openrouter">OpenRouter</option><option value="deepseek">DeepSeek</option></select></Field></div><Field label="Base URL"><input name="base_url" type="url" required placeholder="https://api.example.com/v1" /></Field><Field label="API Key" hint="只发送给你填写的 Base URL，并写入系统凭据存储"><input name="api_key" type="password" required placeholder="sk-…" autoComplete="new-password" /></Field><div className="form-row"><Field label="手动模型 ID" hint="当 /models 不可用时使用"><input name="default_model" placeholder="例如：deepseek-chat" /></Field><Field label="思考强度"><select name="thinking_level" defaultValue="medium"><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option></select></Field></div>{formError && <p className="form-error" role="alert">{formError}</p>}<div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setPanelOpen(false)}>取消</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}保存并检测</button></div></form></SlidePanel>}
     </div>
   )
 }

@@ -1,8 +1,7 @@
 """Deterministic completion checks shared by production and parity tests.
 
-The checks in this module deliberately avoid model judgement.  They prove that
-the runtime produced a well-formed, fully settled tool transcript before a
-candidate answer is allowed to reach the semantic evaluator.
+The checks in this module deliberately avoid model judgement. They are the
+complete main-agent completion gate: no secondary LLM evaluator is involved.
 """
 
 from __future__ import annotations
@@ -177,3 +176,24 @@ def verify_deterministic_completion(
         observed_tool_calls=len(call_ids),
         observed_tool_results=len(result_ids),
     )
+
+
+def decide_deterministic_completion(candidate: Mapping[str, Any]) -> CompletionDecision:
+    """Turn one runtime candidate into a deterministic completion decision."""
+
+    messages = [item for item in candidate.get("messages") or [] if isinstance(item, Mapping)]
+    report = verify_deterministic_completion(
+        output=candidate.get("output"),
+        messages=messages,
+        declared_tool_calls=int(candidate.get("tool_calls") or 0),
+        pending_approval=candidate.get("pending_approval"),
+    )
+    payload = {
+        "stage": "deterministic",
+        "passed": report.passed,
+        "deterministic": report.to_dict(),
+    }
+    if report.passed:
+        return CompletionDecision(True, "确定性验收通过", payload)
+    failed = [check.detail for check in report.checks if not check.passed]
+    return CompletionDecision(False, "确定性运行链路未通过：" + "；".join(failed), payload)

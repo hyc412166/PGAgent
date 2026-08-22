@@ -10,7 +10,7 @@ export interface RunStreamEvent {
   [key: string]: unknown
 }
 
-const terminalTypes = new Set(['run_completed', 'run_stopped', 'model_failed', 'integration_failed', 'failed', 'completed', 'stopped'])
+const terminalTypes = new Set(['run_completed', 'run_interrupted', 'run_stopped', 'model_failed', 'integration_failed', 'failed', 'completed', 'stopped'])
 const terminalStatuses = new Set(['completed', 'stopped', 'failed', 'cancelled'])
 
 export function parseRunStreamEvent(raw: string, fallbackType = ''): RunStreamEvent | null {
@@ -29,6 +29,9 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'run_state': return runStatusPhase(event.status)
     case 'context_prepared':
     case 'context_resumed':
+    case 'context_compaction_started':
+    case 'context_compaction_finished':
+    case 'context_compaction_failed':
     case 'context_compacted': return '正在准备上下文…'
     case 'model_step_started':
     case 'model_retry': return '思考中…'
@@ -50,6 +53,7 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'delegated_child_failed': return '子 Agent 未完成'
     case 'run_completed':
     case 'completed': return '已完成'
+    case 'run_interrupted':
     case 'run_stopped':
     case 'stopped': return '已停止'
     case 'model_failed':
@@ -86,7 +90,13 @@ export function runStatusPhase(status?: string): string {
 }
 
 export function appendAssistantDelta(current: string, event: RunStreamEvent): string {
-  return event.type === 'assistant_delta' && typeof event.delta === 'string' ? current + event.delta : current
+  if (event.type === 'assistant_delta' && typeof event.delta === 'string') return current + event.delta
+  // A stop response can arrive after the browser missed the last few SSE
+  // chunks. The backend includes the authoritative partial output on the
+  // terminal event so the interrupted draft remains editable in the UI.
+  const partial = event.partial_output
+  if (typeof partial === 'string' && partial.length > current.length) return partial
+  return current
 }
 
 export function rememberRunStreamEvent(seenEventIds: Set<string>, event: RunStreamEvent, lastEventId = ''): boolean {
@@ -99,6 +109,14 @@ export function rememberRunStreamEvent(seenEventIds: Set<string>, event: RunStre
 
 export function visibleSessionItems<T>(ownerSessionId: string, activeSessionId: string, items: T[]): T[] {
   return ownerSessionId === activeSessionId ? items : []
+}
+
+export function shouldStartHistoryScroll(
+  anchoringHistory: boolean,
+  historyReady: boolean,
+  stickToBottom: boolean,
+): boolean {
+  return anchoringHistory ? historyReady : stickToBottom
 }
 
 export function isCurrentSessionRun(
@@ -121,4 +139,38 @@ export function shouldRefreshConversationAfterApprovalDecision(decision: 'approv
   // A rejected delegated child writes its terminal result directly into the
   // current session.  Approval/runs alone are insufficient to render it.
   return decision === 'reject'
+}
+
+type StoppedRunNoticeCandidate = { id: string; status?: string; stop_reason?: string; error_message?: string }
+
+export function shouldShowStoppedRunNotice(run: StoppedRunNoticeCandidate | undefined, repliedRunIds: Set<string>, historyReady = true): boolean {
+  if (!historyReady || !run || !['stopped', 'failed'].includes(String(run.status || '')) || repliedRunIds.has(run.id)) return false
+  if (run.status === 'failed') return true
+  const reason = String(run.stop_reason || '')
+  return reason !== 'delegated_child_awaiting_approval'
+}
+
+type PersistedRunReplyCandidate = {
+  role?: string
+  turn_id?: string
+  message_kind?: string
+  metadata?: Record<string, unknown>
+}
+
+export function hasPersistedRunReply(
+  messages: PersistedRunReplyCandidate[],
+  runId: string,
+  turnId = '',
+): boolean {
+  if (!runId && !turnId) return false
+  return messages.some((message) => {
+    if (message.role !== 'assistant') return false
+    const metadataRunId = String(message.metadata?.run_id || '')
+    const messageTurnId = String(message.turn_id || message.metadata?.turn_id || '')
+    return metadataRunId === runId || (
+      Boolean(turnId)
+      && messageTurnId === turnId
+      && (message.message_kind === 'terminal' || message.metadata?.source === 'deterministic_fallback')
+    )
+  })
 }

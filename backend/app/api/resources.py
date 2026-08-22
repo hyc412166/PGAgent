@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import shutil
 from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
@@ -12,17 +13,20 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import (
     Agent,
     Approval,
     ChatMessage,
     DelegatedTask,
+    DraftLaunch,
     Memory,
     ModelConnection,
     Run,
     RunEvent,
     Session as ChatSession,
     Workspace,
+    UsageRecord,
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
     get_db,
@@ -67,7 +71,11 @@ _PUBLIC_RUN_EVENT_TYPES = frozenset({
     "completed",
     "context_prepared",
     "context_compacted",
+    "context_protocol_repaired",
     "context_resumed",
+    "context_compaction_started",
+    "context_compaction_finished",
+    "context_compaction_failed",
     "delegated_child_started",
     "delegated_child_awaiting_approval",
     "delegated_child_completed",
@@ -77,11 +85,20 @@ _PUBLIC_RUN_EVENT_TYPES = frozenset({
     "failed",
     "integration_failed",
     "model_failed",
+    "model_retry",
     "model_step_started",
+    "completion_verification_started",
+    "completion_verification_rejected",
+    "completion_verification_passed",
+    "progress",
+    "agent_progress",
+    "thought_summary",
+    "activity_update",
     "run_completed",
     "run_interrupted",
     "run_stopped",
     "stopped",
+    "terminal_response_persisted",
     "tool_call",
     "tool_finished",
     "tool_result",
@@ -91,13 +108,19 @@ _PUBLIC_RUN_EVENT_TYPES = frozenset({
 _TOOL_START_EVENT_TYPES = frozenset({"tool_call", "tool_started"})
 _TOOL_FINISH_EVENT_TYPES = frozenset({"tool_finished", "tool_result"})
 _TERMINAL_EVENT_TYPES = frozenset({
-    "completed", "failed", "integration_failed", "model_failed", "run_completed", "run_stopped", "stopped"
+    "completed", "failed", "integration_failed", "model_failed", "run_completed", "run_interrupted", "run_stopped", "stopped"
 })
 _PUBLIC_EVENT_NUMBER_FIELDS = frozenset({
+    "after_tokens",
+    "attempt",
+    "before_tokens",
+    "delay_seconds",
     "duration_ms",
     "elapsed_ms",
     "estimated_tokens",
     "omitted_messages",
+    "removed_messages",
+    "affected_call_count",
     "output_chars",
     "question_chars",
     "remaining_call_count",
@@ -105,7 +128,8 @@ _PUBLIC_EVENT_NUMBER_FIELDS = frozenset({
     "thought_duration_ms",
 })
 _PUBLIC_EVENT_BOOLEAN_FIELDS = frozenset({
-    "changed", "has_output", "ok", "pending_approval", "requires_next_message", "task_anchor_preserved", "terminal",
+    "accepted", "complete",
+    "changed", "has_output", "ok", "pending_approval", "requires_next_message", "terminal",
 })
 
 
@@ -146,6 +170,13 @@ def _public_event_text(value: Any, *, limit: int = 160) -> str | None:
     if not isinstance(value, str):
         return None
     return " ".join(value.replace("\x00", "").split())[:limit] or None
+
+
+def _public_thought_text(value: Any, *, limit: int = 20_000) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")[:limit]
+    return text or None
 
 
 def _public_event_url(value: Any) -> str | None:
@@ -220,6 +251,25 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
         if arguments:
             public["arguments"] = arguments
 
+    if event_type in {
+        "context_protocol_repaired",
+        "model_retry",
+        "context_compaction_started",
+        "context_compaction_finished",
+        "context_compaction_failed",
+        "completion_verification_started",
+        "completion_verification_rejected",
+        "completion_verification_passed",
+        "progress",
+        "agent_progress",
+        "thought_summary",
+        "activity_update",
+    }:
+        for key in ("reason", "failure_reason", "phase", "model", "error_kind", "error_type", "progress", "summary", "status_text", "activity"):
+            text = _public_thought_text(source.get(key)) if event_type == "thought_summary" and key == "summary" else _public_event_text(source.get(key), limit=240)
+            if text is not None:
+                public[key] = text
+
     if event_type == "approval_requested":
         request = source.get("request")
         if isinstance(request, dict):
@@ -236,6 +286,12 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
             if request_public:
                 public["request"] = request_public
 
+    if event_type == "terminal_response_persisted":
+        for key in ("turn_id", "message_id", "trace_id", "status", "error_code", "source"):
+            text = _public_event_text(source.get(key), limit=200)
+            if text is not None:
+                public[key] = text
+
     if event_type.startswith("delegated_child_"):
         for key in ("task_id", "delegation_id", "child_run_id", "child_agent_id", "child_agent_name", "task_title", "status"):
             text = _public_event_text(source.get(key), limit=200)
@@ -245,8 +301,17 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
     # Controlled status labels are useful for diagnostics, while free-form
     # error/reason/output text is intentionally kept out of this endpoint.
     if event_type in _TERMINAL_EVENT_TYPES | {"run_interrupted", "approval_rejected"}:
-        for key in ("code", "error_type"):
+        for key in ("code", "error_type", "reason"):
             text = _public_event_text(source.get(key), limit=160)
+            if text is not None:
+                public[key] = text
+    # An explicit user interruption is the one exception where the browser
+    # needs the bounded partial draft to offer "重新编辑" after an SSE
+    # reconnect.  It is not copied into ChatMessage/context and is never
+    # exposed for ordinary completed or failed runs.
+    if event_type == "run_interrupted":
+        for key in ("partial_output", "partial_thought"):
+            text = _public_event_text(source.get(key), limit=100_000)
             if text is not None:
                 public[key] = text
     return public
@@ -619,8 +684,46 @@ def update_session(
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_session(session_id: str, db: Session = Depends(get_db)) -> Response:
-    db.delete(_require(db, ChatSession, session_id, "Session"))
+    item = _require(db, ChatSession, session_id, "Session")
+    active = db.scalar(
+        select(func.count(Run.id)).where(
+            Run.session_id == session_id,
+            Run.status.in_(_ACTIVE_SESSION_RUN_STATUSES),
+        )
+    )
+    if int(active or 0) > 0:
+        raise HTTPException(status_code=409, detail="Cannot delete a conversation while it has an active run")
+
+    run_ids = set(db.scalars(select(Run.id).where(Run.session_id == session_id)))
+    run_ids.update(
+        value
+        for value in db.scalars(
+            select(DelegatedTask.child_run_id).where(DelegatedTask.parent_session_id == session_id)
+        )
+        if value
+    )
+    db.execute(
+        delete(UsageRecord).where(
+            (UsageRecord.session_id == session_id)
+            | (UsageRecord.run_id.in_(run_ids) if run_ids else False)
+        )
+    )
+    if run_ids:
+        db.execute(delete(Run).where(Run.id.in_(run_ids)))
+    db.execute(delete(DraftLaunch).where(DraftLaunch.session_id == session_id))
+    db.execute(delete(Memory).where(Memory.scope == "session", Memory.scope_id == session_id))
+    db.delete(item)
     _commit(db)
+
+    # Runtime artifacts are stored below one server-owned directory per
+    # session.  Cascading the Artifact rows does not remove those payloads, so
+    # finish the user-visible deletion by removing the matching directory too.
+    # Requiring the resolved parent to be the configured artifact root keeps a
+    # corrupt legacy session id from turning this into an arbitrary-path delete.
+    artifact_root = (settings.data_dir / "artifacts").resolve()
+    artifact_directory = (artifact_root / session_id).resolve()
+    if artifact_directory.parent == artifact_root and artifact_directory.is_dir():
+        shutil.rmtree(artifact_directory)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -631,7 +734,7 @@ def list_messages(session_id: str, db: Session = Depends(get_db)) -> list[ChatMe
         db.scalars(
             select(ChatMessage)
             .where(ChatMessage.session_id == session_id)
-            .order_by(ChatMessage.created_at.asc())
+            .order_by(ChatMessage.sequence.asc(), ChatMessage.created_at.asc(), ChatMessage.id.asc())
         )
     )
 

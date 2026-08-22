@@ -22,14 +22,13 @@ from app.database import (
     DEFAULT_WORKSPACE_ID,
     Agent,
     Approval,
-    ChatMessage,
+    ConversationCompaction,
     DraftLaunch,
     ModelConnection,
     Run,
     RunEvent,
     Session,
     Workspace,
-    next_chat_message_sequence,
     get_db,
 )
 from app.schemas import (
@@ -48,6 +47,13 @@ from app.services.run_service import (
 )
 from app.services.run_stream import TERMINAL_EVENT_TYPES, run_stream_broker
 from app.services.skill_service import replace_session_skills, validate_skill_ids
+from app.services.turn_delivery import (
+    find_turn_by_client_message,
+    persist_terminal_response,
+    request_fingerprint,
+    run_for_turn,
+    stage_user_turn,
+)
 
 
 router = APIRouter(prefix="/api", tags=["runtime"])
@@ -55,6 +61,7 @@ router = APIRouter(prefix="/api", tags=["runtime"])
 
 class SessionRunRequest(BaseModel):
     content: str = Field(min_length=1, max_length=100_000)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class SessionContextRead(BaseModel):
@@ -62,12 +69,18 @@ class SessionContextRead(BaseModel):
     limit_tokens: int
     compact_threshold_tokens: int
     percent: float
-    last_compacted_at: datetime | None
+    last_compaction_at: datetime | None
 
 
 class ApprovalRuntimeDecision(BaseModel):
     decision: Literal["approve", "reject"]
     reason: str | None = None
+
+
+class StopRunRequest(BaseModel):
+    # Keep the public API intentionally narrow.  Runtime safety/guard stops
+    # are produced by the engine itself; clients may only request a user stop.
+    reason: Literal["user_interrupted"] = "user_interrupted"
 
 
 def _normalized_workspace_root(root_path: str) -> str:
@@ -160,13 +173,36 @@ def _draft_launch_response(
     )
 
 
-def _mark_unscheduled_draft_run(db: OrmSession, run: Run) -> None:
+def _mark_unscheduled_run(
+    db: OrmSession,
+    run: Run,
+    error: BaseException | None = None,
+) -> None:
     """Persist a terminal outcome if the post-commit coordinator cannot start."""
 
     run.status = "failed"
     run.error_code = "launch_unavailable"
-    run.error_message = "The local run coordinator could not be scheduled"
+    run.error_message = "任务已经保存，但本地执行器未能启动。"
     run.finished_at = datetime.now(timezone.utc)
+    event_payload = {"error_type": "launch_unavailable", "phase": "launch"}
+    if error is not None:
+        event_payload.update({
+            "exception_type": type(error).__name__,
+            # Private diagnostic evidence. Public event serializers omit this
+            # field, and the user-facing reply remains deterministic.
+            "internal_error": (str(error) or type(error).__name__)[:20_000],
+        })
+    db.add(RunEvent(
+        run_id=run.id,
+        event_type="integration_failed",
+        payload=event_payload,
+    ))
+    persist_terminal_response(
+        db,
+        run,
+        error_code=run.error_code,
+        error_message=run.error_message,
+    )
     db.commit()
 
 
@@ -244,22 +280,17 @@ async def launch_draft(
         db.add(chat_session)
         db.flush()
         replace_session_skills(db, chat_session, skill_ids)
-        message = ChatMessage(
-            session_id=chat_session.id,
-            role="user",
-            content=payload.content,
-            sequence=next_chat_message_sequence(db, chat_session.id),
-            extra={"mode": "auto", "source": "draft_launch"},
-        )
-        run = Run(
+        _turn, message, run = stage_user_turn(
+            db,
             session_id=chat_session.id,
             workspace_id=workspace.id,
             agent_id=DEFAULT_AGENT_ID,
+            content=payload.content,
             mode="auto",
-            status="received",
+            client_message_id=payload.idempotency_key,
+            fingerprint=fingerprint,
+            message_extra={"mode": "auto", "source": "draft_launch"},
         )
-        db.add_all([message, run])
-        db.flush()
         record = DraftLaunch(
             idempotency_key=payload.idempotency_key,
             request_fingerprint=fingerprint,
@@ -299,27 +330,42 @@ async def launch_draft(
     try:
         scheduled = coordinator.launch(run.id)
     except Exception as exc:
-        _mark_unscheduled_draft_run(db, run)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The draft was saved, but its run could not be scheduled",
-        ) from exc
+        _mark_unscheduled_run(db, run, exc)
+        return _draft_launch_response(record, expected_fingerprint=fingerprint, db=db, reused=False)
     if not scheduled:
-        _mark_unscheduled_draft_run(db, run)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The draft was saved, but its run could not be scheduled",
-        )
+        _mark_unscheduled_run(db, run)
+        return _draft_launch_response(record, expected_fingerprint=fingerprint, db=db, reused=False)
     return result
 
 
 @router.post("/sessions/{session_id}/run", response_model=RunRead, status_code=status.HTTP_202_ACCEPTED)
 async def launch_session_run(
-    session_id: str, payload: SessionRunRequest, db: OrmSession = Depends(get_db)
+    session_id: str,
+    payload: SessionRunRequest,
+    response: Response,
+    db: OrmSession = Depends(get_db),
 ) -> Run:
     chat_session = db.get(Session, session_id)
     if chat_session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="消息内容不能为空")
+    client_message_id = payload.idempotency_key.strip() if payload.idempotency_key else None
+    fingerprint = request_fingerprint(content)
+    existing_turn = find_turn_by_client_message(
+        db,
+        session_id=session_id,
+        client_message_id=client_message_id,
+    )
+    if existing_turn is not None:
+        if existing_turn.request_fingerprint != fingerprint:
+            raise HTTPException(status_code=409, detail="该消息标识已用于不同内容")
+        existing_run = run_for_turn(db, existing_turn.id)
+        if existing_run is None:
+            raise HTTPException(status_code=409, detail="已接收消息对应的运行记录不存在")
+        response.status_code = status.HTTP_200_OK
+        return existing_run
     # A session always runs through the fixed PGAgent coordinator. This also
     # repairs a legacy session lazily if it predates the coordinator migration.
     agent = db.get(Agent, DEFAULT_AGENT_ID)
@@ -334,19 +380,44 @@ async def launch_session_run(
         raise HTTPException(status_code=409, detail="当前会话已有运行或待审批工具，请先处理后再发送")
 
     mode = "auto"
-    message = ChatMessage(
+    _turn, _message, run = stage_user_turn(
+        db,
         session_id=session_id,
-        role="user",
-        content=payload.content.strip(),
-        sequence=next_chat_message_sequence(db, session_id),
-        extra={"mode": mode},
+        workspace_id=workspace_id,
+        agent_id=agent.id,
+        content=content,
+        mode=mode,
+        client_message_id=client_message_id,
+        fingerprint=fingerprint,
+        message_extra={"mode": mode},
     )
-    run = Run(session_id=session_id, workspace_id=workspace_id, agent_id=agent.id, mode=mode, status="received")
-    db.add_all([message, run])
     chat_session.updated_at = datetime.now(timezone.utc)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        existing_turn = find_turn_by_client_message(
+            db,
+            session_id=session_id,
+            client_message_id=client_message_id,
+        )
+        if existing_turn is None or existing_turn.request_fingerprint != fingerprint:
+            raise HTTPException(status_code=409, detail="消息接收发生冲突") from exc
+        existing_run = run_for_turn(db, existing_turn.id)
+        if existing_run is None:
+            raise HTTPException(status_code=409, detail="已接收消息对应的运行记录不存在") from exc
+        response.status_code = status.HTTP_200_OK
+        return existing_run
     db.refresh(run)
-    coordinator.launch(run.id)
+    try:
+        scheduled = coordinator.launch(run.id)
+    except Exception as exc:
+        _mark_unscheduled_run(db, run, exc)
+        db.refresh(run)
+        return run
+    if not scheduled:
+        _mark_unscheduled_run(db, run)
+        db.refresh(run)
     return run
 
 
@@ -420,13 +491,38 @@ def session_context(session_id: str, db: OrmSession = Depends(get_db)) -> Sessio
     _prepare_session_history(db, chat_session)
     db.commit()
     used_tokens = max(0, min(int(chat_session.context_tokens or 0), settings.context_limit_tokens))
+    latest_compaction = db.scalar(
+        select(ConversationCompaction)
+        .where(ConversationCompaction.session_id == session_id)
+        .order_by(ConversationCompaction.source_sequence.desc(), ConversationCompaction.created_at.desc())
+    )
     return SessionContextRead(
         used_tokens=used_tokens,
         limit_tokens=settings.context_limit_tokens,
         compact_threshold_tokens=settings.compact_threshold_tokens,
         percent=round((used_tokens / settings.context_limit_tokens) * 100, 2),
-        last_compacted_at=chat_session.last_compacted_at,
+        last_compaction_at=latest_compaction.created_at if latest_compaction is not None else None,
     )
+
+
+@router.post("/runs/{run_id}/stop", response_model=RunRead)
+async def stop_run(
+    run_id: str,
+    payload: StopRunRequest | None = None,
+    db: OrmSession = Depends(get_db),
+) -> Run:
+    """Interrupt a running model/tool loop at the user's request.
+
+    The coordinator commits the terminal stop marker before cancelling its
+    asyncio task.  Repeating the request is safe: an already terminal run is
+    returned unchanged and a completed/failed run is never rewritten as an
+    interruption.
+    """
+
+    run = coordinator.stop(run_id, db=db, reason=(payload.reason if payload else "user_interrupted"))
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
 
 
 @router.post("/approvals/{approval_id}/decide", response_model=ApprovalRead)
@@ -469,6 +565,8 @@ async def decide_and_resume(
         run_values = {
             "status": "stopped",
             "stop_reason": "approval_rejected",
+            "error_code": "approval_rejected",
+            "error_message": "所需操作没有获得批准，任务已停止。",
             "finished_at": decided_at,
         }
         db.add(RunEvent(run_id=run.id, event_type="approval_rejected", payload={"approval_id": approval.id}))
@@ -494,6 +592,12 @@ async def decide_and_resume(
             stop_reason="approval_rejected",
             error=payload.reason or "Child approval was rejected",
             error_code="approval_rejected",
+        )
+        persist_terminal_response(
+            db,
+            run,
+            error_code="approval_rejected",
+            error_message=run.error_message,
         )
     db.commit()
     approval = db.get(Approval, approval_id)

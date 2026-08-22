@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import threading
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from sqlalchemy import case, func, or_, select, update
 
@@ -18,14 +20,12 @@ from app.database import (
     Agent,
     Approval,
     ChatMessage,
+    ConversationTurn,
+    ConversationCompaction,
     Artifact,
-    CompactionAttempt,
-    ContextCheckpoint,
-    ContextEpoch,
     DelegatedTask,
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
-    Memory,
     ModelConnection,
     Run,
     RunEvent,
@@ -34,18 +34,54 @@ from app.database import (
     UsageRecord,
     Workspace,
 )
-from app.runtime import AgentRuntime, ContextManager, FilesystemArtifactStore, RunOutcome, RuntimeConfig, normalize_usage
-from app.runtime.context import estimate_tokens, message_tokens
+from app.runtime import (
+    AgentRuntime,
+    ContextManager,
+    FilesystemArtifactStore,
+    RunOutcome,
+    RuntimeConfig,
+    decide_deterministic_completion,
+    normalize_usage,
+)
+from app.runtime.context import message_tokens
 from app.tools import create_default_registry
 from app.tools.registry import TOOL_SCHEMAS
 from app.tools.types import ToolResult
 
 from .model_gateway import ModelConfigurationError, ProviderConfig, build_model_call
-from .completion_evaluator import build_completion_verifier
 from .run_stream import run_stream_broker
+from .turn_delivery import (
+    classify_error_details,
+    classify_exception,
+    ensure_run_turn,
+    is_terminal_delivery,
+    persist_terminal_response,
+    public_error_message,
+    sync_turn_progress,
+    terminal_error_code,
+)
 
 
 ACTIVE_STATUSES = {"received", "preparing_context", "planning", "acting", "observing", "verifying", "running"}
+# ``received`` is included above because it is a schedulable run that may not
+# have reached the runtime yet.  Approval pauses are also user-stoppable; a
+# stop request must settle the pending approval instead of leaving a dead
+# button in the UI.
+STOPPABLE_STATUSES = ACTIVE_STATUSES | {"awaiting_approval"}
+USER_INTERRUPT_REASON = "user_interrupted"
+USER_INTERRUPT_ERROR = "run_interrupted"
+USER_INTERRUPT_REASONS = frozenset({USER_INTERRUPT_REASON, "parent_user_interrupted"})
+
+# ``stream_sink`` is a low-latency UI channel. Provider payloads never pass
+# through directly; reasoning is exposed only as the runtime's typed delta.
+_PUBLIC_TRANSIENT_STREAM_EVENT_TYPES = frozenset({
+    "assistant_delta",
+    "thought_delta",
+    "progress",
+    "agent_progress",
+    "thought_summary",
+    "activity_update",
+})
 
 _DELEGATE_OUTPUT_LIMIT = 16_000
 _DELEGATE_MESSAGE_LIMIT = 20_000
@@ -105,61 +141,45 @@ def _message_payload(message: ChatMessage) -> dict[str, Any]:
     tool_calls = metadata.get("tool_calls")
     if message.role == "assistant" and isinstance(tool_calls, list) and tool_calls:
         payload["tool_calls"] = _json_safe(tool_calls)
+    provider_payload = message.provider_payload if isinstance(message.provider_payload, dict) else {}
+    reasoning_content = provider_payload.get("reasoning_content")
+    if message.role == "assistant" and isinstance(reasoning_content, str) and reasoning_content:
+        payload["reasoning_content"] = reasoning_content
     return payload
 
 
-def _conversation_token_count(summary: str, messages: list[dict[str, Any]]) -> int:
-    summary_tokens = estimate_tokens(summary) if summary.strip() else 0
-    return summary_tokens + sum(message_tokens(message) for message in messages)
+def _compaction_from_db(db: Any, session: Session) -> dict[str, Any]:
+    """Load only the newest full transcript replacement for a session."""
 
-
-def _context_snapshot_from_db(db: Any, session: Session) -> dict[str, Any]:
-    """Load the active durable checkpoint as a provider-facing snapshot.
-
-    ``ContextEpoch`` is the promoted generation; the checkpoint fallback keeps
-    recovery possible if a process stopped between writing the immutable
-    checkpoint and promoting the epoch.  The original ChatMessage transcript
-    is never replaced by this view.
-    """
-
-    epoch = db.scalar(
-        select(ContextEpoch)
-        .where(ContextEpoch.session_id == session.id, ContextEpoch.status == "active")
-        .order_by(ContextEpoch.epoch_number.desc(), ContextEpoch.created_at.desc())
+    compaction = db.scalar(
+        select(ConversationCompaction)
+        .where(ConversationCompaction.session_id == session.id)
+        .order_by(
+            ConversationCompaction.source_sequence.desc(),
+            ConversationCompaction.created_at.desc(),
+            ConversationCompaction.id.desc(),
+        )
     )
-    if epoch is not None:
-        return {
-            "session_id": session.id,
-            "epoch_id": epoch.id,
-            "source_sequence": int(epoch.start_sequence or 0),
-            "sequence": int(epoch.end_sequence or 0),
-            "summary": _json_safe(epoch.summary_json or {}),
-            "task_state": _json_safe(epoch.task_state or {}),
-            "retained_messages": _json_safe(epoch.retained_messages or []),
-            "artifact_refs": _json_safe(epoch.artifact_refs or []),
-            "pinned_rules": _json_safe(epoch.pinned_rules or []),
-            "version": int(epoch.version or 0),
-            "created_at": epoch.created_at.isoformat() if epoch.created_at else None,
-        }
-    checkpoint = db.scalar(
-        select(ContextCheckpoint)
-        .where(ContextCheckpoint.session_id == session.id, ContextCheckpoint.status == "completed")
-        .order_by(ContextCheckpoint.created_at.desc(), ContextCheckpoint.id.desc())
-    )
-    if checkpoint is None:
+    if compaction is None:
         return {}
     return {
+        "schema": "claude_compaction_v1",
+        "id": compaction.id,
         "session_id": session.id,
-        "epoch_id": checkpoint.epoch_id or checkpoint.id,
-        "source_sequence": int(checkpoint.start_sequence or 0),
-        "sequence": int(checkpoint.end_sequence or 0),
-        "summary": _json_safe(checkpoint.summary_json or {}),
-        "task_state": _json_safe(checkpoint.task_state or {}),
-        "retained_messages": _json_safe(checkpoint.retained_messages or []),
-        "artifact_refs": _json_safe(checkpoint.artifact_refs or []),
-        "pinned_rules": _json_safe(checkpoint.pinned_rules or []),
-        "version": int(checkpoint.source_version or 0),
-        "created_at": checkpoint.created_at.isoformat() if checkpoint.created_at else None,
+        "source_sequence": int(compaction.source_sequence or 0),
+        "active_request": str(compaction.active_request or ""),
+        "todo_state": _json_safe(compaction.todo_state or []),
+        "summary": str(compaction.summary or ""),
+        "messages": _json_safe(compaction.continuation_messages or []),
+        "transcript_artifact": _json_safe(compaction.transcript_artifact or {}),
+        "artifact_refs": _json_safe(compaction.artifact_refs or []),
+        "reason": str(compaction.reason or "threshold"),
+        "before_tokens": int(compaction.before_tokens or 0),
+        "after_tokens": int(compaction.after_tokens or 0),
+        "removed_message_count": int(compaction.removed_message_count or 0),
+        "used_model": bool(compaction.used_model),
+        "fallback": bool(compaction.fallback),
+        "created_at": compaction.created_at.isoformat() if compaction.created_at else None,
     }
 
 
@@ -172,36 +192,58 @@ def _chat_message_key(message: Mapping[str, Any]) -> str:
         "name": message.get("name"),
         "tool_call_id": message.get("tool_call_id"),
         "tool_calls": message.get("tool_calls") or [],
+        "reasoning_content": message.get("reasoning_content") or "",
     }
     return json.dumps(_json_safe(selected), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _append_runtime_transcript(db: Any, run_id: str, session_id: str, outcome: RunOutcome) -> None:
+def _append_runtime_transcript(
+    db: Any,
+    run_id: str,
+    session_id: str,
+    outcome: RunOutcome,
+    *,
+    terminal_managed: bool = False,
+) -> None:
     """Persist newly produced assistant/tool items without duplicating history.
 
-    Runtime state contains the current provider view (which may include many
-    older messages and checkpoint material).  We consume matching rows as a
-    multiset and append only items not already durable.  System/checkpoint
-    messages are model-view metadata, not user transcript rows, and are kept in
-    the ContextCheckpoint instead.
+    Runtime state may contain a compacted provider view.  Only its explicit
+    transcript delta is appended; compacted continuation messages remain in
+    ``ConversationCompaction`` and are never duplicated as chat rows.
     """
 
     existing_rows = list(
         db.scalars(
             select(ChatMessage)
             .where(ChatMessage.session_id == session_id)
-            .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            .order_by(ChatMessage.sequence.asc(), ChatMessage.created_at.asc(), ChatMessage.id.asc())
         )
     )
     existing = Counter(_chat_message_key(_message_payload(row)) for row in existing_rows)
     next_sequence = max((int(getattr(row, "sequence", 0) or 0) for row in existing_rows), default=0) + 1
     final_reply_persisted = False
-    runtime_messages = outcome.messages if outcome.transcript_delta is None else outcome.transcript_delta
-    for raw in runtime_messages:
+    runtime_messages = list(outcome.messages if outcome.transcript_delta is None else outcome.transcript_delta)
+    accepted_output = str(outcome.output or "").strip()
+    terminal_candidate_index: int | None = None
+    if terminal_managed and accepted_output:
+        for index, candidate in enumerate(runtime_messages):
+            if (
+                isinstance(candidate, dict)
+                and str(candidate.get("role") or "").strip().lower() == "assistant"
+                and not candidate.get("tool_calls")
+                and str(candidate.get("content") or "").strip() == accepted_output
+            ):
+                terminal_candidate_index = index
+    for index, raw in enumerate(runtime_messages):
         if not isinstance(raw, dict):
             continue
         role = str(raw.get("role") or "").strip().lower()
         if role == "system" or not role:
+            continue
+        if terminal_managed and index == terminal_candidate_index:
+            # The turn finalizer writes the accepted output with a database
+            # exactly-once key. Keeping a second provider transcript copy would
+            # duplicate it on the next context reconstruction.
             continue
         content = str(raw.get("content") or "")
         if role == "tool" and content.startswith("[artifact:"):
@@ -229,6 +271,8 @@ def _append_runtime_transcript(db: Any, run_id: str, session_id: str, outcome: R
             payload["tool_call_id"] = str(raw["tool_call_id"])
         if role == "assistant" and isinstance(raw.get("tool_calls"), list):
             payload["tool_calls"] = _json_safe(raw["tool_calls"])
+        if role == "assistant" and isinstance(raw.get("reasoning_content"), str):
+            payload["reasoning_content"] = str(raw["reasoning_content"])
         if role == "tool" and payload.get("name") == "task" and payload.get("tool_call_id"):
             existing_task_result = db.scalar(
                 select(ChatMessage)
@@ -271,7 +315,11 @@ def _append_runtime_transcript(db: Any, run_id: str, session_id: str, outcome: R
         # reply for backwards-compatible chat APIs. Internal tool turns are
         # still durable, but use ``runtime_run_id`` so they do not appear as
         # duplicate assistant replies in existing consumers.
-        is_final_assistant = role == "assistant" and not payload.get("tool_calls")
+        is_final_assistant = (
+            not terminal_managed
+            and role == "assistant"
+            and not payload.get("tool_calls")
+        )
         final_reply_persisted = final_reply_persisted or is_final_assistant
         metadata: dict[str, Any] = {
             ("run_id" if is_final_assistant else "runtime_run_id"): run_id,
@@ -288,6 +336,10 @@ def _append_runtime_transcript(db: Any, run_id: str, session_id: str, outcome: R
                 tool_call_id=payload.get("tool_call_id"),
                 sequence=next_sequence,
                 extra=metadata,
+                provider_payload=(
+                    {"reasoning_content": payload["reasoning_content"]}
+                    if payload.get("reasoning_content") else {}
+                ),
             )
         )
         next_sequence += 1
@@ -298,7 +350,7 @@ def _append_runtime_transcript(db: Any, run_id: str, session_id: str, outcome: R
     # Tool-driven terminal paths (for example ``question``) carry their final
     # user-facing text in RunOutcome.output but intentionally do not append a
     # second assistant provider message to the tool transcript.
-    if outcome.output and not final_reply_persisted:
+    if outcome.output and not final_reply_persisted and not terminal_managed:
         final_payload = {"role": "assistant", "content": str(outcome.output)}
         db.add(ChatMessage(
             session_id=session_id,
@@ -309,37 +361,27 @@ def _append_runtime_transcript(db: Any, run_id: str, session_id: str, outcome: R
         ))
 
 
-def _lock_context_source(db: Any, session: Session, outcome: RunOutcome) -> bool | None:
-    """Acquire the session write lock iff the compactor's source cursor is current."""
+def _compaction_source_is_current(db: Any, session: Session, outcome: RunOutcome) -> bool | None:
+    """Check the append-only cursor captured before this runtime began."""
 
-    snapshot = dict(outcome.context_snapshot or {})
-    if not snapshot.get("epoch_id") or snapshot.get("source_sequence") is None:
+    compaction = dict(outcome.compaction_state or {})
+    if not compaction or compaction.get("source_sequence") is None:
         return None
-    end_sequence = max(0, int(snapshot.get("sequence") or snapshot.get("end_sequence") or 0))
-    version = max(0, int(snapshot.get("version") or 0))
-    existing = db.scalar(select(ContextCheckpoint.id).where(
-        ContextCheckpoint.session_id == session.id,
-        ContextCheckpoint.end_sequence == end_sequence,
-        ContextCheckpoint.source_version == version,
-        ContextCheckpoint.status == "completed",
-    ))
-    if existing is not None:
+    if compaction.get("id"):
         return None
-    expected = max(0, int(snapshot.get("source_sequence") or 0))
-    maximum = (
-        select(func.coalesce(func.max(ChatMessage.sequence), 0))
-        .where(ChatMessage.session_id == session.id)
-        .scalar_subquery()
+    source_sequence = max(0, int(compaction.get("source_sequence") or 0))
+    delta_count = max(0, int(compaction.get("source_delta_count") or 0))
+    expected_base = max(
+        0,
+        int(compaction.get("base_sequence") or (source_sequence - delta_count)),
     )
-    result = db.execute(
-        update(Session)
-        .where(Session.id == session.id, maximum == expected)
-        .values(context_tokens=Session.context_tokens)
-    )
-    return int(result.rowcount or 0) == 1
+    current = int(db.scalar(
+        select(func.max(ChatMessage.sequence)).where(ChatMessage.session_id == session.id)
+    ) or 0)
+    return current == expected_base
 
 
-def _persist_context_snapshot(
+def _persist_conversation_compaction(
     db: Any,
     session: Session,
     run_id: str,
@@ -347,223 +389,95 @@ def _persist_context_snapshot(
     *,
     source_sequence_valid: bool | None = None,
 ) -> None:
-    """Promote a runtime snapshot atomically with its checkpoint/audit rows."""
+    """Persist one immutable Claude-style full-compaction replacement."""
 
-    snapshot = dict(outcome.context_snapshot or {})
+    compaction = dict(outcome.compaction_state or {})
     all_artifact_refs = [
         *list(outcome.artifact_refs or []),
-        *list(snapshot.get("artifact_refs") or []),
+        *list(compaction.get("artifact_refs") or []),
     ]
-    compaction_finished = [
-        event for event in outcome.events
-        if event.get("type") == "context_compaction_finished"
-    ]
-    compaction_failed = [
-        event for event in outcome.events
-        if event.get("type") == "context_compaction_failed"
-    ]
-    if not snapshot.get("epoch_id"):
-        _persist_artifact_refs(db, session.id, all_artifact_refs)
-        if compaction_failed:
-            last = compaction_failed[-1]
-            db.add(CompactionAttempt(
-                session_id=session.id,
-                trigger="threshold",
-                phase="before_model",
-                status="failed",
-                attempt_number=1,
-                error_code=str(last.get("error_type") or "compaction_failed"),
-                error_message=str(last.get("error") or ""),
-                details={"run_id": run_id},
-                finished_at=_utcnow(),
-            ))
-        elif compaction_finished:
-            last = compaction_finished[-1]
-            db.add(CompactionAttempt(
-                session_id=session.id,
-                trigger=str(last.get("reason") or "threshold"),
-                phase=str(last.get("phase") or "before_model"),
-                status="completed" if bool(last.get("effective")) else "ineffective",
-                attempt_number=max(1, int(last.get("attempts") or 1)),
-                before_tokens=max(0, int(last.get("before_tokens") or 0)),
-                after_tokens=max(0, int(last.get("after_tokens") or 0)),
-                details={"run_id": run_id, "snapshot_missing": True},
-                finished_at=_utcnow(),
-            ))
+    _persist_artifact_refs(db, session.id, all_artifact_refs)
+    if not compaction or compaction.get("schema") != "claude_compaction_v1":
         return
 
-    summary = _json_safe(snapshot.get("summary") or {})
-    retained_messages = _json_safe(snapshot.get("retained_messages") or [])
-    task_state = _json_safe(snapshot.get("task_state") or {})
-    artifact_refs = _json_safe(snapshot.get("artifact_refs") or [])
-    end_sequence = max(0, int(snapshot.get("sequence") or snapshot.get("end_sequence") or 0))
-    version = max(0, int(snapshot.get("version") or 0))
-    last_finished = compaction_finished[-1] if compaction_finished else {}
-    before_tokens = max(0, int(last_finished.get("before_tokens") or 0))
-    after_tokens = max(0, int(last_finished.get("after_tokens") or 0))
-
-    # Idempotency: a retry of persistence must not create a second active view
-    # for the same semantic epoch.
-    existing_checkpoint = db.scalar(
-        select(ContextCheckpoint)
-        .where(
-            ContextCheckpoint.session_id == session.id,
-            ContextCheckpoint.end_sequence == end_sequence,
-            ContextCheckpoint.source_version == version,
-            ContextCheckpoint.status == "completed",
-        )
-        .order_by(ContextCheckpoint.created_at.desc(), ContextCheckpoint.id.desc())
-    )
-    if existing_checkpoint is not None:
-        _persist_artifact_refs(db, session.id, all_artifact_refs, epoch_id=existing_checkpoint.epoch_id)
-        session.context_summary = json.dumps(summary, ensure_ascii=False, sort_keys=True)
-        session.context_tokens = after_tokens or session.context_tokens
-        return
-
-    source_sequence = snapshot.get("source_sequence")
-    checkpoint_start_sequence = max(0, int(source_sequence or 0))
-    if source_sequence is not None:
-        expected_sequence = max(0, int(source_sequence or 0))
-        current_sequence = int(db.scalar(
-            select(func.max(ChatMessage.sequence)).where(ChatMessage.session_id == session.id)
-        ) or 0)
-        source_conflict = source_sequence_valid is False
-        if source_sequence_valid is None:
-            source_conflict = current_sequence != expected_sequence
-        boundary_conflict = end_sequence > current_sequence
-        if source_conflict or boundary_conflict:
-            db.add(CompactionAttempt(
-                session_id=session.id,
-                trigger=str(last_finished.get("reason") or "threshold"),
-                phase="before_model",
-                status="conflict",
-                attempt_number=max(1, int(last_finished.get("attempts") or 1)),
-                before_tokens=before_tokens,
-                after_tokens=after_tokens,
-                source_version=max(0, version - 1),
-                target_version=version,
-                details={
-                    "run_id": run_id,
-                    "expected_source_sequence": expected_sequence,
-                    "current_sequence": current_sequence,
-                    "checkpoint_end_sequence": end_sequence,
-                },
-                finished_at=_utcnow(),
-            ))
-            _persist_artifact_refs(db, session.id, all_artifact_refs)
-            return
-
-    current_active = db.scalar(
-        select(ContextEpoch)
-        .where(ContextEpoch.session_id == session.id, ContextEpoch.status == "active")
-        .order_by(ContextEpoch.version.desc(), ContextEpoch.epoch_number.desc())
-    )
-    if current_active is not None and (
-        int(current_active.version or 0) > version
-        or int(current_active.end_sequence or 0) > end_sequence
-    ):
-        # A newer transcript/checkpoint won the race while the compactor was
-        # running.  Never replace it with an older semantic view.
-        db.add(CompactionAttempt(
-            session_id=session.id,
-            epoch_id=current_active.id,
-            trigger=str(last_finished.get("reason") or "threshold"),
-            phase="before_model",
-            status="conflict",
-            attempt_number=max(1, int(last_finished.get("attempts") or 1)),
-            before_tokens=before_tokens,
-            after_tokens=after_tokens,
-            source_version=version,
-            target_version=int(current_active.version or 0),
-            details={
-                "run_id": run_id,
-                "expected_sequence": end_sequence,
-                "current_sequence": int(current_active.end_sequence or 0),
-            },
-            finished_at=_utcnow(),
-        ))
-        _persist_artifact_refs(db, session.id, all_artifact_refs, epoch_id=current_active.id)
-        return
-
-    active_epochs = list(db.scalars(
-        select(ContextEpoch).where(ContextEpoch.session_id == session.id, ContextEpoch.status == "active")
+    source_sequence = max(0, int(compaction.get("source_sequence") or 0))
+    current_sequence = int(db.scalar(
+        select(func.max(ChatMessage.sequence)).where(ChatMessage.session_id == session.id)
+    ) or 0)
+    existing = db.scalar(select(ConversationCompaction).where(
+        ConversationCompaction.session_id == session.id,
+        ConversationCompaction.source_sequence == source_sequence,
     ))
-    for old_epoch in active_epochs:
-        old_epoch.status = "superseded"
-    next_number = int(db.scalar(
-        select(func.max(ContextEpoch.epoch_number)).where(ContextEpoch.session_id == session.id)
-    ) or -1) + 1
-    epoch = ContextEpoch(
-        session_id=session.id,
-        epoch_number=next_number,
-        status="active",
-        start_sequence=checkpoint_start_sequence,
-        end_sequence=end_sequence,
-        summary_json=summary,
-        retained_messages=retained_messages,
-        task_state=task_state,
-        artifact_refs=artifact_refs,
-        pinned_rules=_json_safe(snapshot.get("pinned_rules") or []),
-        compaction_reason=str(last_finished.get("reason") or "threshold"),
-        before_tokens=before_tokens,
-        after_tokens=after_tokens,
-        version=version,
+    if existing is not None:
+        session.context_tokens = max(0, int(existing.after_tokens or session.context_tokens))
+        return
+    newer = db.scalar(
+        select(ConversationCompaction.id).where(
+            ConversationCompaction.session_id == session.id,
+            ConversationCompaction.source_sequence > source_sequence,
+        )
     )
-    db.add(epoch)
-    db.flush()
-    checkpoint = ContextCheckpoint(
-        session_id=session.id,
-        epoch_id=epoch.id,
-        start_sequence=checkpoint_start_sequence,
-        end_sequence=end_sequence,
-        summary_json=summary,
-        retained_messages=retained_messages,
-        task_state=task_state,
-        artifact_refs=artifact_refs,
-        pinned_rules=_json_safe(snapshot.get("pinned_rules") or []),
-        compaction_reason=str(last_finished.get("reason") or "threshold"),
-        before_tokens=before_tokens,
-        after_tokens=after_tokens,
-        status="completed",
-        source_version=version,
-        promoted_at=_utcnow(),
-    )
-    db.add(checkpoint)
-    db.flush()
-    _persist_artifact_refs(db, session.id, all_artifact_refs, epoch_id=epoch.id)
-
-    attempt_count = max(1, int(last_finished.get("attempts") or 1))
-    for attempt_number in range(1, attempt_count + 1):
-        db.add(CompactionAttempt(
-            session_id=session.id,
-            epoch_id=epoch.id,
-            checkpoint_id=checkpoint.id,
-            trigger=str(last_finished.get("reason") or "threshold"),
-            phase="before_model",
-            status="completed" if bool(last_finished.get("effective", True)) else "ineffective",
-            attempt_number=attempt_number,
-            before_tokens=before_tokens,
-            after_tokens=after_tokens,
-            source_version=max(0, version - 1),
-            target_version=version,
-            details={
-                "run_id": run_id,
-                "used_model": bool(last_finished.get("used_model")),
-                "fallback": bool(last_finished.get("fallback")),
+    if source_sequence_valid is False or source_sequence > current_sequence or newer is not None:
+        db.add(RunEvent(
+            run_id=run_id,
+            event_type="context_compaction_conflict",
+            payload={
+                "source_sequence": source_sequence,
+                "current_sequence": current_sequence,
+                "newer_compaction": newer is not None,
             },
-            finished_at=_utcnow(),
         ))
-    session.context_summary = json.dumps(summary, ensure_ascii=False, sort_keys=True)
-    session.context_tokens = after_tokens or session.context_tokens
-    session.last_compacted_at = _utcnow()
+        return
+
+    finished = next(
+        (
+            event for event in reversed(outcome.events)
+            if event.get("type") == "context_compaction_finished"
+            and bool(event.get("effective"))
+        ),
+        {},
+    )
+    messages = [
+        _json_safe(message)
+        for message in compaction.get("messages") or []
+        if isinstance(message, dict)
+    ]
+    if not messages or not str(messages[0].get("content") or "").startswith("<compacted-context>"):
+        db.add(RunEvent(
+            run_id=run_id,
+            event_type="context_compaction_rejected",
+            payload={"reason": "missing_compacted_continuation", "source_sequence": source_sequence},
+        ))
+        return
+
+    db.add(ConversationCompaction(
+        session_id=session.id,
+        source_run_id=run_id,
+        source_sequence=source_sequence,
+        active_request=str(compaction.get("active_request") or ""),
+        todo_state=_json_safe(compaction.get("todo_state") or []),
+        summary=str(compaction.get("summary") or ""),
+        continuation_messages=messages,
+        transcript_artifact=_json_safe(compaction.get("transcript_artifact") or {}),
+        artifact_refs=_json_safe(compaction.get("artifact_refs") or []),
+        reason=str(finished.get("reason") or compaction.get("reason") or "threshold"),
+        before_tokens=max(0, int(finished.get("before_tokens") or compaction.get("before_tokens") or 0)),
+        after_tokens=max(0, int(finished.get("after_tokens") or compaction.get("after_tokens") or 0)),
+        removed_message_count=max(0, int(compaction.get("removed_message_count") or 0)),
+        used_model=bool(finished.get("used_model") or compaction.get("used_model")),
+        fallback=bool(finished.get("fallback") or compaction.get("fallback")),
+    ))
+    session.context_tokens = max(
+        0,
+        int(finished.get("after_tokens") or compaction.get("after_tokens") or session.context_tokens),
+    )
+
 
 
 def _persist_artifact_refs(
     db: Any,
     session_id: str,
     refs: list[dict[str, Any]],
-    *,
-    epoch_id: str | None = None,
 ) -> None:
     """Persist artifact metadata idempotently; bytes already live in storage_key."""
 
@@ -581,12 +495,9 @@ def _persist_artifact_refs(
             Artifact.storage_path == storage_path,
         ))
         if existing is not None:
-            if epoch_id and not existing.epoch_id:
-                existing.epoch_id = epoch_id
             continue
         db.add(Artifact(
             session_id=session_id,
-            epoch_id=epoch_id,
             kind=str(raw_ref.get("kind") or "tool_output"),
             name=artifact_id[:255],
             storage_path=storage_path,
@@ -599,89 +510,32 @@ def _persist_artifact_refs(
 
 
 def _prepare_session_history(db: Any, session: Session) -> list[dict[str, Any]]:
-    """Return the active checkpoint tail plus the append-only transcript.
+    """Rebuild the provider transcript from one compaction plus its new tail."""
 
-    New sessions use an ordinal boundary captured in ``ContextEpoch``.  The
-    legacy timestamp/extractive path remains only for databases created before
-    checkpoint tables existed; it is never used once a durable epoch is active.
-    """
-
-    all_rows = list(db.scalars(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == session.id)
-        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
-    ))
-    snapshot = _context_snapshot_from_db(db, session)
-    if snapshot:
-        boundary = max(0, int(snapshot.get("sequence") or 0))
-        # The runtime records the number of transcript rows visible when it
-        # compacted.  Clamp malformed/old values rather than hiding messages.
-        if all_rows and all(int(getattr(row, "sequence", 0) or 0) > 0 for row in all_rows):
-            rows = [row for row in all_rows if int(row.sequence or 0) > boundary]
-        else:
-            rows = all_rows[boundary:] if boundary <= len(all_rows) else []
-        messages = [_message_payload(item) for item in rows]
-        summary_tokens = estimate_tokens(snapshot.get("summary") or {})
-        retained_tokens = sum(message_tokens(item) for item in snapshot.get("retained_messages") or [])
-        used_tokens = summary_tokens + retained_tokens + sum(message_tokens(item) for item in messages)
-        session.context_tokens = min(used_tokens, settings.context_limit_tokens)
-        return messages
-
-    # Compatibility fallback for old sessions with only context_summary and a
-    # timestamp cursor.  It is intentionally isolated from the new path.
+    compaction = _compaction_from_db(db, session)
+    boundary = max(0, int(compaction.get("source_sequence") or 0))
     query = select(ChatMessage).where(ChatMessage.session_id == session.id)
-    if session.last_compacted_at is not None:
-        query = query.where(ChatMessage.created_at > session.last_compacted_at)
-    rows = list(db.scalars(query.order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())))
-    messages = [_message_payload(item) for item in rows]
-    used_tokens = _conversation_token_count(session.context_summary or "", messages)
-
-    if used_tokens >= settings.compact_threshold_tokens and rows:
-        recent_budget = max(1, settings.compact_threshold_tokens // 2)
-        keep_from = len(rows)
-        kept_tokens = 0
-        for index in range(len(rows) - 1, -1, -1):
-            cost = message_tokens(messages[index])
-            if kept_tokens and kept_tokens + cost > recent_budget:
-                break
-            if not kept_tokens and cost > recent_budget:
-                # Preserve the newest user turn verbatim; ContextManager will
-                # safely trim it for the provider if one message exceeds 100k.
-                keep_from = index
-                kept_tokens = cost
-                break
-            keep_from = index
-            kept_tokens += cost
-
-        # last_compacted_at is the only durable cursor. Never split rows that
-        # share its timestamp, otherwise an un-compacted sibling could be lost
-        # by the next `created_at > cursor` query.
-        while (
-            0 < keep_from < len(rows)
-            and rows[keep_from - 1].created_at == rows[keep_from].created_at
-        ):
-            keep_from -= 1
-
-        compacted_rows = rows[:keep_from]
-        compacted_messages = messages[:keep_from]
-        if compacted_rows:
-            summary_source: list[dict[str, Any]] = []
-            if session.context_summary:
-                summary_source.append({"role": "summary", "content": session.context_summary})
-            summary_source.extend(compacted_messages)
-            session.context_summary = ContextManager(max_tokens=settings.context_limit_tokens).compact_messages(
-                summary_source,
-                token_budget=min(12_000, settings.compact_threshold_tokens // 4),
-            )
-            session.last_compacted_at = compacted_rows[-1].created_at
-            rows = rows[keep_from:]
-            messages = messages[keep_from:]
-            used_tokens = _conversation_token_count(session.context_summary, messages)
-
-    # This is the durable conversation footprint. The provider-facing builder
-    # separately guarantees it never emits more than context_limit_tokens.
-    session.context_tokens = min(used_tokens, settings.context_limit_tokens)
+    if compaction:
+        query = query.where(ChatMessage.sequence > boundary)
+    rows = list(db.scalars(query.order_by(
+        ChatMessage.sequence.asc(),
+        ChatMessage.created_at.asc(),
+        ChatMessage.id.asc(),
+    )))
+    messages = [
+        *[
+            dict(message)
+            for message in compaction.get("messages") or []
+            if isinstance(message, dict)
+        ],
+        *[_message_payload(row) for row in rows],
+    ]
+    session.context_tokens = min(
+        sum(message_tokens(message) for message in messages),
+        settings.context_limit_tokens,
+    )
     return messages
+
 
 
 def _explicit_setting(*values: str | None) -> str | None:
@@ -1294,6 +1148,11 @@ class _SubagentTaskDelegate:
             # Deliberately omit task_delegate: task was removed from the
             # allowlist and a child never obtains a recursive dispatch hook.
         )
+        # A delegated child runs inside the parent's asyncio task, but its
+        # tools may own subprocesses.  Register its cancellation hook so a
+        # user stop can terminate those side effects as well as the parent
+        # coroutine awaiting the child.
+        coordinator.register_tool_canceller(child_run_id, child_registry.cancel_active)
         child_runtime = AgentRuntime(
             model_call=build_model_call(provider_config),
             tool_registry=child_registry,
@@ -1317,8 +1176,6 @@ class _SubagentTaskDelegate:
                 system_prompt=str(child_binding["agent_system_prompt"]),
                 agent_instructions="",
                 workspace_rules=f"只能访问主会话冻结的工作区：{child_binding['workspace_root']}",
-                summary="",
-                memories=[],
                 recent_messages=[{"role": "user", "content": task}],
                 mode="auto",
                 thread_id=child_run_id,
@@ -1358,9 +1215,22 @@ class _SubagentTaskDelegate:
 class RunCoordinator:
     """Launch, persist and resume local runs without blocking HTTP requests."""
 
+    # Token deltas are intentionally delivered through the in-memory broker;
+    # writing one SQLite row per token would turn streaming into a database
+    # bottleneck.  We retain a bounded per-run copy here so an explicit user
+    # stop can persist the portion that was actually visible at that moment.
+    # Completed runs clear the buffer.  The durable event log still contains
+    # every thought/tool lifecycle event emitted by ``_event_sink``.
+    _stream_buffer_lock = threading.RLock()
+    _stream_buffers: dict[str, dict[str, str]] = {}
+    _interrupt_requested: dict[str, float] = {}
+    _INTERRUPT_MARK_RETENTION_SECONDS = 300.0
+    _MAX_PARTIAL_CHARS = 100_000
+
     def __init__(self) -> None:
         self.checkpointer: Any | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._tool_cancellers: dict[str, Callable[[], None]] = {}
         self._queued_resumes: set[str] = set()
         self._shutting_down = False
 
@@ -1368,6 +1238,91 @@ class RunCoordinator:
         self.checkpointer = checkpointer
         if checkpointer is not None:
             self._shutting_down = False
+
+    def register_tool_canceller(self, run_id: str, callback: Callable[[], None]) -> None:
+        self._tool_cancellers[run_id] = callback
+
+    def unregister_tool_canceller(self, run_id: str) -> None:
+        self._tool_cancellers.pop(run_id, None)
+
+    @classmethod
+    def _remember_stream_delta(cls, run_id: str, event: Mapping[str, Any]) -> None:
+        """Keep bounded visible deltas for a possible user interruption."""
+
+        event_type = str(event.get("type") or "")
+        if event_type == "assistant_delta":
+            key = "output"
+            delta = str(event.get("delta") or "")
+        elif event_type == "thought_delta":
+            key = "thought"
+            delta = str(event.get("delta") or "")
+        elif event_type in {"progress", "agent_progress", "thought_summary", "activity_update"}:
+            key = "thought"
+            delta = str(event.get("summary") or event.get("progress") or event.get("status_text") or event.get("activity") or "")
+        else:
+            return
+        if not delta:
+            return
+        with cls._stream_buffer_lock:
+            now = time.monotonic()
+            stale = [
+                item_id
+                for item_id, marked_at in cls._interrupt_requested.items()
+                if now - marked_at > cls._INTERRUPT_MARK_RETENTION_SECONDS
+            ]
+            for item_id in stale:
+                cls._interrupt_requested.pop(item_id, None)
+            if run_id in cls._interrupt_requested:
+                # A synchronous provider may finish its worker thread after
+                # the asyncio task has been cancelled.  Do not leak late
+                # tokens into a run that is already visible as stopped.
+                return
+            buffer = cls._stream_buffers.setdefault(run_id, {"output": "", "thought": ""})
+            current = buffer.get(key, "")
+            buffer[key] = (current + delta)[-cls._MAX_PARTIAL_CHARS :]
+
+    @classmethod
+    def _partial_stream(cls, run_id: str) -> dict[str, str]:
+        with cls._stream_buffer_lock:
+            return dict(cls._stream_buffers.get(run_id, {"output": "", "thought": ""}))
+
+    @classmethod
+    def _mark_interrupt_and_snapshot(cls, run_id: str) -> dict[str, str]:
+        """Atomically freeze the visible stream before publishing a stop."""
+
+        with cls._stream_buffer_lock:
+            snapshot = dict(cls._stream_buffers.get(run_id, {"output": "", "thought": ""}))
+            # Once the database CAS has claimed the run, no worker-thread
+            # token may be published after this point.  The caller commits
+            # the durable interruption and clears the buffer afterwards.
+            cls._interrupt_requested[run_id] = time.monotonic()
+            return snapshot
+
+    @classmethod
+    def _clear_stream_buffer(cls, run_id: str, *, interrupted: bool = False) -> None:
+        with cls._stream_buffer_lock:
+            cls._stream_buffers.pop(run_id, None)
+            if interrupted:
+                cls._interrupt_requested[run_id] = time.monotonic()
+            else:
+                cls._interrupt_requested.pop(run_id, None)
+
+    @classmethod
+    def _user_interrupt_locked(cls, run: Run) -> bool:
+        return run.status == "stopped" and run.stop_reason in USER_INTERRUPT_REASONS
+
+    @staticmethod
+    def _stop_requested(run_id: str) -> bool:
+        """Check the durable stop marker before starting a newly queued task.
+
+        A stop can race the short window between the HTTP launch commit and
+        ``coordinator.launch``.  In that case there is no asyncio task to
+        cancel yet; the task must still refuse to enter the model/tool loop.
+        """
+
+        with database_module.SessionLocal() as db:
+            run = db.get(Run, run_id)
+            return bool(run is not None and RunCoordinator._user_interrupt_locked(run))
 
     def _clear_task(self, completed: asyncio.Task[None], run_id: str) -> None:
         if self._tasks.get(run_id) is completed:
@@ -1398,6 +1353,355 @@ class RunCoordinator:
         self._tasks[run_id] = task
         task.add_done_callback(lambda completed, key=run_id: self._clear_task(completed, key))
         return True
+
+    def stop(
+        self,
+        run_id: str,
+        *,
+        db: Any | None = None,
+        reason: str = USER_INTERRUPT_REASON,
+    ) -> Run | None:
+        """Stop one run atomically and cancel its in-process task if present.
+
+        The database transition happens before ``asyncio.Task.cancel``.  This
+        ordering closes the race where a provider returns just as the user
+        presses stop: ``_persist_outcome`` sees the durable stop marker and
+        discards that late completion.  Calling this method repeatedly is
+        idempotent for a user-stopped run and never overwrites another
+        terminal outcome.
+
+        ``db`` is accepted so HTTP callers can reuse their request-scoped
+        session.  Maintenance callers may omit it and receive a detached
+        ``Run`` loaded through ``SessionLocal``.
+        """
+
+        owns_db = db is None
+        session = db or database_module.SessionLocal()
+        changed = False
+        parent_bridge_events: list[dict[str, Any]] = []
+        child_run_ids_to_cancel: list[str] = []
+        delegated_parent_id: str | None = None
+        partial = {"output": "", "thought": ""}
+        stream_marked = False
+        try:
+            run = session.get(Run, run_id)
+            if run is None:
+                return None
+            prior_status = str(run.status or "")
+            prior_stop_reason = str(run.stop_reason or "")
+            delegated_parent_id = session.scalar(
+                select(DelegatedTask.parent_run_id)
+                .where(DelegatedTask.child_run_id == run_id)
+            )
+            can_stop = prior_status in STOPPABLE_STATUSES or (
+                prior_status == "stopped"
+                and prior_stop_reason == "delegated_child_awaiting_approval"
+            )
+            if can_stop:
+                now = _utcnow()
+                reason_guard = Run.stop_reason.is_(None) if not prior_stop_reason else Run.stop_reason == prior_stop_reason
+                claimed = session.execute(
+                    update(Run)
+                    .where(
+                        Run.id == run_id,
+                        Run.status == prior_status,
+                        reason_guard,
+                    )
+                    .values(
+                        status="stopped",
+                        stop_reason=reason,
+                        error_code=USER_INTERRUPT_ERROR,
+                        error_message="任务已按你的要求停止。",
+                        finished_at=now,
+                    )
+                )
+                if claimed.rowcount != 1:
+                    # Another stop/outcome won the compare-and-swap.  Reload
+                    # the authoritative terminal row and remain idempotent.
+                    session.rollback()
+                    run = session.get(Run, run_id)
+                    return run
+                else:
+                    session.refresh(run)
+                    run.status = "stopped"
+                    run.stop_reason = reason
+                    run.error_code = USER_INTERRUPT_ERROR
+                    run.error_message = "任务已按你的要求停止。"
+                    run.finished_at = now
+                # Freeze the stream only after the lifecycle CAS succeeds.
+                # Taking the snapshot under the same lock prevents a late
+                # worker-thread delta from appearing in the UI but missing
+                # from the persisted interruption evidence.
+                partial = RunCoordinator._mark_interrupt_and_snapshot(run_id)
+                stream_marked = True
+                interrupted_payload = {
+                    "reason": reason,
+                    "previous_status": prior_status,
+                    "partial_output": partial.get("output") or None,
+                    "partial_thought": partial.get("thought") or None,
+                    "partial_output_chars": len(partial.get("output") or ""),
+                    "partial_thought_chars": len(partial.get("thought") or ""),
+                }
+                session.add(RunEvent(
+                    run_id=run_id,
+                    event_type="run_interrupted",
+                    payload=interrupted_payload,
+                ))
+                session.add(RunEvent(
+                    run_id=run_id,
+                    event_type="run_stopped",
+                    payload={"code": reason, **interrupted_payload},
+                ))
+                # A stop while waiting for a risky tool must invalidate the
+                # approval record.  Otherwise a stale browser click could
+                # later resume a run that the user explicitly cancelled.
+                pending_approvals = list(session.scalars(
+                    select(Approval)
+                    .where(Approval.run_id == run_id, Approval.status == "pending")
+                ))
+                for approval in pending_approvals:
+                    approval.status = "superseded"
+                    approval.reason = "Approval cancelled because the run was interrupted."
+                    approval.decided_at = now
+                    session.add(RunEvent(
+                        run_id=run_id,
+                        event_type="approval_cancelled",
+                        payload={"approval_id": approval.id, "reason": reason},
+                    ))
+
+                # If the parent is stopped, settle any child runs that are
+                # still active.  This preserves the current DelegatedTask
+                # side-panel history and prevents an orphan child from
+                # reporting a completion after its parent was cancelled.
+                child_tasks = list(session.scalars(
+                    select(DelegatedTask).where(
+                        DelegatedTask.parent_run_id == run_id,
+                        DelegatedTask.status == "in_progress",
+                    )
+                ))
+                for child_task in child_tasks:
+                    child_run = session.get(Run, child_task.child_run_id) if child_task.child_run_id else None
+                    if child_run is None or not (
+                        child_run.status in STOPPABLE_STATUSES
+                        or (
+                            child_run.status == "stopped"
+                            and child_run.stop_reason == "delegated_child_awaiting_approval"
+                        )
+                    ):
+                        continue
+                    child_run_ids_to_cancel.append(child_run.id)
+                    child_run.status = "stopped"
+                    child_run.stop_reason = "parent_user_interrupted"
+                    child_run.error_code = USER_INTERRUPT_ERROR
+                    child_run.error_message = "主任务已按用户要求停止。"
+                    child_run.finished_at = now
+                    child_approvals = list(session.scalars(
+                        select(Approval)
+                        .where(Approval.run_id == child_run.id, Approval.status == "pending")
+                    ))
+                    for approval in child_approvals:
+                        approval.status = "superseded"
+                        approval.reason = "Approval cancelled because the parent run was interrupted."
+                        approval.decided_at = now
+                        session.add(RunEvent(
+                            run_id=child_run.id,
+                            event_type="approval_cancelled",
+                            payload={"approval_id": approval.id, "reason": "parent_user_interrupted"},
+                        ))
+                    session.add(RunEvent(
+                        run_id=child_run.id,
+                        event_type="run_interrupted",
+                        payload={
+                            "reason": "parent_user_interrupted",
+                            "parent_run_id": run_id,
+                        },
+                    ))
+                    bridge = self._sync_delegated_child_state(
+                        session,
+                        child_run,
+                        status="stopped",
+                        stop_reason="parent_user_interrupted",
+                        error=child_run.error_message,
+                        error_code=USER_INTERRUPT_ERROR,
+                    )
+                    if bridge is not None:
+                        parent_bridge_events.append(bridge)
+                    elif child_task.status == "in_progress":
+                        # A freshly-created delegation may not have emitted
+                        # its delegation_link event yet.  The durable
+                        # DelegatedTask row is still enough to settle it and
+                        # keep the parent side panel truthful.
+                        child_task.status = "blocked"
+                        child_result = dict(child_task.result or {})
+                        child_result.update({
+                            "task_id": child_task.id,
+                            "delegation_id": child_task.id,
+                            "child_run_id": child_run.id,
+                            "parent_run_id": run_id,
+                            "status": "stopped",
+                            "stop_reason": "parent_user_interrupted",
+                            "error_code": USER_INTERRUPT_ERROR,
+                            "error": child_run.error_message,
+                        })
+                        child_task.result = child_result
+                        bridge = {
+                            "type": "delegated_child_stopped",
+                            "parent_run_id": run_id,
+                            "task_id": child_task.id,
+                            "delegation_id": child_task.id,
+                            "child_run_id": child_run.id,
+                            "status": "stopped",
+                            "stop_reason": "parent_user_interrupted",
+                        }
+                        session.add(RunEvent(
+                            run_id=run_id,
+                            event_type="delegated_child_stopped",
+                            payload=bridge,
+                        ))
+                        parent_bridge_events.append(bridge)
+
+                # A direct stop request may target a delegated child from
+                # the side panel.  The child runs inside the parent
+                # coordinator task, so settle its DelegatedTask before the
+                # recursive parent stop below.  Otherwise the parent stop
+                # sees a child Run that is already terminal and skips the
+                # in-progress delegation row, leaving the side panel stuck.
+                if delegated_parent_id and reason in USER_INTERRUPT_REASONS:
+                    direct_child_task = session.scalar(
+                        select(DelegatedTask)
+                        .where(DelegatedTask.child_run_id == run_id)
+                        .limit(1)
+                    )
+                    if direct_child_task is not None and direct_child_task.status == "in_progress":
+                        bridge = self._sync_delegated_child_state(
+                            session,
+                            run,
+                            status="stopped",
+                            stop_reason=reason,
+                            error=run.error_message,
+                            error_code=USER_INTERRUPT_ERROR,
+                        )
+                        if bridge is not None:
+                            parent_bridge_events.append(bridge)
+                        elif direct_child_task.status == "in_progress":
+                            # Keep the durable task truthful even if a
+                            # partially-created child has not emitted its
+                            # delegation link yet.
+                            direct_child_task.status = "blocked"
+                            direct_result = dict(direct_child_task.result or {})
+                            direct_result.update({
+                                "task_id": direct_child_task.id,
+                                "delegation_id": direct_child_task.id,
+                                "child_run_id": run_id,
+                                "parent_run_id": delegated_parent_id,
+                                "status": "stopped",
+                                "stop_reason": reason,
+                                "error_code": USER_INTERRUPT_ERROR,
+                                "error": run.error_message,
+                            })
+                            direct_child_task.result = direct_result
+                            direct_bridge = {
+                                "type": "delegated_child_stopped",
+                                "parent_run_id": delegated_parent_id,
+                                "task_id": direct_child_task.id,
+                                "delegation_id": direct_child_task.id,
+                                "child_run_id": run_id,
+                                "status": "stopped",
+                                "stop_reason": reason,
+                            }
+                            session.add(RunEvent(
+                                run_id=delegated_parent_id,
+                                event_type="delegated_child_stopped",
+                                payload=direct_bridge,
+                            ))
+                            parent_bridge_events.append(direct_bridge)
+
+                # Store a compact snapshot alongside the interruption event so
+                # history readers can render the partial response without
+                # mistaking it for a completed ChatMessage transcript.
+                session.add(RunEvent(
+                    run_id=run_id,
+                    event_type="runtime_snapshot",
+                    payload={
+                        "status": "stopped",
+                        "output": partial.get("output") or None,
+                        "stop_reason": reason,
+                        "error": run.error_message,
+                        "partial_output": partial.get("output") or None,
+                        "partial_thought": partial.get("thought") or None,
+                    },
+                ))
+                sync_turn_progress(session, run)
+                persist_terminal_response(
+                    session,
+                    run,
+                    error_code=reason,
+                    error_message="任务已按你的要求停止。",
+                )
+                session.commit()
+                changed = True
+                session.refresh(run)
+            else:
+                # A terminal result is authoritative.  In particular, a
+                # late click must not rewrite completed/failed/guard-stopped
+                # history as a user interruption.
+                session.commit()
+
+            if changed:
+                RunCoordinator._clear_stream_buffer(run_id, interrupted=True)
+        finally:
+            if stream_marked and not changed:
+                # A failed DB commit must not leave an active run's stream
+                # permanently muted.
+                RunCoordinator._clear_stream_buffer(run_id)
+            if owns_db:
+                session.close()
+
+        if changed:
+            terminal_event = {
+                "type": "run_stopped",
+                "code": reason,
+                "reason": "任务已按你的要求停止。",
+                "partial_output": partial.get("output") or None,
+                "partial_thought": partial.get("thought") or None,
+            }
+            run_stream_broker.publish(run_id, terminal_event)
+            for bridge in parent_bridge_events:
+                parent_run_id = str(bridge.get("parent_run_id") or "")
+                if parent_run_id:
+                    run_stream_broker.publish(parent_run_id, bridge)
+
+        # A delegated child executes inside the parent coordinator task, so a
+        # direct stop request for the child must also stop its parent.  This
+        # prevents the parent from consuming a synthetic child result and
+        # resuming after the user explicitly interrupted the conversation.
+        if changed and delegated_parent_id and reason in USER_INTERRUPT_REASONS:
+            self.stop(delegated_parent_id, reason=USER_INTERRUPT_REASON)
+
+        # Cancel after the durable transition.  A synchronous provider running
+        # in ``asyncio.to_thread`` cannot be force-killed, but its cancelled
+        # awaiter will discard the eventual result and the stop marker remains
+        # authoritative.
+        target_run_ids = list(dict.fromkeys([run_id, *child_run_ids_to_cancel]))
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        for target_run_id in target_run_ids:
+            canceller = self._tool_cancellers.get(target_run_id)
+            if canceller is not None:
+                try:
+                    canceller()
+                except Exception:
+                    # Cancellation is best effort for a custom registry; the
+                    # durable stop transition and task cancellation still apply.
+                    pass
+                self.unregister_tool_canceller(target_run_id)
+            task = self._tasks.get(target_run_id)
+            if task is not None and not task.done() and task is not current:
+                task.cancel()
+
+        return run
 
     def launch_delegated_child_continuation(self, run_id: str) -> bool:
         """Schedule the parent continuation created by a terminal child.
@@ -1456,6 +1760,7 @@ class RunCoordinator:
             for run in runs:
                 run.status = "stopped"
                 run.stop_reason = "interrupted_restart"
+                run.error_code = "interrupted_restart"
                 run.error_message = "PGAgent 在运行期间被关闭，可重新发送消息继续任务"
                 run.finished_at = _utcnow()
                 db.add(RunEvent(run_id=run.id, event_type="run_interrupted", payload={"reason": "process_restart"}))
@@ -1473,12 +1778,117 @@ class RunCoordinator:
                         parent_run_id = str(parent_event.get("parent_run_id") or "").strip()
                         if parent_run_id:
                             parent_continuation_run_ids.append(parent_run_id)
+                sync_turn_progress(db, run)
+                persist_terminal_response(
+                    db,
+                    run,
+                    error_code="interrupted_restart",
+                    error_message=run.error_message,
+                )
             db.commit()
         for parent_event in parent_bridge_events:
             parent_run_id = str(parent_event.get("parent_run_id") or "")
             if parent_run_id:
                 run_stream_broker.publish(parent_run_id, parent_event)
         return list(dict.fromkeys(parent_continuation_run_ids))
+
+    @staticmethod
+    def reconcile_terminal_deliveries(*, include_legacy: bool = True) -> int:
+        """Repair terminal root runs that do not yet have a durable reply."""
+
+        repaired = 0
+        with database_module.SessionLocal() as db:
+            query = select(Run).where(Run.status.in_({"completed", "failed", "stopped"}))
+            if not include_legacy:
+                query = query.join(ConversationTurn, Run.turn_id == ConversationTurn.id).where(
+                    ConversationTurn.reply_status != "delivered"
+                )
+            runs = list(db.scalars(query.order_by(Run.started_at.desc(), Run.id.desc())))
+            for run in runs:
+                if not is_terminal_delivery(str(run.status or ""), run.stop_reason):
+                    continue
+                turn = ensure_run_turn(db, run)
+                if turn is None or turn.reply_status == "delivered":
+                    continue
+                snapshot = db.scalar(
+                    select(RunEvent)
+                    .where(RunEvent.run_id == run.id, RunEvent.event_type == "runtime_snapshot")
+                    .order_by(RunEvent.created_at.desc(), RunEvent.id.desc())
+                )
+                snapshot_payload = snapshot.payload if snapshot is not None and isinstance(snapshot.payload, dict) else {}
+                output = snapshot_payload.get("output")
+                if run.status == "completed" and not str(output or "").strip():
+                    run.status = "failed"
+                    run.error_code = "empty_model_output"
+                    run.error_message = public_error_message(run.error_code)
+                    run.finished_at = run.finished_at or _utcnow()
+                safe_output = str(output or "").strip() if (
+                    run.status == "completed" or run.stop_reason == "needs_user_input"
+                ) else ""
+                message = persist_terminal_response(
+                    db,
+                    run,
+                    output=safe_output or None,
+                    error_code=run.error_code or run.stop_reason,
+                    error_message=run.error_message,
+                )
+                if message is not None:
+                    repaired += 1
+            db.commit()
+        return repaired
+
+    def reconcile_orphaned_runs(self, *, grace_seconds: float = 30.0) -> list[str]:
+        """Settle accepted root runs whose coordinator task disappeared."""
+
+        now = _utcnow()
+        settled: list[str] = []
+        with database_module.SessionLocal() as db:
+            runs = list(db.scalars(
+                select(Run)
+                .where(Run.status.in_(ACTIVE_STATUSES))
+                .order_by(Run.started_at.asc(), Run.id.asc())
+            ))
+            for run in runs:
+                if run.id in self._tasks and not self._tasks[run.id].done():
+                    continue
+                if db.scalar(select(DelegatedTask.id).where(DelegatedTask.child_run_id == run.id).limit(1)):
+                    continue
+                if run.started_at is None:
+                    age = grace_seconds
+                else:
+                    comparison_now = now if run.started_at.tzinfo is not None else now.replace(tzinfo=None)
+                    age = max(0.0, (comparison_now - run.started_at).total_seconds())
+                if age < grace_seconds:
+                    continue
+                turn = ensure_run_turn(db, run)
+                if turn is None:
+                    continue
+                run.status = "failed"
+                run.stop_reason = None
+                run.error_code = "coordinator_orphaned"
+                run.error_message = public_error_message(run.error_code)
+                run.finished_at = now
+                db.add(RunEvent(
+                    run_id=run.id,
+                    event_type="integration_failed",
+                    payload={"error_type": "coordinator_orphaned", "phase": "scheduling"},
+                ))
+                sync_turn_progress(db, run)
+                persist_terminal_response(
+                    db,
+                    run,
+                    error_code=run.error_code,
+                    error_message=run.error_message,
+                )
+                settled.append(run.id)
+            db.commit()
+        for run_id in settled:
+            run_stream_broker.publish(run_id, {
+                "type": "integration_failed",
+                "code": "coordinator_orphaned",
+                "error": public_error_message("coordinator_orphaned"),
+            })
+        return settled
 
     @staticmethod
     def _event_sink(run_id: str):
@@ -1496,12 +1906,34 @@ class RunCoordinator:
             event_type = str(event.get("type") or "runtime_event")
             payload = {key: _json_safe(value) for key, value in event.items() if key != "type"}
             with database_module.SessionLocal() as db:
+                # Claim the row with a conditional no-op update before
+                # appending the event.  If a user stop already committed, a
+                # late ``to_thread`` sink cannot mutate status or append a
+                # post-stop lifecycle event.
+                claim = db.execute(
+                    update(Run)
+                    .where(
+                        Run.id == run_id,
+                        or_(
+                            Run.status != "stopped",
+                            Run.stop_reason.is_(None),
+                            Run.stop_reason.not_in(USER_INTERRUPT_REASONS),
+                        ),
+                    )
+                    .values(current_step=Run.current_step)
+                )
+                if claim.rowcount != 1:
+                    db.rollback()
+                    return
                 run = db.get(Run, run_id)
                 if run is None:
+                    db.rollback()
                     return
                 db.add(RunEvent(run_id=run_id, event_type=event_type, step=payload.get("step"), payload=payload))
                 if event_type in status_by_event:
                     run.status = status_by_event[event_type]
+                if run.turn_id:
+                    sync_turn_progress(db, run)
                 db.commit()
             # Approval and terminal events are published only after the outcome
             # transaction makes their corresponding rows/messages visible.
@@ -1513,7 +1945,19 @@ class RunCoordinator:
     @staticmethod
     def _stream_sink(run_id: str):
         def sink(event: dict[str, Any]) -> None:
-            run_stream_broker.publish(run_id, _json_safe(event))
+            safe_event = _json_safe(event)
+            if str(safe_event.get("type") or "") not in _PUBLIC_TRANSIENT_STREAM_EVENT_TYPES:
+                return
+            # Keep the low-latency stream transient, but retain a bounded copy
+            # in memory for an explicit stop response.  This avoids one DB
+            # transaction per token while still letting the stop endpoint
+            # persist exactly what the user saw at cancellation time.
+            RunCoordinator._remember_stream_delta(run_id, safe_event)
+            with RunCoordinator._stream_buffer_lock:
+                interrupted = run_id in RunCoordinator._interrupt_requested
+            if interrupted:
+                return
+            run_stream_broker.publish(run_id, safe_event)
 
         return sink
 
@@ -1521,16 +1965,6 @@ class RunCoordinator:
     def _runtime_snapshot(outcome: RunOutcome) -> dict[str, Any]:
         messages = [] if outcome.stop_reason == "acceptance_failed" else outcome.messages
         acceptance_report = dict(outcome.acceptance_report)
-        semantic = acceptance_report.get("semantic")
-        if isinstance(semantic, Mapping):
-            # Model-authored prose may quote rejected candidates or tool
-            # evidence. Persist only the decision fields needed for audit and
-            # recovery; detailed feedback already served its in-memory retry.
-            acceptance_report["semantic"] = {
-                key: semantic[key]
-                for key in ("passed", "model_passed", "score", "threshold", "confidence")
-                if key in semantic
-            }
         return _json_safe({
             "status": outcome.status,
             "output": outcome.output,
@@ -1546,7 +1980,7 @@ class RunCoordinator:
             "usage": outcome.usage,
             "active_elapsed_seconds": outcome.active_elapsed_seconds,
             "runtime_binding": outcome.runtime_binding,
-            "context_snapshot": outcome.context_snapshot,
+            "compaction_state": outcome.compaction_state,
             "artifact_refs": outcome.artifact_refs,
             "transcript_delta": outcome.transcript_delta,
             "verification_trace": outcome.verification_trace,
@@ -1571,7 +2005,7 @@ class RunCoordinator:
             usage=normalize_usage(payload.get("usage")),
             active_elapsed_seconds=max(0.0, float(payload.get("active_elapsed_seconds") or 0.0)),
             runtime_binding=dict(payload.get("runtime_binding") or {}),
-            context_snapshot=dict(payload.get("context_snapshot") or {}),
+            compaction_state=dict(payload.get("compaction_state") or {}),
             artifact_refs=[dict(item) for item in payload.get("artifact_refs") or [] if isinstance(item, dict)],
             transcript_delta=(
                 [dict(item) for item in payload.get("transcript_delta") or [] if isinstance(item, dict)]
@@ -1626,7 +2060,7 @@ class RunCoordinator:
                 raise ModelConfigurationError("当前 Agent 没有可用工作区")
 
             messages = _prepare_session_history(db, session) if session else []
-            context_snapshot = _context_snapshot_from_db(db, session) if session else {}
+            compaction_state = _compaction_from_db(db, session) if session else {}
             if session:
                 count = int(db.scalar(
                     select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session.id)
@@ -1646,13 +2080,6 @@ class RunCoordinator:
             skill_instructions = _read_selected_skill_instructions(db, configured_skill_ids)
             todo_state = _session_todo_state(db, session.id if session else None)
             effective_system_prompt = agent.system_prompt
-            memory_filters = [Memory.scope == "global"]
-            if workspace:
-                memory_filters.append((Memory.scope == "workspace") & (Memory.scope_id == workspace.id))
-            if session:
-                memory_filters.append((Memory.scope == "session") & (Memory.scope_id == session.id))
-            memories = list(db.scalars(select(Memory).where(or_(*memory_filters)).order_by(Memory.pinned.desc(), Memory.updated_at.desc())))
-
             if frozen_binding:
                 frozen_agent_id = str(frozen_binding.get("agent_id") or "").strip()
                 if frozen_agent_id and agent.id != frozen_agent_id:
@@ -1789,10 +2216,7 @@ class RunCoordinator:
                 "agent_instructions": delegate_catalog_prompt,
                 "permission_policy": f"permission_mode={permission_mode}",
                 "workspace_rules": f"仅访问工作区：{workspace_root}",
-                "summary": session.context_summary if session else "",
-                "memories": [{"content": item.content, "pinned": item.pinned} for item in memories],
                 "recent_messages": messages,
-                "task_anchor": ContextManager.task_from_messages(messages),
                 "mode": "auto",
                 "workspace_root": workspace_root,
                 "provider": provider_config,
@@ -1808,12 +2232,10 @@ class RunCoordinator:
                 "allowed_tool_names": allowed_tool_names,
                 "skill_instructions": skill_instructions,
                 "todo_state": todo_state,
-                "task_state": {"todos": todo_state} if todo_state else {},
                 "max_run_seconds": runtime_max_run_seconds,
                 "session_id": session.id if session else None,
-                "context_snapshot": context_snapshot,
+                "compaction_state": compaction_state,
                 "context_sequence": transcript_sequence,
-                "context_version": int(context_snapshot.get("version") or 0),
             }
             db.commit()
 
@@ -1827,16 +2249,18 @@ class RunCoordinator:
                 permission_mode=str(context["permission_mode"]),
             )
 
+        registry = create_default_registry(
+            context["workspace_root"],
+            allowed_tool_names=context["allowed_tool_names"],
+            permission_mode=context["permission_mode"],
+            skill_instructions=context["skill_instructions"],
+            todo_state=context["todo_state"],
+            task_delegate=task_delegate,
+        )
+        coordinator.register_tool_canceller(run_id, registry.cancel_active)
         runtime = AgentRuntime(
             model_call=build_model_call(context["provider"]),
-            tool_registry=create_default_registry(
-                context["workspace_root"],
-                allowed_tool_names=context["allowed_tool_names"],
-                permission_mode=context["permission_mode"],
-                skill_instructions=context["skill_instructions"],
-                todo_state=context["todo_state"],
-                task_delegate=task_delegate,
-            ),
+            tool_registry=registry,
             context_manager=ContextManager(max_tokens=settings.context_limit_tokens),
             artifact_store=FilesystemArtifactStore(
                 settings.data_dir / "artifacts" / str(session.id if session else run.id)
@@ -2004,6 +2428,7 @@ class RunCoordinator:
                 parent is not None
                 and parent.status == "stopped"
                 and parent.stop_reason == "delegated_child_awaiting_approval"
+                and stop_reason not in USER_INTERRUPT_REASONS
                 and waiting_sibling_id is None
             ):
                 parent.status = "received"
@@ -2073,13 +2498,46 @@ class RunCoordinator:
 
     @staticmethod
     def _persist_outcome(run_id: str, outcome: RunOutcome) -> None:
+        event_error_type = next(
+            (
+                str(event.get("error_type") or event.get("error_code") or event.get("code") or "")
+                for event in reversed(outcome.events)
+                if event.get("error_type") or event.get("error_code") or event.get("code")
+            ),
+            "",
+        )
+        effective_status = str(outcome.status or "failed")
+        effective_stop_reason = outcome.stop_reason
+        normalized_error_code: str | None = None
+        safe_error_message: str | None = None
+        if effective_status == "completed" and not str(outcome.output or "").strip():
+            effective_status = "failed"
+            effective_stop_reason = None
+            normalized_error_code = "empty_model_output"
+            safe_error_message = public_error_message(normalized_error_code)
+        elif effective_status == "failed":
+            normalized_error_code = classify_error_details(event_error_type, outcome.error)
+            safe_error_message = public_error_message(normalized_error_code)
+        elif effective_status == "stopped" and is_terminal_delivery(effective_status, effective_stop_reason):
+            normalized_error_code = terminal_error_code(
+                status=effective_status,
+                stop_reason=effective_stop_reason,
+                error_code=event_error_type or None,
+            )
+            safe_error_message = public_error_message(normalized_error_code, effective_status)
+        elif effective_status == "stopped":
+            # Waiting for a delegated child is a resumable pause, not the
+            # terminal delivery boundary for the user's turn.
+            safe_error_message = outcome.error
         snapshot = RunCoordinator._runtime_snapshot(outcome)
+        snapshot["status"] = effective_status
+        snapshot["delivery_error_code"] = normalized_error_code
         publish_type = {
             "awaiting_approval": "approval_requested",
             "completed": "run_completed",
             "stopped": "run_stopped",
             "failed": "model_failed",
-        }.get(outcome.status)
+        }.get(effective_status)
         publish_event = next(
             (
                 _json_safe(event)
@@ -2088,28 +2546,87 @@ class RunCoordinator:
             ),
             None,
         )
+        if effective_status != outcome.status:
+            publish_event = {
+                "type": "model_failed",
+                "code": normalized_error_code,
+                "error": safe_error_message,
+            }
         persisted = False
         parent_bridge_event: dict[str, Any] | None = None
         with database_module.SessionLocal() as db:
+            # Serialize this persistence path against ``stop()``.  Whichever
+            # conditional row update claims the run first owns the lifecycle
+            # transition; a provider result that arrives after a user stop
+            # is discarded before it can append messages or context.
+            claim = db.execute(
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    or_(
+                        Run.status != "stopped",
+                        Run.stop_reason.is_(None),
+                        Run.stop_reason.not_in(USER_INTERRUPT_REASONS),
+                    ),
+                )
+                .values(current_step=Run.current_step)
+            )
+            if claim.rowcount != 1:
+                run = db.get(Run, run_id)
+                if run is not None and RunCoordinator._user_interrupt_locked(run):
+                    db.add(RunEvent(
+                        run_id=run_id,
+                        event_type="run_outcome_discarded",
+                        payload={"reason": USER_INTERRUPT_REASON, "late_status": outcome.status},
+                    ))
+                    db.commit()
+                else:
+                    db.rollback()
+                RunCoordinator._clear_stream_buffer(run_id, interrupted=True)
+                coordinator.unregister_tool_canceller(run_id)
+                return
             run = db.get(Run, run_id)
             if run is None:
                 return
-            run.status = outcome.status
+            # An explicit stop commits before cancelling the in-process task.
+            # A provider may still return from a synchronous worker or a
+            # cancellation race may let this method run; never let that late
+            # outcome rewrite the user's durable stopped state.
+            if RunCoordinator._user_interrupt_locked(run):
+                db.add(RunEvent(
+                    run_id=run_id,
+                    event_type="run_outcome_discarded",
+                    payload={
+                        "reason": USER_INTERRUPT_REASON,
+                        "late_status": outcome.status,
+                    },
+                ))
+                db.commit()
+                RunCoordinator._clear_stream_buffer(run_id, interrupted=True)
+                coordinator.unregister_tool_canceller(run_id)
+                return
+            turn = ensure_run_turn(db, run)
+            run.status = effective_status
             run.current_step = outcome.steps
             run.tool_calls = outcome.tool_calls
-            run.stop_reason = outcome.stop_reason
-            run.error_message = outcome.error
-            if outcome.status in {"completed", "failed", "stopped"}:
+            run.stop_reason = effective_stop_reason
+            run.error_code = normalized_error_code
+            run.error_message = safe_error_message
+            if effective_status in {"completed", "failed", "stopped"}:
                 run.finished_at = _utcnow()
+            else:
+                run.finished_at = None
+            sync_turn_progress(db, run)
             db.add(RunEvent(run_id=run_id, event_type="runtime_snapshot", payload=snapshot))
 
             parent_bridge_event = RunCoordinator._sync_delegated_child_state(
                 db,
                 run,
-                status=outcome.status,
-                output=outcome.output,
-                stop_reason=outcome.stop_reason,
-                error=outcome.error,
+                status=effective_status,
+                output=str(outcome.output or "").strip() or None,
+                stop_reason=effective_stop_reason,
+                error=safe_error_message,
+                error_code=normalized_error_code,
                 pending_approval=outcome.pending_approval,
                 steps=outcome.steps,
                 tool_calls=outcome.tool_calls,
@@ -2121,14 +2638,20 @@ class RunCoordinator:
             if run.session_id and not outcome.runtime_binding.get("delegation_version"):
                 session_for_context = db.get(Session, run.session_id)
                 source_sequence_valid = (
-                    _lock_context_source(db, session_for_context, outcome)
+                    _compaction_source_is_current(db, session_for_context, outcome)
                     if session_for_context is not None
                     else None
                 )
-                _append_runtime_transcript(db, run_id, run.session_id, outcome)
+                _append_runtime_transcript(
+                    db,
+                    run_id,
+                    run.session_id,
+                    outcome,
+                    terminal_managed=turn is not None,
+                )
                 db.flush()
                 if session_for_context is not None:
-                    _persist_context_snapshot(
+                    _persist_conversation_compaction(
                         db,
                         session_for_context,
                         run_id,
@@ -2161,7 +2684,7 @@ class RunCoordinator:
                 record.total_tokens = usage["total_tokens"]
                 record.cost_usd = usage["cost_usd"]
 
-            if outcome.status == "awaiting_approval" and outcome.pending_approval:
+            if effective_status == "awaiting_approval" and outcome.pending_approval:
                 pending = outcome.pending_approval
                 existing_pending = list(db.scalars(
                     select(Approval)
@@ -2187,10 +2710,34 @@ class RunCoordinator:
                         arguments=dict(pending.get("arguments") or {}),
                         reason=str(pending.get("reason") or "该工具会修改本机状态，需要你的确认"),
                     ))
+            terminal_reasoning = next(
+                (
+                    str(message.get("reasoning_content") or "")
+                    for message in reversed(list(outcome.transcript_delta or outcome.messages))
+                    if isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and not message.get("tool_calls")
+                    and str(message.get("content") or "").strip() == str(outcome.output or "").strip()
+                ),
+                "",
+            )
+            persist_terminal_response(
+                db,
+                run,
+                output=str(outcome.output or "").strip() or None,
+                error_code=normalized_error_code,
+                error_message=safe_error_message,
+                provider_payload=(
+                    {"reasoning_content": terminal_reasoning}
+                    if terminal_reasoning else None
+                ),
+            )
             if run.session_id:
                 session = db.get(Session, run.session_id)
                 if session is not None:
                     session.updated_at = _utcnow()
+                    # Recompute after terminal delivery so the UI immediately
+                    # includes the final assistant reply in context usage.
                     _prepare_session_history(db, session)
                     prepared = next(
                         (
@@ -2200,7 +2747,9 @@ class RunCoordinator:
                         ),
                         None,
                     )
-                    if prepared is not None:
+                    if prepared is not None and not is_terminal_delivery(
+                        effective_status, effective_stop_reason
+                    ):
                         session.context_tokens = min(
                             max(0, int(prepared.get("estimated_tokens") or 0)),
                             settings.context_limit_tokens,
@@ -2215,27 +2764,26 @@ class RunCoordinator:
                 run_stream_broker.publish(parent_run_id, parent_bridge_event)
         if persisted:
             coordinator.launch_parent_continuation_if_queued(parent_bridge_event)
+            RunCoordinator._clear_stream_buffer(run_id)
+        coordinator.unregister_tool_canceller(run_id)
 
     async def _execute(self, run_id: str) -> None:
         try:
+            if self._stop_requested(run_id):
+                return
             runtime, context = self._resolve_runtime(run_id)
             self._install_completion_verifier(runtime, context)
             outcome = await runtime.run(
                 system_prompt=context["system_prompt"],
                 agent_instructions=context["agent_instructions"],
                 workspace_rules=context["workspace_rules"],
-                summary=context["summary"],
-                memories=context["memories"],
                 recent_messages=context["recent_messages"],
                 mode=context["mode"],
                 thread_id=run_id,
-                context_snapshot=context.get("context_snapshot"),
+                compaction_state=context.get("compaction_state"),
                 permission_policy=context.get("permission_policy"),
-                task_state=context.get("task_state"),
                 session_id=context.get("session_id"),
                 context_sequence=int(context.get("context_sequence") or 0),
-                context_version=int(context.get("context_version") or 0),
-                prompt_cache_key_seed=context.get("prompt_cache_key_seed"),
             )
             outcome.runtime_binding = {
                 **dict(context["runtime_binding"]),
@@ -2249,6 +2797,8 @@ class RunCoordinator:
 
     async def _resume(self, run_id: str) -> None:
         try:
+            if self._stop_requested(run_id):
+                return
             with database_module.SessionLocal() as db:
                 snapshot = db.scalar(
                     select(RunEvent)
@@ -2281,6 +2831,8 @@ class RunCoordinator:
         """Let the original coordinator model consume a terminal child result."""
 
         try:
+            if self._stop_requested(run_id):
+                return
             with database_module.SessionLocal() as db:
                 snapshot = db.scalar(
                     select(RunEvent)
@@ -2319,41 +2871,87 @@ class RunCoordinator:
             # settled task observation is part of the parent's gated trace.
             runtime.completion_verifier = None
             return
-        original_task = str(context.get("task_anchor") or "").strip()
-        if not original_task:
-            raise ModelConfigurationError("主 Agent 验收器缺少原始任务锚点")
-        provider = context.get("provider")
-        if not isinstance(provider, ProviderConfig):
-            raise ModelConfigurationError("独立验收器缺少冻结的模型配置")
         runtime.config.max_completion_verification_attempts = max(
             1,
-            int(settings.completion_evaluation_max_attempts or 1),
+            int(settings.completion_verification_max_attempts or 1),
         )
-        runtime.completion_verifier = build_completion_verifier(
-            evaluator_call=build_model_call(provider),
-            original_task=original_task,
-            score_threshold=settings.completion_evaluation_score_threshold,
-            timeout_seconds=settings.completion_evaluation_timeout_seconds,
-        )
+        runtime.completion_verifier = decide_deterministic_completion
 
     @staticmethod
     def _persist_failure(run_id: str, error: BaseException) -> None:
         parent_bridge_event: dict[str, Any] | None = None
         with database_module.SessionLocal() as db:
+            claim = db.execute(
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    or_(
+                        Run.status != "stopped",
+                        Run.stop_reason.is_(None),
+                        Run.stop_reason.not_in(USER_INTERRUPT_REASONS),
+                    ),
+                )
+                .values(current_step=Run.current_step)
+            )
+            if claim.rowcount != 1:
+                run = db.get(Run, run_id)
+                if run is not None and RunCoordinator._user_interrupt_locked(run):
+                    db.add(RunEvent(
+                        run_id=run_id,
+                        event_type="run_failure_discarded",
+                        payload={"reason": USER_INTERRUPT_REASON, "error_type": type(error).__name__},
+                    ))
+                    db.commit()
+                else:
+                    db.rollback()
+                RunCoordinator._clear_stream_buffer(run_id, interrupted=True)
+                coordinator.unregister_tool_canceller(run_id)
+                return
             run = db.get(Run, run_id)
             if run is None:
                 return
+            # Cancellation of a synchronous provider happens at the awaiter;
+            # the worker may still raise into this failure path afterwards.
+            # Keep the explicit user/parent stop authoritative.
+            if run.status == "stopped" and run.stop_reason in {
+                USER_INTERRUPT_REASON,
+                "parent_user_interrupted",
+            }:
+                RunCoordinator._clear_stream_buffer(run_id, interrupted=True)
+                coordinator.unregister_tool_canceller(run_id)
+                return
+            raw_error = str(error) or type(error).__name__
+            normalized_error_code = classify_exception(error)
+            safe_error_message = public_error_message(normalized_error_code)
             run.status = "failed"
-            run.error_code = type(error).__name__
-            run.error_message = str(error) or type(error).__name__
+            run.error_code = normalized_error_code
+            run.error_message = safe_error_message
             run.finished_at = _utcnow()
-            db.add(RunEvent(run_id=run_id, event_type="integration_failed", payload={"error": run.error_message}))
+            db.add(RunEvent(
+                run_id=run_id,
+                event_type="integration_failed",
+                payload={
+                    "error_type": type(error).__name__,
+                    "error_code": normalized_error_code,
+                    "phase": "integration",
+                    # Kept in the private event row for diagnosis. The public
+                    # event serializer deliberately does not expose this key.
+                    "internal_error": raw_error[:20_000],
+                },
+            ))
             parent_bridge_event = RunCoordinator._sync_delegated_child_state(
                 db,
                 run,
                 status="failed",
-                error=run.error_message,
-                error_code="delegate_execution_error",
+                error=safe_error_message,
+                error_code=normalized_error_code,
+            )
+            sync_turn_progress(db, run)
+            persist_terminal_response(
+                db,
+                run,
+                error_code=normalized_error_code,
+                error_message=safe_error_message,
             )
             db.commit()
             error_message = run.error_message
@@ -2361,6 +2959,8 @@ class RunCoordinator:
         if parent_bridge_event is not None and parent_bridge_event.get("parent_run_id"):
             run_stream_broker.publish(str(parent_bridge_event["parent_run_id"]), parent_bridge_event)
         coordinator.launch_parent_continuation_if_queued(parent_bridge_event)
+        RunCoordinator._clear_stream_buffer(run_id)
+        coordinator.unregister_tool_canceller(run_id)
 
 
 coordinator = RunCoordinator()

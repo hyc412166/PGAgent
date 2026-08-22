@@ -213,7 +213,6 @@ class SessionCreate(BaseModel):
     thinking_level: ThinkingLevel = "auto"
     permission_mode: PermissionMode = "smart"
     skill_ids: list[str] = Field(default_factory=list, max_length=128)
-    context_summary: str = ""
 
 
 class SessionUpdate(BaseModel):
@@ -225,7 +224,6 @@ class SessionUpdate(BaseModel):
     thinking_level: ThinkingLevel | None = None
     permission_mode: PermissionMode | None = None
     skill_ids: list[str] | None = Field(default=None, max_length=128)
-    context_summary: str | None = None
     status: str | None = None
 
 
@@ -239,9 +237,7 @@ class SessionRead(ORMModel):
     thinking_level: str
     permission_mode: str
     skill_ids: list[str]
-    context_summary: str
     context_tokens: int
-    last_compacted_at: datetime | None
     status: str
     created_at: datetime
     updated_at: datetime
@@ -262,6 +258,8 @@ class ChatMessageRead(ORMModel):
     content: str
     tool_name: str | None
     tool_call_id: str | None
+    turn_id: str | None
+    message_kind: str
     extra: dict[str, Any] = Field(serialization_alias="metadata")
     created_at: datetime
 
@@ -290,6 +288,7 @@ class RunRead(ORMModel):
     session_id: str | None
     workspace_id: str | None
     agent_id: str | None
+    turn_id: str | None
     status: str
     mode: str
     current_step: int

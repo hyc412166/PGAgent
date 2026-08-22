@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 from app.tools.builtins import (
+    delete_file,
     delegate_task_async,
     file_info,
     git_diff,
@@ -198,6 +199,55 @@ def test_write_requires_approval_then_writes(tmp_path: Path) -> None:
     result = write_file(sandbox, "notes/result.txt", "hello", approved=True)
     assert result.ok and result.changed
     assert (tmp_path / "notes" / "result.txt").read_text(encoding="utf-8") == "hello"
+
+
+def test_delete_requires_approval_then_deletes_one_file(tmp_path: Path) -> None:
+    target = tmp_path / "old.txt"
+    target.write_text("remove me", encoding="utf-8")
+    sandbox = WorkspaceSandbox(tmp_path)
+
+    pending = delete_file(sandbox, "old.txt")
+    assert pending.approval_required
+    assert target.exists()
+
+    result = delete_file(sandbox, "old.txt", approved=True)
+    assert result.ok and result.changed
+    assert result.metadata == {"path": "old.txt", "kind": "file"}
+    assert not target.exists()
+
+
+def test_delete_is_idempotent_and_rejects_directories_or_escaped_paths(tmp_path: Path) -> None:
+    sandbox = WorkspaceSandbox(tmp_path)
+    (tmp_path / "folder").mkdir()
+
+    missing = delete_file(sandbox, "missing.txt", approved=True)
+    assert missing.ok and not missing.changed
+    assert missing.metadata["path"] == "missing.txt"
+
+    directory = delete_file(sandbox, "folder", approved=True)
+    assert not directory.ok
+    assert directory.error_code == "directory_not_allowed"
+    assert (tmp_path / "folder").is_dir()
+
+    escaped = delete_file(sandbox, "../outside.txt", approved=True)
+    assert not escaped.ok
+    assert escaped.error_code == "path_error"
+
+
+def test_delete_rejects_link_components_without_touching_the_target(tmp_path: Path) -> None:
+    target = tmp_path / "real.txt"
+    target.write_text("keep", encoding="utf-8")
+    link = tmp_path / "linked.txt"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        return
+
+    result = delete_file(WorkspaceSandbox(tmp_path), "linked.txt", approved=True)
+    assert not result.ok
+    assert result.error_code == "path_link_not_allowed"
+    assert link.exists()
+    assert target.read_text(encoding="utf-8") == "keep"
 
 
 def test_run_command_requires_approval_and_blocks_chaining(tmp_path: Path) -> None:

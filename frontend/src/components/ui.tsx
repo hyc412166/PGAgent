@@ -130,7 +130,7 @@ export function ContextUsageRing({ context }: { context: SessionContext }) {
         <strong>{view.roundedPercent}% 已用</strong>
         <p>{view.detail}</p>
         <small>{view.compressionHint}</small>
-        {context.last_compacted_at && <small>上次压缩：{formatUiDate(context.last_compacted_at)}</small>}
+        {context.last_compaction_at && <small>上次压缩：{formatUiDate(context.last_compaction_at)}</small>}
       </div>
     </div>
   )

@@ -4,6 +4,7 @@ $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $PythonPath = 'E:\anaconda3\envs\agent_dock\python.exe'
 $FrontendIndex = Join-Path $ProjectRoot 'frontend\dist\index.html'
 $LocalEnvironmentFile = Join-Path $ProjectRoot '.env.local'
+$SkillTokenRefreshScript = Join-Path $PSScriptRoot 'refresh-skills-token.ps1'
 $Url = 'http://127.0.0.1:8765'
 
 if (-not (Test-Path -LiteralPath $PythonPath)) {
@@ -15,8 +16,15 @@ if (-not (Test-Path -LiteralPath $FrontendIndex)) {
     try { npm run build } finally { Pop-Location }
 }
 
-# Vercel writes the short-lived development OIDC token to .env.local.  Only
-# import this one value into the PGAgent process; never print or persist it.
+# Refresh the short-lived development OIDC token on every start. A refresh
+# failure must not prevent the rest of PGAgent from starting.
+try {
+    & $SkillTokenRefreshScript
+} catch {
+    Write-Warning "Skill marketplace authentication refresh failed: $($_.Exception.Message)"
+}
+
+# Import only the OIDC value into the PGAgent process; never print it.
 if (Test-Path -LiteralPath $LocalEnvironmentFile) {
     $oidcLine = Get-Content -LiteralPath $LocalEnvironmentFile | Where-Object {
         $_ -match '^\s*VERCEL_OIDC_TOKEN\s*='

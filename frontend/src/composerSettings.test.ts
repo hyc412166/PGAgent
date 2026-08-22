@@ -5,6 +5,7 @@ describe('会话组合设置菜单', () => {
   it('自动思考会逐层继承实际强度', () => {
     expect(resolveEffectiveThinking('auto', 'auto', 'high')).toBe('high')
     expect(thinkingLevelLabels[resolveEffectiveThinking('auto', 'low', 'high')]).toBe('低')
+    expect(resolveEffectiveThinking('auto', 'off', 'auto')).toBe('medium')
   })
 
   it('模型按钮使用短名但保留可识别信息', () => {

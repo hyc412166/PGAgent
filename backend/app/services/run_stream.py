@@ -17,7 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 
-TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_stopped", "model_failed", "integration_failed"})
+TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_interrupted", "run_stopped", "model_failed", "integration_failed"})
 
 
 @dataclass(frozen=True, slots=True)

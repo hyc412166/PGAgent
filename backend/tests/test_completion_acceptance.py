@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import asyncio
 from pathlib import Path
 
 import pytest
@@ -9,12 +8,12 @@ import pytest
 from app.runtime import (
     AgentRuntime,
     CompletionDecision,
+    decide_deterministic_completion,
     ModelTurn,
     ModelToolCall,
     RuntimeConfig,
     verify_deterministic_completion,
 )
-from app.services.completion_evaluator import build_completion_verifier
 from app.tools import create_default_registry
 
 
@@ -62,7 +61,7 @@ def test_deterministic_acceptance_manifest_executes_all_scenarios() -> None:
 async def test_runtime_rejected_candidate_is_revised_and_only_accepted_answer_is_final(tmp_path: Path) -> None:
     model_outputs = iter(["unverified answer", "verified answer"])
     decisions = iter([
-        CompletionDecision(False, "缺少测试证据", {"stage": "semantic", "passed": False}),
+        CompletionDecision(False, "确定性轨迹不完整", {"stage": "deterministic", "passed": False}),
         CompletionDecision(True, "all criteria passed", {"stage": "complete", "passed": True}),
     ])
     observed_model_messages: list[list[dict]] = []
@@ -102,10 +101,10 @@ async def test_runtime_rejected_candidate_is_revised_and_only_accepted_answer_is
     assert [event["type"] for event in outcome.events].count("completion_verification_passed") == 1
     feedback_messages = [
         item for item in observed_model_messages[1]
-        if item.get("role") == "user" and "独立验收器拒绝" in str(item.get("content") or "")
+        if item.get("role") == "user" and "确定性验收拒绝" in str(item.get("content") or "")
     ]
     assert len(feedback_messages) == 1
-    assert "缺少测试证据" in feedback_messages[0]["content"]
+    assert "确定性轨迹不完整" in feedback_messages[0]["content"]
     assert outcome.transcript_delta == [{"role": "assistant", "content": "verified answer"}]
     assert outcome.acceptance_report["passed"] is True
     assert [item["delta"] for item in streamed if item["type"] == "assistant_delta"] == ["verified answer"]
@@ -189,130 +188,43 @@ def test_deterministic_acceptance_rejects_tool_name_mismatch() -> None:
     assert next(item for item in report.checks if item.name == "tool_result_names_match_calls").passed is False
 
 
-@pytest.mark.asyncio
-async def test_independent_evaluator_passes_only_strict_structured_result(tmp_path: Path) -> None:
-    calls: list[dict] = []
-
-    async def evaluator_call(**kwargs) -> ModelTurn:
-        calls.append(kwargs)
-        return ModelTurn(
-            content=json.dumps({
-                "passed": True,
-                "score": 0.94,
-                "summary": "requirements and evidence match",
-                "criteria": [{"criterion": "answer provided", "passed": True, "evidence": "candidate is non-empty"}],
-                "feedback": "",
-                "confidence": 0.9,
-            }),
-            usage={"request_count": 1, "input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
-        )
-
-    verifier = build_completion_verifier(
-        evaluator_call=evaluator_call,
-        original_task="answer the question with evidence",
-        score_threshold=0.8,
-    )
-    decision = await verifier({
-        "output": "done with evidence",
-        "messages": [{"role": "assistant", "content": "done with evidence"}],
+def test_production_completion_decision_is_deterministic_and_has_no_model_usage() -> None:
+    decision = decide_deterministic_completion({
+        "output": "One fact from the conversation is that 1 + 1 was answered as 2.",
+        "messages": [{
+            "role": "assistant",
+            "content": "One fact from the conversation is that 1 + 1 was answered as 2.",
+        }],
         "tool_calls": 0,
         "attempt": 1,
     })
 
     assert decision.accepted
+    assert decision.report["stage"] == "deterministic"
     assert decision.report["deterministic"]["passed"] is True
-    assert decision.report["semantic"]["score"] == 0.94
-    assert decision.usage["request_count"] == 1
-    assert calls[0]["tools"] == []
-    assert calls[0]["mode"] == "evaluation"
-    evaluation_payload = json.loads(calls[0]["messages"][1]["content"])
-    assert "workspace_evidence" not in evaluation_payload
+    assert decision.usage == {}
 
 
 @pytest.mark.asyncio
-async def test_evaluator_ignores_tool_calls_from_prior_session_history(tmp_path: Path) -> None:
-    async def evaluator_call(**_kwargs) -> ModelTurn:
-        return ModelTurn(content=json.dumps({
-            "passed": True,
-            "score": 1,
-            "summary": "current task passed",
-            "criteria": [{"criterion": "current reply", "passed": True, "evidence": "current candidate"}],
-            "feedback": "",
-            "confidence": 1,
-        }))
+async def test_simple_runtime_answer_uses_only_the_main_model_call(tmp_path: Path) -> None:
+    calls = 0
 
-    verifier = build_completion_verifier(
-        evaluator_call=evaluator_call,
-        original_task="new follow-up task",
-        score_threshold=0.8,
+    async def model_call(**_kwargs) -> ModelTurn:
+        nonlocal calls
+        calls += 1
+        return ModelTurn(content="1 + 1 = 2.", usage={"request_count": 1})
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+        completion_verifier=decide_deterministic_completion,
     )
-    # The runtime deliberately supplies only the current Run trace. Historical
-    # calls may exist in provider context, but must not affect this count.
-    decision = await verifier({
-        "output": "new answer",
-        "messages": [{"role": "assistant", "content": "new answer"}],
-        "tool_calls": 0,
-    })
-    assert decision.accepted
-
-
-@pytest.mark.asyncio
-async def test_independent_evaluator_rejects_missing_criteria_and_invalid_json(tmp_path: Path) -> None:
-    responses = iter([
-        ModelTurn(content=json.dumps({"passed": True, "score": 1, "criteria": []})),
-        ModelTurn(content="not json"),
-    ])
-
-    async def evaluator_call(**_kwargs) -> ModelTurn:
-        return next(responses)
-
-    verifier = build_completion_verifier(
-        evaluator_call=evaluator_call,
-        original_task="prove completion",
-        score_threshold=0.8,
+    outcome = await runtime.run(
+        system_prompt="safe",
+        recent_messages=[{"role": "user", "content": "What is 1 + 1?"}],
     )
-    candidate = {
-        "output": "claim",
-        "messages": [{"role": "assistant", "content": "claim"}],
-        "tool_calls": 0,
-    }
-    missing_criteria = await verifier(candidate)
-    invalid_json = await verifier(candidate)
 
-    assert not missing_criteria.accepted
-    assert not missing_criteria.report["semantic"]["passed"]
-    assert not invalid_json.accepted
-    assert invalid_json.report["protocol_error"] == "invalid_json"
-
-
-@pytest.mark.asyncio
-async def test_independent_evaluator_timeout_fails_closed(tmp_path: Path) -> None:
-    async def evaluator_call(**_kwargs) -> ModelTurn:
-        await asyncio.sleep(1)
-        return ModelTurn(content="{}")
-
-    verifier = build_completion_verifier(
-        evaluator_call=evaluator_call,
-        original_task="prove completion",
-        score_threshold=0.8,
-        timeout_seconds=0.01,
-    )
-    decision = await verifier({
-        "output": "claim",
-        "messages": [{"role": "assistant", "content": "claim"}],
-        "tool_calls": 0,
-    })
-    assert not decision.accepted
-    assert decision.report["protocol_error"] == "timeout"
-
-
-def test_synchronous_evaluator_is_rejected_because_it_cannot_be_cancelled(tmp_path: Path) -> None:
-    def evaluator_call(**_kwargs) -> ModelTurn:
-        return ModelTurn(content="{}")
-
-    with pytest.raises(TypeError, match="must be async"):
-        build_completion_verifier(
-            evaluator_call=evaluator_call,
-            original_task="prove completion",
-            score_threshold=0.8,
-        )
+    assert outcome.status == "completed"
+    assert outcome.output == "1 + 1 = 2."
+    assert calls == 1
+    assert outcome.usage["request_count"] == 1
