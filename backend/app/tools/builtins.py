@@ -15,6 +15,7 @@ import signal
 import socket
 import subprocess
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator, Mapping
@@ -1219,6 +1220,222 @@ def write_file(
         return ToolResult("write_file", False, str(exc), error_code="write_error")
 
 
+def delete_file(
+    sandbox: WorkspaceSandbox,
+    path: str,
+    *,
+    approved: bool = False,
+) -> ToolResult:
+    """Delete one workspace file without exposing a general shell primitive."""
+
+    arguments = {"path": path}
+    try:
+        target = sandbox.resolve(path)
+        cursor = sandbox.root
+        for part in Path(path).parts:
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                return ToolResult("delete", False, "删除路径不允许包含 ..", error_code="path_error")
+            cursor = cursor / part
+            is_junction = getattr(cursor, "is_junction", lambda: False)
+            if cursor.is_symlink() or is_junction():
+                return ToolResult(
+                    "delete",
+                    False,
+                    "不允许删除经过符号链接或目录联接的路径",
+                    error_code="path_link_not_allowed",
+                )
+        relative_path = sandbox.relative(target)
+        if not target.exists():
+            return ToolResult(
+                "delete",
+                True,
+                f"文件不存在，无需删除: {relative_path}",
+                metadata={"path": relative_path, "kind": "missing"},
+            )
+        if target.is_dir():
+            return ToolResult(
+                "delete",
+                False,
+                "delete 只允许删除单个文件，不支持目录或递归删除",
+                error_code="directory_not_allowed",
+            )
+        if not target.is_file():
+            return ToolResult(
+                "delete",
+                False,
+                "目标不是普通文件",
+                error_code="file_not_allowed",
+            )
+        if not approved:
+            return _approval("delete", arguments, f"删除文件需要批准: {relative_path}")
+        deleted_path = _atomic_delete_regular_file(sandbox, path)
+        if deleted_path is None:
+            return ToolResult(
+                "delete",
+                True,
+                f"文件不存在，无需删除: {relative_path}",
+                metadata={"path": relative_path, "kind": "missing"},
+            )
+        return ToolResult(
+            "delete",
+            True,
+            f"已删除 {deleted_path}",
+            changed=True,
+            metadata={"path": deleted_path, "kind": "file"},
+        )
+    except (SandboxViolation, OSError, ValueError) as exc:
+        return ToolResult("delete", False, str(exc), error_code="path_error")
+
+
+def _atomic_delete_regular_file(sandbox: WorkspaceSandbox, path: str) -> str | None:
+    """Delete the same filesystem object that is boundary-checked.
+
+    POSIX pins every parent with directory descriptors and ``O_NOFOLLOW``.
+    Windows opens the final object as a handle, validates its kernel-resolved
+    path and attributes, then marks that exact handle for deletion.  This
+    avoids a check-then-unlink race through swapped symlinks or junctions.
+    """
+
+    return _atomic_delete_windows(sandbox, path) if os.name == "nt" else _atomic_delete_posix(sandbox, path)
+
+
+def _atomic_delete_posix(sandbox: WorkspaceSandbox, path: str) -> str | None:
+    import stat
+
+    relative = Path(path)
+    parts = [part for part in relative.parts if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise SandboxViolation("删除路径无效")
+    descriptors: list[int] = []
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_fd = os.open(sandbox.root, flags)
+        descriptors.append(parent_fd)
+        for part in parts[:-1]:
+            parent_fd = os.open(part, flags, dir_fd=parent_fd)
+            descriptors.append(parent_fd)
+        try:
+            info = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            raise SandboxViolation("不允许删除符号链接")
+        if not stat.S_ISREG(info.st_mode):
+            raise SandboxViolation("delete 只允许删除单个普通文件")
+        os.unlink(parts[-1], dir_fd=parent_fd)
+        return "/".join(parts)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _atomic_delete_windows(sandbox: WorkspaceSandbox, path: str) -> str | None:
+    import ctypes
+    from ctypes import wintypes
+
+    relative = Path(path)
+    parts = [part for part in relative.parts if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise SandboxViolation("删除路径无效")
+    lexical = Path(os.path.abspath(sandbox.root.joinpath(*parts)))
+    try:
+        lexical.relative_to(sandbox.root)
+    except ValueError as exc:
+        raise SandboxViolation("路径越过了工作区边界") from exc
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    get_info = kernel32.GetFileInformationByHandle
+    get_info.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+    get_info.restype = wintypes.BOOL
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    get_final_path.restype = wintypes.DWORD
+    set_info = kernel32.SetFileInformationByHandle
+    set_info.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD]
+    set_info.restype = wintypes.BOOL
+
+    delete_access = 0x00010000 | 0x00000080
+    share_all = 0x00000001 | 0x00000002 | 0x00000004
+    open_existing = 3
+    open_reparse_point = 0x00200000
+    backup_semantics = 0x02000000
+    invalid_handle = wintypes.HANDLE(-1).value
+    handle = create_file(
+        str(lexical),
+        delete_access,
+        share_all,
+        None,
+        open_existing,
+        open_reparse_point | backup_semantics,
+        None,
+    )
+    if handle == invalid_handle:
+        error = ctypes.get_last_error()
+        if error in {2, 3}:
+            return None
+        raise OSError(error, ctypes.FormatError(error), str(lexical))
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    class FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+    try:
+        info = ByHandleFileInformation()
+        if not get_info(handle, ctypes.byref(info)):
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error), str(lexical))
+        if info.file_attributes & 0x00000400:
+            raise SandboxViolation("不允许删除符号链接或目录联接")
+        if info.file_attributes & 0x00000010:
+            raise SandboxViolation("delete 只允许删除单个文件，不支持目录或递归删除")
+
+        size = get_final_path(handle, None, 0, 0)
+        if not size:
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error), str(lexical))
+        buffer = ctypes.create_unicode_buffer(size + 1)
+        if not get_final_path(handle, buffer, len(buffer), 0):
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error), str(lexical))
+        final_text = buffer.value
+        if final_text.startswith("\\\\?\\UNC\\"):
+            final_text = "\\\\" + final_text[8:]
+        elif final_text.startswith("\\\\?\\"):
+            final_text = final_text[4:]
+        final_path = Path(final_text)
+        if os.path.normcase(str(final_path)) != os.path.normcase(str(lexical)):
+            raise SandboxViolation("删除路径经过了符号链接或目录联接")
+
+        disposition = FileDispositionInfo(1)
+        if not set_info(handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error), str(lexical))
+        return lexical.relative_to(sandbox.root).as_posix()
+    finally:
+        close_handle(handle)
+
+
 def _split_command(command: str | list[str]) -> list[str]:
     if isinstance(command, list):
         parts = [str(part) for part in command]
@@ -1243,6 +1460,7 @@ def run_command(
     timeout_seconds: float = 30,
     output_limit: int = 20_000,
     allowlist: frozenset[str] = DEFAULT_COMMAND_ALLOWLIST,
+    _cancel_event: threading.Event | None = None,
 ) -> ToolResult:
     arguments = {"command": command, "timeout_seconds": timeout_seconds}
     if not approved:
@@ -1319,9 +1537,22 @@ def run_command(
         ]
         for reader in readers:
             reader.start()
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        deadline = time.monotonic() + timeout
+        cancelled = False
+        timed_out = False
+        while process.poll() is None:
+            if _cancel_event is not None and _cancel_event.is_set():
+                cancelled = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                process.wait(timeout=min(0.2, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+        if cancelled or timed_out:
             tree_terminated = False
             if os.name == "nt":
                 try:
@@ -1352,6 +1583,18 @@ def run_command(
             for reader in readers:
                 reader.join(timeout=2)
             partial = "".join(chunks)
+            if cancelled:
+                return ToolResult(
+                    "run_command",
+                    False,
+                    (partial + "\nCommand execution interrupted by the user.")[:output_limit],
+                    error_code="cancelled",
+                    metadata={
+                        "process_tree_terminated": tree_terminated,
+                        "truncated": output_truncated,
+                        "security_scope": "current_user_host_permissions",
+                    },
+                )
             termination_text = "进程树已终止" if tree_terminated else "主进程已终止，但无法确认全部子进程"
             return ToolResult(
                 "run_command",

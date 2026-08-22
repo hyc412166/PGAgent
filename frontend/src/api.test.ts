@@ -56,6 +56,17 @@ describe('API 客户端', () => {
     }))
   })
 
+  it('可以通过 DELETE 永久删除一条会话', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.delete('/api/sessions/session-1')
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/sessions/session-1', expect.objectContaining({
+      method: 'DELETE',
+    }))
+  })
+
   it('原生文件夹选择使用无路径参数的本地 POST 接口', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ path: 'C:\\Projects\\PGAgent' }),

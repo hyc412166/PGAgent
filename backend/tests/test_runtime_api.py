@@ -17,6 +17,8 @@ from app.database import (
     Approval,
     Base,
     ChatMessage,
+    ConversationCompaction,
+    ConversationTurn,
     DelegatedTask,
     DraftLaunch,
     Run,
@@ -26,7 +28,7 @@ from app.database import (
     configure_database,
     init_db,
 )
-from app.services.run_service import coordinator
+from app.services.run_service import RunCoordinator, coordinator
 from app.services.run_stream import run_stream_broker
 
 
@@ -74,10 +76,38 @@ def test_launch_session_run_persists_message_and_returns_immediately(
     with database.SessionLocal() as db:
         run = db.get(Run, run_id)
         assert run is not None and run.mode == "auto"
+        assert run.turn_id is not None
+        turn = db.get(ConversationTurn, run.turn_id)
+        assert turn is not None and turn.user_message_id is not None
+        assert turn.reply_status == "pending"
         assert run.agent_id == DEFAULT_AGENT_ID
         session = db.get(Session, session_id)
         assert session is not None and session.agent_id == DEFAULT_AGENT_ID
         assert db.query(database.ChatMessage).filter_by(session_id=session_id).one().content == "读取文件"
+
+
+def test_session_run_idempotency_reuses_the_same_accepted_turn(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, launched = client
+    _workspace_id, _agent_id, session_id = _seed()
+    payload = {"content": "读取文件", "idempotency_key": "turn-message-1"}
+
+    first = test_client.post(f"/api/sessions/{session_id}/run", json=payload)
+    retry = test_client.post(f"/api/sessions/{session_id}/run", json=payload)
+    conflict = test_client.post(
+        f"/api/sessions/{session_id}/run",
+        json={"content": "不同任务", "idempotency_key": "turn-message-1"},
+    )
+
+    assert first.status_code == 202, first.text
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["id"] == first.json()["id"]
+    assert conflict.status_code == 409
+    assert launched["calls"] == [(first.json()["id"], False)]
+    with database.SessionLocal() as db:
+        assert db.query(ConversationTurn).count() == 1
+        assert db.query(ChatMessage).filter_by(session_id=session_id, role="user").count() == 1
 
 
 def test_second_active_run_is_rejected(client: tuple[TestClient, dict[str, list]]) -> None:
@@ -123,6 +153,286 @@ def test_run_stream_sends_current_state_replay_and_terminal_with_stable_ids(
     assert run_stream_broker.subscriber_count(run_id) == 0
 
 
+def test_stop_run_is_idempotent_and_keeps_partial_stream_evidence(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, _launched = client
+    workspace_id, agent_id, session_id = _seed()
+    with database.SessionLocal() as db:
+        run = Run(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            status="acting",
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    # Tool lifecycle events are already durable; token deltas remain transient
+    # until the stop endpoint snapshots the visible partial response.
+    RunCoordinator._event_sink(run_id)({
+        "type": "tool_started",
+        "tool_name": "read_file",
+        "tool_call_id": "call-1",
+    })
+    RunCoordinator._stream_sink(run_id)({"type": "assistant_delta", "delta": "partial answer"})
+    RunCoordinator._stream_sink(run_id)({"type": "progress", "summary": "partial thought"})
+
+    response = test_client.post(f"/api/runs/{run_id}/stop")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "stopped"
+    assert response.json()["stop_reason"] == "user_interrupted"
+    assert response.json()["error_code"] == "run_interrupted"
+
+    retry = test_client.post(f"/api/runs/{run_id}/stop", json={"reason": "user_interrupted"})
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["status"] == "stopped"
+    assert retry.json()["stop_reason"] == "user_interrupted"
+
+    # A synchronous provider can finish its worker thread after the stop
+    # commit.  The event sink must reject that late lifecycle event as well.
+    RunCoordinator._event_sink(run_id)({"type": "tool_finished", "tool_name": "read_file"})
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.status == "stopped"
+        events = list(db.scalars(select(RunEvent).where(RunEvent.run_id == run_id)))
+        interrupted = [event for event in events if event.event_type == "run_interrupted"]
+        assert len(interrupted) == 1
+        assert interrupted[0].payload["partial_output"] == "partial answer"
+        assert interrupted[0].payload["partial_thought"] == "partial thought"
+        assert any(event.event_type == "tool_started" for event in events)
+        assert not any(event.event_type == "tool_finished" for event in events)
+
+
+def test_stopping_an_accepted_turn_persists_exactly_one_terminal_reply(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, _launched = client
+    _workspace_id, _agent_id, session_id = _seed()
+    launched = test_client.post(
+        f"/api/sessions/{session_id}/run",
+        json={"content": "执行一个长任务", "idempotency_key": "turn-stop-1"},
+    )
+    assert launched.status_code == 202, launched.text
+    run_id = launched.json()["id"]
+    first = test_client.post(f"/api/runs/{run_id}/stop")
+    second = test_client.post(f"/api/runs/{run_id}/stop")
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.turn_id is not None
+        turn = db.get(ConversationTurn, run.turn_id)
+        assert turn is not None and turn.reply_status == "delivered"
+        replies = list(db.scalars(select(ChatMessage).where(
+            ChatMessage.terminal_for_turn_id == turn.id,
+        )))
+        assert len(replies) == 1
+        assert "按你的要求停止" in replies[0].content
+
+
+def test_stop_run_cancels_in_process_task_and_does_not_rewrite_completed(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, _launched = client
+    workspace_id, agent_id, session_id = _seed()
+
+    class PendingTask:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> bool:
+            self.cancelled = True
+            return True
+
+    with database.SessionLocal() as db:
+        active = Run(session_id=session_id, workspace_id=workspace_id, agent_id=agent_id, status="acting")
+        completed = Run(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            status="completed",
+        )
+        db.add_all([active, completed])
+        db.commit()
+        active_id, completed_id = active.id, completed.id
+
+    pending = PendingTask()
+    coordinator._tasks[active_id] = pending  # type: ignore[assignment]
+    try:
+        response = test_client.post(f"/api/runs/{active_id}/stop")
+        assert response.status_code == 200
+        assert pending.cancelled is True
+    finally:
+        coordinator._tasks.pop(active_id, None)
+
+    untouched = test_client.post(f"/api/runs/{completed_id}/stop")
+    assert untouched.status_code == 200
+    assert untouched.json()["status"] == "completed"
+    assert untouched.json()["stop_reason"] is None
+    with database.SessionLocal() as db:
+        assert db.scalar(
+            select(RunEvent).where(
+                RunEvent.run_id == completed_id,
+                RunEvent.event_type == "run_interrupted",
+            )
+        ) is None
+
+
+def test_stop_waiting_approval_supersedes_pending_and_never_resumes(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, launched = client
+    workspace_id, agent_id, session_id = _seed()
+    with database.SessionLocal() as db:
+        run = Run(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            status="awaiting_approval",
+        )
+        db.add(run)
+        db.flush()
+        approval = Approval(run_id=run.id, tool_name="write_file", arguments={"path": "a.txt"})
+        snapshot = RunEvent(
+            run_id=run.id,
+            event_type="runtime_snapshot",
+            payload={
+                "status": "awaiting_approval",
+                "pending_approval": {
+                    "id": "call-approval",
+                    "tool_name": "write_file",
+                    "arguments": {"path": "a.txt"},
+                },
+            },
+        )
+        db.add_all([approval, snapshot])
+        db.commit()
+        run_id, approval_id = run.id, approval.id
+
+    response = test_client.post(f"/api/runs/{run_id}/stop")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "stopped"
+    assert launched["calls"] == []
+    with database.SessionLocal() as db:
+        cancelled = db.get(Approval, approval_id)
+        assert cancelled is not None and cancelled.status == "superseded"
+        assert db.scalar(
+            select(RunEvent).where(
+                RunEvent.run_id == run_id,
+                RunEvent.event_type == "approval_cancelled",
+            )
+        ) is not None
+
+    # The stale approval click cannot resurrect an explicitly stopped run.
+    rejected = test_client.post(
+        f"/api/approvals/{approval_id}/decide",
+        json={"decision": "approve"},
+    )
+    assert rejected.status_code == 409
+
+
+def test_stopping_parent_settles_active_delegated_child(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, _launched = client
+    workspace_id, agent_id, session_id = _seed()
+    with database.SessionLocal() as db:
+        parent = Run(session_id=session_id, workspace_id=workspace_id, agent_id=agent_id, status="acting")
+        child = Run(session_id=session_id, workspace_id=workspace_id, agent_id=agent_id, status="acting")
+        db.add_all([parent, child])
+        db.flush()
+        delegation = DelegatedTask(
+            parent_run_id=parent.id,
+            parent_session_id=session_id,
+            child_run_id=child.id,
+            child_agent_id=agent_id,
+            title="Inspect files",
+            description="Inspect files",
+            status="in_progress",
+            idempotency_key=f"stop-child-{parent.id}",
+        )
+        db.add(delegation)
+        db.commit()
+        parent_id, child_id, delegation_id = parent.id, child.id, delegation.id
+
+    response = test_client.post(f"/api/runs/{parent_id}/stop")
+    assert response.status_code == 200, response.text
+    with database.SessionLocal() as db:
+        child = db.get(Run, child_id)
+        task = db.get(DelegatedTask, delegation_id)
+        assert child is not None and child.status == "stopped"
+        assert child.stop_reason == "parent_user_interrupted"
+        assert task is not None and task.status == "blocked"
+        assert (task.result or {}).get("status") == "stopped"
+        assert db.scalar(
+            select(RunEvent).where(
+                RunEvent.run_id == parent_id,
+                RunEvent.event_type == "delegated_child_stopped",
+            )
+        ) is not None
+
+
+def test_stopping_delegated_child_settles_task_and_parent(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, _launched = client
+    workspace_id, agent_id, session_id = _seed()
+    with database.SessionLocal() as db:
+        parent = Run(session_id=session_id, workspace_id=workspace_id, agent_id=agent_id, status="acting")
+        child = Run(session_id=session_id, workspace_id=workspace_id, agent_id=agent_id, status="acting")
+        db.add_all([parent, child])
+        db.flush()
+        delegation = DelegatedTask(
+            parent_run_id=parent.id,
+            parent_session_id=session_id,
+            child_run_id=child.id,
+            child_agent_id=agent_id,
+            title="Inspect files",
+            description="Inspect files",
+            status="in_progress",
+            idempotency_key=f"stop-direct-child-{parent.id}",
+        )
+        db.add(delegation)
+        db.flush()
+        db.add(RunEvent(
+            run_id=child.id,
+            event_type="delegation_link",
+            payload={
+                "delegation_id": delegation.id,
+                "parent_run_id": parent.id,
+                "parent_session_id": session_id,
+            },
+        ))
+        db.commit()
+        parent_id, child_id, delegation_id = parent.id, child.id, delegation.id
+
+    response = test_client.post(f"/api/runs/{child_id}/stop")
+    assert response.status_code == 200, response.text
+    with database.SessionLocal() as db:
+        parent = db.get(Run, parent_id)
+        child = db.get(Run, child_id)
+        task = db.get(DelegatedTask, delegation_id)
+        assert parent is not None and parent.status == "stopped"
+        assert parent.stop_reason == "user_interrupted"
+        assert child is not None and child.status == "stopped"
+        assert child.stop_reason == "user_interrupted"
+        assert task is not None and task.status == "blocked"
+        assert (task.result or {}).get("stop_reason") == "user_interrupted"
+        assert db.scalar(
+            select(RunEvent).where(
+                RunEvent.run_id == parent_id,
+                RunEvent.event_type == "delegated_child_stopped",
+            )
+        ) is not None
+
+
 def test_approval_decision_resumes_only_when_approved(client: tuple[TestClient, dict[str, list]]) -> None:
     test_client, launched = client
     workspace_id, agent_id, session_id = _seed()
@@ -151,6 +461,66 @@ def test_approval_decision_resumes_only_when_approved(client: tuple[TestClient, 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "approved"
     assert launched["calls"] == [(run_id, True)]
+
+
+def test_rejecting_root_approval_persists_exactly_one_terminal_reply(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, launched = client
+    _workspace_id, _agent_id, session_id = _seed()
+    accepted = test_client.post(
+        f"/api/sessions/{session_id}/run",
+        json={"content": "请写入文件", "idempotency_key": "reject-root-turn"},
+    )
+    assert accepted.status_code == 202, accepted.text
+    run_id = accepted.json()["id"]
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.turn_id is not None
+        run.status = "awaiting_approval"
+        approval = Approval(
+            run_id=run.id,
+            tool_name="write_file",
+            arguments={"path": "a.txt"},
+        )
+        snapshot = RunEvent(
+            run_id=run.id,
+            event_type="runtime_snapshot",
+            payload={
+                "status": "awaiting_approval",
+                "pending_approval": {
+                    "id": "reject-root-call",
+                    "tool_name": "write_file",
+                    "arguments": {"path": "a.txt"},
+                },
+            },
+        )
+        db.add_all([approval, snapshot])
+        db.commit()
+        approval_id = approval.id
+
+    response = test_client.post(
+        f"/api/approvals/{approval_id}/decide",
+        json={"decision": "reject", "reason": "暂不允许写入"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "rejected"
+    assert launched["calls"] == [(run_id, False)]
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.status == "stopped"
+        assert run.stop_reason == "approval_rejected"
+        turn = db.get(ConversationTurn, run.turn_id)
+        assert turn is not None and turn.reply_status == "delivered"
+        replies = list(db.scalars(select(ChatMessage).where(
+            ChatMessage.terminal_for_turn_id == turn.id,
+        )))
+        assert len(replies) == 1
+        assert replies[0].extra["error_code"] == "approval_rejected"
+        assert replies[0].extra["trace_id"] == turn.trace_id
+        assert "没有获得批准" in replies[0].content
 
 
 def test_approval_decision_is_restored_when_resume_cannot_be_scheduled(
@@ -501,8 +871,11 @@ def test_launch_draft_marks_persisted_run_failed_when_initial_scheduling_fails(
     monkeypatch.setattr(coordinator, "launch", cannot_schedule)
     payload = _draft_payload(key=f"draft-schedule-{failure_mode}")
     failed = test_client.post("/api/drafts/launch", json=payload)
-    assert failed.status_code == 503, failed.text
-    assert _draft_resource_counts() == (1, 1, 1, 1)
+    # The user turn was durably accepted, so scheduling failure is an
+    # execution outcome rather than a transport-level rejection.
+    assert failed.status_code == 202, failed.text
+    assert failed.json()["run"]["status"] == "failed"
+    assert _draft_resource_counts() == (1, 1, 2, 1)
 
     with database.SessionLocal() as db:
         record = db.scalar(select(DraftLaunch).where(DraftLaunch.idempotency_key == payload["idempotency_key"]))
@@ -511,13 +884,34 @@ def test_launch_draft_marks_persisted_run_failed_when_initial_scheduling_fails(
         assert run is not None
         assert run.status == "failed"
         assert run.error_code == "launch_unavailable"
+        assert run.turn_id is not None
+        turn = db.get(ConversationTurn, run.turn_id)
+        assert turn is not None and turn.reply_status == "delivered"
+        replies = list(db.scalars(select(ChatMessage).where(
+            ChatMessage.session_id == run.session_id,
+            ChatMessage.role == "assistant",
+        )))
+        assert len(replies) == 1
+        assert replies[0].terminal_for_turn_id == turn.id
+        assert "本地执行器未能启动" in replies[0].content
+        failed_event = db.scalar(select(RunEvent).where(
+            RunEvent.run_id == run.id,
+            RunEvent.event_type == "integration_failed",
+        ))
+        assert failed_event is not None
+        if failure_mode == "exception":
+            assert failed_event.payload["exception_type"] == "RuntimeError"
+            assert failed_event.payload["internal_error"] == "coordinator unavailable"
+            assert "coordinator unavailable" not in replies[0].content
+        else:
+            assert "internal_error" not in failed_event.payload
         run_id = run.id
 
     retry = test_client.post("/api/drafts/launch", json=payload)
     assert retry.status_code == 200, retry.text
     assert retry.json()["run"]["id"] == run_id
     assert retry.json()["run"]["status"] == "failed"
-    assert _draft_resource_counts() == (1, 1, 1, 1)
+    assert _draft_resource_counts() == (1, 1, 2, 1)
     assert attempts == [(run_id, False)]
     assert launched["calls"] == []
 
@@ -566,7 +960,7 @@ def test_invalid_or_unavailable_draft_launch_leaves_no_rows(
     assert launched["calls"] == []
 
 
-def test_session_context_recalculates_migrated_messages_when_cache_is_zero(
+def test_session_context_recalculates_messages_when_cached_count_is_zero(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
     test_client, _launched = client
@@ -574,7 +968,6 @@ def test_session_context_recalculates_migrated_messages_when_cache_is_zero(
     with database.SessionLocal() as db:
         session = db.get(Session, session_id)
         assert session is not None
-        session.context_summary = "legacy summary"
         session.context_tokens = 0
         db.add_all([
             ChatMessage(session_id=session_id, role="user", content="old question"),
@@ -589,13 +982,13 @@ def test_session_context_recalculates_migrated_messages_when_cache_is_zero(
     assert body["limit_tokens"] == 100_000
     assert body["compact_threshold_tokens"] == 90_000
     assert body["percent"] > 0
-    assert body["last_compacted_at"] is None
+    assert body["last_compaction_at"] is None
     with database.SessionLocal() as db:
         session = db.get(Session, session_id)
         assert session is not None and session.context_tokens == body["used_tokens"]
 
 
-def test_session_context_get_compacts_migrated_history_at_threshold(
+def test_session_context_get_reports_threshold_without_mutating_history(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
     test_client, _launched = client
@@ -621,11 +1014,10 @@ def test_session_context_get_compacts_migrated_history_at_threshold(
     response = test_client.get(f"/api/sessions/{session_id}/context")
     assert response.status_code == 200
     body = response.json()
-    assert 0 < body["used_tokens"] < body["compact_threshold_tokens"]
-    assert body["last_compacted_at"] == old_time.replace(tzinfo=None).isoformat()
+    assert body["used_tokens"] >= body["compact_threshold_tokens"]
+    assert body["last_compaction_at"] is None
     with database.SessionLocal() as db:
         session = db.get(Session, session_id)
         assert session is not None
         assert session.context_tokens == body["used_tokens"]
-        assert session.context_summary
-        assert session.last_compacted_at == old_time.replace(tzinfo=None)
+        assert db.query(ConversationCompaction).filter_by(session_id=session_id).count() == 0

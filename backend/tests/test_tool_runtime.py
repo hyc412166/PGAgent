@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.runtime.context import ContextManager
-from app.runtime.context_service import ContextAssembler, SemanticCompactor
+from app.runtime.context_service import ContextAssembler, ConversationCompactor
 from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig
 from app.tools import create_default_registry
 from app.tools.policy import assess_tool_call
@@ -25,9 +27,15 @@ def test_registry_exposes_only_selected_tools_and_enforces_permission_modes(tmp_
         allowed_tool_names=["webfetch"],
         permission_mode="smart",
     )
-    # Smart mode lets an otherwise safe network tool run, but the tool itself
-    # still rejects SSRF targets before sending a request.
-    blocked = smart_registry.execute("webfetch", {"url": "http://127.0.0.1:8765"})
+    # Smart mode confirms the external boundary first.  Approval only removes
+    # that prompt; the tool still enforces its own SSRF boundary afterwards.
+    pending = smart_registry.execute("webfetch", {"url": "http://127.0.0.1:8765"})
+    assert pending.approval_required
+    blocked = smart_registry.execute(
+        "webfetch",
+        {"url": "http://127.0.0.1:8765"},
+        approved=True,
+    )
     assert not blocked.ok
     assert blocked.error_code == "unsafe_url"
 
@@ -123,6 +131,96 @@ def test_permission_modes_keep_their_distinct_boundaries_for_the_same_write(tmp_
     assert full.execute("write", {"path": ".env", "content": "API_KEY=demo"}).ok
 
 
+def test_delete_is_public_and_smart_mode_always_requires_approval(tmp_path) -> None:
+    target = tmp_path / "obsolete.txt"
+    target.write_text("old", encoding="utf-8")
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["delete"],
+        permission_mode="smart",
+    )
+
+    assert [item["function"]["name"] for item in registry.schemas] == ["delete"]
+    pending = registry.execute("delete", {"path": "obsolete.txt"})
+    assert pending.approval_required
+    assert target.exists()
+
+    approved = registry.execute("delete", {"path": "obsolete.txt"}, approved=True)
+    assert approved.ok and approved.changed
+    assert not target.exists()
+
+
+def test_malformed_provider_tool_arguments_are_rejected_without_execution(tmp_path) -> None:
+    turn = ModelTurn.from_response({
+        "tool_calls": [{
+            "id": "bad-json",
+            "function": {"name": "write", "arguments": '{"path":"x.txt","content":'},
+        }]
+    })
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["write"],
+        permission_mode="full",
+    )
+
+    result = registry.execute("write", turn.tool_calls[0].arguments)
+    assert not result.ok
+    assert result.error_code == "invalid_tool_arguments"
+    assert not (tmp_path / "x.txt").exists()
+    assert "content" not in result.content
+
+
+def test_model_turn_preserves_provider_reasoning_for_followup_requests() -> None:
+    turn = ModelTurn.from_response({
+        "choices": [{"message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "inspect the project first",
+            "tool_calls": [],
+        }}],
+        "usage": {"request_count": 1},
+    })
+
+    assert turn.reasoning_content == "inspect the project first"
+    assert turn.usage["request_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_never_persists_raw_malformed_tool_arguments(tmp_path) -> None:
+    calls = 0
+    malformed = '{"path":"x.txt","content":"DO_NOT_PERSIST"'
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "tool_calls": [{
+                    "id": "bad-json-runtime",
+                    "function": {"name": "write", "arguments": malformed},
+                }]
+            }
+        assert kwargs["messages"][-1]["role"] == "tool"
+        assert "invalid_tool_arguments" in kwargs["messages"][-1]["content"]
+        return ModelTurn(content="参数无效，未执行写入。")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=["write"],
+            permission_mode="full",
+        ),
+    )
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert not (tmp_path / "x.txt").exists()
+    serialized = json.dumps({"messages": outcome.messages, "events": outcome.events}, ensure_ascii=False)
+    assert "DO_NOT_PERSIST" not in serialized
+    assert "_raw" not in serialized
+
+
 def test_edit_glob_and_grep_are_real_sandboxed_tools(tmp_path) -> None:
     (tmp_path / "notes").mkdir()
     target = tmp_path / "notes" / "sample.txt"
@@ -157,6 +255,7 @@ def test_todo_skill_and_task_behavior_is_honest(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
         allowed_tool_names=["todowrite", "skill", "task"],
+        permission_mode="full",
         skill_instructions=[
             {
                 "id": "review",
@@ -228,6 +327,20 @@ async def test_task_delegate_is_not_started_until_parent_approval(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_async_command_approval_does_not_persist_private_cancel_signal(tmp_path) -> None:
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["bash"],
+        permission_mode="ask",
+    )
+    pending = await registry.execute_async("bash", {"command": "echo safe"}, call_id="approval-1")
+    assert pending.approval_required
+    assert pending.approval_request is not None
+    assert "_cancel_event" not in pending.approval_request.arguments
+    json.dumps(pending.approval_request.arguments)
+
+
+@pytest.mark.asyncio
 async def test_question_stops_for_input_without_claiming_completion(tmp_path) -> None:
     async def model_call(**_kwargs):
         return ModelTurn(tool_calls=[ModelToolCall("question-1", "question", {"question": "目标文件是哪一个？"})])
@@ -268,7 +381,7 @@ async def test_provider_context_overflow_compacts_once_and_retries_without_loop(
 
     assembler = ContextAssembler(
         max_tokens=4_096,
-        compaction_threshold=1_800,
+        compaction_threshold_tokens=3_000,
         output_reserve_tokens=500,
         safety_buffer_tokens=100,
     )
@@ -277,12 +390,21 @@ async def test_provider_context_overflow_compacts_once_and_retries_without_loop(
         tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
         context_manager=ContextManager(max_tokens=4_096),
         context_assembler=assembler,
-        semantic_compactor=SemanticCompactor(model_call=model_call, retain_tokens=100),
+        conversation_compactor=ConversationCompactor(
+            model_call=model_call,
+            preserve_recent_messages=1,
+            retain_tokens=100,
+        ),
     )
     outcome = await runtime.run(
         system_prompt="rules",
         agent_instructions="instructions",
-        recent_messages=[{"role": "user", "content": "x" * 16_000}],
+        recent_messages=[
+            {"role": "user", "content": "old " + ("x" * 8_000)},
+            {"role": "assistant", "content": "old result"},
+            {"role": "user", "content": "recover now"},
+            {"role": "assistant", "content": "latest small result"},
+        ],
     )
 
     assert outcome.status == "completed"
@@ -299,7 +421,7 @@ async def test_provider_context_overflow_compacts_once_and_retries_without_loop(
 
 
 @pytest.mark.asyncio
-async def test_threshold_semantic_compaction_rebuilds_concrete_context_bundle(tmp_path) -> None:
+async def test_threshold_full_compaction_builds_exact_continuation(tmp_path) -> None:
     calls: list[str] = []
     model_messages: list[dict] = []
 
@@ -320,7 +442,7 @@ async def test_threshold_semantic_compaction_rebuilds_concrete_context_bundle(tm
 
     assembler = ContextAssembler(
         max_tokens=4_096,
-        compaction_threshold=1_800,
+        compaction_threshold_tokens=1_800,
         output_reserve_tokens=500,
         safety_buffer_tokens=100,
     )
@@ -329,14 +451,18 @@ async def test_threshold_semantic_compaction_rebuilds_concrete_context_bundle(tm
         tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
         context_manager=ContextManager(max_tokens=4_096),
         context_assembler=assembler,
-        semantic_compactor=SemanticCompactor(model_call=model_call, retain_tokens=100),
+        conversation_compactor=ConversationCompactor(
+            model_call=model_call,
+            preserve_recent_messages=1,
+            retain_tokens=100,
+        ),
     )
     outcome = await runtime.run(
         system_prompt="stable rules",
         agent_instructions="stable instructions",
-        memories=[{"content": "keep this memory", "pinned": True}],
         recent_messages=[
-            {"role": "user", "content": "important task " + ("x" * 4_000)},
+            {"role": "user", "content": "old context " + ("x" * 4_000)},
+            {"role": "user", "content": "important task"},
             {"role": "assistant", "content": "intermediate result " + ("y" * 4_000)},
         ],
     )
@@ -345,8 +471,8 @@ async def test_threshold_semantic_compaction_rebuilds_concrete_context_bundle(tm
     assert outcome.output == "compacted answer"
     assert "compaction" in calls
     rendered = "\n".join(str(item.get("content") or "") for item in model_messages)
-    assert "[固定] keep this memory" in rendered
-    assert "<user_task>" in rendered
+    assert "<compacted-context>" in rendered
+    assert "<active-request>important task</active-request>" in rendered
     assert "important task" in rendered
     assert any(event["type"] == "context_compaction_finished" and event.get("effective") for event in outcome.events)
 

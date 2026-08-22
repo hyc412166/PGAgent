@@ -1,19 +1,25 @@
 import {
+  Brain,
   Bot,
   CheckCheck,
   ChevronRight,
   Copy,
+  FileText,
+  Globe2,
   LoaderCircle,
+  Pencil,
+  Search,
   ShieldCheck,
   SquareTerminal,
   Users,
+  Wrench,
   X,
   XCircle,
   CheckCircle2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { memo } from 'react'
-import { formatLiveThinkingDuration, formatThoughtDuration, type ThoughtTimelineState } from '../../thoughtTimeline'
+import { formatLiveThinkingDuration, formatThoughtDuration, type ThoughtActivityIcon, type ThoughtActivityItem, type ThoughtTimelineState } from '../../thoughtTimeline'
 import type { Approval, DelegatedTask, Message, Run, RunEvent } from '../../types'
 import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../components/ui'
 import { statusText } from '../../components/status'
@@ -151,37 +157,95 @@ export const MessageBubble = memo(function MessageBubble({ message }: { message:
   )
 })
 
+function ThoughtActivityIcon({ icon }: { icon: ThoughtActivityIcon }) {
+  if (icon === 'task') return <span className="thought-activity-icon is-task"><PenguinMark size={13} /></span>
+  if (icon === 'search') return <span className="thought-activity-icon is-search"><Search size={13} /></span>
+  if (icon === 'read') return <span className="thought-activity-icon is-read"><FileText size={13} /></span>
+  if (icon === 'write' || icon === 'edit') return <span className="thought-activity-icon is-write"><Pencil size={13} /></span>
+  if (icon === 'shell') return <span className="thought-activity-icon is-shell"><SquareTerminal size={13} /></span>
+  if (icon === 'approval') return <span className="thought-activity-icon is-approval"><ShieldCheck size={13} /></span>
+  if (icon === 'context') return <span className="thought-activity-icon is-context"><Globe2 size={13} /></span>
+  if (icon === 'think') return <span className="thought-activity-icon is-think"><Brain size={13} /></span>
+  return <span className="thought-activity-icon is-generic"><Wrench size={13} /></span>
+}
+
+function fallbackThoughtItems(timeline: ThoughtTimelineState): ThoughtActivityItem[] {
+  if (timeline.items?.length) return timeline.items
+  return timeline.tools.map((tool) => ({
+    id: tool.id,
+    kind: 'tool' as const,
+    icon: 'generic' as const,
+    title: tool.name,
+    detail: tool.target,
+    status: tool.status,
+  }))
+}
+
+function hasActivityDetails(items: ThoughtActivityItem[]) {
+  // A generic model-step marker is useful for the live phase/timer, but it
+  // is not expandable content by itself.  Show the disclosure only when a
+  // real safe progress summary or tool/context activity exists.
+  return items.some((item) => Boolean(item.detail.trim()) || item.kind !== 'thought')
+}
+
+function ThoughtActivityList({ items, live = false, activeItemId }: { items: ThoughtActivityItem[]; live?: boolean; activeItemId?: string }) {
+  if (!items.length) return null
+  return <div className={`thought-activity-list ${live ? 'is-live' : ''}`} aria-label="处理过程">
+    {items.map((item) => <div key={item.id} className={`thought-activity kind-${item.kind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
+      <ThoughtActivityIcon icon={item.icon} />
+      <div className="thought-activity-copy"><strong>{item.title}</strong>{item.detail && <span title={item.detail}>{item.detail}</span>}</div>
+    </div>)}
+  </div>
+}
+
 export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({ runId, timeline }: { runId: string; timeline: ThoughtTimelineState }) {
   const [expanded, setExpanded] = useState(false)
   const duration = formatThoughtDuration(timeline.elapsedMs)
-  const hasDetails = timeline.tools.length > 0
+  const items = fallbackThoughtItems(timeline)
+  const hasDetails = hasActivityDetails(items)
+  const summary = timeline.conclusion || '处理完成'
 
   return <article className={`completed-thought ${hasDetails && expanded ? 'expanded' : ''} ${hasDetails ? '' : 'no-details'}`}>
     {hasDetails ? <button type="button" className="completed-thought-toggle" aria-expanded={expanded} aria-controls={`thought-details-${runId}`} onClick={() => setExpanded((value) => !value)}>
-      <span className="completed-thought-duration">已处理 {duration}</span><ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
+      <span className="completed-thought-duration">已处理 {duration}</span><span className="completed-thought-summary">{summary}</span><ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
     </button> : <span className="completed-thought-duration completed-thought-static">已处理 {duration}</span>}
-    {hasDetails && expanded && <div id={`thought-details-${runId}`} className="thought-tool-list" aria-label="工具调用">{timeline.tools.map((tool) => <p key={tool.id} className={`thought-tool ${tool.status}`}><span>{tool.name.startsWith('Web') ? '⌁' : '→'}</span><strong>{tool.name}</strong>{tool.target && <code title={tool.target}>{tool.target}</code>}{tool.status === 'running' && <i aria-label="运行中" />}</p>)}</div>}
+    {hasDetails && expanded && <div id={`thought-details-${runId}`}><ThoughtActivityList items={items} /></div>}
   </article>
 })
 
 export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunView }) {
   const [now, setNow] = useState(() => Date.now())
+  const [expanded, setExpanded] = useState(true)
   useEffect(() => {
     if (liveRun.thought.startedAt === null || liveRun.thought.finished) return
     setNow(Date.now())
     const timer = window.setInterval(() => setNow(Date.now()), 1_000)
     return () => window.clearInterval(timer)
   }, [liveRun.thought.finished, liveRun.thought.startedAt])
+  useEffect(() => {
+    setExpanded(true)
+  }, [liveRun.runId])
+  useEffect(() => {
+    if (liveRun.thought.finished || liveRun.status === 'terminal') setExpanded(false)
+  }, [liveRun.status, liveRun.thought.finished])
   const liveThoughtMs = liveRun.thought.startedAt === null ? 0 : Math.max(0, now - liveRun.thought.startedAt)
   const phase = liveRun.phase.includes('子 Agent')
     ? liveRun.phase
     : !liveRun.thought.finished && liveRun.status !== 'awaiting_approval' && liveRun.thinkingStatus
       ? `${liveRun.thinkingStatus} ${formatLiveThinkingDuration(liveThoughtMs)}`
       : liveRun.phase || '已完成'
+  const items = fallbackThoughtItems(liveRun.thought)
+  const hasDetails = hasActivityDetails(items)
   return (
     <article className={`message assistant live-message ${liveRun.status === 'terminal' ? 'live-message-terminal' : ''}`}>
       <div className="message-avatar"><PenguinMark size={21} /></div>
-      <div className="message-body"><div className="message-meta"><strong>PGAgent</strong><span className="live-phase"><i aria-hidden="true" />{phase}</span></div>{liveRun.draft && <div className="message-content">{liveRun.draft}</div>}{liveRun.error && <p className="live-error">{liveRun.error}</p>}</div>
+      <div className="message-body"><div className="message-meta"><strong>PGAgent</strong><span className="live-phase">{phase}</span></div>
+        {hasDetails && <div className={`live-thought ${expanded ? 'expanded' : ''}`}>
+          <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `已处理 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '处理过程'}</span></button>
+          {expanded && <ThoughtActivityList items={items} live activeItemId={liveRun.thought.activeItemId} />}
+        </div>}
+        {liveRun.draft && <div className="message-content">{liveRun.draft}</div>}{liveRun.error && <p className="live-error">{liveRun.error}</p>}
+      </div>
     </article>
   )
 })

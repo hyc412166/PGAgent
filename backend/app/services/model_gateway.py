@@ -135,6 +135,42 @@ def _text_fragment(chunk: Mapping[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
+def _reasoning_fragment(chunk: Mapping[str, Any]) -> str:
+    """Extract provider reasoning without mixing it into answer content."""
+
+    choices = chunk.get("choices") or []
+    if not isinstance(choices, list) or not choices:
+        return ""
+    choice = choices[0]
+    if not isinstance(choice, Mapping):
+        choice = _as_mapping(choice)
+    delta = choice.get("delta") or {}
+    if not isinstance(delta, Mapping):
+        delta = _as_mapping(delta)
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = delta.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _assistant_reasoning(payload: Mapping[str, Any]) -> str:
+    choices = payload.get("choices") or []
+    if not isinstance(choices, list) or not choices:
+        return ""
+    choice = choices[0]
+    if not isinstance(choice, Mapping):
+        choice = _as_mapping(choice)
+    message = choice.get("message") or {}
+    if not isinstance(message, Mapping):
+        message = _as_mapping(message)
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = message.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
 def _raw_usage(payload: Mapping[str, Any]) -> dict[str, Any]:
     usage = payload.get("usage") or {}
     if isinstance(usage, Mapping):
@@ -168,8 +204,10 @@ async def _consume_stream(
     config: ProviderConfig,
     model: str,
     on_delta: DeltaCallback | None,
+    on_thought_delta: DeltaCallback | None,
 ) -> dict[str, Any]:
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: dict[int, dict[str, Any]] = {}
     usage: dict[str, Any] = {}
     chunk_count = 0
@@ -182,6 +220,11 @@ async def _consume_stream(
             if fragment:
                 content_parts.append(fragment)
                 await _emit_delta(on_delta, fragment)
+                visible_output = True
+            reasoning_fragment = _reasoning_fragment(chunk)
+            if reasoning_fragment:
+                reasoning_parts.append(reasoning_fragment)
+                await _emit_delta(on_thought_delta, reasoning_fragment)
                 visible_output = True
             for fallback_index, raw_call in enumerate(_tool_call_fragments(chunk)):
                 raw_index = raw_call.get("index", fallback_index)
@@ -240,6 +283,7 @@ async def _consume_stream(
             "message": {
                 "role": "assistant",
                 "content": "".join(content_parts),
+                "reasoning_content": "".join(reasoning_parts),
                 "tool_calls": assembled_calls,
             }
         }],
@@ -257,6 +301,7 @@ def build_model_call(config: ProviderConfig):
         tools: list[dict[str, Any]],
         mode: str,
         on_delta: DeltaCallback | None = None,
+        on_thought_delta: DeltaCallback | None = None,
         prompt_cache_key: str | None = None,
     ) -> Any:
         api_key = get_api_key(config.secret_ref)
@@ -275,9 +320,6 @@ def build_model_call(config: ProviderConfig):
             "stream_options": {"include_usage": True},
             "drop_params": True,
         }
-        output_limit = 2_000 if mode == "compaction" else config.max_output_tokens
-        if output_limit > 0:
-            kwargs["max_tokens"] = int(output_limit)
         if prompt_cache_key:
             # LiteLLM forwards this to OpenAI-compatible providers that support
             # explicit prompt caching.  Providers that do not support it safely
@@ -303,11 +345,13 @@ def build_model_call(config: ProviderConfig):
                 config=config,
                 model=model,
                 on_delta=on_delta,
+                on_thought_delta=on_thought_delta,
             )
 
         # Some OpenAI-compatible relays silently ignore stream=True and return
         # a normal completion. Treat that as an explicit safe one-shot fallback.
         payload = _normalized_payload(_as_mapping(response), config)
+        await _emit_delta(on_thought_delta, _assistant_reasoning(payload))
         await _emit_delta(on_delta, _assistant_content(payload))
         return payload
 

@@ -37,6 +37,62 @@ describe('实时 Thought 时间线', () => {
     expect(hasVisibleCompletedThought(timeline)).toBe(true)
     expect(timeline.elapsedMs).toBe(858)
     expect(timeline.tools[0]).toMatchObject({ name: 'WebFetch', target: 'https://example.com/docs', status: 'completed' })
+    expect(timeline.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'thought', title: '思考', detail: '' }),
+      expect.objectContaining({ kind: 'tool', title: 'WebFetch', icon: 'search', status: 'completed' }),
+    ]))
+  })
+
+  it('只展示安全进度摘要，不把原始 reasoning 或敏感参数带入时间线', () => {
+    const started = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'model_step_started',
+      summary: '正在检查项目结构',
+      reasoning: '这是不应直接展示的隐藏思维链',
+      arguments: { api_key: 'secret-value' },
+    }, 1_000)
+    const activity = updateThoughtTimeline(started, {
+      type: 'progress',
+      progress: '已完成目录扫描',
+      reasoning: '仍然不能展示',
+    }, 1_100)
+    expect(activity.items.map((item) => item.detail)).toEqual(['正在检查项目结构', '已完成目录扫描'])
+    expect(JSON.stringify(activity.items)).not.toContain('隐藏思维链')
+  })
+
+  it('把实时思考增量连续追加到当前思考项，并由最终摘要收束', () => {
+    const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+    const first = updateThoughtTimeline(started, { type: 'thought_delta', step: 1, delta: '先检查' }, 1_050)
+    const second = updateThoughtTimeline(first, { type: 'thought_delta', step: 1, delta: '天气来源。' }, 1_100)
+    const finished = updateThoughtTimeline(second, { type: 'thought_summary', step: 1, summary: '先检查天气来源。', complete: true }, 1_150)
+
+    expect(second.items).toEqual([
+      expect.objectContaining({ id: 'thought-step-1', title: '思考', detail: '先检查天气来源。', status: 'running' }),
+    ])
+    expect(second.activeItemId).toBe('thought-step-1')
+    expect(finished.items[0]).toMatchObject({ detail: '先检查天气来源。', status: 'completed' })
+    expect(finished.activeItemId).toBeUndefined()
+  })
+
+  it('只把当前正在运行的步骤标记为呼吸灯目标', () => {
+    const thinking = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+    expect(thinking.activeItemId).toBe('thought-step-1')
+
+    const tool = updateThoughtTimeline(thinking, { type: 'tool_started', tool_name: 'websearch', tool_call_id: 'web-1' }, 1_100)
+    expect(tool.activeItemId).toBe('web-1')
+
+    const finished = updateThoughtTimeline(tool, { type: 'tool_finished', tool_call_id: 'web-1', ok: true }, 1_200)
+    expect(finished.activeItemId).toBeUndefined()
+
+    const verifying = updateThoughtTimeline(finished, { type: 'completion_verification_started', event_id: 'verify-1' }, 1_300)
+    expect(verifying.activeItemId).toBe('verify-1')
+  })
+
+  it('中断后用服务端快照补齐可能漏掉的最后一段思考', () => {
+    const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 2 }, 1_000)
+    const partial = updateThoughtTimeline(started, { type: 'thought_delta', step: 2, delta: '正在分析' }, 1_100)
+    const stopped = updateThoughtTimeline(partial, { type: 'run_stopped', partial_thought: '正在分析天气数据。' }, 1_200)
+
+    expect(stopped.items[0]).toMatchObject({ detail: '正在分析天气数据。', status: 'completed' })
   })
 
   it('为默认收起的处理摘要提取安全、简短的结论首行', () => {

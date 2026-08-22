@@ -149,7 +149,7 @@ export interface SessionContext {
   limit_tokens: number
   compact_threshold_tokens: number
   percent: number
-  last_compacted_at?: string
+  last_compaction_at?: string
 }
 
 export interface FolderSelection {
@@ -217,6 +217,8 @@ export interface Message {
   created_at?: string
   tool_name?: string
   tool_call_id?: string
+  turn_id?: string
+  message_kind?: string
   status?: string
   metadata?: ApiRecord
 }
@@ -235,6 +237,7 @@ export interface Run {
   id: string
   session_id?: string
   agent_id?: string
+  turn_id?: string
   agent_name?: string
   title?: string
   status?: string
@@ -246,6 +249,8 @@ export interface Run {
   input_tokens?: number
   output_tokens?: number
   stop_reason?: string
+  error_code?: string
+  error_message?: string
   created_at?: string
   started_at?: string
   finished_at?: string

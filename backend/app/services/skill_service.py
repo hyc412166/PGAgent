@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -41,6 +42,9 @@ MAX_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_ARCHIVE_FILES = 5_000
 MAX_ARCHIVE_EXPANDED_BYTES = 50 * 1024 * 1024
 SKILLS_SH_BASE_URL = "https://skills.sh"
+PROJECT_ROOT = settings.data_dir.parent
+LOCAL_ENV_FILE = PROJECT_ROOT / ".env.local"
+SKILL_TOKEN_REFRESH_SCRIPT = PROJECT_ROOT / "scripts" / "refresh-skills-token.ps1"
 MARKET_BROWSE_VIEWS = frozenset({"all-time", "trending", "hot", "curated"})
 MARKET_LEADERBOARD_LIMIT = 6
 MARKET_LEADERBOARD_SEARCH_LIMIT = 50
@@ -48,6 +52,7 @@ MARKET_LEADERBOARD_TTL_SECONDS = 30 * 60
 GITHUB_ALLOWED_HOSTS = frozenset({"github.com", "api.github.com", "codeload.github.com"})
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SAFE_GITHUB_PART_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_MARKET_TOKEN_REFRESH_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,12 +388,73 @@ def install_local_skill(
         raise
 
 
+def _static_market_token() -> str | None:
+    return os.getenv("SKILLS_SH_API_TOKEN") or os.getenv("PGAGENT_SKILLS_SH_API_TOKEN")
+
+
 def _market_token() -> str | None:
-    return (
-        os.getenv("SKILLS_SH_API_TOKEN")
-        or os.getenv("PGAGENT_SKILLS_SH_API_TOKEN")
-        or os.getenv("VERCEL_OIDC_TOKEN")
-    )
+    return _static_market_token() or os.getenv("VERCEL_OIDC_TOKEN")
+
+
+def _read_local_oidc_token() -> str | None:
+    """Read only VERCEL_OIDC_TOKEN from the CLI-managed local environment file."""
+
+    try:
+        lines = LOCAL_ENV_FILE.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    for line in reversed(lines):
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "VERCEL_OIDC_TOKEN":
+            token = value.strip()
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+                token = token[1:-1]
+            return token or None
+    return None
+
+
+def _refresh_vercel_oidc_token(*, failed_token: str | None = None) -> str:
+    """Refresh the local development OIDC token without exposing its value."""
+
+    with _MARKET_TOKEN_REFRESH_LOCK:
+        current = os.getenv("VERCEL_OIDC_TOKEN")
+        if failed_token and current and current != failed_token:
+            return current
+        try:
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(SKILL_TOKEN_REFRESH_SCRIPT),
+                ],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="skills.sh marketplace token refresh could not be started",
+            ) from exc
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=502,
+                detail="skills.sh marketplace token refresh failed; run vercel login and retry",
+            )
+        token = _read_local_oidc_token()
+        if not token or token == failed_token:
+            raise HTTPException(
+                status_code=502,
+                detail="skills.sh marketplace token refresh did not return a fresh token",
+            )
+        os.environ["VERCEL_OIDC_TOKEN"] = token
+        return token
 
 
 def market_status() -> tuple[bool, str | None]:
@@ -401,14 +467,20 @@ def _skills_sh_json(path: str, *, params: dict[str, Any] | None = None) -> dict[
     token = _market_token()
     if not token:
         raise HTTPException(status_code=409, detail="skills.sh marketplace token is not configured")
-    try:
-        response = httpx.get(
+
+    def request(current_token: str) -> httpx.Response:
+        return httpx.get(
             f"{SKILLS_SH_BASE_URL}{path}",
             params=params,
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            headers={"Authorization": f"Bearer {current_token}", "Accept": "application/json"},
             timeout=10.0,
             follow_redirects=False,
         )
+
+    try:
+        response = request(token)
+        if response.status_code == 401 and not _static_market_token():
+            response = request(_refresh_vercel_oidc_token(failed_token=token))
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"skills.sh marketplace request failed: {exc}") from exc
     if response.status_code == 401:

@@ -20,7 +20,7 @@ class RunGraphState(TypedDict, total=False):
     seen_observations: list[str]
     usage: dict[str, Any]
     context: dict[str, Any]
-    context_snapshot: dict[str, Any]
+    compaction_state: dict[str, Any]
     context_artifact_refs: list[dict[str, Any]]
     transcript_delta: list[dict[str, Any]]
     verification_trace: list[dict[str, Any]]

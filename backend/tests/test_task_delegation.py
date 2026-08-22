@@ -208,8 +208,6 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         system_prompt=context["system_prompt"],
         agent_instructions=context["agent_instructions"],
         workspace_rules=context["workspace_rules"],
-        summary=context["summary"],
-        memories=context["memories"],
         recent_messages=context["recent_messages"],
         mode=context["mode"],
         thread_id=delegated_run["run_id"],
@@ -257,19 +255,6 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
 
     async def parent_model(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal parent_calls
-        if kwargs.get("mode") == "evaluation":
-            return ModelTurn(content=json.dumps({
-                "passed": True,
-                "score": 1.0,
-                "summary": "delegated result and parent synthesis are present",
-                "criteria": [{
-                    "criterion": "parent synthesized the completed child result",
-                    "passed": True,
-                    "evidence": "the parent trace contains the terminal task observation",
-                }],
-                "feedback": "",
-                "confidence": 1.0,
-            }))
         parent_calls += 1
         if parent_calls == 1:
             return ModelTurn(tool_calls=[ModelToolCall(
@@ -277,8 +262,14 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
                 "task",
                 {"task": "write the delegated result", "agent_id": delegated_run["child_id"]},
             )])
-        tool_messages = [item for item in kwargs["messages"] if item.get("role") == "tool"]
-        delegated_payload = json.loads(json.loads(tool_messages[-1]["content"])["content"])
+        updates = [
+            item for item in kwargs["messages"]
+            if item.get("role") == "user"
+            and str(item.get("content") or "").startswith("<delegated-task-update>")
+        ]
+        assert len(updates) == 1
+        result_payload = json.loads(str(updates[0]["content"]).splitlines()[2])
+        delegated_payload = json.loads(result_payload["content"])
         assert delegated_payload["status"] == "completed"
         assert delegated_payload["output"] == "child result after approval"
         return ModelTurn(content="parent summary after delegated child")
@@ -308,8 +299,6 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
         system_prompt=context["system_prompt"],
         agent_instructions=context["agent_instructions"],
         workspace_rules=context["workspace_rules"],
-        summary=context["summary"],
-        memories=context["memories"],
         recent_messages=context["recent_messages"],
         mode=context["mode"],
         thread_id=delegated_run["run_id"],
@@ -506,6 +495,12 @@ async def test_child_failure_blocks_once_and_repeated_delegate_call_is_idempoten
         task = db.scalar(select(DelegatedTask))
         assert task is not None and task.status == "blocked"
         assert task.result["status"] == "failed"
+        child_run = db.get(Run, task.child_run_id)
+        assert child_run is not None and child_run.turn_id is None
+        assert not list(db.scalars(select(ChatMessage).where(
+            ChatMessage.session_id == delegated_run["session_id"],
+            ChatMessage.role == "assistant",
+        )))
         assert len(list(db.scalars(select(RunEvent).where(
             RunEvent.run_id == delegated_run["run_id"],
             RunEvent.event_type == "delegated_child_failed",

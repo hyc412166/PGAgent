@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .tools.advanced_contract import CLAW_TOOL_NAMES, LEARN_TOOL_NAMES
+
 
 @dataclass(frozen=True, slots=True)
 class BuiltinTool:
@@ -71,6 +73,18 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
         enabled=True,
         availability="available",
         runtime_tool_id="edit",
+    ),
+    BuiltinTool(
+        id="delete",
+        name="delete",
+        label="删除文件",
+        description="删除项目目录中的单个普通文件；不支持目录、递归删除或符号链接，并受工作区边界保护。",
+        category="filesystem",
+        risk_level="high",
+        enabled=True,
+        availability="available",
+        runtime_tool_id="delete",
+        requires_approval=True,
     ),
     BuiltinTool(
         id="glob",
@@ -192,6 +206,46 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
         enabled=True,
         availability="available",
         runtime_tool_id="file_info",
+    ),
+)
+
+
+_REFERENCE_TOOL_NAMES = ("read_file", "write_file", *CLAW_TOOL_NAMES, *LEARN_TOOL_NAMES)
+_REFERENCE_NETWORK = {"WebFetch", "WebSearch", "RemoteTrigger", "MCP", "McpAuth"}
+_REFERENCE_EXECUTION = {"PowerShell", "REPL", "background_run"}
+_REFERENCE_FILESYSTEM = {
+    "read_file", "write_file", "edit_file", "glob_search", "grep_search",
+    "NotebookEdit", "MemoryWrite", "MemoryRead", "MemoryList",
+}
+_REFERENCE_HIGH_RISK = {
+    "write_file", "edit_file", "NotebookEdit", "PowerShell", "REPL", "RemoteTrigger",
+    "MCP", "MemoryWrite", "background_run", "CronCreate", "CronDelete",
+}
+
+# The reference projects expose a broad built-in contract.  These entries are
+# real runtime capabilities, not UI-only placeholders, and are enabled for new
+# default agents exactly like PGAgent's compact aliases above.
+BUILTIN_TOOL_CATALOG = (
+    *BUILTIN_TOOL_CATALOG,
+    *(
+        BuiltinTool(
+            id=name,
+            name=name,
+            label=name,
+            description=f"Learn Claude Code / Claw Code compatible {name} capability.",
+            category=(
+                "network" if name in _REFERENCE_NETWORK
+                else "execution" if name in _REFERENCE_EXECUTION
+                else "filesystem" if name in _REFERENCE_FILESYSTEM
+                else "orchestration"
+            ),
+            risk_level="adaptive" if name in _REFERENCE_HIGH_RISK else "low",
+            enabled=True,
+            availability="available",
+            runtime_tool_id=name,
+            requires_approval=name in _REFERENCE_HIGH_RISK,
+        )
+        for name in _REFERENCE_TOOL_NAMES
     ),
 )
 

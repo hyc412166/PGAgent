@@ -1,6 +1,6 @@
 # PGAgent
 
-> 主 Agent 的候选结果在发送给用户前会经过两层验收：确定性运行链路检查，以及无工具、隔离上下文中的独立 evaluator 语义验收。失败反馈会驱动主 Agent 继续修订，默认最多 3 次；未通过的候选不会写入聊天记录或发布 `run_completed`。确定性场景清单位于 `backend/tests/acceptance_scenarios.json`。
+> 主 Agent 的候选结果在发送给用户前只经过本地确定性运行链路检查，不会额外调用模型评分。检查失败会驱动主 Agent 修订，默认最多 3 次；未通过的候选不会写入聊天记录或发布 run_completed。确定性场景清单位于 backend/tests/acceptance_scenarios.json。
 
 PGAgent 是一个本地优先、单用户的 Agent 工作台。它参考了视频中 TWork 的产品形态，以及 Claude Code 的 harness 思路：模型在一个简洁的工具循环里动态安排工作，外层由 LangGraph 管理阶段、checkpoint、人工审批和安全停止。
 
@@ -11,6 +11,7 @@ PGAgent 是一个本地优先、单用户的 Agent 工作台。它参考了视�
 - 总览、项目与会话、子 Agent、运行记录、用量统计、模型设置六个主要界面。
 - 左侧会话栏按项目组织。项目是一个受沙箱保护的本地目录；默认工作区中的一次性任务显示在“任务”区。
 - 点击“新建对话”只创建浏览器内草稿；首次发送通过单个原子、幂等请求以首条内容生成标题并写入项目、会话、消息和运行记录。网络中断后使用同一草稿重试只会返回原会话与原运行，不会重复调用模型。
+- 每条被后端接收的用户消息都会原子创建一个 `ConversationTurn` 交付回执，并最终写入且只写入一条用户可见的终态回复。模型空输出、工具或集成异常、用户停止、审批拒绝、调度失败和进程重启也会得到带追踪号的确定性说明；该兜底不调用模型或 evaluator。子 Agent 只回传结构化结果，由主控或本地兜底统一汇总，不会越级向主会话重复回复。
 - 所有会话由固定的“PGAgent 主控”处理意图识别、任务分析/编排、结果汇总与下一步决策。用户创建且启用的 Agent 均为可复用子 Agent；主控可通过 `task` 将一个或多个明确子任务交给精确 Agent ID，并接收真实的结构化子运行结果。相互独立的子任务会并行执行。
 - 会话输入区可直接切换模型和思考强度，并显示当前上下文 Token 占用。
 - OpenAI 兼容中转站、OpenRouter、DeepSeek 等连接；填写 Base URL 与 API Key 后自动请求 `/models`，也支持手动模型 ID。
@@ -67,6 +68,7 @@ API Key 不写入 SQLite，保存到 Windows Credential Manager；数据库只�
 - `GET /api/usage/runs/{run_id}`：读取单次运行的精确 Token/缓存/成本明细；无 provider 用量回报时返回 `null`。
 - `GET /api/skills`、`POST /api/skills/import`：列出或安全导入本地 `SKILL.md` 文件夹。
 - `GET /api/skills/market/status`、`POST /api/skills/market/search`：skills.sh 市场状态与搜索。市场 API 需要环境变量 `SKILLS_SH_API_TOKEN`（或 Vercel OIDC token）；未配置时会明确返回 `available=false`，不会伪造搜索结果。
+- 本地启动会通过已登录且已关联项目的 Vercel CLI 刷新短期 OIDC token；运行中若 skills.sh 返回 401，后端会刷新一次并重试。刷新失败不会阻止 PGAgent 的其他本地功能启动。
 - `POST /api/skills/market/install`：传入 `market_id` 或受限的公开 GitHub 仓库/ZIP `source_url`。默认只返回候选 Skill 与文件预览；再次携带 `confirm=true` 才会复制，不执行任何 Skill 脚本。
 - `AgentCreate/AgentUpdate` 支持 `tool_ids`、`skill_ids`；`SessionCreate/SessionUpdate` 支持 `permission_mode`、`skill_ids`。相应 Read 响应始终返回这些字段。固定 PGAgent 主控展示全套内置工具，不能修改或删除。
 

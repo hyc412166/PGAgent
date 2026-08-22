@@ -7,6 +7,7 @@ import time
 import pytest
 
 from app.runtime.context import ContextManager
+from app.runtime.context_service import ConversationCompactor
 from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage
 from app.runtime.errors import APIErrorKind, call_with_retry, classify_api_error
 from app.runtime.guards import LoopGuard
@@ -77,7 +78,7 @@ def test_zero_hard_limits_allow_large_runs_but_keep_anti_loop_guards() -> None:
 
 
 @pytest.mark.asyncio
-async def test_production_context_path_keeps_summary_memory_and_task_anchor(tmp_path) -> None:
+async def test_production_context_is_stable_prefix_plus_transcript(tmp_path) -> None:
     observed: list[dict] = []
 
     async def model_call(**kwargs) -> ModelTurn:
@@ -90,17 +91,111 @@ async def test_production_context_path_keeps_summary_memory_and_task_anchor(tmp_
     )
     outcome = await runtime.run(
         system_prompt="safe",
-        summary="legacy checkpoint facts",
-        memories=[{"content": "prefer Chinese", "pinned": True}],
         recent_messages=[{"role": "user", "content": "finish the refactor"}],
     )
 
     assert outcome.status == "completed"
     rendered = "\n".join(str(item.get("content") or "") for item in observed)
-    assert "legacy checkpoint facts" in rendered
-    assert "[固定] prefer Chinese" in rendered
-    assert "<user_task>" in rendered
+    assert "## System rules\nsafe" in rendered
+    assert "<user_task>" not in rendered
     assert "finish the refactor" in rendered
+
+
+@pytest.mark.asyncio
+async def test_production_context_is_an_append_only_provider_prefix_across_user_turns(tmp_path) -> None:
+    observed: list[list[dict]] = []
+
+    async def model_call(**kwargs) -> ModelTurn:
+        observed.append([dict(item) for item in kwargs["messages"]])
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+    first_transcript = [{"role": "user", "content": "first task"}]
+    await runtime.run(system_prompt="safe", recent_messages=first_transcript)
+    await runtime.run(
+        system_prompt="safe",
+        recent_messages=[
+            *first_transcript,
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "second task"},
+        ],
+    )
+
+    assert len(observed) == 2
+    assert observed[1][:len(observed[0])] == observed[0]
+    assert not any("<user_task>" in str(item.get("content") or "") for messages in observed for item in messages)
+
+
+@pytest.mark.asyncio
+async def test_provider_boundary_repairs_corrupt_historical_tool_groups(tmp_path) -> None:
+    observed: list[dict] = []
+
+    async def model_call(**kwargs) -> ModelTurn:
+        observed.extend(dict(item) for item in kwargs["messages"])
+        return ModelTurn(content="recovered")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+        context_manager=ContextManager(max_tokens=512),
+    )
+    outcome = await runtime.run(
+        system_prompt="safe",
+        recent_messages=[],
+        prepared_messages=[
+            {"role": "system", "content": "safe"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-a", "function": {"name": "read_file", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-a", "content": "valid"},
+            {"role": "tool", "tool_call_id": "orphan", "content": "invalid"},
+            {"role": "user", "content": "continue"},
+        ],
+    )
+
+    assert outcome.status == "completed"
+    assert [item["role"] for item in observed] == ["system", "user"]
+    repair = next(item for item in outcome.events if item["type"] == "context_protocol_repaired")
+    assert repair["removed_messages"] == 3
+    assert repair["affected_call_ids"] == ["call-a", "orphan"]
+
+
+@pytest.mark.asyncio
+async def test_production_prepare_audits_corrupt_historical_tool_groups(tmp_path) -> None:
+    observed: list[dict] = []
+
+    async def model_call(**kwargs) -> ModelTurn:
+        observed.extend(dict(item) for item in kwargs["messages"])
+        return ModelTurn(content="recovered")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+    outcome = await runtime.run(
+        system_prompt="safe",
+        recent_messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-a", "function": {"name": "read_file", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-a", "content": "valid"},
+            {"role": "tool", "tool_call_id": "orphan", "content": "invalid"},
+            {"role": "user", "content": "continue"},
+        ],
+    )
+
+    assert outcome.status == "completed"
+    assert all(item.get("tool_call_id") not in {"call-a", "orphan"} for item in observed)
+    repair = next(item for item in outcome.events if item["type"] == "context_protocol_repaired")
+    assert repair["phase"] == "prepare"
+    assert repair["removed_messages"] == 3
 
 
 @pytest.mark.asyncio
@@ -521,16 +616,15 @@ async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_production_context_path_keeps_task_anchor_after_approval_resume(tmp_path) -> None:
+async def test_production_context_path_keeps_original_task_after_approval_resume(tmp_path) -> None:
     task = "Write the approved file and keep this goal after resume."
     turns = 0
 
     async def model_call(**kwargs) -> ModelTurn:
         nonlocal turns
         turns += 1
-        anchors = [item for item in kwargs["messages"] if ContextManager.is_task_anchor(item)]
-        assert len(anchors) == 1
-        assert task in anchors[0]["content"]
+        assert any(item.get("role") == "user" and item.get("content") == task for item in kwargs["messages"])
+        assert not any("<user_task>" in str(item.get("content") or "") for item in kwargs["messages"])
         if turns == 1:
             return ModelTurn(tool_calls=[
                 ModelToolCall("approved-write", "write_file", {"path": "goal.txt", "content": "kept"})
@@ -552,7 +646,7 @@ async def test_production_context_path_keeps_task_anchor_after_approval_resume(t
 
 
 @pytest.mark.asyncio
-async def test_runtime_trim_keeps_current_task_anchor_through_approval_resume(tmp_path) -> None:
+async def test_full_compaction_keeps_current_request_through_approval_resume(tmp_path) -> None:
     task = "Create the approved report and do not lose this task after context compaction."
     calls = 0
 
@@ -560,9 +654,12 @@ async def test_runtime_trim_keeps_current_task_anchor_through_approval_resume(tm
         nonlocal calls
         calls += 1
         messages = kwargs["messages"]
-        anchors = [item for item in messages if ContextManager.is_task_anchor(item)]
-        assert len(anchors) == 1
-        assert task in anchors[0]["content"]
+        continuations = [
+            item for item in messages
+            if str(item.get("content") or "").startswith("<compacted-context>")
+        ]
+        assert len(continuations) == 1
+        assert task in continuations[0]["content"]
         if calls == 1:
             # The retained prior observation remains a complete provider-valid
             # assistant/tool pair even as the old user turn is discarded.
@@ -577,6 +674,7 @@ async def test_runtime_trim_keeps_current_task_anchor_through_approval_resume(tm
 
     durable_events: list[dict] = []
     recent_messages = [
+        {"role": "user", "content": "old background " + ("x" * 8_000)},
         {"role": "user", "content": task},
         {
             "role": "assistant",
@@ -594,6 +692,12 @@ async def test_runtime_trim_keeps_current_task_anchor_through_approval_resume(tm
         model_call=model_call,
         tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
         context_manager=ContextManager(max_tokens=560),
+        conversation_compactor=ConversationCompactor(
+            model_call=lambda **_kwargs: {
+                "choices": [{"message": {"content": "Old read completed; approved report remains."}}]
+            },
+            preserve_recent_messages=2,
+        ),
         event_sink=durable_events.append,
     )
 
@@ -608,8 +712,8 @@ async def test_runtime_trim_keeps_current_task_anchor_through_approval_resume(tm
     assert resumed.output == "report complete"
     assert (tmp_path / "report.txt").read_text(encoding="utf-8") == "approved"
     assert calls == 2
-    compacted = [event for event in durable_events if event["type"] == "context_compacted"]
-    assert compacted and compacted[-1]["task_anchor_preserved"] is True
+    compacted = [event for event in durable_events if event["type"] == "context_compaction_finished"]
+    assert compacted and compacted[-1]["effective"] is True
 
 
 @pytest.mark.asyncio
@@ -894,6 +998,33 @@ async def test_assistant_deltas_use_only_transient_stream_sink(tmp_path) -> None
     assert all(event["type"] == "assistant_delta" for event in transient_events)
     assert not any(event["type"] == "assistant_delta" for event in durable_events)
     assert not any(event["type"] == "assistant_delta" for event in outcome.events)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_deltas_stream_live_and_finish_as_one_durable_thought(tmp_path) -> None:
+    durable_events: list[dict] = []
+    transient_events: list[dict] = []
+
+    async def model_call(**kwargs) -> ModelTurn:  # type: ignore[no-untyped-def]
+        await kwargs["on_thought_delta"]("先读取")
+        await kwargs["on_thought_delta"]("天气数据。")
+        await kwargs["on_delta"]("今天晴。")
+        return ModelTurn(content="今天晴。")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+        event_sink=durable_events.append,
+        stream_sink=transient_events.append,
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert [event["delta"] for event in transient_events if event["type"] == "thought_delta"] == ["先读取", "天气数据。"]
+    summaries = [event for event in durable_events if event["type"] == "thought_summary"]
+    assert summaries[-1]["summary"] == "先读取天气数据。"
+    assert summaries[-1]["step"] == 1
 
 
 @pytest.mark.asyncio

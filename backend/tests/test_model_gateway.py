@@ -64,7 +64,7 @@ async def test_gateway_maps_openai_compatible_connection_and_thinking(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_gateway_uses_bounded_compaction_output_and_disables_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gateway_leaves_output_uncapped_and_disables_compaction_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
     async def fake_completion(**kwargs):  # type: ignore[no-untyped-def]
@@ -87,7 +87,7 @@ async def test_gateway_uses_bounded_compaction_output_and_disables_reasoning(mon
     ))
 
     await call(messages=[{"role": "user", "content": "compact"}], tools=[], mode="compaction")
-    assert captured["max_tokens"] == 2_000
+    assert "max_tokens" not in captured
     assert "reasoning_effort" not in captured
 
 
@@ -137,6 +137,43 @@ async def test_gateway_aggregates_streamed_text_and_usage(monkeypatch: pytest.Mo
     assert response["usage"]["output_tokens"] == 2
     assert response["usage"]["cost_usd"] == 0.01
     assert deltas == ["hello ", "world"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_streams_reasoning_separately_from_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def chunks():  # type: ignore[no-untyped-def]
+        yield {"choices": [{"delta": {"reasoning_content": "先检查"}}]}
+        yield {"choices": [{"delta": {"reasoning": "天气来源。"}}]}
+        yield {"choices": [{"delta": {"content": "今天晴。"}}]}
+
+    async def fake_completion(**_kwargs):  # type: ignore[no-untyped-def]
+        return chunks()
+
+    monkeypatch.setattr(model_gateway, "get_api_key", lambda _ref: "secret")
+    monkeypatch.setattr(model_gateway.litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(model_gateway.litellm, "completion_cost", lambda **_kwargs: 0.0)
+    call = build_model_call(ProviderConfig(
+        provider="deepseek",
+        base_url="https://api.test/v1",
+        secret_ref="credential:test",
+        model_id="reasoner",
+    ))
+    answer_deltas: list[str] = []
+    thought_deltas: list[str] = []
+
+    response = await call(
+        messages=[],
+        tools=[],
+        mode="auto",
+        on_delta=answer_deltas.append,
+        on_thought_delta=thought_deltas.append,
+    )
+
+    message = response["choices"][0]["message"]
+    assert message["content"] == "今天晴。"
+    assert message["reasoning_content"] == "先检查天气来源。"
+    assert answer_deltas == ["今天晴。"]
+    assert thought_deltas == ["先检查", "天气来源。"]
 
 
 @pytest.mark.asyncio

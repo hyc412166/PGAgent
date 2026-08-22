@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -19,20 +22,44 @@ from app.database import init_db
 from app.services.run_service import coordinator
 
 
+logger = logging.getLogger(__name__)
+
+
+async def _delivery_watchdog() -> None:
+    """Repair rare post-acceptance gaps without involving another model."""
+
+    while True:
+        await asyncio.sleep(10)
+        try:
+            coordinator.reconcile_orphaned_runs()
+            coordinator.reconcile_terminal_deliveries(include_legacy=False)
+        except Exception:
+            # A temporary database failure must not permanently disable later
+            # repair attempts. The exception remains available in local logs.
+            logger.exception("PGAgent delivery watchdog reconciliation failed")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.workspaces_dir.mkdir(parents=True, exist_ok=True)
     init_db()
     continuation_run_ids = coordinator.reconcile_interrupted_runs()
+    coordinator.reconcile_terminal_deliveries()
     async with AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_path)) as saver:
         await saver.setup()
         coordinator.set_checkpointer(saver)
         for run_id in continuation_run_ids:
             coordinator.launch_delegated_child_continuation(run_id)
-        yield
-        await coordinator.shutdown()
-        coordinator.set_checkpointer(None)
+        watchdog = asyncio.create_task(_delivery_watchdog(), name="pgagent-delivery-watchdog")
+        try:
+            yield
+        finally:
+            watchdog.cancel()
+            with suppress(asyncio.CancelledError):
+                await watchdog
+            await coordinator.shutdown()
+            coordinator.set_checkpointer(None)
 
 
 _LOCAL_BROWSER_HOSTS = frozenset({"127.0.0.1", "localhost"})

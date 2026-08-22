@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect
+from sqlalchemy.exc import IntegrityError
 
 from app.api.resources import router as resources_router
+from app.api import resources as resources_api
 from app import database
 from app.database import (
     Base,
@@ -21,9 +24,10 @@ from app.database import (
     DEFAULT_WORKSPACE_NAME,
     Artifact,
     ModelConnection,
-    CompactionAttempt,
-    ContextCheckpoint,
-    ContextEpoch,
+    ChatMessage,
+    ConversationCompaction,
+    ConversationTurn,
+    Run,
     Session,
     configure_database,
     init_db,
@@ -50,6 +54,7 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
         "agents",
         "sessions",
         "chat_messages",
+        "conversation_turns",
         "runs",
         "draft_launches",
         "run_events",
@@ -61,13 +66,75 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
         "agent_skills",
         "session_skills",
         "usage_records",
-        "context_epochs",
-        "context_checkpoints",
+        "conversation_compactions",
         "artifacts",
-        "compaction_attempts",
     }.issubset(tables)
     assert "team_tasks" not in tables
     assert "agent_messages" not in tables
+    assert "context_epochs" not in tables
+    assert "context_checkpoints" not in tables
+    assert "compaction_attempts" not in tables
+
+    def unique_cover_count(table_name: str, column_name: str) -> int:
+        constraints = sum(
+            constraint.get("column_names") == [column_name]
+            for constraint in inspect(database.engine).get_unique_constraints(table_name)
+        )
+        indexes = sum(
+            bool(index.get("unique")) and index.get("column_names") == [column_name]
+            for index in inspect(database.engine).get_indexes(table_name)
+        )
+        return constraints + indexes
+
+    assert unique_cover_count("chat_messages", "terminal_for_turn_id") == 1
+    assert unique_cover_count("runs", "turn_id") == 1
+
+
+def test_turn_schema_enforces_one_terminal_reply_per_accepted_message(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{(tmp_path / 'turn-schema.db').as_posix()}")
+    init_db()
+    with database.SessionLocal() as db:
+        session = Session(title="Delivery")
+        db.add(session)
+        db.flush()
+        turn = ConversationTurn(session_id=session.id, client_message_id="client-1")
+        db.add(turn)
+        db.flush()
+        user = ChatMessage(
+            session_id=session.id,
+            role="user",
+            content="hello",
+            turn_id=turn.id,
+            message_kind="user_request",
+            sequence=1,
+        )
+        run = Run(session_id=session.id, turn_id=turn.id)
+        first = ChatMessage(
+            session_id=session.id,
+            role="assistant",
+            content="done",
+            turn_id=turn.id,
+            message_kind="terminal",
+            terminal_for_turn_id=turn.id,
+            sequence=2,
+        )
+        db.add_all([user, run, first])
+        db.commit()
+        assert first.id
+
+        db.add(ChatMessage(
+            session_id=session.id,
+            role="assistant",
+            content="duplicate",
+            turn_id=turn.id,
+            message_kind="terminal",
+            terminal_for_turn_id=turn.id,
+            sequence=3,
+        ))
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+    Base.metadata.drop_all(bind=database.engine)
 
 
 def test_init_removes_retired_team_collaboration_tables(tmp_path: Path) -> None:
@@ -101,8 +168,8 @@ def test_retired_team_collaboration_routes_are_absent(client: TestClient) -> Non
     assert not [path for path in paths if path.startswith("/api/teams")]
 
 
-def test_context_persistence_models_round_trip_and_cascade(tmp_path: Path) -> None:
-    """New context records are durable and follow their owning session."""
+def test_compaction_persistence_round_trip_and_cascade(tmp_path: Path) -> None:
+    """A single compacted replacement is durable and follows its session."""
 
     configure_database(f"sqlite:///{(tmp_path / 'context.db').as_posix()}")
     init_db()
@@ -110,67 +177,41 @@ def test_context_persistence_models_round_trip_and_cascade(tmp_path: Path) -> No
         session = Session(title="Context persistence")
         db.add(session)
         db.flush()
-        epoch = ContextEpoch(
+        compaction = ConversationCompaction(
             session_id=session.id,
-            epoch_number=0,
-            start_sequence=1,
-            end_sequence=4,
-            summary_json={"objective": "keep task state"},
-            task_state={"pending_work": ["verify"]},
-        )
-        db.add(epoch)
-        db.flush()
-        checkpoint = ContextCheckpoint(
-            session_id=session.id,
-            epoch_id=epoch.id,
-            start_sequence=1,
-            end_sequence=4,
-            summary_json={"objective": "keep task state"},
+            source_sequence=4,
+            active_request="ship feature",
+            todo_state=[{"content": "verify", "status": "pending"}],
+            summary="files were updated",
+            continuation_messages=[{"role": "user", "content": "<compacted-context>state</compacted-context>"}],
+            transcript_artifact={"artifact_id": "artifact_" + ("b" * 24)},
             before_tokens=100_000,
             after_tokens=10_000,
-            source_version=3,
-            promoted_at=database.utcnow(),
+            removed_message_count=3,
         )
         artifact = Artifact(
             session_id=session.id,
-            epoch_id=epoch.id,
             kind="tool_output",
             name="listing.json",
             storage_path="artifacts/listing.json",
             sha256="a" * 64,
             preview="two files",
         )
-        attempt = CompactionAttempt(
-            session_id=session.id,
-            epoch_id=epoch.id,
-            checkpoint_id=checkpoint.id,
-            trigger="threshold",
-            phase="before_model",
-            status="completed",
-            source_version=3,
-            target_version=4,
-            before_tokens=100_000,
-            after_tokens=10_000,
-            finished_at=database.utcnow(),
-        )
-        db.add_all((checkpoint, artifact, attempt))
+        db.add_all((compaction, artifact))
         db.commit()
         session_id = session.id
-        epoch_id = epoch.id
+        compaction_id = compaction.id
 
     with database.SessionLocal() as db:
         restored = db.get(Session, session_id)
         assert restored is not None
-        assert restored.context_epochs[0].id == epoch_id
-        assert restored.context_checkpoints[0].after_tokens == 10_000
+        assert restored.conversation_compactions[0].id == compaction_id
+        assert restored.conversation_compactions[0].after_tokens == 10_000
         assert restored.artifacts[0].sha256 == "a" * 64
-        assert restored.compaction_attempts[0].target_version == 4
         db.delete(restored)
         db.commit()
-        assert db.get(ContextEpoch, epoch_id) is None
-        assert db.query(ContextCheckpoint).count() == 0
+        assert db.get(ConversationCompaction, compaction_id) is None
         assert db.query(Artifact).count() == 0
-        assert db.query(CompactionAttempt).count() == 0
 
 
 def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path: Path) -> None:
@@ -223,8 +264,10 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     session_columns = {column["name"] for column in inspector.get_columns("sessions")}
     assert "is_default" in agent_columns
     assert {
-        "model_connection_id", "model_id", "thinking_level", "permission_mode", "context_tokens", "last_compacted_at"
+        "model_connection_id", "model_id", "thinking_level", "permission_mode", "context_tokens"
     }.issubset(session_columns)
+    assert "context_summary" not in session_columns
+    assert "last_compacted_at" not in session_columns
     with database.SessionLocal() as db:
         assert db.get(database.Workspace, "legacy-workspace") is not None
         assert db.get(database.Workspace, DEFAULT_WORKSPACE_ID) is not None
@@ -345,6 +388,60 @@ def test_workspace_filesystem_root_uses_project_fallback_name(client: TestClient
     assert created.json()["name"] == "项目"
 
 
+def test_delete_session_purges_its_complete_conversation_history(
+    client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = client.post("/api/sessions", json={"title": "Delete me"})
+    assert response.status_code == 201
+    session_id = response.json()["id"]
+    data_dir = tmp_path / "runtime-data"
+    artifact_dir = data_dir / "artifacts" / session_id
+    artifact_dir.mkdir(parents=True)
+    artifact_file = artifact_dir / "artifact_deadbeefdeadbeef.bin"
+    artifact_file.write_text("private archived transcript", encoding="utf-8")
+    monkeypatch.setattr(resources_api, "settings", SimpleNamespace(data_dir=data_dir))
+
+    with database.SessionLocal() as db:
+        run = database.Run(session_id=session_id, status="completed")
+        message = database.ChatMessage(session_id=session_id, role="user", content="hello", sequence=1)
+        memory = database.Memory(scope="session", scope_id=session_id, content="temporary")
+        artifact = database.Artifact(
+            session_id=session_id,
+            name="archived transcript",
+            storage_path=str(artifact_file),
+            size_bytes=artifact_file.stat().st_size,
+        )
+        db.add_all((run, message, memory, artifact))
+        db.flush()
+        event = database.RunEvent(run_id=run.id, event_type="completed")
+        approval = database.Approval(run_id=run.id, tool_name="write", arguments={}, status="approved")
+        usage = database.UsageRecord(
+            run_id=run.id,
+            session_id=session_id,
+            model_id="test-model",
+            provider="test",
+        )
+        db.add_all((event, approval, usage))
+        db.commit()
+        run_id = run.id
+
+    deleted = client.delete(f"/api/sessions/{session_id}")
+    assert deleted.status_code == 204
+    assert not artifact_dir.exists()
+
+    with database.SessionLocal() as db:
+        assert db.get(database.Session, session_id) is None
+        assert db.get(database.Run, run_id) is None
+        assert db.query(database.ChatMessage).filter_by(session_id=session_id).count() == 0
+        assert db.query(database.RunEvent).filter_by(run_id=run_id).count() == 0
+        assert db.query(database.Approval).filter_by(run_id=run_id).count() == 0
+        assert db.query(database.UsageRecord).filter_by(session_id=session_id).count() == 0
+        assert db.query(database.Memory).filter_by(scope="session", scope_id=session_id).count() == 0
+        assert db.query(database.Artifact).filter_by(session_id=session_id).count() == 0
+
+
 def test_defaults_are_seeded_protected_and_used_for_new_sessions(client: TestClient) -> None:
     workspaces = client.get("/api/workspaces").json()
     agents = client.get("/api/agents").json()
@@ -396,7 +493,6 @@ def test_defaults_are_seeded_protected_and_used_for_new_sessions(client: TestCli
     assert body["agent_id"] == DEFAULT_AGENT_ID
     assert body["thinking_level"] == "auto"
     assert body["context_tokens"] == 0
-    assert body["last_compacted_at"] is None
 
 
 def test_sessions_always_use_the_fixed_coordinator(client: TestClient) -> None:
@@ -571,6 +667,12 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
             ),
             database.RunEvent(
                 run_id=run["id"],
+                event_type="thought_summary",
+                step=1,
+                payload={"step": 1, "summary": "line one\n" + ("x" * 20_050), "complete": True},
+            ),
+            database.RunEvent(
+                run_id=run["id"],
                 event_type="tool_started",
                 payload={
                     "tool_name": "read",
@@ -612,7 +714,7 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
     assert response.status_code == 200, response.text
     events = response.json()
     assert {event["event_type"] for event in events} == {
-        "model_step_started", "tool_started", "tool_finished", "run_completed",
+        "model_step_started", "thought_summary", "tool_started", "tool_finished", "run_completed",
     }
     events_by_type = {event["event_type"]: event for event in events}
     assert events_by_type["tool_started"]["payload"] == {
@@ -633,6 +735,11 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
         "tool_name": "read",
         "tool_call_id": "call-1",
     }
+    thought = events_by_type["thought_summary"]["payload"]
+    assert thought["complete"] is True
+    assert thought["step"] == 1
+    assert "\n" in thought["summary"]
+    assert len(thought["summary"]) == 20_000
     serialized = str(events)
     for private_value in (
         "private message", "snapshot-secret", "env:secret", "# SKILL.md",

@@ -28,6 +28,13 @@ export function createDraftIdempotencyKey(randomId?: () => string): string {
   return `draft-${id}`
 }
 
+export function createTurnIdempotencyKey(randomId?: () => string): string {
+  const id = randomId?.()
+    ?? globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  return `turn-${id}`
+}
+
 export function buildDraftLaunchPayload(
   idempotencyKey: string,
   content: string,

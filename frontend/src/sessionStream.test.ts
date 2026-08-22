@@ -1,12 +1,38 @@
 import { describe, expect, it } from 'vitest'
-import { appendAssistantDelta, isCurrentSessionRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, visibleSessionItems } from './sessionStream'
+import { appendAssistantDelta, hasPersistedRunReply, isCurrentSessionRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
 
 describe('会话 SSE 事件', () => {
+  it('所有没有持久化回复的终态都显示兜底提示', () => {
+    expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: '已连续 4 步没有产生有效进展' }, new Set())).toBe(true)
+    expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'user_interrupted' }, new Set())).toBe(true)
+    expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'approval_rejected' }, new Set())).toBe(true)
+    expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'delegated_child_awaiting_approval' }, new Set())).toBe(false)
+    expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'failure' }, new Set(['r1']))).toBe(false)
+    expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'failure' }, new Set(), false)).toBe(false)
+    expect(shouldShowStoppedRunNotice({ id: 'r2', status: 'failed', error_message: 'provider rejected context' }, new Set())).toBe(true)
+    expect(shouldShowStoppedRunNotice({ id: 'r2', status: 'failed', error_message: 'provider rejected context' }, new Set(['r2']))).toBe(false)
+    expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'completed' }, new Set())).toBe(false)
+  })
+
+  it('按 run 或 turn 标识判断当前运行是否已有持久化终态回复', () => {
+    const messages = [
+      { role: 'assistant', turn_id: 'turn-1', message_kind: 'terminal', metadata: { run_id: 'run-1' } },
+      { role: 'assistant', metadata: { runtime_run_id: 'run-2' } },
+    ]
+    expect(hasPersistedRunReply(messages, 'run-1')).toBe(true)
+    expect(hasPersistedRunReply(messages, 'missing', 'turn-1')).toBe(true)
+    expect(hasPersistedRunReply(messages, 'run-2')).toBe(false)
+  })
   it('解析生命周期与文本增量', () => {
     const delta = parseRunStreamEvent('{"type":"assistant_delta","delta":"你好"}')
     expect(delta).toEqual({ type: 'assistant_delta', delta: '你好' })
     expect(appendAssistantDelta('开始：', delta!)).toBe('开始：你好')
     expect(runStreamPhase(delta!)).toBe('正在回复…')
+  })
+
+  it('在中断终态用服务端 partial_output 补齐丢失的流片段', () => {
+    expect(appendAssistantDelta('你好', { type: 'run_stopped', partial_output: '你好，世界' })).toBe('你好，世界')
+    expect(appendAssistantDelta('你好，世界', { type: 'run_stopped', partial_output: '你好' })).toBe('你好，世界')
   })
 
   it('识别工具、审批与终态', () => {
@@ -54,5 +80,12 @@ describe('会话 SSE 事件', () => {
   it('refreshes the session after a rejected child approval', () => {
     expect(shouldRefreshConversationAfterApprovalDecision('reject')).toBe(true)
     expect(shouldRefreshConversationAfterApprovalDecision('approve')).toBe(false)
+  })
+
+  it('历史会话必须等消息和思考记录完成装载后才启动到底部的平滑滚动', () => {
+    expect(shouldStartHistoryScroll(true, false, true)).toBe(false)
+    expect(shouldStartHistoryScroll(true, true, false)).toBe(true)
+    expect(shouldStartHistoryScroll(false, false, true)).toBe(true)
+    expect(shouldStartHistoryScroll(false, true, false)).toBe(false)
   })
 })
