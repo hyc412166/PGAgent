@@ -59,6 +59,8 @@ DEFAULT_AGENT_SYSTEM_PROMPT = """你是 PGAgent 主控，负责整个会话的�
 
 你的职责是：理解用户意图与约束，判断任务难度，必要时形成清晰计划，汇总已经获得的证据与结果，并决定应继续推进还是直接给出结果。简单、明确且可安全完成的任务可以由你直接完成。
 
+对于包含两个或以上可验证步骤的任务，在执行前使用 todowrite 建立结构化计划；开始步骤时标记 in_progress，完成后立即写入 completed 并推进下一步。恢复包中的 durable task 是跨运行任务事实：不要重复已完成步骤，needs_recovery 步骤必须先读取文件、Git 状态、测试结果或其他实际证据，再决定补做还是完成。不要依赖隐藏推理保存任务进度。
+
 用户创建的 Agent 是可供委派的子 Agent 配置；当系统在 Agent 配置中提供“可委派的子 Agent”列表时，你可以且只能用 task 工具把明确子任务交给其中的精确 agent_id。不要声称已经调用了不存在、未启用或未完成的子 Agent、工具或 Skill；应先确认工具返回的结构化结果，再汇总给用户。遇到没有合适子 Agent 的复杂或专业任务时，先完成你能够可靠完成的分析、规划或结果整理。
 
 始终以用户目标为中心；在不确定、可能破坏数据或需要额外授权时先说明原因。输出应区分已验证事实、推断和下一步建议。"""
@@ -401,6 +403,16 @@ class Run(Base):
     turn_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("conversation_turns.id", ondelete="SET NULL"), unique=True, index=True, nullable=True
     )
+    task_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("durable_tasks.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    plan_step_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("plan_steps.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    run_kind: Mapped[str] = mapped_column(String(24), default="initial", nullable=False)
+    resumed_from_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     status: Mapped[str] = mapped_column(String(32), default="received", index=True, nullable=False)
     mode: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
     current_step: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -411,6 +423,165 @@ class Run(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DurableTask(TimestampMixin, Base):
+    """A durable user goal that may span multiple model runs."""
+
+    __tablename__ = "durable_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    origin_turn_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("conversation_turns.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    goal: Mapped[str] = mapped_column(Text, nullable=False)
+    constraints: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="planning", index=True, nullable=False)
+    active_step_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    resume_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PlanStep(TimestampMixin, Base):
+    """One semantic plan step whose progress survives process loss."""
+
+    __tablename__ = "plan_steps"
+    __table_args__ = (Index("ix_plan_steps_task_position", "task_id", "position"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("durable_tasks.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    external_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True, nullable=False)
+    executor_kind: Mapped[str] = mapped_column(String(24), default="main", index=True, nullable=False)
+    assigned_agent_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    # Informational backlink only, matching ``last_run_id`` below. Run already
+    # points at PlanStep; a reverse SQLite FK would create a DDL cycle.
+    assigned_run_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    claim_owner: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    workspace_mode: Mapped[str] = mapped_column(String(24), default="shared", nullable=False)
+    worktree_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completed_work: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    remaining_work: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    next_action: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    result: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    evidence: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    # Informational backlink only. Keeping this as a plain indexed identifier
+    # avoids a runs <-> plan_steps DDL cycle while Run owns the live FK.
+    last_run_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PlanStepDependency(Base):
+    """A directed edge from one plan step to a prerequisite step."""
+
+    __tablename__ = "plan_step_dependencies"
+    __table_args__ = (
+        UniqueConstraint("step_id", "depends_on_step_id", name="uq_plan_step_dependency_edge"),
+        Index("ix_plan_step_dependencies_prerequisite", "depends_on_step_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    step_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("plan_steps.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    depends_on_step_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("plan_steps.id", ondelete="CASCADE"), nullable=False
+    )
+
+
+class CollaborationEvent(Base):
+    """Durable completion/message event consumed by collaboration runtimes."""
+
+    __tablename__ = "collaboration_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("durable_tasks.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    plan_step_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("plan_steps.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    run_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    source_kind: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    source_id: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumer_run_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CollaborationTeam(TimestampMixin, Base):
+    __tablename__ = "collaboration_teams"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    parent_run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="CASCADE"), unique=True, index=True, nullable=False
+    )
+    session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    task_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("durable_tasks.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(160), default="Agent team", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True, nullable=False)
+
+
+class TeammateWorker(TimestampMixin, Base):
+    __tablename__ = "teammate_workers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    team_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("collaboration_teams.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    agent_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    role: Mapped[str] = mapped_column(String(160), default="teammate", nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="idle", index=True, nullable=False)
+    current_plan_step_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("plan_steps.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    last_run_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    workspace_mode: Mapped[str] = mapped_column(String(24), default="shared", nullable=False)
+    worktree_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    branch_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class CollaborationMessage(Base):
+    __tablename__ = "collaboration_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    team_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("collaboration_teams.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    sender_worker_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("teammate_workers.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    recipient_worker_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("teammate_workers.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    message_type: Mapped[str] = mapped_column(String(32), default="message", index=True, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class DraftLaunch(TimestampMixin, Base):
@@ -472,10 +643,93 @@ class Memory(TimestampMixin, Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     scope: Mapped[str] = mapped_column(String(24), index=True, nullable=False)
     scope_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    name: Mapped[str] = mapped_column(String(200), default="Memory", index=True, nullable=False)
     title: Mapped[str] = mapped_column(String(200), default="Memory", nullable=False)
+    memory_type: Mapped[str] = mapped_column(String(24), default="project", index=True, nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    tags: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True, nullable=False)
+    source_session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    source_turn_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("conversation_turns.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    superseded_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("memories.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     extra: Mapped[dict] = mapped_column("metadata", JSON, default=dict, nullable=False)
+
+
+class MemoryJob(TimestampMixin, Base):
+    """Durable auxiliary model work used to extract persistent memories."""
+
+    __tablename__ = "memory_jobs"
+    __table_args__ = (UniqueConstraint("run_id", "kind", name="uq_memory_jobs_run_kind"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    workspace_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String(24), default="extract", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    result: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    request_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cache_creation_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+
+
+class BackgroundJob(TimestampMixin, Base):
+    """A durable command launched by an Agent run and observed before reply."""
+
+    __tablename__ = "background_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    workspace_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    plan_step_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("plan_steps.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    workspace_root: Mapped[str] = mapped_column(Text, nullable=False)
+    command: Mapped[str] = mapped_column(Text, nullable=False)
+    shell: Mapped[str] = mapped_column(String(24), default="command", nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True, nullable=False)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=3600, nullable=False)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    log_path: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    output_preview: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    observed_by_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    waiting_run_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
 
 
 class DelegatedTask(TimestampMixin, Base):
@@ -499,6 +753,12 @@ class DelegatedTask(TimestampMixin, Base):
     )
     child_agent_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agents.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    plan_step_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("plan_steps.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    teammate_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("teammate_workers.id", ondelete="SET NULL"), index=True, nullable=True
     )
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -589,6 +849,42 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "runs": {
         "turn_id": "VARCHAR(36)",
+        "task_id": "VARCHAR(36)",
+        "plan_step_id": "VARCHAR(36)",
+        "run_kind": "VARCHAR(24) NOT NULL DEFAULT 'initial'",
+        "resumed_from_run_id": "VARCHAR(36)",
+    },
+    "memories": {
+        "name": "VARCHAR(200) NOT NULL DEFAULT 'Memory'",
+        "memory_type": "VARCHAR(24) NOT NULL DEFAULT 'project'",
+        "description": "TEXT NOT NULL DEFAULT ''",
+        "tags": "JSON NOT NULL DEFAULT '[]'",
+        "status": "VARCHAR(24) NOT NULL DEFAULT 'active'",
+        "source_session_id": "VARCHAR(36)",
+        "source_turn_id": "VARCHAR(36)",
+        "superseded_by": "VARCHAR(36)",
+    },
+    "memory_jobs": {
+        "lease_expires_at": "DATETIME",
+    },
+    "background_jobs": {
+        "observed_by_run_id": "VARCHAR(36)",
+        "plan_step_id": "VARCHAR(36)",
+        "waiting_run_id": "VARCHAR(36)",
+    },
+    "plan_steps": {
+        "executor_kind": "VARCHAR(24) NOT NULL DEFAULT 'main'",
+        "assigned_agent_id": "VARCHAR(36)",
+        "assigned_run_id": "VARCHAR(36)",
+        "claim_owner": "VARCHAR(160)",
+        "workspace_mode": "VARCHAR(24) NOT NULL DEFAULT 'shared'",
+        "worktree_path": "TEXT",
+        "attempt": "INTEGER NOT NULL DEFAULT 0",
+        "error": "TEXT",
+    },
+    "delegated_tasks": {
+        "plan_step_id": "VARCHAR(36)",
+        "teammate_id": "VARCHAR(36)",
     },
 }
 
@@ -626,6 +922,10 @@ def _migrate_sqlite_columns() -> None:
                         'UPDATE chat_messages SET sequence = ? WHERE id = ?',
                         (counters[key], row_id),
                     )
+            if table_name == "memories" and "name" not in existing:
+                connection.exec_driver_sql(
+                    "UPDATE memories SET name = title WHERE title IS NOT NULL AND title != ''"
+                )
 
 
 def _migrate_sqlite_indexes() -> None:
@@ -662,6 +962,12 @@ def _migrate_sqlite_indexes() -> None:
                     'WHERE "terminal_for_turn_id" IS NOT NULL'
                 )
         if "runs" in tables:
+            run_columns = {column["name"] for column in inspector.get_columns("runs")}
+            for column_name in ("task_id", "plan_step_id", "resumed_from_run_id"):
+                if column_name in run_columns:
+                    connection.exec_driver_sql(
+                        f'CREATE INDEX IF NOT EXISTS "ix_runs_{column_name}" ON "runs" ("{column_name}")'
+                    )
             if has_unique_constraint("runs", "turn_id"):
                 connection.exec_driver_sql('DROP INDEX IF EXISTS "uq_runs_turn_id"')
             elif not has_unique_index("runs", "turn_id"):
@@ -669,6 +975,76 @@ def _migrate_sqlite_indexes() -> None:
                     'CREATE UNIQUE INDEX "uq_runs_turn_id" '
                     'ON "runs" ("turn_id") WHERE "turn_id" IS NOT NULL'
                 )
+        if "plan_steps" in tables:
+            plan_step_columns = {column["name"] for column in inspector.get_columns("plan_steps")}
+            for column_name in ("executor_kind", "assigned_agent_id", "assigned_run_id"):
+                if column_name in plan_step_columns:
+                    connection.exec_driver_sql(
+                        f'CREATE INDEX IF NOT EXISTS "ix_plan_steps_{column_name}" '
+                        f'ON "plan_steps" ("{column_name}")'
+                    )
+        if "delegated_tasks" in tables:
+            delegated_columns = {column["name"] for column in inspector.get_columns("delegated_tasks")}
+            for column_name in ("plan_step_id", "teammate_id"):
+                if column_name in delegated_columns:
+                    connection.exec_driver_sql(
+                        f'CREATE INDEX IF NOT EXISTS "ix_delegated_tasks_{column_name}" '
+                        f'ON "delegated_tasks" ("{column_name}")'
+                    )
+        if "background_jobs" in tables:
+            background_columns = {column["name"] for column in inspector.get_columns("background_jobs")}
+            for column_name in ("plan_step_id", "waiting_run_id"):
+                if column_name in background_columns:
+                    connection.exec_driver_sql(
+                        f'CREATE INDEX IF NOT EXISTS "ix_background_jobs_{column_name}" '
+                        f'ON "background_jobs" ("{column_name}")'
+                    )
+        if "memories" in tables:
+            for column_name in (
+                "name", "memory_type", "status", "source_session_id", "source_turn_id", "superseded_by",
+            ):
+                connection.exec_driver_sql(
+                    f'CREATE INDEX IF NOT EXISTS "ix_memories_{column_name}" '
+                    f'ON "memories" ("{column_name}")'
+                )
+            duplicate_groups = connection.exec_driver_sql(
+                "SELECT scope, COALESCE(scope_id, ''), LOWER(name) "
+                "FROM memories WHERE status = 'active' "
+                "GROUP BY scope, COALESCE(scope_id, ''), LOWER(name) HAVING COUNT(*) > 1"
+            ).fetchall()
+            for scope, normalized_scope_id, normalized_name in duplicate_groups:
+                if normalized_scope_id:
+                    rows = connection.exec_driver_sql(
+                        "SELECT id FROM memories WHERE status = 'active' AND scope = ? AND scope_id = ? "
+                        "AND LOWER(name) = ? ORDER BY updated_at DESC, created_at DESC, id DESC",
+                        (scope, normalized_scope_id, normalized_name),
+                    ).fetchall()
+                else:
+                    rows = connection.exec_driver_sql(
+                        "SELECT id FROM memories WHERE status = 'active' AND scope = ? AND scope_id IS NULL "
+                        "AND LOWER(name) = ? ORDER BY updated_at DESC, created_at DESC, id DESC",
+                        (scope, normalized_name),
+                    ).fetchall()
+                winner = str(rows[0][0])
+                for row in rows[1:]:
+                    connection.exec_driver_sql(
+                        "UPDATE memories SET status = 'superseded', superseded_by = ? WHERE id = ?",
+                        (winner, str(row[0])),
+                    )
+            connection.exec_driver_sql(
+                'CREATE UNIQUE INDEX IF NOT EXISTS "uq_memories_active_scope_name" '
+                'ON "memories" ("scope", COALESCE("scope_id", \'\'), LOWER("name")) '
+                'WHERE "status" = \'active\''
+            )
+        if "memory_jobs" in tables:
+            connection.exec_driver_sql(
+                'CREATE INDEX IF NOT EXISTS "ix_memory_jobs_lease_expires_at" '
+                'ON "memory_jobs" ("lease_expires_at")'
+            )
+            connection.exec_driver_sql(
+                'CREATE UNIQUE INDEX IF NOT EXISTS "uq_memory_jobs_run_kind" '
+                'ON "memory_jobs" ("run_id", "kind") WHERE "run_id" IS NOT NULL'
+            )
 
 
 def _drop_retired_team_collaboration_tables() -> None:

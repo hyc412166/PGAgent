@@ -16,9 +16,13 @@ data/*.db
 data/*.db-*
 data/backups/
 data/*.log
+data/background-jobs/
 data/workspaces/*
 !data/workspaces/.gitkeep
 data/skills/
+data/memories/
+data/AGENTS.md
+data/AGENTS.override.md
 
 # Editors and OS
 .vscode/
@@ -29,3 +33,4 @@ Thumbs.db
 .vercel
 .env*
 .omo/
+.pgagent/

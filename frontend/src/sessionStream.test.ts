@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { appendAssistantDelta, hasPersistedRunReply, isCurrentSessionRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
+import { appendAssistantDelta, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
 
 describe('会话 SSE 事件', () => {
   it('所有没有持久化回复的终态都显示兜底提示', () => {
@@ -7,6 +7,8 @@ describe('会话 SSE 事件', () => {
     expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'user_interrupted' }, new Set())).toBe(true)
     expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'approval_rejected' }, new Set())).toBe(true)
     expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'delegated_child_awaiting_approval' }, new Set())).toBe(false)
+    expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'waiting_background' }, new Set())).toBe(false)
+    expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'delegated_child_waiting_event' }, new Set())).toBe(false)
     expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'failure' }, new Set(['r1']))).toBe(false)
     expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'failure' }, new Set(), false)).toBe(false)
     expect(shouldShowStoppedRunNotice({ id: 'r2', status: 'failed', error_message: 'provider rejected context' }, new Set())).toBe(true)
@@ -46,6 +48,16 @@ describe('会话 SSE 事件', () => {
     expect(isTerminalRunStreamEvent({ type: 'run_state', status: 'completed', terminal: true })).toBe(true)
     expect(isTerminalRunStatus('failed')).toBe(true)
     expect(runStatusPhase('awaiting_approval')).toBe('等待你的审批')
+  })
+
+  it('后台和子 Agent 等待态保持 SSE 打开而不是误判为终态', () => {
+    expect(isResumableWaitingRun({ status: 'stopped', stop_reason: 'waiting_background' })).toBe(true)
+    expect(isResumableWaitingRun({ status: 'stopped', stop_reason: 'delegated_child_waiting_event' })).toBe(true)
+    expect(isTerminalRunStreamEvent({ type: 'run_state', status: 'stopped', reason: 'waiting_background', terminal: false })).toBe(false)
+    expect(isTerminalRunStreamEvent({ type: 'run_stopped', reason: 'delegated_child_waiting_event', terminal: false })).toBe(false)
+    expect(isTerminalRunStreamEvent({ type: 'run_stopped', reason: 'user_interrupted' })).toBe(true)
+    expect(runStreamPhase({ type: 'run_state', status: 'stopped', reason: 'waiting_background' })).toBe('等待后台任务完成…')
+    expect(runStreamPhase({ type: 'run_stopped', reason: 'delegated_child_waiting_event' })).toBe('等待子 Agent 返回…')
   })
 
   it('忽略无法识别的损坏事件', () => {

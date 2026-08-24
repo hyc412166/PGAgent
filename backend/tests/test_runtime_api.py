@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app import database
-from app.api.runtime import router
+from app.api.runtime import _stream_event_is_terminal, router
 from app.database import (
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
@@ -21,6 +21,8 @@ from app.database import (
     ConversationTurn,
     DelegatedTask,
     DraftLaunch,
+    DurableTask,
+    PlanStep,
     Run,
     RunEvent,
     Session,
@@ -30,6 +32,7 @@ from app.database import (
 )
 from app.services.run_service import RunCoordinator, coordinator
 from app.services.run_stream import run_stream_broker
+from app.services.task_state import sync_todos_for_run, transition_run_task
 
 
 @pytest.fixture()
@@ -47,6 +50,13 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient,
     with TestClient(app) as test_client:
         yield test_client, launched
     Base.metadata.drop_all(bind=database.engine)
+
+
+def test_waiting_stop_events_do_not_close_the_run_stream() -> None:
+    assert not _stream_event_is_terminal({"type": "run_stopped", "reason": "waiting_background"})
+    assert not _stream_event_is_terminal({"type": "run_stopped", "reason": "delegated_child_waiting_event"})
+    assert _stream_event_is_terminal({"type": "run_stopped", "reason": "user_interrupted"})
+    assert _stream_event_is_terminal({"type": "run_completed"})
 
 
 def _seed() -> tuple[str, str, str]:
@@ -84,6 +94,47 @@ def test_launch_session_run_persists_message_and_returns_immediately(
         session = db.get(Session, session_id)
         assert session is not None and session.agent_id == DEFAULT_AGENT_ID
         assert db.query(database.ChatMessage).filter_by(session_id=session_id).one().content == "读取文件"
+
+
+def test_continue_turn_binds_latest_interrupted_durable_task(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, launched = client
+    _workspace_id, _agent_id, session_id = _seed()
+    initial = test_client.post(f"/api/sessions/{session_id}/run", json={"content": "实现恢复链路"})
+    assert initial.status_code == 202
+    initial_run_id = initial.json()["id"]
+    sync_todos_for_run(initial_run_id, [
+        {"id": "schema", "content": "持久化计划", "status": "completed"},
+        {"id": "resume", "content": "恢复未完成步骤", "status": "in_progress"},
+    ])
+    with database.SessionLocal() as db:
+        interrupted = db.get(Run, initial_run_id)
+        assert interrupted is not None
+        task_id = interrupted.task_id
+        assert task_id
+        interrupted.status = "stopped"
+        interrupted.stop_reason = "interrupted_restart"
+        transition_run_task(db, interrupted, status="stopped", stop_reason=interrupted.stop_reason)
+        db.commit()
+
+    resumed = test_client.post(
+        f"/api/sessions/{session_id}/run",
+        json={"content": "继续刚刚的工作"},
+    )
+    assert resumed.status_code == 202, resumed.text
+    payload = resumed.json()
+    assert payload["run_kind"] == "recovery"
+    assert payload["resumed_from_run_id"] == initial_run_id
+    assert payload["task_id"] == task_id
+    with database.SessionLocal() as db:
+        recovered = db.get(Run, payload["id"])
+        assert recovered is not None and recovered.task_id
+        task = db.get(DurableTask, recovered.task_id)
+        step = db.get(PlanStep, recovered.plan_step_id)
+        assert task is not None and task.goal == "实现恢复链路"
+        assert step is not None and step.status == "needs_recovery"
+    assert launched["calls"] == [(initial_run_id, False), (payload["id"], False)]
 
 
 def test_session_run_idempotency_reuses_the_same_accepted_turn(

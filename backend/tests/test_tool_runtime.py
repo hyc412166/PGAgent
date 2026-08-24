@@ -276,6 +276,11 @@ def test_todo_skill_and_task_behavior_is_honest(tmp_path) -> None:
     )
     assert todos.ok
     assert registry.runtime_state()["todo_state"][1]["status"] == "in_progress"
+    missing_id = registry.execute(
+        "todowrite",
+        {"todos": [{"content": "Unstable step", "status": "pending"}]},
+    )
+    assert not missing_id.ok and missing_id.error_code == "invalid_todos"
     skill = registry.execute("skill", {"skill_id": "review"})
     assert skill.ok
     assert "Read the diff" in skill.content

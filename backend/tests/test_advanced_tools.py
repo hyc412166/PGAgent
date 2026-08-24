@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 
 from app.tools import create_default_registry
 
@@ -25,7 +26,7 @@ LEARN_TOOL_NAMES = {
     "load_skill", "compress", "background_run", "check_background", "task_create",
     "task_get", "task_update", "task_list", "spawn_teammate", "list_teammates",
     "send_message", "read_inbox", "broadcast", "shutdown_request", "plan_approval",
-    "idle", "claim_task",
+    "integrate_teammate", "idle", "claim_task",
 }
 
 
@@ -44,7 +45,7 @@ def test_explicit_empty_tool_selection_is_actually_empty(tmp_path) -> None:
     assert registry.schemas == []
 
 
-def test_notebook_edit_and_memory_are_real_and_durable(tmp_path) -> None:
+def test_notebook_edit_is_real_and_memory_requires_canonical_store(tmp_path) -> None:
     notebook = tmp_path / "demo.ipynb"
     notebook.write_text(json.dumps({
         "cells": [{"id": "first", "cell_type": "code", "source": ["print(1)\n"], "metadata": {}, "outputs": []}],
@@ -58,17 +59,12 @@ def test_notebook_edit_and_memory_are_real_and_durable(tmp_path) -> None:
         "new_source": "print(2)",
         "edit_mode": "replace",
     })
-    saved = first.execute("MemoryWrite", {
-        "name": "preference",
-        "memory_type": "user",
-        "description": "language preference",
-        "body": "Answer in Chinese",
-    })
     second = create_default_registry(str(tmp_path), permission_mode="full")
-    loaded = second.execute("MemoryRead", {"name": "preference"})
 
     assert edited.ok and "print(2)" in notebook.read_text(encoding="utf-8")
-    assert saved.ok and loaded.ok and "Answer in Chinese" in loaded.content
+    assert "MemoryWrite" not in first.enabled_tool_names
+    assert "MemoryRead" not in second.enabled_tool_names
+    assert not (tmp_path / ".memory").exists()
 
 
 def test_task_board_survives_registry_recreation(tmp_path) -> None:
@@ -89,6 +85,7 @@ def test_smart_mode_escalates_advanced_side_effect_and_network_tools(tmp_path) -
         str(tmp_path),
         allowed_tool_names=["MemoryWrite", "Config", "TaskCreate", "RemoteTrigger"],
         permission_mode="smart",
+        memory_store=SimpleNamespace(write=lambda **_kwargs: None),
     )
 
     calls = (

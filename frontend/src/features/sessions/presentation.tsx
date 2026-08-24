@@ -20,7 +20,7 @@ import {
 import { useEffect, useState } from 'react'
 import { memo } from 'react'
 import { formatLiveThinkingDuration, formatThoughtDuration, type ThoughtActivityIcon, type ThoughtActivityItem, type ThoughtTimelineState } from '../../thoughtTimeline'
-import type { Approval, DelegatedTask, Message, Run, RunEvent } from '../../types'
+import type { Approval, DelegatedTask, Message, Run, RunEvent, Teammate } from '../../types'
 import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../components/ui'
 import { statusText } from '../../components/status'
 import { PenguinMark } from '../../components/penguin'
@@ -67,6 +67,7 @@ function childTaskOutput(task?: DelegatedTask) {
 export const ChildAgentPanel = memo(function ChildAgentPanel({
   open,
   tasks,
+  teammates,
   loading,
   error,
   selectedTask,
@@ -80,6 +81,7 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
 }: {
   open: boolean
   tasks: DelegatedTask[]
+  teammates: Teammate[]
   loading: boolean
   error: string
   selectedTask?: DelegatedTask
@@ -95,6 +97,7 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
   const toolEvents = events.filter((event) => ['tool_started', 'tool_finished', 'tool_result'].includes(event.type || event.event_type || ''))
   return <aside className={`child-agent-panel ${open ? 'is-open' : 'is-closed'}`} aria-label="子 Agent 工作详情" aria-hidden={!open} inert={!open}>
     <header className="child-panel-header"><div><span className="eyebrow">协作执行</span><strong>子 Agent</strong></div><button type="button" className="icon-button" onClick={onClose} aria-label="收起子 Agent 侧栏"><X size={16} /></button></header>
+    {!!teammates.length && <section className="teammate-roster" aria-label="持久化队友"><strong>协作队友</strong><div>{teammates.map((teammate) => <span key={teammate.id} className={`teammate teammate-${teammate.status}`} title={teammate.branch_name || teammate.worktree_path || '共享工作区'}><Bot size={12} /><b>{teammate.name}</b><small>{teammate.status}{teammate.workspace_mode === 'worktree' ? ' · worktree' : ''}</small></span>)}</div></section>}
     {error ? <ErrorState message={error} onRetry={onRetry} /> : loading && !tasks.length ? <LoadingState label="正在读取子 Agent…" /> : !tasks.length ? <EmptyState icon={Users} title="子 Agent 正在启动" description="任务创建后会显示在这里。" /> : <>
       <div className="child-task-list" role="list" aria-label="本次调用的子 Agent">
         {tasks.map((task) => {

@@ -19,7 +19,11 @@ from app.database import (
 
 
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "stopped"})
-NON_TERMINAL_STOP_REASONS = frozenset({"delegated_child_awaiting_approval"})
+NON_TERMINAL_STOP_REASONS = frozenset({
+    "delegated_child_awaiting_approval",
+    "delegated_child_waiting_event",
+    "waiting_background",
+})
 
 
 def utcnow() -> datetime:

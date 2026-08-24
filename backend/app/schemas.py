@@ -270,6 +270,10 @@ class RunCreate(BaseModel):
     agent_id: str | None = None
     mode: AgentMode = "auto"
     status: str = "received"
+    task_id: str | None = None
+    plan_step_id: str | None = None
+    run_kind: Literal["initial", "continuation", "recovery"] = "initial"
+    resumed_from_run_id: str | None = None
 
 
 class RunUpdate(BaseModel):
@@ -289,6 +293,10 @@ class RunRead(ORMModel):
     workspace_id: str | None
     agent_id: str | None
     turn_id: str | None
+    task_id: str | None
+    plan_step_id: str | None
+    run_kind: str
+    resumed_from_run_id: str | None
     status: str
     mode: str
     current_step: int
@@ -299,6 +307,49 @@ class RunRead(ORMModel):
     error_message: str | None
     started_at: datetime
     finished_at: datetime | None
+
+
+class PlanStepRead(ORMModel):
+    id: str
+    external_id: str
+    position: int
+    title: str
+    description: str
+    status: str
+    completed_work: list[Any]
+    remaining_work: list[Any]
+    next_action: str
+    result: str
+    evidence: list[Any]
+    depends_on: list[str]
+    executor_kind: str
+    assigned_agent_id: str | None
+    assigned_run_id: str | None
+    claim_owner: str | None
+    workspace_mode: str
+    worktree_path: str | None
+    attempt: int
+    error: str | None
+    last_run_id: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DurableTaskRead(BaseModel):
+    id: str
+    session_id: str
+    origin_turn_id: str | None
+    goal: str
+    constraints: list[Any]
+    status: str
+    active_step_id: str | None
+    resume_summary: str
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    steps: list[PlanStepRead]
 
 
 class DraftLaunchRequest(BaseModel):
@@ -389,8 +440,12 @@ MemoryScope = Literal["global", "workspace", "session"]
 class MemoryCreate(BaseModel):
     scope: MemoryScope
     scope_id: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=200)
     title: str = Field(default="Memory", min_length=1, max_length=200)
+    memory_type: Literal["user", "feedback", "project", "reference"] = "project"
+    description: str = ""
     content: str = Field(min_length=1)
+    tags: list[str] = Field(default_factory=list)
     pinned: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -398,13 +453,20 @@ class MemoryCreate(BaseModel):
     def validate_scope_id(self) -> "MemoryCreate":
         if self.scope != "global" and not self.scope_id:
             raise ValueError("scope_id is required for workspace and session memories")
+        if self.scope == "global" and self.scope_id:
+            raise ValueError("global memories must not include scope_id")
         return self
 
 
 class MemoryUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
     title: str | None = Field(default=None, min_length=1, max_length=200)
+    memory_type: Literal["user", "feedback", "project", "reference"] | None = None
+    description: str | None = None
     content: str | None = Field(default=None, min_length=1)
+    tags: list[str] | None = None
     pinned: bool | None = None
+    status: Literal["active", "superseded", "archived"] | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -412,9 +474,17 @@ class MemoryRead(ORMModel):
     id: str
     scope: str
     scope_id: str | None
+    name: str
     title: str
+    memory_type: str
+    description: str
     content: str
+    tags: list[str]
     pinned: bool
+    status: str
+    source_session_id: str | None
+    source_turn_id: str | None
+    superseded_by: str | None
     extra: dict[str, Any] = Field(serialization_alias="metadata")
     created_at: datetime
     updated_at: datetime
@@ -577,9 +647,79 @@ class DelegatedTaskRead(ORMModel):
     parent_session_id: str | None
     child_run_id: str | None
     child_agent_id: str | None
+    plan_step_id: str | None
+    teammate_id: str | None
     title: str
     description: str
     status: str
     result: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+
+
+class BackgroundJobRead(ORMModel):
+    """Durable background command state visible from a conversation."""
+
+    id: str
+    run_id: str | None
+    session_id: str | None
+    workspace_id: str | None
+    plan_step_id: str | None
+    command: str
+    shell: str
+    status: str
+    timeout_seconds: int
+    pid: int | None
+    exit_code: int | None
+    log_path: str
+    output_preview: str
+    error: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    observed_at: datetime | None
+    observed_by_run_id: str | None
+    waiting_run_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TeammateRead(ORMModel):
+    id: str
+    team_id: str
+    agent_id: str
+    name: str
+    role: str
+    status: str
+    current_plan_step_id: str | None
+    last_run_id: str | None
+    workspace_mode: str
+    worktree_path: str | None
+    branch_name: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CollaborationMessageRead(ORMModel):
+    id: str
+    team_id: str
+    sender_worker_id: str | None
+    recipient_worker_id: str | None
+    message_type: str
+    content: str
+    payload: dict[str, Any]
+    read_at: datetime | None
+    created_at: datetime
+
+
+class CollaborationEventRead(ORMModel):
+    id: str
+    task_id: str | None
+    plan_step_id: str | None
+    run_id: str | None
+    source_kind: str
+    source_id: str
+    event_type: str
+    payload: dict[str, Any]
+    consumed_at: datetime | None
+    consumer_run_id: str | None
+    created_at: datetime

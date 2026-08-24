@@ -8,34 +8,45 @@ import json
 import threading
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
-from sqlalchemy import case, func, or_, select, update
+from sqlalchemy import case, func, or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 
 from app import database as database_module
 from app.config import settings
 from app.database import (
     Agent,
     Approval,
+    BackgroundJob,
     ChatMessage,
+    CollaborationEvent,
+    CollaborationMessage,
+    CollaborationTeam,
     ConversationTurn,
     ConversationCompaction,
     Artifact,
     DelegatedTask,
+    DurableTask,
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
     ModelConnection,
+    Memory,
+    MemoryJob,
+    PlanStep,
     Run,
     RunEvent,
     Session,
     Skill,
+    TeammateWorker,
     UsageRecord,
     Workspace,
 )
 from app.runtime import (
     AgentRuntime,
+    CompletionDecision,
     ContextManager,
     FilesystemArtifactStore,
     RunOutcome,
@@ -48,8 +59,26 @@ from app.tools import create_default_registry
 from app.tools.registry import TOOL_SCHEMAS
 from app.tools.types import ToolResult
 
+from . import background_job_service
 from .model_gateway import ModelConfigurationError, ProviderConfig, build_model_call
+from .background_job_service import BackgroundJobToolStore
+from .memory_service import (
+    MemoryToolStore,
+    ensure_user_memory_snapshot,
+    extraction_prompt,
+    memory_payload,
+    parse_extraction_response,
+    recall_memories,
+    refresh_memory_markdown_projection,
+    render_memory_snapshot,
+    store_memory,
+    visible_memory_query,
+)
+from .instruction_service import load_instruction_chain, render_workspace_rules
 from .run_stream import run_stream_broker
+from .task_state import recovery_prompt, sync_todos_for_run, todo_state_for_run, transition_run_task
+from .task_graph import TaskGraphToolStore, ready_steps, refresh_task_state, settle_step, upsert_delegated_graph
+from .team_service import TeamToolStore, teammate_context
 from .turn_delivery import (
     classify_error_details,
     classify_exception,
@@ -70,6 +99,37 @@ ACTIVE_STATUSES = {"received", "preparing_context", "planning", "acting", "obser
 STOPPABLE_STATUSES = ACTIVE_STATUSES | {"awaiting_approval"}
 USER_INTERRUPT_REASON = "user_interrupted"
 USER_INTERRUPT_ERROR = "run_interrupted"
+_CHILD_FORBIDDEN_ORCHESTRATION_TOOLS = frozenset({
+    "task",
+    "Agent",
+    "spawn_teammate",
+    "TeamCreate",
+    "TeamDelete",
+    "WorkerCreate",
+    "WorkerGet",
+    "WorkerObserve",
+    "WorkerResolveTrust",
+    "WorkerAwaitReady",
+    "WorkerSendPrompt",
+    "WorkerRestart",
+    "WorkerTerminate",
+    "WorkerObserveCompletion",
+    "task_create",
+    "task_get",
+    "task_update",
+    "task_list",
+    "TaskCreate",
+    "RunTaskPacket",
+    "TaskGet",
+    "TaskList",
+    "TaskStop",
+    "TaskUpdate",
+    "TaskOutput",
+    "claim_task",
+    "shutdown_request",
+    "plan_approval",
+    "integrate_teammate",
+})
 USER_INTERRUPT_REASONS = frozenset({USER_INTERRUPT_REASON, "parent_user_interrupted"})
 
 # ``stream_sink`` is a low-latency UI channel. Provider payloads never pass
@@ -132,7 +192,12 @@ def approval_matches_pending(approval: Approval, pending: dict[str, Any] | None)
 
 
 def _message_payload(message: ChatMessage) -> dict[str, Any]:
-    payload: dict[str, Any] = {"role": message.role, "content": message.content}
+    provider_payload = message.provider_payload if isinstance(message.provider_payload, dict) else {}
+    rendered_content = provider_payload.get("rendered_content")
+    payload: dict[str, Any] = {
+        "role": message.role,
+        "content": rendered_content if message.role == "user" and isinstance(rendered_content, str) else message.content,
+    }
     if message.tool_name:
         payload["name"] = message.tool_name
     if message.tool_call_id:
@@ -141,7 +206,6 @@ def _message_payload(message: ChatMessage) -> dict[str, Any]:
     tool_calls = metadata.get("tool_calls")
     if message.role == "assistant" and isinstance(tool_calls, list) and tool_calls:
         payload["tool_calls"] = _json_safe(tool_calls)
-    provider_payload = message.provider_payload if isinstance(message.provider_payload, dict) else {}
     reasoning_content = provider_payload.get("reasoning_content")
     if message.role == "assistant" and isinstance(reasoning_content, str) and reasoning_content:
         payload["reasoning_content"] = reasoning_content
@@ -665,7 +729,7 @@ def _active_child_agents(db: Any) -> list[Agent]:
     ))
 
 
-def _delegate_catalog_prompt(db: Any) -> str:
+def _delegate_catalog_prompt(db: Any, run: Run) -> str:
     """Make the main runtime's valid delegate IDs visible to the model.
 
     The main coordinator stays system-owned and prompt-free as a profile. This
@@ -679,7 +743,7 @@ def _delegate_catalog_prompt(db: Any) -> str:
         return ""
     lines = [
         "可委派的子 Agent（仅在任务确实较复杂、专业，或用户明确要求时使用 task 工具）：",
-        "- 单个子任务使用 task + agent_id；多个相互独立的子任务请使用 tasks 数组，系统会并行启动并在全部结束后返回结果。",
+        "- 单个子任务使用 task + agent_id；批量任务使用 tasks 数组中的稳定 id/depends_on 声明依赖，无依赖节点会并行启动。",
         "- 每项任务都必须使用下列精确 agent_id；子 Agent 的实际权限和工具会由系统再次校验。",
     ]
     for child in children:
@@ -689,6 +753,33 @@ def _delegate_catalog_prompt(db: Any) -> str:
         lines.append(f"- {child.id} | {name}{suffix}")
     if len(children) >= _DELEGATE_AGENT_CATALOG_LIMIT:
         lines.append("- 列表已截断；如未找到匹配子 Agent，请直接完成可安全完成的部分或向用户说明。")
+    team = db.scalar(select(CollaborationTeam).where(
+        CollaborationTeam.parent_run_id == run.id
+    ))
+    if team is None and run.task_id:
+        team = db.scalar(
+            select(CollaborationTeam)
+            .where(
+                CollaborationTeam.task_id == run.task_id,
+                CollaborationTeam.status == "active",
+            )
+            .order_by(CollaborationTeam.updated_at.desc(), CollaborationTeam.id.desc())
+        )
+        if team is not None:
+            team.parent_run_id = run.id
+    if team is not None:
+        workers = list(db.scalars(
+            select(TeammateWorker)
+            .where(TeammateWorker.team_id == team.id)
+            .order_by(TeammateWorker.created_at.asc(), TeammateWorker.id.asc())
+        ))
+        if workers:
+            lines.append("持久化队友（task 的 agent_id 可直接使用 teammate id，系统会恢复其收件箱和历史）：")
+            for worker in workers:
+                lines.append(
+                    f"- teammate={worker.id} | {worker.name} | role={worker.role} | "
+                    f"status={worker.status} | workspace={worker.workspace_mode}"
+                )
     return "\n".join(lines)
 
 
@@ -760,6 +851,44 @@ class _SubagentTaskDelegate:
             str(name).strip() for name in parent_allowed_tool_names if str(name).strip()
         )
         self.permission_mode = str(permission_mode or "smart")
+        self._plan_step_ids: dict[str, dict[str, str]] = {}
+        self._worker_by_external_id: dict[str, dict[str, str]] = {}
+
+    def prepare_graph(self, specs: list[dict[str, Any]], *, call_id: str | None = None) -> None:
+        """Persist the complete DAG before any child in its first wave starts."""
+
+        resolved_specs: list[dict[str, Any]] = []
+        graph_key = str(call_id or "")
+        worker_map: dict[str, str] = {}
+        with database_module.SessionLocal() as db:
+            for raw in specs:
+                spec = dict(raw)
+                worker = db.get(TeammateWorker, str(spec.get("agent_id") or ""))
+                if worker is not None:
+                    team = db.get(CollaborationTeam, worker.team_id)
+                    if team is None or team.parent_run_id != self.parent_run_id:
+                        raise ValueError("teammate does not belong to this parent run")
+                    worker_map[str(spec["id"])] = worker.id
+                    spec["agent_id"] = worker.agent_id
+                    spec["workspace_mode"] = worker.workspace_mode
+                resolved_specs.append(spec)
+        self._plan_step_ids[graph_key] = upsert_delegated_graph(
+            self.parent_run_id,
+            resolved_specs,
+            graph_call_id=call_id,
+        )
+        self._worker_by_external_id[graph_key] = worker_map
+
+    def block_step(
+        self,
+        external_id: str,
+        reason: str,
+        *,
+        graph_call_id: str | None = None,
+    ) -> None:
+        step_id = self._plan_step_ids.get(str(graph_call_id or ""), {}).get(str(external_id))
+        if step_id:
+            settle_step(step_id, status="failed", error=reason)
 
     @staticmethod
     def _configuration_matches_parent(connection: ModelConnection, binding: dict[str, Any]) -> bool:
@@ -807,12 +936,14 @@ class _SubagentTaskDelegate:
     def _error_code_for_status(status: str) -> str | None:
         return {
             "awaiting_approval": "delegate_child_awaiting_approval",
+            "waiting_background": "delegate_child_waiting_event",
             "stopped": "delegate_child_stopped",
             "failed": "delegate_child_failed",
         }.get(status, "delegate_child_incomplete") if status != "completed" else None
 
     def _tool_result_from_payload(self, payload: dict[str, Any]) -> ToolResult:
         status = str(payload.get("status") or "failed")
+        waiting_event = status == "waiting_background"
         delegation_id = str(payload.get("delegation_id") or payload.get("task_id") or "")
         return ToolResult(
             "task",
@@ -827,11 +958,14 @@ class _SubagentTaskDelegate:
                 "child_agent_id": str(payload.get("agent", {}).get("id") or "")
                 if isinstance(payload.get("agent"), dict)
                 else "",
+                "plan_step_id": str(payload.get("plan_step_id") or ""),
+                "plan_step_external_id": str(payload.get("plan_step_external_id") or ""),
                 "status": status,
                 # A child approval is not an ordinary failed observation.  The
                 # parent runtime uses this explicit marker to stop without
                 # inventing a final answer while the child remains resumable.
-                "delegated_child_awaiting_approval": status == "awaiting_approval",
+                "delegated_child_awaiting_approval": status in {"awaiting_approval", "waiting_background"},
+                "delegated_child_waiting_event": waiting_event,
             },
         )
 
@@ -896,6 +1030,8 @@ class _SubagentTaskDelegate:
         self,
         db: Any,
         child: Agent,
+        *,
+        workspace_root_override: str | None = None,
     ) -> tuple[ProviderConfig, dict[str, Any], list[dict[str, str]]]:
         """Snapshot all execution-relevant child settings before model I/O."""
 
@@ -929,14 +1065,17 @@ class _SubagentTaskDelegate:
         child_tools = [
             tool_name
             for tool_name in _allowed_runtime_tool_names(list(getattr(child, "tool_ids", []) or []))
-            if tool_name in parent_allowed and tool_name != "task"
+            if tool_name in parent_allowed and tool_name not in _CHILD_FORBIDDEN_ORCHESTRATION_TOOLS
         ]
         child_skill_ids = list(getattr(child, "skill_ids", []) or [])
         skill_instructions = _read_selected_skill_instructions(db, child_skill_ids)
-        workspace_root = str(self.parent_binding.get("workspace_root") or "").strip()
+        workspace_root = str(
+            workspace_root_override or self.parent_binding.get("workspace_root") or ""
+        ).strip()
         if not workspace_root:
             raise RuntimeError("主会话缺少冻结的工作区")
 
+        agents_instructions, agents_instruction_sources = load_instruction_chain(workspace_root)
         provider_config = ProviderConfig(
             provider=connection.provider,
             base_url=connection.base_url,
@@ -953,6 +1092,8 @@ class _SubagentTaskDelegate:
             "agent_system_prompt": (str(child.system_prompt or "") + _DELEGATE_CHILD_SYSTEM_SUFFIX).strip(),
             "child_agent_id": child.id,
             "workspace_root": workspace_root,
+            "agents_instructions": agents_instructions,
+            "agents_instruction_sources": agents_instruction_sources,
             "model_connection_id": connection.id,
             "provider": connection.provider,
             "base_url": connection.base_url,
@@ -981,11 +1122,20 @@ class _SubagentTaskDelegate:
             "permission_mode": str(binding.get("permission_mode") or "smart"),
             "allowed_tool_names": list(binding.get("allowed_tool_names") or []),
             "skill_ids": list(binding.get("skill_ids") or []),
-            "workspace_inherited": True,
+            "workspace_mode": str(binding.get("workspace_mode") or "shared"),
+            "workspace_inherited": str(binding.get("workspace_mode") or "shared") == "shared",
             "recursive_task_enabled": False,
         }
 
-    async def __call__(self, task: str, *, agent_id: str = "", call_id: str | None = None) -> ToolResult:
+    async def __call__(
+        self,
+        task: str,
+        *,
+        agent_id: str = "",
+        call_id: str | None = None,
+        plan_step_external_id: str | None = None,
+        graph_call_id: str | None = None,
+    ) -> ToolResult:
         """Persist, execute and summarize exactly one bounded child task."""
 
         requested_agent_id = str(agent_id or "").strip()
@@ -997,7 +1147,12 @@ class _SubagentTaskDelegate:
         child_binding: dict[str, Any] | None = None
         child_skill_instructions: list[dict[str, str]] = []
         child_max_run_seconds: float | None = None
+        graph_key = str(graph_call_id or "")
+        plan_step_id = self._plan_step_ids.get(graph_key, {}).get(str(plan_step_external_id or ""))
+        teammate_id = self._worker_by_external_id.get(graph_key, {}).get(str(plan_step_external_id or ""))
         with database_module.SessionLocal() as db:
+            if plan_step_id and db.get_bind().dialect.name == "sqlite":
+                db.execute(text("BEGIN IMMEDIATE"))
             existing = db.scalar(
                 select(DelegatedTask).where(DelegatedTask.idempotency_key == idempotency_key)
             )
@@ -1013,7 +1168,21 @@ class _SubagentTaskDelegate:
                     message="相同的子 Agent 任务已经在执行中",
                 )
 
-            child = db.get(Agent, requested_agent_id)
+            teammate = db.get(TeammateWorker, teammate_id or requested_agent_id)
+            if teammate is not None:
+                team = db.get(CollaborationTeam, teammate.team_id)
+                if team is None or team.parent_run_id != self.parent_run_id:
+                    teammate = None
+                elif teammate.status in {"provisioning", "stopped", "failed", "stopping"}:
+                    return self._blocked_result(
+                        task_id=plan_step_id,
+                        child_run_id=None,
+                        agent=None,
+                        code="teammate_not_available",
+                        message="The persistent teammate is stopped or unavailable.",
+                    )
+            teammate_id = teammate.id if teammate is not None else None
+            child = db.get(Agent, teammate.agent_id if teammate is not None else requested_agent_id)
             if child is None or child.id == DEFAULT_AGENT_ID or child.is_default:
                 return self._blocked_result(
                     task_id=None,
@@ -1031,7 +1200,20 @@ class _SubagentTaskDelegate:
                     message="请求的子 Agent 已被禁用",
                 )
             try:
-                provider_config, child_binding, child_skill_instructions = self._freeze_child_binding(db, child)
+                provider_config, child_binding, child_skill_instructions = self._freeze_child_binding(
+                    db,
+                    child,
+                    workspace_root_override=(
+                        teammate.worktree_path if teammate is not None and teammate.workspace_mode == "worktree" else None
+                    ),
+                )
+                if teammate is not None:
+                    child_binding["workspace_mode"] = teammate.workspace_mode
+                    child_binding["agent_system_prompt"] = (
+                        str(child_binding["agent_system_prompt"])
+                        + f"\n\nPersistent teammate identity: {teammate.name}; role: {teammate.role}.\n"
+                        + teammate.prompt
+                    ).strip()
                 child_max_run_seconds = self._remaining_parent_run_seconds(db)
             except (ModelConfigurationError, RuntimeError) as exc:
                 return self._blocked_result(
@@ -1051,6 +1233,36 @@ class _SubagentTaskDelegate:
                     message="The parent run has no remaining execution time for a delegated child.",
                 )
 
+            if plan_step_id:
+                step = db.get(PlanStep, plan_step_id)
+                if step is not None and step.status == "completed":
+                    return self._tool_result_from_payload({
+                        "task_id": step.id,
+                        "delegation_id": step.id,
+                        "plan_step_id": step.id,
+                        "plan_step_external_id": step.external_id,
+                        "agent": {"id": child.id, "name": _single_line(child.name, limit=120)},
+                        "status": "completed",
+                        "output": step.result,
+                        "workspace_changed": False,
+                    })
+                ready_ids = {item.id for item in ready_steps(db, step.task_id)} if step is not None else set()
+                if step is None or step.id not in ready_ids:
+                    return self._blocked_result(
+                        task_id=plan_step_id,
+                        child_run_id=None,
+                        agent=child,
+                        code="delegate_step_not_ready",
+                        message="The delegated plan step is not ready or is already claimed.",
+                    )
+                step.status = "in_progress"
+                step.started_at = step.started_at or _utcnow()
+                step.assigned_agent_id = child.id
+                step.workspace_mode = teammate.workspace_mode if teammate is not None else "shared"
+                step.worktree_path = teammate.worktree_path if teammate is not None else None
+                step.attempt = int(step.attempt or 0) + 1
+                step.error = None
+
             delegation = DelegatedTask(
                 parent_run_id=self.parent_run_id,
                 parent_session_id=db.scalar(select(Run.session_id).where(Run.id == self.parent_run_id)),
@@ -1058,6 +1270,8 @@ class _SubagentTaskDelegate:
                 description=task,
                 status="in_progress",
                 child_agent_id=child.id,
+                plan_step_id=plan_step_id,
+                teammate_id=teammate_id,
                 idempotency_key=idempotency_key,
                 result={
                     "status": "in_progress",
@@ -1081,12 +1295,26 @@ class _SubagentTaskDelegate:
             child_run.workspace_id = db.scalar(
                 select(Run.workspace_id).where(Run.id == self.parent_run_id)
             )
+            child_memory_snapshot = recall_memories(
+                db,
+                task,
+                workspace_id=child_run.workspace_id,
+                session_id=child_run.session_id,
+            )
+            rendered_child_task = render_memory_snapshot(task, child_memory_snapshot)
+            if teammate is not None:
+                rendered_child_task = teammate_context(db, teammate) + "\n\n" + rendered_child_task
             child_binding = {
                 **child_binding,
                 "delegation_id": delegation.id,
                 "parent_agent_id": self.parent_agent_id,
                 "parent_session_id": child_run.session_id,
                 "max_run_seconds": child_max_run_seconds,
+                "memory_snapshot": child_memory_snapshot,
+                "rendered_task": rendered_child_task,
+                "plan_step_id": plan_step_id,
+                "plan_step_external_id": plan_step_external_id,
+                "teammate_id": teammate_id,
             }
             delegation.child_run_id = child_run.id
             delegation.result = {
@@ -1096,7 +1324,36 @@ class _SubagentTaskDelegate:
                 "child_run_id": child_run.id,
                 "parent_run_id": self.parent_run_id,
                 "parent_session_id": child_run.session_id,
+                "plan_step_id": plan_step_id,
+                "plan_step_external_id": plan_step_external_id,
+                "teammate_id": teammate_id,
             }
+            if plan_step_id:
+                plan_step = db.get(PlanStep, plan_step_id)
+                if plan_step is not None:
+                    plan_step.assigned_run_id = child_run.id
+            if teammate is not None:
+                teammate.status = "working"
+                teammate.current_plan_step_id = plan_step_id
+                teammate.last_run_id = child_run.id
+            # Persist the complete frozen child configuration in the same
+            # transaction that creates the child Run. If the process exits
+            # before the first provider response, recovery still has the
+            # exact execution binding rather than only its public summary.
+            db.add(RunEvent(
+                run_id=child_run.id,
+                event_type="runtime_snapshot",
+                payload=RunCoordinator._runtime_snapshot(RunOutcome(
+                    status="received",
+                    output=None,
+                    messages=[],
+                    events=[],
+                    steps=0,
+                    tool_calls=0,
+                    mode="auto",
+                    runtime_binding=child_binding,
+                )),
+            ))
             # This link exists before model I/O. It lets terminal failure
             # handling reconcile the delegation even if no runtime snapshot was
             # ever produced.
@@ -1139,12 +1396,30 @@ class _SubagentTaskDelegate:
             "child_agent_name": _single_line(child.name, limit=120),
             "task_title": self._task_title(task),
         })
+        child_background_store = BackgroundJobToolStore(
+            run_id=child_run_id,
+            workspace_id=child_run.workspace_id,
+            session_id=child_run.session_id,
+            workspace_root=str(child_binding["workspace_root"]),
+        )
+        child_team_store = TeamToolStore(
+            run_id=self.parent_run_id,
+            session_id=child_run.session_id,
+            workspace_root=str(child_binding["workspace_root"]),
+            actor_worker_id=teammate_id,
+        ) if teammate_id else None
         child_registry = create_default_registry(
             str(child_binding["workspace_root"]),
             allowed_tool_names=child_binding["allowed_tool_names"],
             permission_mode=child_binding["permission_mode"],
             skill_instructions=child_skill_instructions,
             todo_state=[],
+            memory_store=MemoryToolStore(
+                workspace_id=child_run.workspace_id,
+                session_id=child_run.session_id,
+            ),
+            background_store=child_background_store,
+            team_store=child_team_store,
             # Deliberately omit task_delegate: task was removed from the
             # allowlist and a child never obtains a recursive dispatch hook.
         )
@@ -1171,12 +1446,28 @@ class _SubagentTaskDelegate:
             ),
             checkpointer=coordinator.checkpointer,
         )
+        RunCoordinator._install_completion_verifier(
+            child_runtime,
+            {
+                "runtime_binding": child_binding,
+                "background_store": child_background_store,
+            },
+        )
         try:
             outcome = await child_runtime.run(
                 system_prompt=str(child_binding["agent_system_prompt"]),
-                agent_instructions="",
-                workspace_rules=f"只能访问主会话冻结的工作区：{child_binding['workspace_root']}",
-                recent_messages=[{"role": "user", "content": task}],
+                agent_instructions=(
+                    "耗时命令可先用 background_run 启动；完成其他独立工作后，必须调用 "
+                    "check_background(wait=true) 等待并读取终态，不能把入队当作完成。"
+                    if {"background_run", "check_background"}.issubset(
+                        set(child_binding["allowed_tool_names"])
+                    ) else ""
+                ),
+                workspace_rules=render_workspace_rules(
+                    str(child_binding["workspace_root"]),
+                    str(child_binding.get("agents_instructions") or ""),
+                ),
+                recent_messages=[{"role": "user", "content": str(child_binding["rendered_task"])}],
                 mode="auto",
                 thread_id=child_run_id,
             )
@@ -1197,7 +1488,11 @@ class _SubagentTaskDelegate:
             **child_binding,
             **child_registry.runtime_state(),
         }
-        RunCoordinator._persist_outcome(child_run_id, outcome)
+        RunCoordinator._persist_outcome(
+            child_run_id,
+            outcome,
+            child_background_store.delivered_terminal_ids(),
+        )
         with database_module.SessionLocal() as db:
             persisted_delegation = db.get(DelegatedTask, delegation_id)
             if persisted_delegation is None:
@@ -1230,14 +1525,19 @@ class RunCoordinator:
     def __init__(self) -> None:
         self.checkpointer: Any | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._memory_tasks: dict[str, asyncio.Task[None]] = {}
         self._tool_cancellers: dict[str, Callable[[], None]] = {}
         self._queued_resumes: set[str] = set()
         self._shutting_down = False
+        self._event_loop: asyncio.AbstractEventLoop | None = None
 
     def set_checkpointer(self, checkpointer: Any | None) -> None:
         self.checkpointer = checkpointer
         if checkpointer is not None:
             self._shutting_down = False
+            self._event_loop = asyncio.get_running_loop()
+        else:
+            self._event_loop = None
 
     def register_tool_canceller(self, run_id: str, callback: Callable[[], None]) -> None:
         self._tool_cancellers[run_id] = callback
@@ -1354,6 +1654,261 @@ class RunCoordinator:
         task.add_done_callback(lambda completed, key=run_id: self._clear_task(completed, key))
         return True
 
+    def _schedule_background_continuation(self, run_id: str, job_id: str) -> None:
+        def launch() -> None:
+            run_stream_broker.publish(run_id, {
+                "type": "background_continuation_started",
+                "run_id": run_id,
+                "background_job_id": job_id,
+            })
+            self.launch(run_id, resume=True)
+
+        loop = self._event_loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(launch)
+
+    def notify_background_terminal(self, job_id: str) -> bool:
+        """Wake a run only after every background job registered to it is terminal."""
+
+        target_run_id: str | None = None
+        with database_module.SessionLocal() as db:
+            if db.get_bind().dialect.name == "sqlite":
+                db.execute(text("BEGIN IMMEDIATE"))
+            job = db.get(BackgroundJob, job_id)
+            if job is None:
+                return False
+            target_run_id = str(job.waiting_run_id or job.run_id or "") or None
+            if target_run_id is None:
+                return False
+            active_sibling = db.scalar(select(BackgroundJob.id).where(
+                BackgroundJob.waiting_run_id == target_run_id,
+                BackgroundJob.status.in_({"queued", "running"}),
+            ).limit(1))
+            if active_sibling is not None:
+                return False
+            run = db.get(Run, target_run_id)
+            if run is None or run.status != "stopped" or run.stop_reason != "waiting_background":
+                return False
+            run.status = "received"
+            run.stop_reason = None
+            run.error_code = None
+            run.error_message = None
+            run.finished_at = None
+            if run.task_id:
+                task = db.get(DurableTask, run.task_id)
+                if task is not None and task.status == "waiting":
+                    task.status = "running"
+                    task.resume_summary = "A background terminal event arrived; resume and consume its result."
+            db.add(RunEvent(
+                run_id=run.id,
+                event_type="background_continuation_queued",
+                payload={"background_job_id": job.id},
+            ))
+            db.commit()
+        self._schedule_background_continuation(target_run_id, job_id)
+        return True
+
+    def reconcile_waiting_background_runs(self) -> list[str]:
+        """Recover event/run commit races without invoking the model on a timer."""
+
+        with database_module.SessionLocal() as db:
+            waiting = list(db.scalars(select(Run.id).where(
+                Run.status == "stopped",
+                Run.stop_reason == "waiting_background",
+            )))
+            terminal_job_by_run = {
+                str(run_id): str(job_id)
+                for run_id, job_id in db.execute(
+                    select(BackgroundJob.waiting_run_id, BackgroundJob.id)
+                    .where(
+                        BackgroundJob.waiting_run_id.in_(waiting),
+                        BackgroundJob.status.in_({"completed", "failed", "cancelled"}),
+                    )
+                    .order_by(BackgroundJob.finished_at.desc(), BackgroundJob.id.desc())
+                ).all()
+                if run_id
+            }
+        resumed: list[str] = []
+        for run_id, job_id in terminal_job_by_run.items():
+            if self.notify_background_terminal(job_id):
+                resumed.append(run_id)
+        return resumed
+
+    def launch_memory_job(self, job_id: str) -> bool:
+        """Schedule durable auxiliary extraction without blocking reply delivery."""
+
+        if self._shutting_down:
+            return False
+        current = self._memory_tasks.get(job_id)
+        if current is not None and not current.done():
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        task = loop.create_task(self._process_memory_job(job_id), name=f"pgagent-memory-{job_id}")
+        self._memory_tasks[job_id] = task
+        task.add_done_callback(
+            lambda completed, key=job_id: self._memory_tasks.pop(key, None)
+            if self._memory_tasks.get(key) is completed else None
+        )
+        return True
+
+    @staticmethod
+    def pending_memory_job_ids(*, recover_running: bool = True) -> list[str]:
+        """Reset process-interrupted workers and return retryable durable jobs."""
+
+        with database_module.SessionLocal() as db:
+            if recover_running:
+                now = _utcnow()
+                for job in db.scalars(select(MemoryJob).where(
+                    MemoryJob.status == "running",
+                    or_(MemoryJob.lease_expires_at.is_(None), MemoryJob.lease_expires_at <= now),
+                )):
+                    job.status = "pending"
+                    job.error = "worker process restarted before completion"
+                    job.lease_expires_at = None
+            db.commit()
+            return list(db.scalars(
+                select(MemoryJob.id)
+                .where(MemoryJob.status == "pending", MemoryJob.attempts < 3)
+                .order_by(MemoryJob.created_at.asc(), MemoryJob.id.asc())
+            ))
+
+    async def _process_memory_job(self, job_id: str) -> None:
+        with database_module.SessionLocal() as db:
+            lease_seconds = max(300, int(settings.model_timeout_seconds) + 60)
+            claim = db.execute(
+                update(MemoryJob)
+                .where(MemoryJob.id == job_id, MemoryJob.status == "pending", MemoryJob.attempts < 3)
+                .values(
+                    status="running",
+                    attempts=MemoryJob.attempts + 1,
+                    error=None,
+                    lease_expires_at=_utcnow() + timedelta(seconds=lease_seconds),
+                )
+            )
+            if claim.rowcount != 1:
+                db.rollback()
+                return
+            db.commit()
+            job = db.get(MemoryJob, job_id)
+            if job is None:
+                return
+            claim_attempt = int(job.attempts)
+            payload = dict(job.payload or {})
+            binding = dict(payload.get("runtime_binding") or {})
+            connection = db.get(ModelConnection, str(binding.get("model_connection_id") or ""))
+            if connection is None or not connection.enabled:
+                db.execute(
+                    update(MemoryJob)
+                    .where(
+                        MemoryJob.id == job_id,
+                        MemoryJob.status == "running",
+                        MemoryJob.attempts == claim_attempt,
+                    )
+                    .values(status="failed", error="model connection unavailable", lease_expires_at=None)
+                )
+                db.commit()
+                return
+            provider_config = ProviderConfig(
+                provider=str(binding.get("provider") or connection.provider),
+                base_url=str(binding.get("base_url") or connection.base_url),
+                secret_ref=str(binding.get("secret_ref") or connection.secret_ref),
+                model_id=str(binding.get("model_id") or connection.default_model or ""),
+                model_connection_id=connection.id,
+                thinking_level="off",
+                custom_headers=dict(connection.custom_headers or {}),
+            )
+            catalog = [
+                memory_payload(item, include_content=False)
+                for item in db.scalars(visible_memory_query(
+                    workspace_id=job.workspace_id,
+                    session_id=job.session_id,
+                ).order_by(Memory.updated_at.desc()).limit(20))
+            ]
+            messages = extraction_prompt(
+                user_request=str(payload.get("user_request") or ""),
+                assistant_response=str(payload.get("assistant_response") or ""),
+                tool_observations=[
+                    str(item) for item in payload.get("tool_observations") or []
+                ],
+                existing_catalog=catalog,
+            )
+            source_turn_id = str(payload.get("turn_id") or "") or None
+
+        try:
+            response = await asyncio.wait_for(
+                build_model_call(provider_config)(messages=messages, tools=[], mode="memory"),
+                timeout=float(settings.model_timeout_seconds),
+            )
+            raw = dict(response) if isinstance(response, Mapping) else {}
+            choices = raw.get("choices") or []
+            first = choices[0] if isinstance(choices, list) and choices else {}
+            message = first.get("message") if isinstance(first, Mapping) else {}
+            content = str(message.get("content") or "") if isinstance(message, Mapping) else ""
+            candidates = parse_extraction_response(content)
+            usage = normalize_usage(raw.get("usage") if isinstance(raw.get("usage"), Mapping) else {})
+            with database_module.SessionLocal() as db:
+                fence = db.execute(
+                    update(MemoryJob)
+                    .where(
+                        MemoryJob.id == job_id,
+                        MemoryJob.status == "running",
+                        MemoryJob.attempts == claim_attempt,
+                    )
+                    .values(status="committing")
+                )
+                if fence.rowcount != 1:
+                    db.rollback()
+                    return
+                job = db.get(MemoryJob, job_id)
+                if job is None:
+                    return
+                stored: list[str] = []
+                for candidate in candidates:
+                    try:
+                        item = store_memory(
+                            db,
+                            **candidate,
+                            workspace_id=job.workspace_id,
+                            session_id=job.session_id,
+                            source_turn_id=source_turn_id,
+                            metadata={"source": "automatic_extraction", "memory_job_id": job.id},
+                        )
+                    except ValueError:
+                        continue
+                    stored.append(item.id)
+                job.status = "completed"
+                job.lease_expires_at = None
+                job.result = {"candidate_count": len(candidates), "memory_ids": stored}
+                for key in (
+                    "request_count", "input_tokens", "output_tokens", "cache_creation_tokens",
+                    "cache_read_tokens", "total_tokens", "cost_usd",
+                ):
+                    setattr(job, key, usage[key])
+                db.commit()
+            refresh_memory_markdown_projection()
+        except Exception as exc:
+            with database_module.SessionLocal() as db:
+                job = db.get(MemoryJob, job_id)
+                if job is None:
+                    return
+                db.execute(
+                    update(MemoryJob)
+                    .where(
+                        MemoryJob.id == job_id,
+                        MemoryJob.status == "running",
+                        MemoryJob.attempts == claim_attempt,
+                    )
+                    .values(
+                        status="pending" if claim_attempt < 3 else "failed",
+                        error=f"{type(exc).__name__}: {str(exc)[:1000]}",
+                        lease_expires_at=None,
+                    )
+                )
+                db.commit()
+
     def stop(
         self,
         run_id: str,
@@ -1395,7 +1950,7 @@ class RunCoordinator:
             )
             can_stop = prior_status in STOPPABLE_STATUSES or (
                 prior_status == "stopped"
-                and prior_stop_reason == "delegated_child_awaiting_approval"
+                and not is_terminal_delivery(prior_status, prior_stop_reason)
             )
             if can_stop:
                 now = _utcnow()
@@ -1631,6 +2186,7 @@ class RunCoordinator:
                         "partial_thought": partial.get("thought") or None,
                     },
                 ))
+                transition_run_task(session, run, status="stopped", stop_reason=reason)
                 sync_turn_progress(session, run)
                 persist_terminal_response(
                     session,
@@ -1683,6 +2239,7 @@ class RunCoordinator:
         # awaiter will discard the eventual result and the stop marker remains
         # authoritative.
         target_run_ids = list(dict.fromkeys([run_id, *child_run_ids_to_cancel]))
+        background_job_service.background_job_manager.cancel_for_runs(target_run_ids)
         try:
             current = asyncio.current_task()
         except RuntimeError:
@@ -1742,12 +2299,17 @@ class RunCoordinator:
     async def shutdown(self) -> None:
         self._shutting_down = True
         self._queued_resumes.clear()
-        tasks = [task for task in self._tasks.values() if not task.done()]
+        tasks = [
+            task
+            for task in [*self._tasks.values(), *self._memory_tasks.values()]
+            if not task.done()
+        ]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
+        self._memory_tasks.clear()
 
     @staticmethod
     def reconcile_interrupted_runs() -> list[str]:
@@ -1764,6 +2326,7 @@ class RunCoordinator:
                 run.error_message = "PGAgent 在运行期间被关闭，可重新发送消息继续任务"
                 run.finished_at = _utcnow()
                 db.add(RunEvent(run_id=run.id, event_type="run_interrupted", payload={"reason": "process_restart"}))
+                transition_run_task(db, run, status="stopped", stop_reason="interrupted_restart")
                 parent_event = RunCoordinator._sync_delegated_child_state(
                     db,
                     run,
@@ -2059,6 +2622,18 @@ class RunCoordinator:
             if workspace is None:
                 raise ModelConfigurationError("当前 Agent 没有可用工作区")
 
+            if session is not None and run.turn_id and not delegated_child:
+                current_user = db.scalar(select(ChatMessage).where(
+                    ChatMessage.turn_id == run.turn_id,
+                    ChatMessage.role == "user",
+                ))
+                if current_user is not None:
+                    ensure_user_memory_snapshot(
+                        db,
+                        current_user,
+                        workspace_id=workspace.id,
+                        session_id=session.id,
+                    )
             messages = _prepare_session_history(db, session) if session else []
             compaction_state = _compaction_from_db(db, session) if session else {}
             if session:
@@ -2078,8 +2653,10 @@ class RunCoordinator:
             permission_mode = str(getattr(session, "permission_mode", "smart") or "smart")
             allowed_tool_names = _allowed_runtime_tool_names(agent_tool_ids)
             skill_instructions = _read_selected_skill_instructions(db, configured_skill_ids)
-            todo_state = _session_todo_state(db, session.id if session else None)
+            todo_state = todo_state_for_run(db, run) or _session_todo_state(db, session.id if session else None)
             effective_system_prompt = agent.system_prompt
+            agents_instructions = ""
+            agents_instruction_sources: list[str] = []
             if frozen_binding:
                 frozen_agent_id = str(frozen_binding.get("agent_id") or "").strip()
                 if frozen_agent_id and agent.id != frozen_agent_id:
@@ -2109,6 +2686,11 @@ class RunCoordinator:
                 if connection_changed:
                     raise RuntimeError("模型连接配置在审批等待期间已改变，已拒绝续跑")
                 workspace_root = str(frozen_binding["workspace_root"])
+                agents_instructions = str(frozen_binding.get("agents_instructions") or "")
+                if isinstance(frozen_binding.get("agents_instruction_sources"), list):
+                    agents_instruction_sources = [
+                        str(item) for item in frozen_binding["agents_instruction_sources"]
+                    ]
                 provider_config = ProviderConfig(
                     provider=str(frozen_binding["provider"]),
                     base_url=str(frozen_binding["base_url"]),
@@ -2177,6 +2759,7 @@ class RunCoordinator:
                     connection.thinking_level,
                 ) or "auto"
                 workspace_root = workspace.root_path
+                agents_instructions, agents_instruction_sources = load_instruction_chain(workspace_root)
                 provider_config = ProviderConfig(
                     provider=connection.provider,
                     base_url=connection.base_url,
@@ -2188,6 +2771,8 @@ class RunCoordinator:
                 )
                 frozen_binding = {
                     "workspace_root": workspace_root,
+                    "agents_instructions": agents_instructions,
+                    "agents_instruction_sources": agents_instruction_sources,
                     "model_connection_id": connection.id,
                     "provider": connection.provider,
                     "base_url": connection.base_url,
@@ -2205,7 +2790,56 @@ class RunCoordinator:
                     "custom_headers_digest": _configuration_digest(connection.custom_headers or {}),
                 }
 
-            delegate_catalog_prompt = "" if frozen_binding.get("delegation_version") else _delegate_catalog_prompt(db)
+            delegate_catalog_prompt = "" if frozen_binding.get("delegation_version") else _delegate_catalog_prompt(db, run)
+            terminal_background_job_ids: list[str] = []
+            if not frozen_binding.get("delegation_version"):
+                delegate_catalog_prompt += recovery_prompt(db, run)
+            if {"background_run", "check_background"}.issubset(set(allowed_tool_names)):
+                delegate_catalog_prompt += (
+                    "\n后台作业规则：耗时下载、安装或构建可先调用 background_run，随后继续完成不依赖其结果的工作；"
+                    "后台作业入队不代表任务完成。若最终候选结果产生时作业仍在运行，运行时会暂停并由终态事件自动恢复；"
+                    "仅在需要主动查看中间日志时调用 check_background，不要反复轮询。\n"
+                )
+                background_ownership = (
+                    BackgroundJob.run_id == run.id
+                    if frozen_binding.get("delegation_version")
+                    else BackgroundJob.session_id == (session.id if session else None)
+                )
+                active_background_jobs = list(db.scalars(
+                    select(BackgroundJob).where(
+                        background_ownership,
+                        BackgroundJob.status.in_({"queued", "running"}),
+                    ).order_by(BackgroundJob.created_at.asc())
+                )) if session is not None else []
+                if active_background_jobs:
+                    delegate_catalog_prompt += "\n本会话仍在运行的后台作业：\n" + "\n".join(
+                        f"- id={job.id} status={job.status} command={_single_line(job.command, limit=240)}"
+                        for job in active_background_jobs
+                    ) + "\n可继续其他独立工作；无需询问它们是否完成。\n"
+                terminal_background_jobs = list(db.scalars(
+                    select(BackgroundJob).where(
+                        background_ownership,
+                        BackgroundJob.status.in_({"completed", "failed", "cancelled"}),
+                        BackgroundJob.observed_at.is_(None),
+                    ).order_by(BackgroundJob.created_at.asc())
+                )) if session is not None else []
+                if terminal_background_jobs:
+                    terminal_background_job_ids = [job.id for job in terminal_background_jobs]
+                    terminal_payloads = []
+                    for job in terminal_background_jobs:
+                        terminal_payloads.append({
+                            "id": job.id,
+                            "status": job.status,
+                            "exit_code": job.exit_code,
+                            "output": job.output_preview,
+                            "error": job.error,
+                        })
+                    delegate_catalog_prompt += (
+                        "\n<background-task-events>\n"
+                        "以下是运行时推送的后台终态事件；直接使用这些结果继续任务，不要再次轮询。\n"
+                        + json.dumps(terminal_payloads, ensure_ascii=False)[:20_000]
+                        + "\n</background-task-events>\n"
+                    )
 
             context = {
                 "system_prompt": effective_system_prompt,
@@ -2215,7 +2849,7 @@ class RunCoordinator:
                 # exposing child prompts, credentials, or workspaces.
                 "agent_instructions": delegate_catalog_prompt,
                 "permission_policy": f"permission_mode={permission_mode}",
-                "workspace_rules": f"仅访问工作区：{workspace_root}",
+                "workspace_rules": render_workspace_rules(workspace_root, agents_instructions),
                 "recent_messages": messages,
                 "mode": "auto",
                 "workspace_root": workspace_root,
@@ -2249,14 +2883,48 @@ class RunCoordinator:
                 permission_mode=str(context["permission_mode"]),
             )
 
+        background_store = BackgroundJobToolStore(
+            run_id=run_id,
+            workspace_id=workspace.id,
+            session_id=session.id if session else None,
+            workspace_root=context["workspace_root"],
+            include_session_jobs=not bool(context["runtime_binding"].get("delegation_version")),
+        )
+        background_store.track_terminal_deliveries(terminal_background_job_ids)
+        delegated_teammate_id = str(context["runtime_binding"].get("teammate_id") or "")
+        team_store = (
+            TeamToolStore(
+                run_id=str(context["runtime_binding"].get("parent_run_id") or run_id),
+                session_id=session.id if session else None,
+                workspace_root=context["workspace_root"],
+                actor_worker_id=delegated_teammate_id or None,
+            )
+            if not context["runtime_binding"].get("delegation_version") or delegated_teammate_id
+            else None
+        )
+        task_store = None if context["runtime_binding"].get("delegation_version") else TaskGraphToolStore(
+            run_id=run_id
+        )
         registry = create_default_registry(
             context["workspace_root"],
             allowed_tool_names=context["allowed_tool_names"],
             permission_mode=context["permission_mode"],
             skill_instructions=context["skill_instructions"],
             todo_state=context["todo_state"],
+            todo_change_sink=(
+                (lambda todos, key=run_id: sync_todos_for_run(key, todos))
+                if not context["runtime_binding"].get("delegation_version") else None
+            ),
+            memory_store=MemoryToolStore(
+                workspace_id=workspace.id,
+                session_id=session.id if session else None,
+            ),
+            background_store=background_store,
+            team_store=team_store,
+            task_store=task_store,
             task_delegate=task_delegate,
         )
+        context["background_store"] = background_store
         coordinator.register_tool_canceller(run_id, registry.cancel_active)
         runtime = AgentRuntime(
             model_call=build_model_call(context["provider"]),
@@ -2367,14 +3035,20 @@ class RunCoordinator:
         child_name = _single_line(child.name, limit=120) if child is not None else "Child Agent"
         public_binding = _SubagentTaskDelegate._public_binding(binding) if binding else {}
         safe_pending = _SubagentTaskDelegate._safe_pending_summary(pending_approval)
+        linked_plan_step = db.get(PlanStep, task.plan_step_id) if task.plan_step_id else None
+        waiting_background = status == "stopped" and stop_reason == "waiting_background"
+        public_status = "waiting_background" if waiting_background else status
         payload = {
             "task_id": task.id,
             "delegation_id": task.id,
             "child_run_id": run.id,
             "parent_run_id": link["parent_run_id"],
             "parent_session_id": run.session_id or link.get("parent_session_id"),
+            "plan_step_id": task.plan_step_id,
+            "plan_step_external_id": linked_plan_step.external_id if linked_plan_step is not None else None,
+            "teammate_id": task.teammate_id,
             "agent": {"id": child_id, "name": child_name},
-            "status": status,
+            "status": public_status,
             "output": str(output or "")[:_DELEGATE_OUTPUT_LIMIT],
             "output_truncated": len(str(output or "")) > _DELEGATE_OUTPUT_LIMIT,
             "stop_reason": _single_line(stop_reason, limit=200),
@@ -2387,7 +3061,7 @@ class RunCoordinator:
             "usage": normalize_usage(usage),
             "binding": public_binding,
         }
-        task_status = "in_progress" if status == "awaiting_approval" else (
+        task_status = "in_progress" if status == "awaiting_approval" or waiting_background else (
             "completed" if status == "completed" else "blocked"
         )
         changed = (
@@ -2397,6 +3071,34 @@ class RunCoordinator:
         if changed:
             task.status = task_status
             task.result = payload
+        worker = db.get(TeammateWorker, task.teammate_id) if task.teammate_id else None
+        if worker is not None:
+            if status == "awaiting_approval" or waiting_background:
+                worker.status = "working"
+            elif status == "completed":
+                worker.status = "stopped" if worker.status == "stopping" else "idle"
+                worker.current_plan_step_id = None
+            else:
+                # Assignment failure is durable history, not destruction of
+                # the reusable teammate identity. A later graph step may
+                # safely assign the same teammate again.
+                worker.status = "stopped" if worker.status == "stopping" else "idle"
+                worker.current_plan_step_id = None
+            worker.last_run_id = run.id
+        if task.plan_step_id:
+            plan_step = linked_plan_step or db.get(PlanStep, task.plan_step_id)
+            if plan_step is not None and status in {"completed", "failed", "stopped"} and not waiting_background:
+                plan_step.status = "completed" if status == "completed" else "failed"
+                plan_step.result = str(output or "")
+                plan_step.error = None if status == "completed" else str(error or stop_reason or status)
+                plan_step.remaining_work = [] if status == "completed" else list(
+                    plan_step.remaining_work or [plan_step.title]
+                )
+                if status == "completed":
+                    plan_step.completed_work = list(plan_step.completed_work or [plan_step.title])
+                plan_step.completed_at = _utcnow()
+                plan_step.assigned_run_id = run.id
+                refresh_task_state(db, plan_step.task_id)
 
         event_type = {
             "awaiting_approval": "delegated_child_awaiting_approval",
@@ -2404,8 +3106,34 @@ class RunCoordinator:
             "stopped": "delegated_child_stopped",
             "failed": "delegated_child_failed",
         }.get(status, "delegated_child_incomplete")
+        if waiting_background:
+            event_type = "delegated_child_waiting_background"
+        if changed:
+            db.add(CollaborationEvent(
+                task_id=linked_plan_step.task_id if linked_plan_step is not None else None,
+                plan_step_id=task.plan_step_id,
+                run_id=link["parent_run_id"] or None,
+                source_kind="delegated_child",
+                source_id=run.id,
+                event_type=event_type,
+                payload=payload,
+            ))
+            if worker is not None and status in {"completed", "failed", "stopped"} and not waiting_background:
+                worker_message = CollaborationMessage(
+                    team_id=worker.team_id,
+                    sender_worker_id=worker.id,
+                    recipient_worker_id=None,
+                    message_type="task_result",
+                    content=str(output or error or stop_reason or status)[:20_000],
+                    payload={
+                        "delegation_id": task.id,
+                        "plan_step_id": task.plan_step_id,
+                        "status": status,
+                    },
+                )
+                db.add(worker_message)
         continuation_queued = False
-        if status in {"completed", "failed", "stopped"} and link["parent_run_id"]:
+        if status in {"completed", "failed", "stopped"} and not waiting_background and link["parent_run_id"]:
             # A parallel parent must resume only after every child that paused
             # for approval has reached a terminal state.  At the point the
             # parent is stopped for delegated approval, any remaining
@@ -2427,7 +3155,7 @@ class RunCoordinator:
             if (
                 parent is not None
                 and parent.status == "stopped"
-                and parent.stop_reason == "delegated_child_awaiting_approval"
+                and parent.stop_reason in {"delegated_child_awaiting_approval", "delegated_child_waiting_event"}
                 and stop_reason not in USER_INTERRUPT_REASONS
                 and waiting_sibling_id is None
             ):
@@ -2435,6 +3163,11 @@ class RunCoordinator:
                 parent.stop_reason = None
                 parent.error_message = None
                 parent.finished_at = None
+                if parent.task_id:
+                    parent_task = db.get(DurableTask, parent.task_id)
+                    if parent_task is not None and parent_task.status == "waiting":
+                        parent_task.status = "running"
+                        parent_task.resume_summary = "A delegated child terminal event arrived; resume coordination."
                 continuation_queued = True
                 db.add(RunEvent(
                     run_id=parent.id,
@@ -2497,7 +3230,11 @@ class RunCoordinator:
         )
 
     @staticmethod
-    def _persist_outcome(run_id: str, outcome: RunOutcome) -> None:
+    def _persist_outcome(
+        run_id: str,
+        outcome: RunOutcome,
+        consumed_background_event_ids: Iterable[str] = (),
+    ) -> None:
         event_error_type = next(
             (
                 str(event.get("error_type") or event.get("error_code") or event.get("code") or "")
@@ -2554,6 +3291,7 @@ class RunCoordinator:
             }
         persisted = False
         parent_bridge_event: dict[str, Any] | None = None
+        extraction_job_id: str | None = None
         with database_module.SessionLocal() as db:
             # Serialize this persistence path against ``stop()``.  Whichever
             # conditional row update claims the run first owns the lifecycle
@@ -2616,6 +3354,7 @@ class RunCoordinator:
                 run.finished_at = _utcnow()
             else:
                 run.finished_at = None
+            transition_run_task(db, run, status=effective_status, stop_reason=effective_stop_reason)
             sync_turn_progress(db, run)
             db.add(RunEvent(run_id=run_id, event_type="runtime_snapshot", payload=snapshot))
 
@@ -2732,6 +3471,49 @@ class RunCoordinator:
                     if terminal_reasoning else None
                 ),
             )
+            if (
+                effective_status == "completed"
+                and turn is not None
+                and run.session_id
+                and not outcome.runtime_binding.get("delegation_version")
+                and str(outcome.output or "").strip()
+            ):
+                existing_job = db.scalar(select(MemoryJob).where(
+                    MemoryJob.run_id == run.id,
+                    MemoryJob.kind == "extract",
+                ))
+                if existing_job is None:
+                    user_message = db.get(ChatMessage, turn.user_message_id) if turn.user_message_id else None
+                    candidate_job = MemoryJob(
+                        run_id=run.id,
+                        session_id=run.session_id,
+                        workspace_id=run.workspace_id,
+                        kind="extract",
+                        status="pending",
+                        payload={
+                            "turn_id": turn.id,
+                            "user_request": user_message.content if user_message is not None else "",
+                            "assistant_response": str(outcome.output or "").strip(),
+                            "tool_observations": [
+                                str(message.get("content") or "")[:1_500]
+                                for message in (outcome.transcript_delta or outcome.messages)
+                                if isinstance(message, Mapping) and message.get("role") == "tool"
+                            ][-8:],
+                            "runtime_binding": dict(outcome.runtime_binding or {}),
+                        },
+                    )
+                    try:
+                        with db.begin_nested():
+                            db.add(candidate_job)
+                            db.flush()
+                        existing_job = candidate_job
+                    except IntegrityError:
+                        existing_job = db.scalar(select(MemoryJob).where(
+                            MemoryJob.run_id == run.id,
+                            MemoryJob.kind == "extract",
+                        ))
+                if existing_job is not None:
+                    extraction_job_id = existing_job.id
             if run.session_id:
                 session = db.get(Session, run.session_id)
                 if session is not None:
@@ -2754,6 +3536,28 @@ class RunCoordinator:
                             max(0, int(prepared.get("estimated_tokens") or 0)),
                             settings.context_limit_tokens,
                         )
+            background_event_ids = sorted({
+                str(job_id) for job_id in consumed_background_event_ids if str(job_id)
+            })
+            if background_event_ids:
+                consumed_at = _utcnow()
+                db.execute(
+                    update(BackgroundJob)
+                    .where(
+                        BackgroundJob.id.in_(background_event_ids),
+                        BackgroundJob.observed_at.is_(None),
+                    )
+                    .values(observed_at=consumed_at, observed_by_run_id=run_id)
+                )
+                db.execute(
+                    update(CollaborationEvent)
+                    .where(
+                        CollaborationEvent.source_kind == "background_job",
+                        CollaborationEvent.source_id.in_(background_event_ids),
+                        CollaborationEvent.consumed_at.is_(None),
+                    )
+                    .values(consumed_at=consumed_at, consumer_run_id=run_id)
+                )
             db.commit()
             persisted = True
         if persisted and publish_event is not None:
@@ -2764,6 +3568,10 @@ class RunCoordinator:
                 run_stream_broker.publish(parent_run_id, parent_bridge_event)
         if persisted:
             coordinator.launch_parent_continuation_if_queued(parent_bridge_event)
+            if effective_status == "stopped" and effective_stop_reason == "waiting_background":
+                coordinator.reconcile_waiting_background_runs()
+            if extraction_job_id:
+                coordinator.launch_memory_job(extraction_job_id)
             RunCoordinator._clear_stream_buffer(run_id)
         coordinator.unregister_tool_canceller(run_id)
 
@@ -2789,7 +3597,11 @@ class RunCoordinator:
                 **dict(context["runtime_binding"]),
                 **runtime.tool_registry.runtime_state(),
             }
-            self._persist_outcome(run_id, outcome)
+            self._persist_outcome(
+                run_id,
+                outcome,
+                context["background_store"].delivered_terminal_ids(),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2812,16 +3624,44 @@ class RunCoordinator:
                 raise RuntimeError("运行快照缺少冻结配置，已拒绝在可变环境中续跑")
             runtime, context = self._resolve_runtime(run_id, runtime_binding=prior.runtime_binding)
             self._install_completion_verifier(runtime, context)
-            outcome = await runtime.resume_after_approval(
-                prior,
-                thread_id=run_id,
-                runtime_context=context,
-            )
+            if prior.stop_reason == "waiting_background":
+                outcome = await runtime.run(
+                    system_prompt=context["system_prompt"],
+                    agent_instructions=context["agent_instructions"],
+                    workspace_rules=context["workspace_rules"],
+                    recent_messages=[],
+                    mode=prior.mode,
+                    thread_id=run_id,
+                    prepared_messages=prior.messages,
+                    prior_events=prior.events,
+                    guard_snapshot=prior.guard_snapshot,
+                    prior_usage=prior.usage,
+                    prior_active_elapsed_seconds=prior.active_elapsed_seconds,
+                    compaction_state=prior.compaction_state,
+                    permission_policy=context.get("permission_policy"),
+                    session_id=context.get("session_id"),
+                    context_sequence=int(context.get("context_sequence") or 0),
+                    artifact_refs=prior.artifact_refs,
+                    transcript_delta=prior.transcript_delta or [],
+                    prior_verification_trace=prior.verification_trace,
+                    prior_completion_verification_attempts=prior.completion_verification_attempts,
+                    prior_acceptance_report=prior.acceptance_report,
+                )
+            else:
+                outcome = await runtime.resume_after_approval(
+                    prior,
+                    thread_id=run_id,
+                    runtime_context=context,
+                )
             outcome.runtime_binding = {
                 **dict(context["runtime_binding"]),
                 **runtime.tool_registry.runtime_state(),
             }
-            self._persist_outcome(run_id, outcome)
+            self._persist_outcome(
+                run_id,
+                outcome,
+                context["background_store"].delivered_terminal_ids(),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2855,7 +3695,11 @@ class RunCoordinator:
                 **dict(context["runtime_binding"]),
                 **runtime.tool_registry.runtime_state(),
             }
-            self._persist_outcome(run_id, outcome)
+            self._persist_outcome(
+                run_id,
+                outcome,
+                context["background_store"].delivered_terminal_ids(),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2866,16 +3710,84 @@ class RunCoordinator:
         """Attach the main-agent-only completion gate to a resolved runtime."""
 
         binding = context.get("runtime_binding")
-        if isinstance(binding, Mapping) and binding.get("delegation_version"):
-            # Child agents never produce the user-facing final answer. Their
-            # settled task observation is part of the parent's gated trace.
-            runtime.completion_verifier = None
-            return
+        background_store = context.get("background_store")
         runtime.config.max_completion_verification_attempts = max(
             1,
             int(settings.completion_verification_max_attempts or 1),
         )
-        runtime.completion_verifier = decide_deterministic_completion
+        if isinstance(binding, Mapping) and binding.get("delegation_version"):
+            # Child agents never produce the user-facing final answer. Their
+            # settled task observation is part of the parent's gated trace.
+            if background_store is None:
+                runtime.completion_verifier = None
+            else:
+                def verify_child_background(_candidate: Mapping[str, Any]) -> CompletionDecision:
+                    active = background_store.active_jobs()
+                    if active:
+                        registered = background_store.register_waiter()
+                        if registered:
+                            return CompletionDecision(
+                                False,
+                                "后台作业仍在运行；本次执行将暂停，并在终态事件到达后自动恢复。",
+                                {"background_jobs": [
+                                    {"id": item["id"], "status": item["status"]} for item in active
+                                    if item["id"] in registered
+                                ]},
+                                defer_until_event=True,
+                            )
+                    terminal_results = background_store.observe_terminal_results()
+                    if terminal_results:
+                        return CompletionDecision(
+                            False,
+                            "后台作业已结束。请根据以下终态事件完成当前子任务：\n"
+                            + json.dumps(terminal_results, ensure_ascii=False)[:8_000],
+                            {"background_jobs": [
+                                {"id": item["id"], "status": item["status"]} for item in terminal_results
+                            ]},
+                        )
+                    return CompletionDecision(True, "子 Agent 后台作业均已结束并读取")
+
+                runtime.completion_verifier = verify_child_background
+            return
+        if background_store is None:
+            runtime.completion_verifier = decide_deterministic_completion
+            return
+
+        def verify(candidate: Mapping[str, Any]):
+            decision = decide_deterministic_completion(candidate)
+            active = background_store.active_jobs() if background_store is not None else []
+            if decision.accepted and active:
+                registered = background_store.register_waiter()
+                if registered:
+                    decision.accepted = False
+                    decision.defer_until_event = True
+                    decision.reason = "后台作业仍在运行；本次执行将暂停，并在终态事件到达后自动恢复。"
+                    decision.report = {
+                        **dict(decision.report or {}),
+                        "background_jobs": [
+                            {"id": item["id"], "status": item["status"]} for item in active
+                            if item["id"] in registered
+                        ],
+                    }
+                else:
+                    active = []
+            if decision.accepted and not active and background_store is not None:
+                terminal_results = background_store.observe_terminal_results()
+                if terminal_results:
+                    decision.accepted = False
+                    decision.reason = (
+                        "后台作业已结束。请根据以下终态事件更新结论，不需要再次轮询：\n"
+                        + json.dumps(terminal_results, ensure_ascii=False)[:8_000]
+                    )
+                    decision.report = {
+                        **dict(decision.report or {}),
+                        "background_jobs": [
+                            {"id": item["id"], "status": item["status"]} for item in terminal_results
+                        ],
+                    }
+            return decision
+
+        runtime.completion_verifier = verify
 
     @staticmethod
     def _persist_failure(run_id: str, error: BaseException) -> None:
@@ -2927,6 +3839,7 @@ class RunCoordinator:
             run.error_code = normalized_error_code
             run.error_message = safe_error_message
             run.finished_at = _utcnow()
+            transition_run_task(db, run, status="failed")
             db.add(RunEvent(
                 run_id=run_id,
                 event_type="integration_failed",

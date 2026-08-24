@@ -823,6 +823,7 @@ class AgentRuntime:
             }
 
         async def act_node(state: RunGraphState) -> RunGraphState:
+            nonlocal active_started_at
             time_decision = self._run_time_decision(active_elapsed_base, active_started_at)
             if time_decision.stop:
                 stopped = self._stop_state(state, time_decision)
@@ -1126,6 +1127,27 @@ class AgentRuntime:
                         failure_reason=_safe_event_text(decision.reason) if not decision.accepted else "",
                     )
                     if not decision.accepted:
+                        if decision.defer_until_event:
+                            reason = str(decision.reason or "Waiting for an external task event")
+                            stopped = {
+                                **state,
+                                "status": "stopped",
+                                "messages": [
+                                    item for item in state.get("messages", [])
+                                    if not str(item.get("content") or "").startswith("[内部验收反馈")
+                                ],
+                                "stop_reason": "waiting_background",
+                                "error": reason,
+                                "output": None,
+                            }
+                            stopped["events"] = await self._publish(
+                                stopped,
+                                "run_stopped",
+                                code="waiting_background",
+                                reason=reason,
+                                attempts=attempt,
+                            )
+                            return stopped
                         limit = max(1, int(self.config.max_completion_verification_attempts or 1))
                         if attempt >= limit:
                             reason = f"候选结果连续 {attempt} 次未通过验收，详见验收报告"
@@ -1409,6 +1431,12 @@ class AgentRuntime:
                         return stopped
                     return waiting
 
+                background_wait_seconds = max(
+                    0.0,
+                    float(result.metadata.get("background_wait_seconds") or 0.0),
+                )
+                active_started_at += background_wait_seconds
+
                 tool_message, artifact_refs = self._prepare_tool_result_message(
                     tool_call_id=call.id,
                     tool_name=call.name,
@@ -1451,18 +1479,23 @@ class AgentRuntime:
                         continue
                     child_run_id = str(result.metadata.get("child_run_id") or "")
                     task_id = str(result.metadata.get("task_id") or "")
-                    reason = "A delegated child run is awaiting user approval."
+                    waiting_event = bool(result.metadata.get("delegated_child_waiting_event"))
+                    stop_reason = "delegated_child_waiting_event" if waiting_event else "delegated_child_awaiting_approval"
+                    reason = (
+                        "A delegated child run is waiting for a background terminal event."
+                        if waiting_event else "A delegated child run is awaiting user approval."
+                    )
                     stopped = {
                         **state,
                         "status": "stopped",
                         "messages": messages,
-                        "stop_reason": "delegated_child_awaiting_approval",
+                        "stop_reason": stop_reason,
                         "error": reason,
                     }
                     stopped["events"] = await self._publish(
                         stopped,
                         "run_stopped",
-                        code="delegated_child_awaiting_approval",
+                        code=stop_reason,
                         reason=reason,
                         child_run_id=child_run_id,
                         task_id=task_id,
@@ -1513,18 +1546,26 @@ class AgentRuntime:
                     }
                     for result in parallel_child_waits
                 ]
-                reason = "One or more delegated child runs are awaiting user approval."
+                waiting_event = any(
+                    bool(result.metadata.get("delegated_child_waiting_event"))
+                    for result in parallel_child_waits
+                )
+                stop_reason = "delegated_child_waiting_event" if waiting_event else "delegated_child_awaiting_approval"
+                reason = (
+                    "One or more delegated child runs are waiting for background terminal events."
+                    if waiting_event else "One or more delegated child runs are awaiting user approval."
+                )
                 stopped = {
                     **state,
                     "status": "stopped",
                     "messages": messages,
-                    "stop_reason": "delegated_child_awaiting_approval",
+                    "stop_reason": stop_reason,
                     "error": reason,
                 }
                 stopped["events"] = await self._publish(
                     stopped,
                     "run_stopped",
-                    code="delegated_child_awaiting_approval",
+                    code=stop_reason,
                     reason=reason,
                     waiting_children=waiting_children,
                     elapsed_ms=round((self.clock() - active_started_at) * 1000),
@@ -1740,11 +1781,16 @@ class AgentRuntime:
         if result.metadata.get("delegated_child_awaiting_approval"):
             child_run_id = str(result.metadata.get("child_run_id") or "")
             task_id = str(result.metadata.get("task_id") or "")
-            reason = "A delegated child run is awaiting user approval."
+            waiting_event = bool(result.metadata.get("delegated_child_waiting_event"))
+            stop_reason = "delegated_child_waiting_event" if waiting_event else "delegated_child_awaiting_approval"
+            reason = (
+                "A delegated child run is waiting for a background terminal event."
+                if waiting_event else "A delegated child run is awaiting user approval."
+            )
             events = await self._publish(
                 {"events": events},
                 "run_stopped",
-                code="delegated_child_awaiting_approval",
+                code=stop_reason,
                 reason=reason,
                 child_run_id=child_run_id,
                 task_id=task_id,
@@ -1758,7 +1804,7 @@ class AgentRuntime:
                 steps=restored.steps,
                 tool_calls=restored.calls,
                 mode=prior.mode,
-                stop_reason="delegated_child_awaiting_approval",
+                stop_reason=stop_reason,
                 error=reason,
                 guard_snapshot=restored.snapshot(),
                 usage=normalize_usage(prior.usage),
@@ -1921,11 +1967,16 @@ class AgentRuntime:
             if remaining_result.metadata.get("delegated_child_awaiting_approval"):
                 child_run_id = str(remaining_result.metadata.get("child_run_id") or "")
                 task_id = str(remaining_result.metadata.get("task_id") or "")
-                reason = "A delegated child run is awaiting user approval."
+                waiting_event = bool(remaining_result.metadata.get("delegated_child_waiting_event"))
+                stop_reason = "delegated_child_waiting_event" if waiting_event else "delegated_child_awaiting_approval"
+                reason = (
+                    "A delegated child run is waiting for a background terminal event."
+                    if waiting_event else "A delegated child run is awaiting user approval."
+                )
                 events = await self._publish(
                     {"events": events},
                     "run_stopped",
-                    code="delegated_child_awaiting_approval",
+                    code=stop_reason,
                     reason=reason,
                     child_run_id=child_run_id,
                     task_id=task_id,
@@ -1939,7 +1990,7 @@ class AgentRuntime:
                     steps=restored.steps,
                     tool_calls=restored.calls,
                     mode=prior.mode,
-                    stop_reason="delegated_child_awaiting_approval",
+                    stop_reason=stop_reason,
                     error=reason,
                     guard_snapshot=restored.snapshot(),
                     usage=normalize_usage(prior.usage),
@@ -2124,7 +2175,7 @@ class AgentRuntime:
 
         if (
             prior.status != "stopped"
-            or prior.stop_reason != "delegated_child_awaiting_approval"
+            or prior.stop_reason not in {"delegated_child_awaiting_approval", "delegated_child_waiting_event"}
         ):
             raise ValueError("only a parent stopped for a delegated child can continue")
         if self.config.max_run_seconds is not None and self.config.max_run_seconds < 0:

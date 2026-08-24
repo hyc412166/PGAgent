@@ -83,6 +83,7 @@ SIDE_EFFECT_OR_NETWORK_TOOLS: Final[frozenset[str]] = frozenset(
         "read_inbox",
         "broadcast",
         "shutdown_request",
+        "integrate_teammate",
         "plan_approval",
         "TeamCreate",
         "TeamDelete",
