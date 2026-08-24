@@ -53,7 +53,7 @@ import { fallbackMarketCategories, leaderboardRefreshDelayMs, marketCategoryDefi
 import { buildDraftLaunchPayload, createDraftIdempotencyKey, createTurnIdempotencyKey } from './draftLaunch'
 import { availableConnectionModels, resolveEffectiveModelSettings } from './modelSettings'
 import { buildSessionNavigation, folderName, isDefaultWorkspace, projectRootForSession } from './sessionNavigation'
-import { appendAssistantDelta, hasPersistedRunReply, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems, type RunStreamEvent } from './sessionStream'
+import { appendAssistantDelta, hasPersistedRunReply, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStreamPhase, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems, type RunStreamEvent } from './sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, pickThinkingStatus, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline, type ThoughtTimelineState } from './thoughtTimeline'
 import { ThoughtHydrationRegistry, type ThoughtHydrationToken } from './thoughtHydration'
 import { usageDateKey, usageDateOptions, usageDatePresetBounds, usageDateRange, usageRangeLabel, type QuickUsageDatePreset, type UsageDatePreset } from './usageDateRange'
@@ -68,13 +68,17 @@ import type {
   Connection,
   DashboardData,
   DelegatedTask,
+  DurableTask,
   Health,
   Message,
+  MemoryRecord,
+  PersonalizationSettings,
   Run,
   RunEvent,
   RunUsage,
   Session,
   SessionContext,
+  Teammate,
   ThinkingLevel,
   UsageBreakdownItem,
   UsageSession,
@@ -106,13 +110,42 @@ type ProjectHoverCard = { id: string; name: string; path: string; conversationCo
 type DraftSessionSettings = { model_connection_id: string | null; model_id: string | null; thinking_level: ThinkingLevel; skill_ids: string[]; permission_mode: PermissionMode }
 type DraftLaunchResponse = { session: Session; run: Run; workspace?: Workspace }
 type ComposerTextAreaHandle = { getValue: () => string; clear: () => void; setValue: (value: string) => void; focus: () => void }
+type MemoryRecall = { message_id: string; session_id: string; turn_id?: string; request: string; memories: Array<{ id: string; name?: string; memory_type?: string }>; created_at?: string }
 
 const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'medium', skill_ids: [], permission_mode: 'smart' }
 const emptyDraftContext: SessionContext = { used_tokens: 0, limit_tokens: 100_000, compact_threshold_tokens: 90_000, percent: 0 }
 const noDelegatedTasks: DelegatedTask[] = []
+const noTeammates: Teammate[] = []
 
 function emptyLiveRun(): LiveRunState {
   return { runId: '', phase: '', draft: '', status: 'idle', error: '', thought: emptyThoughtTimeline, thinkingStatus: '' }
+}
+
+const taskStatusLabels: Record<string, string> = {
+  planning: '正在规划',
+  running: '执行中',
+  paused: '已暂停',
+  needs_recovery: '需要恢复核验',
+  blocked: '等待处理',
+}
+
+function DurableTaskCard({ task, onResume }: { task: DurableTask; onResume: () => void }) {
+  const resumable = task.status === 'paused' || task.status === 'needs_recovery' || task.status === 'blocked'
+  return <article className={`durable-task-card task-${task.status}`}>
+    <header>
+      <span className="durable-task-mark"><Workflow size={15} /></span>
+      <div><small>持久化任务</small><strong>{task.goal}</strong></div>
+      <StatusBadge status={taskStatusLabels[task.status] || task.status} />
+    </header>
+    <ol className="durable-plan-track">
+      {task.steps.map((step) => <li key={step.id} className={`step-${step.status}`}>
+        <span className="plan-step-node">{step.status === 'completed' ? <Check size={11} /> : step.position}</span>
+        <div><strong>{step.title}</strong><span className="durable-step-meta">{step.executor_kind === 'subagent' ? '子 Agent' : step.executor_kind === 'background' ? '后台' : '主 Agent'}{step.depends_on?.length ? ` · 依赖 ${step.depends_on.join(', ')}` : ' · 可立即执行'}{step.workspace_mode === 'worktree' ? ' · 独立 worktree' : ''}</span>{step.next_action && step.status !== 'completed' ? <small>{step.next_action}</small> : null}</div>
+      </li>)}
+    </ol>
+    {task.resume_summary ? <p className="durable-task-summary">{task.resume_summary}</p> : null}
+    {resumable ? <button type="button" className="durable-task-resume" onClick={onResume}><Play size={12} />继续此任务</button> : null}
+  </article>
 }
 
 const runStreamEventNames = [
@@ -144,9 +177,11 @@ const runStreamEventNames = [
   'delegated_child_started',
   'delegated_child_continuation_started',
   'delegated_child_awaiting_approval',
+  'delegated_child_waiting_background',
   'delegated_child_completed',
   'delegated_child_stopped',
   'delegated_child_failed',
+  'background_continuation_started',
   'run_completed',
   'run_interrupted',
   'run_stopped',
@@ -256,6 +291,8 @@ const navigation = [
   { path: '/runs', label: '运行记录', icon: History },
   { path: '/usage', label: '用量统计', icon: ChartNoAxesCombined },
   { path: '/settings/models', label: '模型设置', icon: Settings2 },
+  { path: '/settings/personalization', label: '个性化', icon: Sparkles },
+  { path: '/settings/memories', label: '持久记忆', icon: Database },
   { path: '/settings/appearance', label: '界面设置', icon: Type },
 ]
 
@@ -350,6 +387,8 @@ function AppShell() {
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/usage" element={<UsagePage />} />
           <Route path="/settings/models" element={<ModelsPage />} />
+          <Route path="/settings/personalization" element={<PersonalizationPage />} />
+          <Route path="/settings/memories" element={<MemoriesPage />} />
           <Route path="/settings/appearance" element={<AppearanceSettingsPage fontScale={fontScale} onFontScaleChange={setFontScale} />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
@@ -903,6 +942,13 @@ function SessionsPage() {
       items: await api.list<DelegatedTask>(`/api/sessions/${encodeURIComponent(activeId)}/delegations`, ['delegations']),
     }
   }, [activeId])
+  const teammates = useApiData<Teammate[]>([], () => activeId
+    ? api.list<Teammate>(`/api/sessions/${encodeURIComponent(activeId)}/teammates`, ['teammates'])
+    : Promise.resolve([]), [activeId])
+  const durableTask = useApiData<DurableTask | null>(null, () => activeId
+    ? api.get<DurableTask | null>(`/api/sessions/${encodeURIComponent(activeId)}/active-task`)
+    : Promise.resolve(null), [activeId])
+  const refreshDurableTask = durableTask.refresh
   const context = useApiData<SessionContext | null>(null, () => activeId ? api.get<SessionContext>(`/api/sessions/${activeId}/context`) : Promise.resolve(null), [activeId])
   const activeSession = sessions.data.find((item) => stringId(item.id) === activeId)
   const activeAgent = agents.data.find((item) => item.id === activeSession?.agent_id)
@@ -916,9 +962,13 @@ function SessionsPage() {
   // actionable in this very conversation instead of hidden behind a parent
   // run that has already stopped for the child.
   const activeRun = sessionRuns.find((item) => item.status === 'awaiting_approval')
+    ?? sessionRuns.find((item) => isResumableWaitingRun(item))
     ?? sessionRuns.find((item) => activeRunStatuses.has(item.status || ''))
     ?? sessionRuns[0]
   const activeRunId = activeRun?.id || ''
+  const activeRunCanStream = Boolean(activeRun && (
+    activeRunStatuses.has(activeRun.status || '') || isResumableWaitingRun(activeRun)
+  ))
   // `sending` only covers the initial launch request. Once the request has
   // returned, the run is still active while its SSE stream/fallback polling
   // is working. Keep the composer action bound to that run so users can
@@ -927,17 +977,13 @@ function SessionsPage() {
     liveRun.runId
       && (
         ['connecting', 'live', 'fallback', 'awaiting_approval'].includes(liveRun.status)
-        || (
-          sessionRuns.some((item) => item.id === liveRun.runId
-            && item.status === 'stopped'
-            && item.stop_reason === 'delegated_child_awaiting_approval')
-        )
+        || sessionRuns.some((item) => item.id === liveRun.runId && isResumableWaitingRun(item))
       ),
   )
   const activeRunIsInterruptible = Boolean(
     liveRun.status !== 'terminal'
       && activeRunId
-      && activeRunStatuses.has(activeRun?.status || ''),
+      && activeRunCanStream,
   )
   const interruptibleRunId = liveRunIsActive ? liveRun.runId : activeRunIsInterruptible ? activeRunId : ''
   const canInterrupt = Boolean(interruptibleRunId)
@@ -979,6 +1025,7 @@ function SessionsPage() {
     .map(([runId, timeline]) => `${runId}:${timeline.elapsedMs}:${timeline.tools.length}:${timeline.items?.length ?? 0}`)
     .join('|')
   const visibleChildTasks = childTasks.data.ownerSessionId === activeId ? childTasks.data.items : noDelegatedTasks
+  const visibleTeammates = activeId ? teammates.data : noTeammates
   const sessionNavigation = buildSessionNavigation(workspaces.data, sessions.data)
   const activeChildTask = visibleChildTasks.find((task) => task.id === selectedChildTaskId) ?? visibleChildTasks[0]
   const childTaskRunId = stringId(activeChildTask?.child_run_id) || stringId(activeChildTask?.result?.child_run_id)
@@ -1002,10 +1049,11 @@ function SessionsPage() {
   const refreshMessages = messages.refresh
   const refreshRuns = runs.refresh
   const refreshChildTasks = childTasks.refresh
+  const refreshTeammates = teammates.refresh
   const refreshContext = context.refresh
   const setRunsState = runs.setState
   const setApprovalsState = approvals.setState
-  const settingsLocked = activeRunStatuses.has(activeRun?.status || '') || !['idle', 'terminal'].includes(liveRun.status)
+  const settingsLocked = activeRunCanStream || !['idle', 'terminal'].includes(liveRun.status)
 
   useEffect(() => {
     if (liveRun.status !== 'terminal' || !liveRun.runId || !hasVisibleCompletedThought(liveRun.thought)) return
@@ -1299,7 +1347,7 @@ function SessionsPage() {
     }
     if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
 
-    await Promise.all([refreshRuns(), refreshContext(), refreshChildTasks(), refreshApprovalsForSession(sessionId)])
+    await Promise.all([refreshRuns(), refreshContext(), refreshChildTasks(), refreshTeammates(), refreshDurableTask(), refreshApprovalsForSession(sessionId)])
     if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
 
     const hasPersistedReply = Boolean(
@@ -1311,7 +1359,7 @@ function SessionsPage() {
     if (hasPersistedReply || (!hasDraft && !userInterruptedTerminal)) {
       setLiveRun(emptyLiveRun())
     }
-  }, [closeRunTransport, refreshApprovalsForSession, refreshChildTasks, refreshContext, refreshMessages, refreshRuns])
+  }, [closeRunTransport, refreshApprovalsForSession, refreshChildTasks, refreshContext, refreshDurableTask, refreshMessages, refreshRuns, refreshTeammates])
 
   const startRunFallback = useCallback((runId: string, sessionId = activeIdRef.current) => {
     eventSourceRef.current?.close()
@@ -1346,16 +1394,17 @@ function SessionsPage() {
         }
         if (!run || streamRunIdRef.current !== runId || activeIdRef.current !== sessionId) return
         const status = run.status || ''
+        const resumableWaiting = isResumableWaitingRun(run)
         setLiveRun((previous) => ({
           ...previous,
           runId,
-          phase: runStatusPhase(status),
-          status: status === 'awaiting_approval' ? 'awaiting_approval' : isTerminalRunStatus(status) ? 'terminal' : 'fallback',
+          phase: runStreamPhase({ type: 'run_state', status, reason: run.stop_reason }),
+          status: status === 'awaiting_approval' ? 'awaiting_approval' : isTerminalRunStatus(status) && !resumableWaiting ? 'terminal' : 'fallback',
           error: '',
         }))
         void refreshRuns()
         if (status === 'awaiting_approval') void refreshApprovalsForSession(sessionId)
-        if (isTerminalRunStatus(status)) {
+        if (isTerminalRunStatus(status) && !resumableWaiting) {
           await syncTerminalRun(runId, { type: 'run_state', status, terminal: true, error: status === 'failed' ? (run.error_message || run.stop_reason) : undefined, reason: run.stop_reason }, sessionId)
         }
       } finally {
@@ -1439,9 +1488,13 @@ function SessionsPage() {
         thought: updateThoughtTimeline(previous.thought, parsed),
       }))
       if (waitingApproval) void refreshApprovalsForSession(sessionId)
+      if (parsed.type === 'tool_finished' && ['todowrite', 'TodoWrite'].includes(String(parsed.tool_name || ''))) {
+        void refreshDurableTask()
+      }
       if (delegatedChildEvent) {
         void refreshRuns()
         void refreshChildTasks()
+        void refreshTeammates()
         setChildPanelOpen(true)
       }
       if (terminal) void syncTerminalRun(runId, parsed, sessionId)
@@ -1464,7 +1517,7 @@ function SessionsPage() {
         startRunFallback(runId, sessionId)
       }, streamErrorCountRef.current >= 3 ? 3500 : 6500)
     }
-  }, [refreshApprovalsForSession, refreshChildTasks, refreshRuns, startRunFallback, syncTerminalRun])
+  }, [refreshApprovalsForSession, refreshChildTasks, refreshDurableTask, refreshRuns, refreshTeammates, startRunFallback, syncTerminalRun])
 
   useEffect(() => {
     closeRunTransport()
@@ -1490,10 +1543,10 @@ function SessionsPage() {
   }, [activeId, refreshContext, refreshMessages, refreshRuns, startRunStream, visibleMessages])
 
   useEffect(() => {
-    if (!activeId || messages.loading || !activeRun?.id || !activeRunStatuses.has(activeRun.status || '') || liveRun.status === 'terminal') return
+    if (!activeId || messages.loading || !activeRun?.id || !activeRunCanStream || liveRun.status === 'terminal') return
     if (streamRunIdRef.current === activeRun.id) return
     startRunStream(activeRun.id, activeId)
-  }, [activeId, activeRun?.id, activeRun?.status, liveRun.status, messages.loading, startRunStream, visibleMessages])
+  }, [activeId, activeRun?.id, activeRun?.status, activeRun?.stop_reason, activeRunCanStream, liveRun.status, messages.loading, startRunStream, visibleMessages])
 
   // A newly opened history stays pinned until both messages and persisted
   // thought/tool timelines have hydrated. Programmatic layout scroll events
@@ -1596,6 +1649,7 @@ function SessionsPage() {
       void messages.refresh()
       void runs.refresh()
       void context.refresh()
+      void durableTask.refresh()
       startRunStream(launched.id, targetSessionId)
     } catch (error) {
       setLiveRun(emptyLiveRun())
@@ -1603,7 +1657,7 @@ function SessionsPage() {
       if (!draftActive && activeId) {
         // The request may have committed before the transport failed. Reload
         // durable state so an accepted turn never remains a bare user bubble.
-        void Promise.all([messages.refresh(), runs.refresh(), context.refresh()])
+        void Promise.all([messages.refresh(), runs.refresh(), context.refresh(), durableTask.refresh()])
       }
     } finally {
       sendingRef.current = false
@@ -1872,6 +1926,10 @@ function SessionsPage() {
                   return <Fragment key={message.id}>{completedThought && <CompletedThoughtTimeline runId={messageRunId} timeline={completedThought} />}<MessageBubble message={message} /></Fragment>
                 }) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
                 {!draftActive && messages.error && !!visibleMessages.length && <p className="inline-error" role="alert">消息同步失败：{messages.error}</p>}
+                {!draftActive && durableTask.data && <DurableTaskCard task={durableTask.data} onResume={() => {
+                  composerInputRef.current?.setValue('继续刚刚的工作')
+                  composerInputRef.current?.focus()
+                }} />}
                 {!draftActive && stoppedRunNotices.map((run) => <div key={`run-notice:${run.id}`} className="stopped-run-notice" role="status"><AlertCircle size={16} /><div><strong>{run.status === 'failed' ? '本次运行失败，未生成最终回复' : '本次运行已停止，未生成最终回复'}</strong><p>{run.error_message || run.stop_reason || 'Agent 未能继续执行，请调整指令后重试。'}</p></div></div>)}
                 {liveRun.status !== 'idle'
                   && (!completedThoughtsByRun[liveRun.runId] || (canEditInterrupted && liveRun.runId === interruptedRunId))
@@ -1981,6 +2039,7 @@ function SessionsPage() {
           <ChildAgentPanel
             open={childPanelOpen}
             tasks={visibleChildTasks}
+            teammates={visibleTeammates}
             loading={childTasks.loading}
             error={childTasks.error}
             selectedTask={activeChildTask}
@@ -1990,7 +2049,7 @@ function SessionsPage() {
             eventsError={childTaskEvents.error}
             onClose={() => setChildPanelOpen(false)}
             onSelect={setSelectedChildTaskId}
-            onRetry={() => { void childTasks.reload(); void childTaskEvents.reload() }}
+            onRetry={() => { void childTasks.reload(); void teammates.reload(); void childTaskEvents.reload() }}
           />
       </div>
       {projectHoverCard && createPortal(
@@ -2143,6 +2202,139 @@ function UsageBreakdown({ title, eyebrow, emptyDescription, data, initialLoading
     <div className="card-heading"><div><p className="eyebrow">{eyebrow}</p><h2>{title}</h2></div>{refreshing && <UsageRefreshBadge />}</div>
     {error && !data.length ? <ErrorState message={error} onRetry={onRetry} /> : initialLoading ? <LoadingState /> : data.length ? <div className="usage-table-wrap"><table><thead><tr><th>名称</th><th>响应数</th><th>Tokens</th><th>命中率</th><th>总成本</th><th>平均成本</th></tr></thead><tbody>{data.map((item) => <tr key={item.id}><th><span title={item.path || item.title}>{item.title}</span>{item.path && <small title={item.path}>{item.path}</small>}</th><td>{item.requests.toLocaleString()}</td><td>{item.tokens.toLocaleString()}</td><td>{usageRate(item.cache_hit_rate).toFixed(1)}%</td><td>{formatCost(item.total_cost_usd)}</td><td>{formatCost(item.avg_cost_usd)}</td></tr>)}</tbody></table></div> : <EmptyState icon={ChartNoAxesCombined} title="暂无用量记录" description={emptyDescription} />}
   </section>
+}
+
+function PersonalizationPage() {
+  const personalization = useApiData<PersonalizationSettings | null>(null, () => api.get<PersonalizationSettings>('/api/system/personalization'), [])
+  const [draft, setDraft] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    if (personalization.data) setDraft(personalization.data.custom_instructions)
+  }, [personalization.data])
+
+  async function savePersonalization() {
+    setSaving(true); setSaveError(''); setSaved(false)
+    try {
+      const result = await api.put<PersonalizationSettings>('/api/system/personalization', { custom_instructions: draft })
+      personalization.setState({ data: result, loading: false, error: '' })
+      setDraft(result.custom_instructions)
+      setSaved(true)
+    } catch (cause) {
+      setSaveError(describeError(cause))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const maximum = personalization.data?.max_characters ?? 32768
+  const changed = personalization.data !== null && draft !== personalization.data.custom_instructions
+  return <div className="page personalization-settings-page">
+    <PageHeader eyebrow="GLOBAL AGENTS.MD" title="个性化" description="为所有新任务设置固定工作原则、回答偏好和长期约束。内容保存在全局 AGENTS.md，而不是持久记忆。" />
+    <section className="personalization-card card">
+      <div className="card-heading"><div><p className="eyebrow">CUSTOM INSTRUCTIONS</p><h2>个人指令</h2></div><span className="personalization-count">{draft.length.toLocaleString()} / {maximum.toLocaleString()}</span></div>
+      {personalization.initialLoading ? <LoadingState /> : personalization.error ? <ErrorState message={personalization.error} onRetry={personalization.reload} /> : <>
+        <p className="personalization-help">每个新 Run 会在模型调用前读取并冻结这些规则。项目根目录中的 AGENTS.md 会排在个人指令之后，因此可以提供更具体的项目约束；已经运行中的任务不会被即时改写。</p>
+        {personalization.data?.override_active && <div className="personalization-warning"><AlertCircle size={16} /><div><strong>AGENTS.override.md 正在生效</strong><span>当前有效内容来自 {personalization.data.effective_path}。这里保存的 AGENTS.md 会在移除 override 后恢复生效。</span></div></div>}
+        <textarea
+          className="personalization-editor"
+          aria-label="全局个人指令"
+          value={draft}
+          maxLength={maximum}
+          rows={16}
+          placeholder={'例如：\n- 默认使用中文解释\n- 修改代码后运行相关测试\n- 涉及架构变化时先说明取舍'}
+          onChange={(event) => { setDraft(event.target.value); setSaved(false) }}
+        />
+        <div className="personalization-meta"><span>保存位置</span><code>{personalization.data?.agents_path}</code></div>
+        <div className="personalization-actions">
+          {saveError && <div className="inline-error"><AlertCircle size={15} />{saveError}</div>}
+          {saved && <span className="personalization-saved"><CheckCircle2 size={15} />已保存，将从下一次新运行开始生效</span>}
+          <button className="button button-secondary" type="button" disabled={!changed || saving} onClick={() => { setDraft(personalization.data?.custom_instructions ?? ''); setSaved(false) }}>撤销修改</button>
+          <button className="button button-primary" type="button" disabled={!changed || saving || draft.length > maximum} onClick={() => void savePersonalization()}>{saving ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}保存指令</button>
+        </div>
+      </>}
+    </section>
+  </div>
+}
+
+
+function MemoriesPage() {
+  const memories = useApiData<MemoryRecord[]>([], () => api.list<MemoryRecord>('/api/memories?memory_status=active', ['memories']), [])
+  const recalls = useApiData<MemoryRecall[]>([], () => api.list<MemoryRecall>('/api/memory-recalls?limit=20', ['memory_recalls']), [])
+  const workspaces = useApiData<Workspace[]>([], () => api.list<Workspace>('/api/workspaces', ['workspaces']), [])
+  const [query, setQuery] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const visible = memories.data.filter((item) => {
+    const needle = query.trim().toLocaleLowerCase()
+    return !needle || `${item.name} ${item.description} ${item.content} ${item.tags.join(' ')}`.toLocaleLowerCase().includes(needle)
+  })
+
+  async function createMemory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    const scope = String(form.get('scope') || 'global')
+    const scopeId = String(form.get('scope_id') || '') || null
+    setSaving(true); setError('')
+    try {
+      await api.post('/api/memories', {
+        scope,
+        scope_id: scope === 'global' ? null : scopeId,
+        name: String(form.get('name') || '').trim(),
+        memory_type: String(form.get('memory_type') || 'project'),
+        description: String(form.get('description') || '').trim(),
+        content: String(form.get('content') || '').trim(),
+        tags: String(form.get('tags') || '').split(',').map((tag) => tag.trim()).filter(Boolean),
+        pinned: form.get('pinned') === 'on',
+      })
+      event.currentTarget.reset()
+      await memories.reload()
+    } catch (cause) { setError(describeError(cause)) } finally { setSaving(false) }
+  }
+
+  async function archiveMemory(id: string) {
+    setError('')
+    try { await api.delete(`/api/memories/${encodeURIComponent(id)}`); await memories.reload() }
+    catch (cause) { setError(describeError(cause)) }
+  }
+
+  return <div className="page memory-settings-page">
+    <PageHeader eyebrow="CONVERSATION MEMORY" title="持久记忆" description="SQLite 是唯一真源；每个新问题只召回相关记录，并把当轮结果冻结在用户消息中。" />
+    <section className="memory-create-card card">
+      <div className="card-heading"><div><p className="eyebrow">NEW MEMORY</p><h2>新增或更新记忆</h2></div></div>
+      <form className="memory-form" onSubmit={createMemory}>
+        <Field label="名称"><input name="name" required maxLength={200} /></Field>
+        <Field label="类型"><select name="memory_type" defaultValue="project"><option value="user">用户偏好</option><option value="feedback">反馈</option><option value="project">项目</option><option value="reference">参考资料</option></select></Field>
+        <Field label="作用域"><select name="scope" defaultValue="global"><option value="global">全局</option><option value="workspace">项目</option></select></Field>
+        <Field label="项目"><select name="scope_id" defaultValue=""><option value="">仅全局记忆无需选择</option>{workspaces.data.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
+        <Field label="说明"><input name="description" maxLength={1000} /></Field>
+        <Field label="标签（逗号分隔）"><input name="tags" /></Field>
+        <Field label="内容"><textarea name="content" required rows={5} /></Field>
+        <label className="memory-pin"><input type="checkbox" name="pinned" /> 固定优先级</label>
+        <div className="memory-form-actions"><button className="primary-button" type="submit" disabled={saving}>{saving ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}保存</button></div>
+      </form>
+      {error && <div className="inline-error"><AlertCircle size={15} />{error}</div>}
+    </section>
+    <section className="memory-list-card card">
+      <div className="card-heading"><div><p className="eyebrow">ACTIVE INDEX</p><h2>有效记忆</h2></div><label className="memory-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称、标签或内容" /></label></div>
+      {memories.error && !memories.data.length ? <ErrorState message={memories.error} onRetry={memories.reload} /> : memories.initialLoading ? <LoadingState /> : visible.length ? <div className="memory-grid">{visible.map((item) => <article className="memory-record" key={item.id}>
+        <header><div><strong>{item.name}</strong><span>{item.scope} · {item.memory_type}{item.pinned ? ' · pinned' : ''}</span></div><button className="icon-button" type="button" title="归档" aria-label={`归档 ${item.name}`} onClick={() => void archiveMemory(item.id)}><Trash2 size={15} /></button></header>
+        {item.description && <p className="memory-description">{item.description}</p>}
+        <pre>{item.content}</pre>
+        {!!item.tags.length && <footer>{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</footer>}
+        {(item.source_session_id || item.source_turn_id) && <small>来源：{item.source_session_id ? `会话 ${item.source_session_id}` : ''}{item.source_turn_id ? ` / 轮次 ${item.source_turn_id}` : ''}</small>}
+      </article>)}</div> : <EmptyState icon={Database} title="暂无匹配记忆" description="显式保存，或在完成对话后由后台提取可复用信息。" />}
+    </section>
+    <section className="memory-list-card card">
+      <div className="card-heading"><div><p className="eyebrow">TURN SNAPSHOTS</p><h2>最近逐轮召回</h2></div></div>
+      {recalls.initialLoading ? <LoadingState /> : recalls.data.length ? <div className="memory-recall-list">{recalls.data.map((recall) => <article key={recall.message_id}>
+        <div><strong>{recall.request}</strong><small>{formatDate(recall.created_at)} · {recall.session_id}</small></div>
+        <p>{recall.memories.length ? recall.memories.map((item) => item.name || item.id).join('、') : '本轮没有召回相关记忆'}</p>
+      </article>)}</div> : <EmptyState icon={History} title="暂无逐轮快照" description="新问题首次送模后，这里会展示该轮实际冻结的召回结果。" />}
+    </section>
+  </div>
 }
 
 function AppearanceSettingsPage({ fontScale, onFontScaleChange }: { fontScale: number; onFontScaleChange: (value: number) => void }) {

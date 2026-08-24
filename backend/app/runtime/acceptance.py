@@ -36,6 +36,7 @@ class CompletionDecision:
     reason: str
     report: dict[str, Any] = field(default_factory=dict)
     usage: dict[str, Any] = field(default_factory=dict)
+    defer_until_event: bool = False
 
 
 def _tool_result_ids(messages: Sequence[Mapping[str, Any]]) -> list[str]:

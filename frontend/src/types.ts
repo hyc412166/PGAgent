@@ -16,6 +16,34 @@ export interface Workspace {
   updated_at?: string
 }
 
+export interface MemoryRecord {
+  id: string
+  scope: 'global' | 'workspace' | 'session'
+  scope_id: string | null
+  name: string
+  title: string
+  memory_type: 'user' | 'feedback' | 'project' | 'reference'
+  description: string
+  content: string
+  tags: string[]
+  pinned: boolean
+  status: 'active' | 'superseded' | 'archived'
+  source_session_id?: string | null
+  source_turn_id?: string | null
+  superseded_by?: string | null
+  created_at?: string
+  updated_at?: string
+}
+
+export interface PersonalizationSettings {
+  custom_instructions: string
+  effective_instructions: string
+  agents_path: string
+  effective_path: string
+  override_active: boolean
+  max_characters: number
+}
+
 export interface AgentProfile {
   id: string
   name: string
@@ -238,6 +266,10 @@ export interface Run {
   session_id?: string
   agent_id?: string
   turn_id?: string
+  task_id?: string
+  plan_step_id?: string
+  run_kind?: 'initial' | 'continuation' | 'recovery'
+  resumed_from_run_id?: string
   agent_name?: string
   title?: string
   status?: string
@@ -256,6 +288,45 @@ export interface Run {
   finished_at?: string
   updated_at?: string
   events?: RunEvent[]
+}
+
+export interface PlanStep {
+  id: string
+  external_id: string
+  position: number
+  title: string
+  description?: string
+  status: 'pending' | 'in_progress' | 'needs_recovery' | 'blocked' | 'completed' | 'failed' | 'cancelled'
+  completed_work?: unknown[]
+  remaining_work?: unknown[]
+  next_action?: string
+  result?: string
+  evidence?: unknown[]
+  depends_on?: string[]
+  executor_kind?: 'main' | 'subagent' | 'background' | string
+  assigned_agent_id?: string
+  assigned_run_id?: string
+  claim_owner?: string
+  workspace_mode?: 'shared' | 'worktree' | string
+  worktree_path?: string
+  attempt?: number
+  error?: string
+  last_run_id?: string
+}
+
+export interface DurableTask {
+  id: string
+  session_id: string
+  origin_turn_id?: string
+  goal: string
+  constraints?: unknown[]
+  status: 'planning' | 'running' | 'waiting' | 'paused' | 'needs_recovery' | 'blocked' | 'completed' | 'failed' | 'cancelled'
+  active_step_id?: string
+  resume_summary?: string
+  completed_at?: string
+  created_at?: string
+  updated_at?: string
+  steps: PlanStep[]
 }
 
 export interface RunUsage {
@@ -313,11 +384,29 @@ export interface DelegatedTask {
   parent_session_id?: string
   child_run_id?: string
   child_agent_id?: string
+  plan_step_id?: string
+  teammate_id?: string
   child_agent_name?: string
   title: string
   description?: string
   status?: string
   result?: ApiRecord
+  created_at?: string
+  updated_at?: string
+}
+
+export interface Teammate {
+  id: string
+  team_id: string
+  agent_id: string
+  name: string
+  role: string
+  status: string
+  current_plan_step_id?: string
+  last_run_id?: string
+  workspace_mode: 'shared' | 'worktree' | string
+  worktree_path?: string
+  branch_name?: string
   created_at?: string
   updated_at?: string
 }

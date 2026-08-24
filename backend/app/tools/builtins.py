@@ -696,12 +696,12 @@ def web_search(
     )
 
 
-def _normalize_todos(value: Any) -> list[dict[str, str]]:
+def _normalize_todos(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("todos 必须是列表")
     if len(value) > MAX_TODOS:
         raise ValueError(f"todos 最多 {MAX_TODOS} 项")
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     allowed_statuses = {"pending", "in_progress", "completed", "cancelled"}
     seen_ids: set[str] = set()
     for index, raw in enumerate(value, start=1):
@@ -710,9 +710,9 @@ def _normalize_todos(value: Any) -> list[dict[str, str]]:
         content = str(raw.get("content") or "").strip()
         if not content or len(content) > 1_000:
             raise ValueError(f"第 {index} 项 todo 的 content 不能为空且最多 1000 字符")
-        todo_id = str(raw.get("id") or index).strip()
+        todo_id = str(raw.get("id") or "").strip()
         if not todo_id or len(todo_id) > 120 or todo_id in seen_ids:
-            raise ValueError(f"第 {index} 项 todo 的 id 无效或重复")
+            raise ValueError(f"第 {index} 项 todo 必须提供稳定且不重复的 id")
         seen_ids.add(todo_id)
         status = str(raw.get("status") or "pending").strip().lower()
         if status not in allowed_statuses:
@@ -720,7 +720,38 @@ def _normalize_todos(value: Any) -> list[dict[str, str]]:
         item = {"id": todo_id, "content": content, "status": status}
         if raw.get("active_form"):
             item["active_form"] = str(raw["active_form"])[:1_000]
+        dependencies = raw.get("depends_on", raw.get("blockedBy", []))
+        if dependencies is None:
+            dependencies = []
+        if not isinstance(dependencies, (list, tuple)):
+            raise ValueError(f"第 {index} 项 todo 的 depends_on 必须是数组")
+        item["depends_on"] = list(dict.fromkeys(
+            str(value).strip() for value in dependencies if str(value).strip()
+        ))
+        executor_kind = str(raw.get("executor_kind") or raw.get("executor") or "main").strip().lower()
+        if executor_kind not in {"main", "subagent", "background"}:
+            raise ValueError(f"第 {index} 项 todo 的 executor_kind 无效")
+        item["executor_kind"] = executor_kind
+        assigned_agent_id = str(raw.get("agent_id") or raw.get("assigned_agent_id") or "").strip()
+        if executor_kind == "subagent" and not assigned_agent_id:
+            raise ValueError(f"第 {index} 项 subagent todo 必须提供 agent_id")
+        if assigned_agent_id:
+            item["agent_id"] = assigned_agent_id
+        workspace_mode = str(raw.get("workspace_mode") or "shared").strip().lower()
+        if workspace_mode not in {"shared", "worktree"}:
+            raise ValueError(f"第 {index} 项 todo 的 workspace_mode 无效")
+        item["workspace_mode"] = workspace_mode
         normalized.append(item)
+    known_ids = {item["id"] for item in normalized}
+    for item in normalized:
+        for dependency_id in item["depends_on"]:
+            if dependency_id not in known_ids:
+                raise ValueError(f"todo {item['id']} 依赖不存在的步骤 {dependency_id}")
+            if dependency_id == item["id"]:
+                raise ValueError(f"todo {item['id']} 不能依赖自身")
+    from app.services.task_graph import validate_dependency_graph
+
+    validate_dependency_graph(normalized)
     return normalized
 
 
@@ -728,7 +759,7 @@ def todo_write(
     _sandbox: WorkspaceSandbox,
     todos: list[dict[str, Any]],
     *,
-    todo_state: list[dict[str, str]],
+    todo_state: list[dict[str, Any]],
 ) -> ToolResult:
     """Replace the run's structured todo state with validated items."""
 
@@ -769,12 +800,14 @@ def ask_question(
     )
 
 
-def normalize_delegate_requests(
+def normalize_delegate_specs(
     task: object = "",
     agent_id: object = "",
     tasks: object = None,
-) -> tuple[list[tuple[str, str]], str | None, str | None]:
-    """Normalize one task call or an explicit parallel task batch."""
+    step_id: object = "",
+    depends_on: object = None,
+) -> tuple[list[dict[str, Any]], str | None, str | None]:
+    """Normalize one task or a dependency-aware batch."""
 
     if tasks is not None:
         if str(task or "").strip() or str(agent_id or "").strip():
@@ -782,9 +815,9 @@ def normalize_delegate_requests(
         if not isinstance(tasks, (list, tuple)) or not tasks:
             return [], "invalid_task", "tasks 必须是非空数组"
         if len(tasks) > MAX_PARALLEL_DELEGATED_TASKS:
-            return [], "delegate_parallel_limit", f"单次最多并行委派 {MAX_PARALLEL_DELEGATED_TASKS} 个子 Agent 任务"
-        normalized: list[tuple[str, str]] = []
-        for item in tasks:
+            return [], "delegate_parallel_limit", f"单次最多委派 {MAX_PARALLEL_DELEGATED_TASKS} 个子 Agent 任务"
+        normalized: list[dict[str, Any]] = []
+        for index, item in enumerate(tasks, start=1):
             if not isinstance(item, Mapping):
                 return [], "invalid_task", "tasks 中每一项必须是对象"
             request = str(item.get("task") or "").strip()
@@ -793,16 +826,66 @@ def normalize_delegate_requests(
                 return [], "invalid_task", "tasks 中的 task 不能为空或过长"
             if not target or len(target) > 80:
                 return [], "invalid_delegate_agent", "tasks 中每一项都必须提供有效的子 Agent ID"
-            normalized.append((request, target))
-        return normalized, None, None
+            external_id = str(item.get("id") or item.get("step_id") or "").strip()
+            dependencies = item.get("depends_on", item.get("blockedBy", []))
+            if dependencies is None:
+                dependencies = []
+            if not isinstance(dependencies, (list, tuple)):
+                return [], "invalid_task_dependencies", "tasks 中的 depends_on 必须是数组"
+            workspace_mode = str(item.get("workspace_mode") or "shared").strip().lower()
+            if workspace_mode not in {"shared", "worktree"}:
+                return [], "invalid_workspace_mode", "workspace_mode 必须是 shared 或 worktree"
+            normalized.append({
+                "id": external_id or f"generated-{index}",
+                "generated_id": not bool(external_id),
+                "task": request,
+                "agent_id": target,
+                "depends_on": list(dict.fromkeys(
+                    str(value).strip() for value in dependencies if str(value).strip()
+                )),
+                "workspace_mode": workspace_mode,
+            })
+    else:
+        request = str(task or "").strip()
+        if not request or len(request) > 8_000:
+            return [], "invalid_task", "task 不能为空或过长"
+        target = str(agent_id or "").strip()
+        if not target or len(target) > 80:
+            return [], "invalid_delegate_agent", "必须提供有效的子 Agent ID"
+        dependencies = [] if depends_on is None else depends_on
+        if not isinstance(dependencies, (list, tuple)):
+            return [], "invalid_task_dependencies", "depends_on 必须是数组"
+        external_id = str(step_id or "").strip()
+        normalized = [{
+            "id": external_id or "generated-1",
+            "generated_id": not bool(external_id),
+            "task": request,
+            "agent_id": target,
+            "depends_on": [str(value).strip() for value in dependencies if str(value).strip()],
+            "workspace_mode": "shared",
+        }]
+    graph_rows = [
+        {"id": item["id"], "depends_on": item["depends_on"]}
+        for item in normalized
+    ]
+    try:
+        from app.services.task_graph import validate_dependency_graph
 
-    request = str(task or "").strip()
-    if not request or len(request) > 8_000:
-        return [], "invalid_task", "task 不能为空或过长"
-    target = str(agent_id or "").strip()
-    if not target or len(target) > 80:
-        return [], "invalid_delegate_agent", "必须提供有效的子 Agent ID"
-    return [(request, target)], None, None
+        validate_dependency_graph(graph_rows)
+    except ValueError as exc:
+        return [], "invalid_task_dependencies", str(exc)
+    return normalized, None, None
+
+
+def normalize_delegate_requests(
+    task: object = "",
+    agent_id: object = "",
+    tasks: object = None,
+) -> tuple[list[tuple[str, str]], str | None, str | None]:
+    """Compatibility projection of normalized delegation specifications."""
+
+    specs, error_code, error = normalize_delegate_specs(task, agent_id, tasks)
+    return [(str(item["task"]), str(item["agent_id"])) for item in specs], error_code, error
 
 
 def _invalid_delegate_result(code: str, message: str) -> ToolResult:
@@ -815,6 +898,8 @@ def delegate_task(
     *,
     agent_id: str = "",
     tasks: object = None,
+    step_id: str = "",
+    depends_on: object = None,
     delegate: Callable[..., ToolResult | Awaitable[ToolResult]] | None = None,
 ) -> ToolResult:
     """Synchronous compatibility path for a real, injected task delegate.
@@ -871,6 +956,8 @@ def _call_task_delegate(
     agent_id: str,
     *,
     call_id: str | None,
+    plan_step_external_id: str | None = None,
+    graph_call_id: str | None = None,
 ) -> ToolResult | Awaitable[ToolResult]:
     """Call modern delegates while preserving one-argument test adapters.
 
@@ -887,14 +974,61 @@ def _call_task_delegate(
         parameters = signature.parameters.values()
         accepts_keywords = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
         names = signature.parameters
-        if accepts_keywords or "agent_id" in names or "call_id" in names:
+        if (
+            accepts_keywords
+            or "agent_id" in names
+            or "call_id" in names
+            or "plan_step_external_id" in names
+            or "graph_call_id" in names
+        ):
             keyword_arguments: dict[str, str | None] = {}
             if accepts_keywords or "agent_id" in names:
                 keyword_arguments["agent_id"] = agent_id
             if accepts_keywords or "call_id" in names:
                 keyword_arguments["call_id"] = call_id
+            if accepts_keywords or "plan_step_external_id" in names:
+                keyword_arguments["plan_step_external_id"] = plan_step_external_id
+            if accepts_keywords or "graph_call_id" in names:
+                keyword_arguments["graph_call_id"] = graph_call_id
             return delegate(task, **keyword_arguments)
     return delegate(task)
+
+
+def _prepare_delegate_graph(delegate: Any, specs: list[dict[str, Any]], call_id: str | None) -> Any:
+    prepare_graph = getattr(delegate, "prepare_graph", None)
+    if not callable(prepare_graph):
+        return None
+    try:
+        signature = inspect.signature(prepare_graph)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None and (
+        "call_id" in signature.parameters
+        or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+    ):
+        return prepare_graph(specs, call_id=call_id)
+    return prepare_graph(specs)
+
+
+def _block_delegate_step(
+    delegate: Any,
+    external_id: str,
+    reason: str,
+    graph_call_id: str | None,
+) -> Any:
+    block_step = getattr(delegate, "block_step", None)
+    if not callable(block_step):
+        return None
+    try:
+        signature = inspect.signature(block_step)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None and (
+        "graph_call_id" in signature.parameters
+        or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+    ):
+        return block_step(external_id, reason, graph_call_id=graph_call_id)
+    return block_step(external_id, reason)
 
 
 async def delegate_task_async(
@@ -903,6 +1037,8 @@ async def delegate_task_async(
     *,
     agent_id: str = "",
     tasks: object = None,
+    step_id: str = "",
+    depends_on: object = None,
     delegate: Callable[..., ToolResult | Awaitable[ToolResult]] | None = None,
     call_id: str | None = None,
 ) -> ToolResult:
@@ -913,7 +1049,7 @@ async def delegate_task_async(
     and no-progress guards remain responsible for recovery.
     """
 
-    requests, error_code, error = normalize_delegate_requests(task, agent_id, tasks)
+    specs, error_code, error = normalize_delegate_specs(task, agent_id, tasks, step_id, depends_on)
     if error_code and error:
         return _invalid_delegate_result(error_code, error)
     if delegate is None:
@@ -924,27 +1060,114 @@ async def delegate_task_async(
             error_code="delegated_task_unavailable",
         )
     try:
-        async def invoke(index: int, request: str, target: str) -> ToolResult:
-            child_call_id = f"{call_id}:{index}" if call_id and len(requests) > 1 else call_id
-            result = _call_task_delegate(delegate, request, target, call_id=child_call_id)
+        for index, spec in enumerate(specs, start=1):
+            if spec.pop("generated_id", False):
+                spec["id"] = f"delegate-{call_id or 'call'}-{index}"[:120]
+        prepared = _prepare_delegate_graph(delegate, specs, call_id)
+        if inspect.isawaitable(prepared):
+            await prepared
+
+        async def invoke(index: int, spec: dict[str, Any]) -> ToolResult:
+            child_call_id = f"{call_id}:{spec['id']}" if call_id and len(specs) > 1 else call_id
+            result = _call_task_delegate(
+                delegate,
+                str(spec["task"]),
+                str(spec["agent_id"]),
+                call_id=child_call_id,
+                plan_step_external_id=str(spec["id"]),
+                graph_call_id=call_id,
+            )
             if inspect.isawaitable(result):
                 result = await result
             if isinstance(result, ToolResult):
                 return result
             return ToolResult("task", False, "子 Agent 委派器返回了无效结果", error_code="delegate_error")
 
-        results = await asyncio.gather(
-            *(invoke(index, request, target) for index, (request, target) in enumerate(requests)),
-            return_exceptions=True,
-        )
-        normalized_results: list[ToolResult] = []
-        for result in results:
-            if isinstance(result, ToolResult):
-                normalized_results.append(result)
-            else:
-                normalized_results.append(
-                    ToolResult("task", False, f"子 Agent 委派失败: {type(result).__name__}", error_code="delegate_error")
+        results_by_id: dict[str, ToolResult] = {}
+        pending = {str(spec["id"]): spec for spec in specs}
+        execution_waves: list[list[str]] = []
+        while pending:
+            ready = [
+                spec for spec in pending.values()
+                if all(
+                    dependency_id in results_by_id and results_by_id[dependency_id].ok
+                    for dependency_id in spec["depends_on"]
                 )
+            ]
+            if not ready:
+                for spec in pending.values():
+                    waiting_dependencies = [
+                        dependency_id for dependency_id in spec["depends_on"]
+                        if dependency_id in results_by_id
+                        and results_by_id[dependency_id].metadata.get("delegated_child_awaiting_approval")
+                    ]
+                    failed_dependencies = [
+                        dependency_id for dependency_id in spec["depends_on"]
+                        if dependency_id in results_by_id
+                        and not results_by_id[dependency_id].ok
+                        and dependency_id not in waiting_dependencies
+                    ]
+                    if waiting_dependencies and not failed_dependencies:
+                        waiting_event = any(
+                            results_by_id[dependency_id].metadata.get("delegated_child_waiting_event")
+                            for dependency_id in waiting_dependencies
+                        )
+                        results_by_id[str(spec["id"])] = ToolResult(
+                            "task",
+                            False,
+                            f"prerequisite task is waiting: {', '.join(waiting_dependencies)}",
+                            error_code="delegate_dependency_waiting",
+                            metadata={
+                                "plan_step_external_id": str(spec["id"]),
+                                "blocked_by": waiting_dependencies,
+                                "delegated_child_awaiting_approval": True,
+                                "delegated_child_waiting_event": waiting_event,
+                            },
+                        )
+                        continue
+                    results_by_id[str(spec["id"])] = ToolResult(
+                        "task",
+                        False,
+                        f"prerequisite task failed: {', '.join(failed_dependencies)}",
+                        error_code="delegate_dependency_failed",
+                        metadata={"plan_step_external_id": str(spec["id"]), "blocked_by": failed_dependencies},
+                    )
+                    blocked = _block_delegate_step(
+                        delegate,
+                        str(spec["id"]),
+                        f"prerequisite task failed: {', '.join(failed_dependencies)}",
+                        call_id,
+                    )
+                    if blocked is not None:
+                        if inspect.isawaitable(blocked):
+                            await blocked
+                pending.clear()
+                break
+            execution_waves.append([str(spec["id"]) for spec in ready])
+            wave_results = await asyncio.gather(
+                *(invoke(index, spec) for index, spec in enumerate(ready)),
+                return_exceptions=True,
+            )
+            for spec, result in zip(ready, wave_results, strict=True):
+                if isinstance(result, ToolResult):
+                    stored_result = result
+                else:
+                    stored_result = ToolResult(
+                        "task", False, f"子 Agent 委派失败: {type(result).__name__}", error_code="delegate_error"
+                    )
+                results_by_id[str(spec["id"])] = stored_result
+                if not stored_result.ok and not stored_result.metadata.get("delegated_child_awaiting_approval"):
+                    blocked = _block_delegate_step(
+                        delegate,
+                        str(spec["id"]),
+                        stored_result.error_code or stored_result.content or "delegated task failed",
+                        call_id,
+                    )
+                    if blocked is not None:
+                        if inspect.isawaitable(blocked):
+                            await blocked
+                pending.pop(str(spec["id"]), None)
+        normalized_results = [results_by_id[str(spec["id"])] for spec in specs]
         if len(normalized_results) == 1:
             return normalized_results[0]
 
@@ -962,10 +1185,14 @@ async def delegate_task_async(
             bool(result.metadata.get("delegated_child_awaiting_approval"))
             for result in normalized_results
         )
+        waiting_event = any(
+            bool(result.metadata.get("delegated_child_waiting_event"))
+            for result in normalized_results
+        )
         succeeded = sum(1 for result in normalized_results if result.ok)
         if waiting:
-            aggregate_status = "awaiting_approval"
-            aggregate_error_code = "delegate_child_awaiting_approval"
+            aggregate_status = "waiting_background" if waiting_event else "awaiting_approval"
+            aggregate_error_code = "delegate_child_waiting_event" if waiting_event else "delegate_child_awaiting_approval"
         elif succeeded == len(normalized_results):
             aggregate_status = "completed"
             aggregate_error_code = None
@@ -977,7 +1204,8 @@ async def delegate_task_async(
             aggregate_error_code = "delegate_batch_failed"
         aggregate = {
             "status": aggregate_status,
-            "parallel": True,
+            "parallel": any(len(wave) > 1 for wave in execution_waves),
+            "execution_waves": execution_waves,
             "child_count": len(children),
             "completed_count": succeeded,
             "failed_count": len(children) - succeeded,
@@ -991,10 +1219,12 @@ async def delegate_task_async(
             error_code=aggregate_error_code,
             metadata={
                 "status": aggregate["status"],
-                "parallel": True,
+                "parallel": aggregate["parallel"],
+                "execution_waves": execution_waves,
                 "child_count": len(children),
                 "children": [dict(result.metadata) for result in normalized_results],
                 "delegated_child_awaiting_approval": waiting,
+                "delegated_child_waiting_event": waiting_event,
             },
         )
     except Exception as exc:

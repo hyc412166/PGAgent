@@ -453,6 +453,48 @@ async def test_active_runtime_accumulates_across_approval_pause(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_background_wait_does_not_consume_active_runtime_budget(tmp_path) -> None:
+    clock = ManualClock()
+    turns = 0
+
+    class BackgroundStore:
+        def check(self, **_kwargs) -> ToolResult:
+            clock.advance(10.0)
+            return ToolResult(
+                "check_background",
+                True,
+                '{"status":"completed"}',
+                metadata={"background_wait_seconds": 10.0},
+            )
+
+    async def model_call(**_kwargs) -> ModelTurn:
+        nonlocal turns
+        turns += 1
+        clock.advance(0.4)
+        if turns == 1:
+            return ModelTurn(tool_calls=[
+                ModelToolCall("wait-bg", "check_background", {"task_id": "job-1", "wait": True})
+            ])
+        return ModelTurn(content="background result received")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=["check_background"],
+            background_store=BackgroundStore(),
+        ),
+        config=RuntimeConfig(max_run_seconds=1.0),
+        clock=clock,
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert outcome.active_elapsed_seconds == pytest.approx(0.8)
+
+
+@pytest.mark.asyncio
 async def test_provider_timeout_is_not_misclassified_as_run_fuse(tmp_path) -> None:
     clock = ManualClock()
     attempts = 0

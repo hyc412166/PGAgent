@@ -26,6 +26,7 @@ from app.database import (
 )
 from app.runtime import RunOutcome
 from app.services.run_service import RunCoordinator, _prepare_session_history
+from app.services import instruction_service
 from app.runtime import AgentRuntime, decide_deterministic_completion
 from app.tools import create_default_registry
 
@@ -988,6 +989,50 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
 
     with pytest.raises(RuntimeError, match="模型连接配置在审批等待期间已改变"):
         RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
+
+
+def test_runtime_freezes_global_and_project_agents_instructions(
+    seeded_run: tuple[str, str],
+) -> None:
+    run_id, _session_id = seeded_run
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None
+        workspace = db.get(Workspace, run.workspace_id)
+        assert workspace is not None
+        db.add(ModelConnection(
+            name="Instruction snapshot connection",
+            provider="openai_compatible",
+            base_url="https://example.test/v1",
+            secret_ref="instruction-test-secret",
+            default_model="instruction-test-model",
+            status="connected",
+        ))
+        db.commit()
+        workspace_root = Path(workspace.root_path)
+    workspace_root.mkdir(parents=True)
+    instruction_service.write_personal_instructions("personal version one")
+    project_agents = workspace_root / "AGENTS.md"
+    project_agents.write_text("project version one", encoding="utf-8")
+
+    _runtime, context = RunCoordinator._resolve_runtime(run_id)
+    rules = context["workspace_rules"]
+    binding = dict(context["runtime_binding"])
+
+    assert rules.index("personal version one") < rules.index("project version one")
+    assert binding["agents_instructions"] in rules
+    assert binding["agents_instruction_sources"] == [
+        str(instruction_service.personal_agents_path().resolve()),
+        str(project_agents.resolve()),
+    ]
+
+    instruction_service.write_personal_instructions("personal version two")
+    project_agents.write_text("project version two", encoding="utf-8")
+    _runtime, resumed = RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
+
+    assert "personal version one" in resumed["workspace_rules"]
+    assert "project version one" in resumed["workspace_rules"]
+    assert "version two" not in resumed["workspace_rules"]
 
 
 def test_fallback_connection_does_not_reuse_model_from_disabled_connection(

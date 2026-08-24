@@ -14,10 +14,12 @@ from app.database import (
     Agent,
     AgentTool,
     Approval,
+    BackgroundJob,
     Base,
     ChatMessage,
     DelegatedTask,
     ModelConnection,
+    PlanStep,
     Run,
     RunEvent,
     Session,
@@ -26,6 +28,7 @@ from app.database import (
 from app.runtime import RunOutcome
 from app.runtime.engine import ModelToolCall, ModelTurn
 from app.services import run_service
+from app.services.background_job_service import background_job_manager
 from app.services.run_service import RunCoordinator
 
 
@@ -151,6 +154,34 @@ def delegated_run(tmp_path: Path) -> dict[str, str]:
     Base.metadata.drop_all(bind=database.engine)
 
 
+def test_concurrent_task_calls_keep_separate_dag_bindings(delegated_run: dict[str, str]) -> None:
+    delegate = run_service._SubagentTaskDelegate(
+        parent_run_id=delegated_run["run_id"],
+        parent_agent_id=database.DEFAULT_AGENT_ID,
+        parent_binding={},
+        parent_allowed_tool_names=[],
+        permission_mode="full",
+    )
+    delegate.prepare_graph(
+        [{"id": "shared", "task": "First graph", "agent_id": delegated_run["child_id"]}],
+        call_id="tool-call-first",
+    )
+    delegate.prepare_graph(
+        [{"id": "shared", "task": "Second graph", "agent_id": delegated_run["child_id"]}],
+        call_id="tool-call-second",
+    )
+
+    assert set(delegate._plan_step_ids) == {"tool-call-first", "tool-call-second"}
+    first_id = delegate._plan_step_ids["tool-call-first"]["shared"]
+    second_id = delegate._plan_step_ids["tool-call-second"]["shared"]
+    assert first_id != second_id
+    delegate.block_step("shared", "first graph failed", graph_call_id="tool-call-first")
+
+    with database.SessionLocal() as db:
+        assert db.get(PlanStep, first_id).status == "failed"
+        assert db.get(PlanStep, second_id).status == "pending"
+
+
 @pytest.mark.asyncio
 async def test_task_executes_child_with_frozen_limited_binding_and_returns_structured_result(
     delegated_run: dict[str, str], monkeypatch: pytest.MonkeyPatch
@@ -180,6 +211,23 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         nonlocal child_calls
         child_calls += 1
         observed_child_tools[:] = [item["function"]["name"] for item in kwargs["tools"]]
+        if child_calls == 1:
+            with database.SessionLocal() as db:
+                task_record = db.scalar(select(DelegatedTask).where(
+                    DelegatedTask.parent_run_id == delegated_run["run_id"]
+                ))
+                assert task_record is not None and task_record.child_run_id
+                initial_snapshot = db.scalar(select(RunEvent).where(
+                    RunEvent.run_id == task_record.child_run_id,
+                    RunEvent.event_type == "runtime_snapshot",
+                ))
+                assert initial_snapshot is not None
+                frozen_binding = initial_snapshot.payload["runtime_binding"]
+                assert frozen_binding["delegation_id"] == task_record.id
+                assert frozen_binding["workspace_root"] == delegated_run["parent_root"]
+                assert frozen_binding["rendered_task"]
+                assert "memory_snapshot" in frozen_binding
+                assert "skill_instructions" in frozen_binding
         # A malicious/buggy provider response that tries to recurse is still
         # rejected by the child registry; the second turn gives a real result.
         if child_calls == 1:
@@ -525,6 +573,8 @@ async def test_child_timeout_is_limited_to_the_parent_remaining_budget(
     class FakeChildRuntime:
         def __init__(self, *, config, **_kwargs):  # type: ignore[no-untyped-def]
             captured_limits.append(config.max_run_seconds)
+            self.config = config
+            self.completion_verifier = None
 
         async def run(self, **_kwargs):  # type: ignore[no-untyped-def]
             return RunOutcome(
@@ -545,3 +595,100 @@ async def test_child_timeout_is_limited_to_the_parent_remaining_budget(
     assert 0 < captured_limits[0] < 5
     with database.SessionLocal() as db:
         assert db.scalar(select(DelegatedTask)) is not None
+
+
+@pytest.mark.asyncio
+async def test_delegated_child_uses_durable_background_job_and_must_observe_it(
+    delegated_run: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with database.SessionLocal() as db:
+        db.add_all([
+            AgentTool(agent_id=delegated_run["child_id"], tool_id="background_run"),
+            AgentTool(agent_id=delegated_run["child_id"], tool_id="check_background"),
+        ])
+        db.commit()
+
+    parent_calls = 0
+    child_calls = 0
+
+    async def parent_model(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal parent_calls
+        parent_calls += 1
+        if parent_calls == 1:
+            return ModelTurn(tool_calls=[ModelToolCall(
+                "delegate-background",
+                "task",
+                {"task": "run durable background work", "agent_id": delegated_run["child_id"]},
+            )])
+        return ModelTurn(content="child background work verified")
+
+    async def child_model(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal child_calls
+        child_calls += 1
+        if child_calls == 1:
+            tool_names = {item["function"]["name"] for item in kwargs["tools"]}
+            assert {"background_run", "check_background"}.issubset(tool_names)
+            return ModelTurn(tool_calls=[ModelToolCall(
+                "child-background-start",
+                "background_run",
+                {
+                    "command": "Start-Sleep -Milliseconds 250; Write-Output child-durable-result",
+                    "shell": "powershell",
+                    "timeout": 30,
+                },
+            )])
+        if child_calls == 2:
+            return ModelTurn(content="premature child completion")
+        assert any(
+            "<background-task-events>" in str(item.get("content") or "")
+            and "child-durable-result" in str(item.get("content") or "")
+            for item in kwargs["messages"]
+        )
+        return ModelTurn(content="child durable background result verified")
+
+    def fake_build_model_call(config):  # type: ignore[no-untyped-def]
+        return parent_model if config.model_id == "parent-model" else child_model
+
+    monkeypatch.setattr(run_service, "build_model_call", fake_build_model_call)
+    run_service.coordinator._event_loop = asyncio.get_running_loop()
+    background_job_manager.set_terminal_listener(
+        run_service.coordinator.notify_background_terminal
+    )
+    try:
+        runtime, context = RunCoordinator._resolve_runtime(delegated_run["run_id"])
+        RunCoordinator._install_completion_verifier(runtime, context)
+        outcome = await runtime.run(
+            system_prompt=context["system_prompt"],
+            agent_instructions=context["agent_instructions"],
+            workspace_rules=context["workspace_rules"],
+            recent_messages=context["recent_messages"],
+            mode=context["mode"],
+            thread_id=delegated_run["run_id"],
+        )
+
+        assert outcome.status == "stopped"
+        assert outcome.stop_reason == "delegated_child_waiting_event"
+        outcome.runtime_binding = {
+            **dict(context["runtime_binding"]),
+            **runtime.tool_registry.runtime_state(),
+        }
+        RunCoordinator._persist_outcome(delegated_run["run_id"], outcome)
+        for _ in range(300):
+            with database.SessionLocal() as db:
+                parent = db.get(Run, delegated_run["run_id"])
+                if parent is not None and parent.status == "completed":
+                    break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("event-driven child/background continuation did not complete")
+    finally:
+        background_job_manager.set_terminal_listener(None)
+        run_service.coordinator._event_loop = None
+
+    assert child_calls == 3
+    with database.SessionLocal() as db:
+        job = db.scalar(select(BackgroundJob))
+        task = db.scalar(select(DelegatedTask))
+        assert job is not None and job.status == "completed"
+        assert job.observed_at is not None
+        assert task is not None and job.run_id == task.child_run_id

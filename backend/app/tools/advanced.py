@@ -296,6 +296,7 @@ def background_run(
     *,
     timeout: int = 120,
     shell: str = "command",
+    plan_step_id: str = "",
 ) -> ToolResult:
     task_id = f"bg-{uuid4().hex[:12]}"
     state = {
@@ -304,6 +305,7 @@ def background_run(
         "status": "queued",
         "created_at": _utcnow(),
         "workspace": str(sandbox.root),
+        "plan_step_id": str(plan_step_id or ""),
     }
     with _BACKGROUND_LOCK:
         _BACKGROUND[task_id] = state
@@ -507,6 +509,24 @@ def memory_list(sandbox: WorkspaceSandbox) -> ToolResult:
     return _record_result("MemoryList", records)
 
 
+def memory_search(sandbox: WorkspaceSandbox, query: str, limit: int = 5) -> ToolResult:
+    """Compatibility search for registries not connected to the canonical store."""
+
+    needle = str(query or "").strip().casefold()
+    if not needle:
+        return ToolResult("MemorySearch", False, "query is required", error_code="invalid_arguments")
+    directory = sandbox.root / ".memory"
+    records: list[dict[str, Any]] = []
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.md")):
+            content = path.read_text(encoding="utf-8", errors="replace")
+            if needle in content.casefold() or needle in path.stem.casefold():
+                records.append({"name": path.stem, "content": content})
+                if len(records) >= max(1, min(20, int(limit))):
+                    break
+    return _record_result("MemorySearch", records)
+
+
 def _message_state(sandbox: WorkspaceSandbox) -> dict[str, list[dict[str, Any]]]:
     value = _read_state(sandbox, "messages.json", {})
     return {str(key): list(items) for key, items in value.items() if isinstance(items, list)}
@@ -570,6 +590,20 @@ def broadcast(sandbox: WorkspaceSandbox, content: str) -> ToolResult:
 
 def shutdown_request(sandbox: WorkspaceSandbox, teammate: str) -> ToolResult:
     return send_message(sandbox, teammate, "Please shut down.", msg_type="shutdown_request")
+
+
+def integrate_teammate(
+    _sandbox: WorkspaceSandbox,
+    teammate: str,
+    commit_message: str = "",
+    paths: Sequence[str] = (),
+) -> ToolResult:
+    return ToolResult(
+        "integrate_teammate",
+        False,
+        "worktree integration requires a durable run-scoped teammate",
+        error_code="durable_team_unavailable",
+    )
 
 
 def plan_approval(sandbox: WorkspaceSandbox, request_id: str, approve: bool, feedback: str = "") -> ToolResult:

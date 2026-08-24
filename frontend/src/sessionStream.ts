@@ -12,6 +12,22 @@ export interface RunStreamEvent {
 
 const terminalTypes = new Set(['run_completed', 'run_interrupted', 'run_stopped', 'model_failed', 'integration_failed', 'failed', 'completed', 'stopped'])
 const terminalStatuses = new Set(['completed', 'stopped', 'failed', 'cancelled'])
+const resumableWaitingReasons = new Set([
+  'waiting_background',
+  'delegated_child_waiting_event',
+  'delegated_child_awaiting_approval',
+])
+
+type WaitingRunCandidate = { status?: string; stop_reason?: string; reason?: string }
+
+export function isResumableWaitingRun(run: WaitingRunCandidate | undefined): boolean {
+  if (!run || run.status !== 'stopped') return false
+  return resumableWaitingReasons.has(String(run.stop_reason || run.reason || ''))
+}
+
+function waitingRunPhase(reason: string): string {
+  return reason === 'waiting_background' ? '等待后台任务完成…' : '等待子 Agent 返回…'
+}
 
 export function parseRunStreamEvent(raw: string, fallbackType = ''): RunStreamEvent | null {
   try {
@@ -26,7 +42,10 @@ export function parseRunStreamEvent(raw: string, fallbackType = ''): RunStreamEv
 
 export function runStreamPhase(event: RunStreamEvent): string {
   switch (event.type) {
-    case 'run_state': return runStatusPhase(event.status)
+    case 'run_state': return isResumableWaitingRun({
+      status: event.status,
+      reason: String(event.reason || event.stop_reason || ''),
+    }) ? waitingRunPhase(String(event.reason || event.stop_reason || '')) : runStatusPhase(event.status)
     case 'context_prepared':
     case 'context_resumed':
     case 'context_compaction_started':
@@ -47,6 +66,8 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'approval_granted': return '审批已通过，继续处理…'
     case 'delegated_child_started': return '子 Agent 正在处理任务…'
     case 'delegated_child_awaiting_approval': return '子 Agent 正等待你的审批'
+    case 'delegated_child_waiting_background': return '子 Agent 正等待后台任务完成…'
+    case 'background_continuation_started': return '后台任务已完成，正在继续处理…'
     case 'delegated_child_completed': return '子 Agent 已返回结果'
     case 'delegated_child_continuation_started': return '主 Agent 正在汇总子 Agent 结果…'
     case 'delegated_child_stopped':
@@ -55,7 +76,10 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'completed': return '已完成'
     case 'run_interrupted':
     case 'run_stopped':
-    case 'stopped': return '已停止'
+    case 'stopped': {
+      const reason = String(event.reason || event.stop_reason || '')
+      return isResumableWaitingRun({ status: 'stopped', reason }) ? waitingRunPhase(reason) : '已停止'
+    }
     case 'model_failed':
     case 'integration_failed':
     case 'failed': return '运行失败'
@@ -64,6 +88,12 @@ export function runStreamPhase(event: RunStreamEvent): string {
 }
 
 export function isTerminalRunStreamEvent(event: RunStreamEvent): boolean {
+  if (event.terminal === false) return false
+  const inferredStatus = event.status || (event.type === 'run_stopped' || event.type === 'stopped' ? 'stopped' : '')
+  if (isResumableWaitingRun({
+    status: inferredStatus,
+    reason: String(event.reason || event.stop_reason || ''),
+  })) return false
   return event.terminal === true || terminalTypes.has(event.type) || (event.type === 'run_state' && isTerminalRunStatus(event.status))
 }
 
@@ -146,8 +176,7 @@ type StoppedRunNoticeCandidate = { id: string; status?: string; stop_reason?: st
 export function shouldShowStoppedRunNotice(run: StoppedRunNoticeCandidate | undefined, repliedRunIds: Set<string>, historyReady = true): boolean {
   if (!historyReady || !run || !['stopped', 'failed'].includes(String(run.status || '')) || repliedRunIds.has(run.id)) return false
   if (run.status === 'failed') return true
-  const reason = String(run.stop_reason || '')
-  return reason !== 'delegated_child_awaiting_approval'
+  return !isResumableWaitingRun(run)
 }
 
 type PersistedRunReplyCandidate = {

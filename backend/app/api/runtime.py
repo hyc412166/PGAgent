@@ -47,8 +47,10 @@ from app.services.run_service import (
 )
 from app.services.run_stream import TERMINAL_EVENT_TYPES, run_stream_broker
 from app.services.skill_service import replace_session_skills, validate_skill_ids
+from app.services.task_state import bind_recovery_task
 from app.services.turn_delivery import (
     find_turn_by_client_message,
+    is_terminal_delivery,
     persist_terminal_response,
     request_fingerprint,
     run_for_turn,
@@ -57,6 +59,18 @@ from app.services.turn_delivery import (
 
 
 router = APIRouter(prefix="/api", tags=["runtime"])
+
+
+def _stream_event_is_terminal(event: dict) -> bool:
+    event_type = str(event.get("type") or "")
+    if event_type not in TERMINAL_EVENT_TYPES:
+        return False
+    if event_type in {"run_stopped", "stopped"}:
+        return is_terminal_delivery(
+            "stopped",
+            str(event.get("stop_reason") or event.get("reason") or "") or None,
+        )
+    return True
 
 
 class SessionRunRequest(BaseModel):
@@ -391,6 +405,7 @@ async def launch_session_run(
         fingerprint=fingerprint,
         message_extra={"mode": mode},
     )
+    bind_recovery_task(db, run, content)
     chat_session.updated_at = datetime.now(timezone.utc)
     try:
         db.commit()
@@ -438,7 +453,7 @@ async def stream_run(run_id: str, request: Request) -> EventSourceResponse:
             "stop_reason": run.stop_reason,
             "error_code": run.error_code,
             "error": run.error_message,
-            "terminal": run.status in {"completed", "failed", "stopped"},
+            "terminal": is_terminal_delivery(run.status, run.stop_reason),
         }
 
     replay, subscription = run_stream_broker.subscribe(run_id)
@@ -464,14 +479,14 @@ async def stream_run(run_id: str, request: Request) -> EventSourceResponse:
             yield encode(initial_state)
             for event in replay:
                 yield encode(event)
-                if str(event.get("type") or "") in TERMINAL_EVENT_TYPES:
+                if _stream_event_is_terminal(event):
                     return
             if initial_state["terminal"]:
                 return
             while not await request.is_disconnected():
                 event = await subscription.queue.get()
                 yield encode(event)
-                if str(event.get("type") or "") in TERMINAL_EVENT_TYPES:
+                if _stream_event_is_terminal(event):
                     return
         finally:
             run_stream_broker.unsubscribe(subscription)

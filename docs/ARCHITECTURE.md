@@ -15,13 +15,21 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 
 新建对话先存在于前端草稿状态，不写 SQLite；当用户从某个项目会话发起新对话时，草稿仅在前端预选该项目目录，仍可重新选择或清除。第一次发送通过 `POST /api/drafts/launch` 的单个事务创建（或复用）项目、以首条内容生成会话标题，并原子创建会话、`ConversationTurn`、用户消息、根运行和幂等记录，提交后才启动运行。浏览器保留草稿级幂等键；同键同内容重试只返回原会话与原运行，不会二次启动模型，同键不同内容会明确返回冲突。后续每条会话消息同样携带客户端幂等键。离开未发送的草稿不会留下会话、消息、运行或 Token 用量。
 
-每个会话固定绑定 `DEFAULT_AGENT_ID`，即不可编辑、不可删除的 PGAgent 主控。主控负责意图识别、复杂度判断、规划、执行结果汇总和继续/输出决策。已启用的用户创建 Agent 会作为可委派子 Agent 的安全目录项提供给主控；主控可通过 `task(agent_id, task)` 委派单个任务，也可通过 `task(tasks=[...])` 并行委派多个独立任务，不会伪造未执行的委派。
+每个会话固定绑定 `DEFAULT_AGENT_ID`，即不可编辑、不可删除的 PGAgent 主控。主控负责意图识别、复杂度判断、规划、执行结果汇总和继续/输出决策。已启用的用户创建 Agent 会作为可委派子 Agent 的安全目录项提供给主控；主控可通过 `task(agent_id, task)` 委派单个任务，也可通过 `task(tasks=[...])` 提交带显式 `id/depends_on` 的任务图。没有依赖关系的节点在同一波并发执行，后继节点仅在全部前置节点成功后解锁。
 
 ## 对话交付保证
 
 `ConversationTurn` 是一次已接收用户输入的持久化交付回执，不是上下文任务目标。一个 Turn 可以在内部拆成多个目标、工具步骤和子 Run，但数据库通过唯一终态键保证它最终至多写入一条用户可见 assistant 终态消息；正常模型输出、失败、停止、审批拒绝、空输出、调度失败和重启中断都通过同一确定性收口函数写入。模型没有可用输出时由本地模板生成说明和追踪号，不调用额外模型或 evaluator。`execution_status` 可为 `partial_failure`，而 `reply_status=delivered` 仅表示系统已经向用户交代清楚，两者不能混为一谈。
 
 子 Agent 只把结构化结果写回 `delegated_tasks`，不直接占用主会话的终态回复。主控正常时负责自然语言汇总；若主控在汇总阶段失败，系统会根据每个子任务的完成、失败、停止及 `workspace_changed` 记录生成基础汇总，并提醒可能存在的部分修改。进程启动和后台 watchdog 会修复终态但缺少回复的历史/异常 Run，并结束没有协调器任务的孤儿根 Run。SSE 仅用于实时显示，前端断流后按 `run_id/turn_id` 重新读取持久化消息。
+
+## 持久化任务计划与恢复
+
+`ConversationTurn` 负责一轮消息的可靠交付，`DurableTask` 则负责跨多轮、跨进程保存用户目标。主控对包含两个以上可核验步骤的工作调用 `todowrite` 后，后端会同步创建一条 `durable_tasks`、`plan_steps` 和 `plan_step_dependencies`；每一步使用跨更新保持不变的显式 ID，并保存状态、执行器类型（主 Agent、子 Agent 或后台 Job）、目标 Agent/Run、工作区模式、尝试次数、结果与证据。SQLite `BEGIN IMMEDIATE` 保护“检查依赖并认领”这一原子边界，保证并发执行器不会重复认领同一步。`Run.task_id/plan_step_id` 记录本次运行归属，`run_kind/resumed_from_run_id` 记录初次执行或恢复链路。兼容的 `TaskCreate/task_create/TaskUpdate/task_update/claim_task` 也使用这套表，不再在真实运行中维护第二份 `tasks.json`。任务面板通过 `/api/sessions/{id}/active-task` 显示依赖、执行器和进度，完整历史可由 `/api/sessions/{id}/tasks` 获取。
+
+用户主动停止时，任务转为 `paused`；进程重启会把遗留的活动 Run 收口为 `stopped/interrupted_restart`，任务和当时的活动步骤转为 `needs_recovery`。用户随后输入“继续刚刚的工作”等明确续接语句时，新 Run 会绑定该会话最近的未完成任务，并收到后端生成的恢复包。恢复包是结构化事实来源：模型不得重做已完成步骤，对 `needs_recovery` 步骤必须先检查文件、测试或其他工作区事实，再决定标记完成还是补做。每次成功的 `todowrite` 都会重新落盘进度，所以恢复不依赖模型从整段聊天历史中猜测做到哪里。
+
+浏览器单独断网不会立即中止后端 Run；重新连接后前端继续按持久化 Run、消息和任务状态同步。如果后端进程同时退出，则以上启动收口与恢复包流程生效。任务粒度是语义步骤，不是任意工具调用级事务，因此中断发生在写文件或外部副作用中间时，系统只保证标记为待核验，不会假定该动作成功，也不会盲目自动重放。
 
 ## 外层状态机
 
@@ -38,8 +46,8 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 - 文件工具通过 `WorkspaceSandbox` 解析真实路径并拒绝目录逃逸、Junction 和符号链接越界。`edit` 只做精确文本替换，默认要求唯一匹配；`glob`/`grep` 有扫描、文件大小和结果上限。
 - `bash` 从不启动 shell，只允许裸 allowlist 可执行文件，使用工作区 cwd、超时、进程树终止和输出上限。`full` 仅跳过审批，不会取消 allowlist 或工作区边界。
 - `webfetch` 使用无环境代理的 HTTP 客户端，只允许公开 HTTP(S) DNS 地址，拒绝私网/回环/保留地址与自动重定向，并限制响应大小和超时；`websearch` 通过 DuckDuckGo HTML 返回真实解析结果，失败时显式返回 provider 不可用。
-- `todowrite` 是 JSON 可序列化的运行/会话待办状态；`skill` 只按 ID 返回会话已选的受管理 `SKILL.md` 文本，不执行脚本；`question` 结束本轮并将澄清问题作为正常助手消息。`task` 会为每个子任务创建幂等的委派记录和独立子 `Run`；批量任务通过异步 gather 并行执行，待全部子运行有结果后把带状态、run/task ID、工具计数和截断输出的结构化结果交回主控。
-- 子 Agent 继承父运行已经冻结的工作区和权限模式；它的工具为“父运行允许工具”与“子 Agent 自己勾选工具”的交集，强制移除 `task`，并冻结自身的模型、Skill 和提示词。子 Run 若需要二次审批会真实进入 `awaiting_approval`/`blocked`，绝不把未批准操作说成已完成。
+- `todowrite` 是 JSON 可序列化的运行/会话待办状态；`skill` 只按 ID 返回会话已选的受管理 `SKILL.md` 文本，不执行脚本；`question` 结束本轮并将澄清问题作为正常助手消息。`task` 会先持久化完整 DAG，再按 ready wave 并发创建幂等委派记录和独立子 `Run`；失败前置节点的后继任务不会被错误启动。
+- 子 Agent 继承父运行已经冻结的权限模式；它的工具为“父运行允许工具”与“子 Agent 自己勾选工具”的交集，并强制移除递归委派、团队管理和共享任务板写入工具。子 Run 若需要二次审批会真实进入 `awaiting_approval`，若其后台 Job 未完成则进入事件等待，绝不把未批准或仅入队的操作说成已完成。
 - `ask`：写入、命令、委派与联网均须批准；`smart`：低风险读取和受限公网读取自动执行，写入、命令和委派须批准；`full`：无需批准，但仍保留上述基础安全边界。
 - 事件流提供 `model_step_started`、`tool_started`、`tool_finished` 和终态事件，携带安全参数摘要和耗时；工具结果正文、写入正文、Token/API Key 不写入时间线事件。
 
@@ -68,7 +76,13 @@ Skill registry 仅管理本地副本和元数据：`SKILL.md` 必须为 UTF-8，
 
 ## 子 Agent 委派
 
-SQLite `delegated_tasks` 保存父会话、父 Run、子 Run、目标 Agent、状态和结构化结果。`task` 采用单层并行委派：一项父工具调用最多创建 8 个子 Run；同一轮返回的多个独立 `task` 调用也会并行执行，避免无界 fan-out。子 Agent 使用父会话冻结的工作区和权限边界，在独立上下文中执行，并且不能再次获得 `task` 工具。主控负责拆解、验收和汇总，子 Agent 的完整输出不会作为普通助手消息重复插入主会话。
+SQLite `delegated_tasks` 保存父会话、父 Run、子 Run、任务图步骤、持久化队友和结构化结果。`task` 采用单层、有依赖的并行委派：一项父工具调用最多创建 8 个子 Run；同一 ready wave 通过异步任务并发执行，下一 wave 等待其声明的前置节点完成，避免无界 fan-out 和错误串行。每次直接委派创建的一次性子运行在任务完成后结束；它不是常驻进程。
+
+需要跨多次分配保留角色、提示词、历史结果和收件箱时，主控使用 `spawn_teammate` 创建 `collaboration_teams/teammate_workers` 中的持久化队友身份。持久化的是身份和协作上下文，不是永久占用线程的 LLM 进程；每次分配仍创建一个新的子 Run，但会注入该队友的未读消息和最近任务结果。`send_message/read_inbox/broadcast` 使用 SQLite `collaboration_messages`，子 Agent 可向 `lead` 回信；终态和消息通知写入 `collaboration_events`。状态可通过 `/api/sessions/{id}/teammates`、`collaboration-messages` 和 `collaboration-events` 查询。
+
+队友默认共享父工作区。`workspace_mode=worktree` 会为该队友创建独立 Git branch/worktree，子 Run 的沙箱根切换到该 worktree，避免多个写入型 Agent 同时修改同一目录。创建流程先短事务写入 `provisioning`，再在事务外执行 Git，成功后用第二个短事务转为 `idle`，所以大型仓库或 Git hook 不会长期占用 SQLite 写锁。主控通过需要审批的 `integrate_teammate` 显式提交并合并队友分支；队友仍在工作时拒绝合并，冲突或超时时执行 `merge --abort` 并返回明确错误。
+
+长时间下载、安装和构建使用持久化 `background_jobs`。`background_run` 只负责入队并立即返回 Job ID，命令由独立后台线程执行，状态、PID、超时、日志路径和终态结果写入 SQLite；传入 `plan_step_id` 时 Job 会原子认领并在终态结算对应 DAG 步骤。Agent 可在入队后继续处理不依赖该结果的 ready step。若准备结束时仍有活动 Job，完成验收把 Run 持久化为 `stopped/waiting_background` 并登记 `waiting_run_id`，不再让 LLM 循环调用“完成了吗”。后台线程只在终态写一次事件并通知协调器；协调器确认该 Run 的全部等待 Job 均终态后自动恢复模型，启动 watchdog 也会重放遗漏的通知。终态事件先作为未确认消息注入模型，只有包含处理结果的 Run outcome 成功提交时才在同一事务中写入 `observed_at/consumed_at`；provider 失败或进程退出会保留事件供下次至少一次重投。`check_background` 保留为人工查询兼容工具，不是自动续跑的必要条件。正常关闭时运行中的 Job 会终止并回到队列，下次启动自动恢复；异常退出后无法证明原进程终态的 Job 会明确标记失败，不会盲目重复安装命令。会话可通过 `/api/sessions/{id}/background-jobs` 读取持久状态。
 
 ## 模型网关
 

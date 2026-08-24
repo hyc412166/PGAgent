@@ -120,6 +120,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {
                 "task": {"type": "string"},
                 "agent_id": {"type": "string"},
+                "step_id": {"type": "string"},
+                "depends_on": {"type": "array", "items": {"type": "string"}},
                 "tasks": {
                     "type": "array",
                     "maxItems": 8,
@@ -128,6 +130,9 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "properties": {
                             "task": {"type": "string"},
                             "agent_id": {"type": "string"},
+                            "id": {"type": "string"},
+                            "depends_on": {"type": "array", "items": {"type": "string"}},
+                            "workspace_mode": {"type": "string", "enum": ["shared", "worktree"]},
                         },
                         "required": ["task", "agent_id"],
                     },
@@ -140,7 +145,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "todowrite": {
-        "description": "更新本次运行的结构化任务清单。",
+        "description": "更新本次运行的结构化任务清单；每一步必须提供跨更新保持不变的 id。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -153,8 +158,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                             "content": {"type": "string"},
                             "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]},
                             "active_form": {"type": "string"},
+                            "depends_on": {"type": "array", "items": {"type": "string"}},
+                            "executor_kind": {"type": "string", "enum": ["main", "subagent", "background"]},
+                            "agent_id": {"type": "string"},
+                            "workspace_mode": {"type": "string", "enum": ["shared", "worktree"]},
                         },
-                        "required": ["content", "status"],
+                        "required": ["id", "content", "status"],
                     },
                 }
             },
@@ -277,6 +286,7 @@ LEGACY_TOOL_NAMES: tuple[str, ...] = (
     "run_command",
 )
 ALL_TOOL_NAMES: tuple[str, ...] = (*PUBLIC_TOOL_NAMES, *LEGACY_TOOL_NAMES)
+_CANONICAL_MEMORY_TOOL_NAMES = frozenset({"MemoryWrite", "MemoryRead", "MemoryList", "MemorySearch"})
 
 # A provider batch containing only these tools is safe to execute concurrently:
 # none mutates workspace/runtime state and result ordering is restored to the
@@ -304,12 +314,12 @@ PARALLEL_READ_ONLY_TOOL_NAMES = frozenset({
     "ToolSearch",
     "Sleep",
     "idle",
-    "check_background",
     "task_get",
     "task_list",
     "list_teammates",
     "MemoryRead",
     "MemoryList",
+    "MemorySearch",
     "TaskGet",
     "TaskList",
     "TaskOutput",
@@ -398,6 +408,11 @@ class ToolRegistry:
         permission_mode: str = "smart",
         skill_instructions: Iterable[Mapping[str, Any] | str] | None = None,
         todo_state: Iterable[Mapping[str, Any]] | None = None,
+        todo_change_sink: Callable[[list[dict[str, Any]]], None] | None = None,
+        memory_store: Any | None = None,
+        background_store: Any | None = None,
+        team_store: Any | None = None,
+        task_store: Any | None = None,
         task_delegate: Callable[..., ToolResult | Any] | None = None,
     ) -> None:
         self.sandbox = sandbox
@@ -405,10 +420,15 @@ class ToolRegistry:
         self._tools: dict[str, Callable[..., ToolResult]] = {}
         self._known_tools = set(TOOL_SCHEMAS)
         self._task_delegate = task_delegate
+        self._todo_change_sink = todo_change_sink
+        self._memory_store = memory_store
+        self._background_store = background_store
+        self._team_store = team_store
+        self._task_store = task_store
         self._active_cancel_lock = threading.RLock()
         self._active_cancel_events: dict[str, threading.Event] = {}
         self._skill_instructions = _normalize_skill_instructions(skill_instructions)
-        self._todo_state: list[dict[str, str]] = []
+        self._todo_state: list[dict[str, Any]] = []
         if todo_state is not None:
             try:
                 normalized = builtins._normalize_todos(list(todo_state))
@@ -420,7 +440,15 @@ class ToolRegistry:
         source_names = ALL_TOOL_NAMES if allowed_tool_names is None else allowed_tool_names
         selected = tuple(str(name).strip() for name in source_names if str(name).strip())
         for name in selected:
+            if name in _CANONICAL_MEMORY_TOOL_NAMES and self._memory_store is None:
+                continue
             self._register_default(name)
+
+    def _write_todos(self, sandbox: WorkspaceSandbox, todos: list[dict[str, Any]]) -> ToolResult:
+        result = builtins.todo_write(sandbox, todos=todos, todo_state=self._todo_state)
+        if result.ok and self._todo_change_sink is not None:
+            self._todo_change_sink([dict(item) for item in self._todo_state])
+        return result
 
     def _register_default(self, name: str) -> None:
         mapping: dict[str, Callable[..., ToolResult]] = {
@@ -434,7 +462,7 @@ class ToolRegistry:
             "webfetch": builtins.web_fetch,
             "websearch": builtins.web_search,
             "task": lambda sandbox, **kwargs: builtins.delegate_task(sandbox, delegate=self._task_delegate, **kwargs),
-            "todowrite": lambda sandbox, **kwargs: builtins.todo_write(sandbox, todo_state=self._todo_state, **kwargs),
+            "todowrite": lambda sandbox, todos: self._write_todos(sandbox, todos),
             "question": builtins.ask_question,
             "skill": lambda sandbox, **kwargs: builtins.load_skill(sandbox, skill_instructions=self._skill_instructions, **kwargs),
             "git_status": builtins.git_status,
@@ -458,11 +486,7 @@ class ToolRegistry:
             ),
             "WebFetch": builtins.web_fetch,
             "WebSearch": builtins.web_search,
-            "TodoWrite": lambda sandbox, todos: builtins.todo_write(
-                sandbox,
-                todos=_normalize_claw_todos(todos),
-                todo_state=self._todo_state,
-            ),
+            "TodoWrite": lambda sandbox, todos: self._write_todos(sandbox, _normalize_claw_todos(todos)),
             "Skill": lambda sandbox, skill="", skill_id="", name="": builtins.load_skill(
                 sandbox,
                 skill_id=skill_id or skill,
@@ -491,19 +515,31 @@ class ToolRegistry:
             "REPL": advanced.repl,
             "PowerShell": advanced.powershell,
             "AskUserQuestion": builtins.ask_question,
-            "TaskCreate": lambda sandbox, **kwargs: advanced.task_create(sandbox, tool_name="TaskCreate", **kwargs),
-            "RunTaskPacket": lambda sandbox, packet: advanced.task_create(sandbox, packet=packet, tool_name="RunTaskPacket"),
-            "TaskGet": lambda sandbox, **kwargs: advanced.task_get(sandbox, tool_name="TaskGet", **kwargs),
-            "TaskList": lambda sandbox: advanced.task_list(sandbox, tool_name="TaskList"),
-            "TaskStop": lambda sandbox, task_id, message=None: advanced.task_update(
-                sandbox,
-                task_id,
-                status="stopped",
-                message=message,
-                tool_name="TaskStop",
+            "TaskCreate": (
+                lambda _sandbox, **kwargs: self._task_store.create(tool_name="TaskCreate", **kwargs)
+            ) if self._task_store is not None else lambda sandbox, **kwargs: advanced.task_create(sandbox, tool_name="TaskCreate", **kwargs),
+            "RunTaskPacket": (
+                lambda _sandbox, packet: self._task_store.create(packet=packet, tool_name="RunTaskPacket")
+            ) if self._task_store is not None else lambda sandbox, packet: advanced.task_create(sandbox, packet=packet, tool_name="RunTaskPacket"),
+            "TaskGet": (
+                lambda _sandbox, **kwargs: self._task_store.get(tool_name="TaskGet", **kwargs)
+            ) if self._task_store is not None else lambda sandbox, **kwargs: advanced.task_get(sandbox, tool_name="TaskGet", **kwargs),
+            "TaskList": (
+                lambda _sandbox: self._task_store.list(tool_name="TaskList")
+            ) if self._task_store is not None else lambda sandbox: advanced.task_list(sandbox, tool_name="TaskList"),
+            "TaskStop": (
+                lambda _sandbox, task_id, message=None: self._task_store.update(
+                    task_id=task_id, status="stopped", message=message, tool_name="TaskStop"
+                )
+            ) if self._task_store is not None else lambda sandbox, task_id, message=None: advanced.task_update(
+                sandbox, task_id, status="stopped", message=message, tool_name="TaskStop",
             ),
-            "TaskUpdate": lambda sandbox, **kwargs: advanced.task_update(sandbox, tool_name="TaskUpdate", **kwargs),
-            "TaskOutput": advanced.task_output,
+            "TaskUpdate": (
+                lambda _sandbox, **kwargs: self._task_store.update(tool_name="TaskUpdate", **kwargs)
+            ) if self._task_store is not None else lambda sandbox, **kwargs: advanced.task_update(sandbox, tool_name="TaskUpdate", **kwargs),
+            "TaskOutput": (
+                lambda _sandbox, task_id: self._task_store.get(task_id=task_id, tool_name="TaskOutput")
+            ) if self._task_store is not None else advanced.task_output,
             "WorkerCreate": advanced.worker_create,
             "WorkerGet": lambda sandbox, worker_id: advanced._worker_action(sandbox, worker_id, "WorkerGet"),
             "WorkerObserve": lambda sandbox, worker_id, **kwargs: advanced._worker_action(sandbox, worker_id, "WorkerObserve", **kwargs),
@@ -535,30 +571,60 @@ class ToolRegistry:
             "GitLog": advanced.git_log,
             "GitShow": advanced.git_show,
             "GitBlame": advanced.git_blame,
-            "MemoryWrite": advanced.memory_write,
-            "MemoryRead": advanced.memory_read,
-            "MemoryList": advanced.memory_list,
+            "MemoryWrite": (lambda _sandbox, **kwargs: self._memory_store.write(**kwargs)) if self._memory_store is not None else advanced.memory_write,
+            "MemoryRead": (lambda _sandbox, **kwargs: self._memory_store.read(**kwargs)) if self._memory_store is not None else advanced.memory_read,
+            "MemoryList": (lambda _sandbox, **kwargs: self._memory_store.list(**kwargs)) if self._memory_store is not None else advanced.memory_list,
+            "MemorySearch": (lambda _sandbox, **kwargs: self._memory_store.search(**kwargs)) if self._memory_store is not None else advanced.memory_search,
             "load_skill": lambda sandbox, **kwargs: builtins.load_skill(
                 sandbox,
                 skill_instructions=self._skill_instructions,
                 **kwargs,
             ),
             "compress": advanced.request_compaction,
-            "background_run": advanced.background_run,
-            "check_background": advanced.check_background,
-            "task_create": advanced.task_create,
-            "task_get": advanced.task_get,
-            "task_update": advanced.task_update,
-            "task_list": advanced.task_list,
-            "spawn_teammate": advanced.spawn_teammate,
-            "list_teammates": advanced.list_teammates,
-            "send_message": advanced.send_message,
-            "read_inbox": advanced.read_inbox,
-            "broadcast": advanced.broadcast,
-            "shutdown_request": advanced.shutdown_request,
+            "background_run": (
+                lambda _sandbox, **kwargs: self._background_store.start(**kwargs)
+            ) if self._background_store is not None else advanced.background_run,
+            "check_background": (
+                lambda _sandbox, **kwargs: self._background_store.check(**kwargs)
+            ) if self._background_store is not None else advanced.check_background,
+            "task_create": (
+                lambda _sandbox, **kwargs: self._task_store.create(**kwargs)
+            ) if self._task_store is not None else advanced.task_create,
+            "task_get": (
+                lambda _sandbox, **kwargs: self._task_store.get(**kwargs)
+            ) if self._task_store is not None else advanced.task_get,
+            "task_update": (
+                lambda _sandbox, **kwargs: self._task_store.update(**kwargs)
+            ) if self._task_store is not None else advanced.task_update,
+            "task_list": (
+                lambda _sandbox: self._task_store.list()
+            ) if self._task_store is not None else advanced.task_list,
+            "spawn_teammate": (
+                lambda _sandbox, **kwargs: self._team_store.spawn(**kwargs)
+            ) if self._team_store is not None else advanced.spawn_teammate,
+            "list_teammates": (
+                lambda _sandbox: self._team_store.list()
+            ) if self._team_store is not None else advanced.list_teammates,
+            "send_message": (
+                lambda _sandbox, **kwargs: self._team_store.send_message(**kwargs)
+            ) if self._team_store is not None else advanced.send_message,
+            "read_inbox": (
+                lambda _sandbox, **kwargs: self._team_store.read_inbox(**kwargs)
+            ) if self._team_store is not None else advanced.read_inbox,
+            "broadcast": (
+                lambda _sandbox, **kwargs: self._team_store.broadcast(**kwargs)
+            ) if self._team_store is not None else advanced.broadcast,
+            "shutdown_request": (
+                lambda _sandbox, **kwargs: self._team_store.shutdown(**kwargs)
+            ) if self._team_store is not None else advanced.shutdown_request,
+            "integrate_teammate": (
+                lambda _sandbox, **kwargs: self._team_store.integrate(**kwargs)
+            ) if self._team_store is not None else advanced.integrate_teammate,
             "plan_approval": advanced.plan_approval,
             "idle": advanced.idle_tool,
-            "claim_task": advanced.task_claim,
+            "claim_task": (
+                lambda _sandbox, **kwargs: self._task_store.claim(**kwargs)
+            ) if self._task_store is not None else advanced.task_claim,
         }
         function = mapping.get(name)
         if function is not None:
@@ -688,7 +754,7 @@ class ToolRegistry:
         # effective grant after policy has checked it.
         if name in {"write", "write_file", "edit", "edit_file", "delete", "bash", "run_command"}:
             kwargs["approved"] = True
-        if _cancel_event is not None and name in {"bash", "run_command"}:
+        if _cancel_event is not None and name in {"bash", "run_command", "check_background"}:
             # This is an in-process cancellation signal, not a model/tool
             # argument.  Inject it only after policy approval so it can never
             # leak into ApprovalRequest JSON or the persisted run snapshot.
@@ -799,6 +865,11 @@ def create_default_registry(
     permission_mode: str = "smart",
     skill_instructions: Iterable[Mapping[str, Any] | str] | None = None,
     todo_state: Iterable[Mapping[str, Any]] | None = None,
+    todo_change_sink: Callable[[list[dict[str, Any]]], None] | None = None,
+    memory_store: Any | None = None,
+    background_store: Any | None = None,
+    team_store: Any | None = None,
+    task_store: Any | None = None,
     task_delegate: Callable[..., ToolResult | Any] | None = None,
 ) -> ToolRegistry:
     """Create a sandboxed registry with an explicit, frozen capability list."""
@@ -809,5 +880,10 @@ def create_default_registry(
         permission_mode=permission_mode,
         skill_instructions=skill_instructions,
         todo_state=todo_state,
+        todo_change_sink=todo_change_sink,
+        memory_store=memory_store,
+        background_store=background_store,
+        team_store=team_store,
+        task_store=task_store,
         task_delegate=task_delegate,
     )

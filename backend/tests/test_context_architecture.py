@@ -34,6 +34,23 @@ def test_uncompacted_history_is_append_only_and_keeps_one_cache_namespace() -> N
     assert second.requires_compaction is False
 
 
+def test_memory_snapshot_changes_only_transcript_not_cache_namespace() -> None:
+    assembler = ContextAssembler(max_tokens=10_000, output_reserve_tokens=0, safety_buffer_tokens=0)
+    stable = assembler.stable_prefix(system_rules="safe", workspace_rules="repo")
+    old = assembler.assemble(stable_prefix=stable, transcript=[{
+        "role": "user",
+        "content": "<memory-context>pytest</memory-context>\n<current-request>run tests</current-request>",
+    }])
+    new = assembler.assemble(stable_prefix=stable, transcript=[{
+        "role": "user",
+        "content": "<memory-context>pytest -q</memory-context>\n<current-request>run tests</current-request>",
+    }])
+
+    assert old.cache_key == new.cache_key
+    assert old.stable_prefix == new.stable_prefix
+    assert old.transcript != new.transcript
+
+
 def test_assembler_never_trims_seen_history_when_over_budget() -> None:
     assembler = ContextAssembler(max_tokens=400, output_reserve_tokens=0, safety_buffer_tokens=0)
     stable = assembler.stable_prefix(system_rules="safe")
@@ -130,4 +147,3 @@ def test_new_user_request_supersedes_request_inside_old_continuation() -> None:
 
     assert layout.messages[-1]["content"] == "second task"
     assert layout.messages.count(old_continuation) == 1
-

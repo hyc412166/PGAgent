@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -17,14 +17,20 @@ from app.config import settings
 from app.database import (
     Agent,
     Approval,
+    BackgroundJob,
     ChatMessage,
+    CollaborationEvent,
+    CollaborationMessage,
+    CollaborationTeam,
     DelegatedTask,
+    DurableTask,
     DraftLaunch,
     Memory,
     ModelConnection,
     Run,
     RunEvent,
     Session as ChatSession,
+    TeammateWorker,
     Workspace,
     UsageRecord,
     DEFAULT_AGENT_ID,
@@ -37,10 +43,14 @@ from app.schemas import (
     AgentRead,
     AgentUpdate,
     ApprovalRead,
+    BackgroundJobRead,
     ChatMessageCreate,
     ChatMessageRead,
+    CollaborationEventRead,
+    CollaborationMessageRead,
     DashboardRead,
     DelegatedTaskRead,
+    DurableTaskRead,
     MemoryCreate,
     MemoryRead,
     MemoryUpdate,
@@ -52,11 +62,15 @@ from app.schemas import (
     SessionCreate,
     SessionRead,
     SessionUpdate,
+    TeammateRead,
     WorkspaceCreate,
     WorkspaceRead,
     WorkspaceUpdate,
 )
+from app.services.memory_service import recall_memories, refresh_memory_markdown_projection, store_memory
 from app.services.skill_service import replace_agent_capabilities, replace_session_skills
+from app.services.task_state import latest_resumable_task, task_payload
+from app.services.team_service import cleanup_session_worktrees
 
 
 router = APIRouter(prefix="/api", tags=["resources"])
@@ -353,6 +367,9 @@ def _workspace_name_from_root(root_path: str) -> str:
 @router.get("/dashboard", response_model=DashboardRead)
 def dashboard(db: Session = Depends(get_db)) -> DashboardRead:
     count = lambda model: db.scalar(select(func.count()).select_from(model)) or 0
+    agent_count = db.scalar(
+        select(func.count()).select_from(Agent).where(Agent.is_default.is_(False))
+    ) or 0
     active_runs = db.scalar(
         select(func.count()).select_from(Run).where(
             Run.status.not_in(("completed", "failed", "stopped"))
@@ -363,7 +380,7 @@ def dashboard(db: Session = Depends(get_db)) -> DashboardRead:
     ) or 0
     return DashboardRead(
         workspaces=count(Workspace),
-        agents=count(Agent),
+        agents=agent_count,
         sessions=count(ChatSession),
         active_runs=active_runs,
         pending_approvals=pending_approvals,
@@ -425,6 +442,7 @@ def update_workspace(
         item.root_path = _normalized_workspace_root(payload.root_path)
     _commit(db)
     db.refresh(item)
+    refresh_memory_markdown_projection()
     return item
 
 
@@ -435,6 +453,7 @@ def delete_workspace(workspace_id: str, db: Session = Depends(get_db)) -> Respon
         raise HTTPException(status_code=409, detail="The default workspace cannot be deleted")
     db.delete(item)
     _commit(db)
+    refresh_memory_markdown_projection()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -556,6 +575,38 @@ def get_session(session_id: str, db: Session = Depends(get_db)) -> ChatSession:
     return _require(db, ChatSession, session_id, "Session")
 
 
+@router.get("/sessions/{session_id}/tasks", response_model=list[DurableTaskRead])
+def list_session_tasks(session_id: str, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    _require(db, ChatSession, session_id, "Session")
+    tasks = list(db.scalars(
+        select(DurableTask)
+        .where(DurableTask.session_id == session_id)
+        .order_by(DurableTask.updated_at.desc(), DurableTask.created_at.desc(), DurableTask.id.desc())
+    ))
+    return [task_payload(db, item) for item in tasks]
+
+
+@router.get("/sessions/{session_id}/active-task", response_model=DurableTaskRead | None)
+def get_session_active_task(session_id: str, db: Session = Depends(get_db)) -> dict[str, Any] | None:
+    _require(db, ChatSession, session_id, "Session")
+    task = latest_resumable_task(db, session_id)
+    return task_payload(db, task) if task is not None else None
+
+
+@router.get("/sessions/{session_id}/background-jobs", response_model=list[BackgroundJobRead])
+def list_session_background_jobs(
+    session_id: str,
+    db: Session = Depends(get_db),
+) -> list[BackgroundJobRead]:
+    _require(db, ChatSession, session_id, "Session")
+    jobs = list(db.scalars(
+        select(BackgroundJob)
+        .where(BackgroundJob.session_id == session_id)
+        .order_by(BackgroundJob.created_at.desc(), BackgroundJob.id.desc())
+    ))
+    return [BackgroundJobRead.model_validate(job) for job in jobs]
+
+
 @router.get("/sessions/{session_id}/delegations", response_model=list[DelegatedTaskRead])
 def list_session_delegations(
     session_id: str,
@@ -634,6 +685,8 @@ def list_session_delegations(
             parent_session_id=session_id,
             child_run_id=child_run.id,
             child_agent_id=child_run.agent_id,
+            plan_step_id=None,
+            teammate_id=None,
             title=title,
             description=description,
             status=child_run.status,
@@ -643,6 +696,59 @@ def list_session_delegations(
         ))
 
     return sorted(items, key=lambda item: item.updated_at, reverse=True)
+
+
+@router.get("/sessions/{session_id}/teammates", response_model=list[TeammateRead])
+def list_session_teammates(session_id: str, db: Session = Depends(get_db)) -> list[TeammateWorker]:
+    _require(db, ChatSession, session_id, "Session")
+    team_ids = select(CollaborationTeam.id).where(CollaborationTeam.session_id == session_id)
+    return list(db.scalars(
+        select(TeammateWorker)
+        .where(TeammateWorker.team_id.in_(team_ids))
+        .order_by(TeammateWorker.created_at.asc(), TeammateWorker.id.asc())
+    ))
+
+
+@router.get(
+    "/sessions/{session_id}/collaboration-messages",
+    response_model=list[CollaborationMessageRead],
+)
+def list_session_collaboration_messages(
+    session_id: str,
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> list[CollaborationMessage]:
+    _require(db, ChatSession, session_id, "Session")
+    team_ids = select(CollaborationTeam.id).where(CollaborationTeam.session_id == session_id)
+    return list(db.scalars(
+        select(CollaborationMessage)
+        .where(CollaborationMessage.team_id.in_(team_ids))
+        .order_by(CollaborationMessage.created_at.desc(), CollaborationMessage.id.desc())
+        .limit(limit)
+    ))
+
+
+@router.get(
+    "/sessions/{session_id}/collaboration-events",
+    response_model=list[CollaborationEventRead],
+)
+def list_session_collaboration_events(
+    session_id: str,
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> list[CollaborationEvent]:
+    _require(db, ChatSession, session_id, "Session")
+    task_ids = select(DurableTask.id).where(DurableTask.session_id == session_id)
+    run_ids = select(Run.id).where(Run.session_id == session_id)
+    return list(db.scalars(
+        select(CollaborationEvent)
+        .where(or_(
+            CollaborationEvent.task_id.in_(task_ids),
+            CollaborationEvent.run_id.in_(run_ids),
+        ))
+        .order_by(CollaborationEvent.created_at.desc(), CollaborationEvent.id.desc())
+        .limit(limit)
+    ))
 
 
 @router.patch("/sessions/{session_id}", response_model=SessionRead)
@@ -679,12 +785,24 @@ def update_session(
     item.agent_id = DEFAULT_AGENT_ID
     _commit(db)
     db.refresh(item)
+    refresh_memory_markdown_projection()
     return item
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_session(session_id: str, db: Session = Depends(get_db)) -> Response:
     item = _require(db, ChatSession, session_id, "Session")
+    active_background_jobs = db.scalar(
+        select(func.count(BackgroundJob.id)).where(
+            BackgroundJob.session_id == session_id,
+            BackgroundJob.status.in_({"queued", "running"}),
+        )
+    )
+    if int(active_background_jobs or 0) > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete a conversation while it has active background jobs",
+        )
     active = db.scalar(
         select(func.count(Run.id)).where(
             Run.session_id == session_id,
@@ -693,6 +811,16 @@ def delete_session(session_id: str, db: Session = Depends(get_db)) -> Response:
     )
     if int(active or 0) > 0:
         raise HTTPException(status_code=409, detail="Cannot delete a conversation while it has an active run")
+
+    workspace = db.get(Workspace, item.workspace_id)
+    if workspace is not None:
+        try:
+            cleanup_session_worktrees(db, session_id, workspace.root_path)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot delete conversation worktrees: {exc}",
+            ) from exc
 
     run_ids = set(db.scalars(select(Run.id).where(Run.session_id == session_id)))
     run_ids.update(
@@ -714,6 +842,7 @@ def delete_session(session_id: str, db: Session = Depends(get_db)) -> Response:
     db.execute(delete(Memory).where(Memory.scope == "session", Memory.scope_id == session_id))
     db.delete(item)
     _commit(db)
+    refresh_memory_markdown_projection()
 
     # Runtime artifacts are stored below one server-owned directory per
     # session.  Cascading the Artifact rows does not remove those payloads, so
@@ -851,11 +980,50 @@ def list_approvals(
 # Memories -------------------------------------------------------------------
 
 
+@router.get("/memory-recalls")
+def list_memory_recalls(
+    session_id: str | None = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    query = select(ChatMessage).where(ChatMessage.role == "user")
+    if session_id:
+        query = query.where(ChatMessage.session_id == session_id)
+    rows = list(db.scalars(query.order_by(
+        ChatMessage.created_at.desc(), ChatMessage.sequence.desc(), ChatMessage.id.desc(),
+    ).limit(limit)))
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        provider_payload = row.provider_payload if isinstance(row.provider_payload, dict) else {}
+        snapshot = provider_payload.get("memory_snapshot")
+        if not isinstance(snapshot, list):
+            continue
+        result.append({
+            "message_id": row.id,
+            "session_id": row.session_id,
+            "turn_id": row.turn_id,
+            "request": row.content,
+            "memories": [
+                {
+                    "id": item.get("id"),
+                    "name": item.get("name"),
+                    "memory_type": item.get("memory_type"),
+                    "updated_at": item.get("updated_at"),
+                }
+                for item in snapshot if isinstance(item, dict)
+            ],
+            "created_at": row.created_at,
+        })
+    return result
+
+
 @router.get("/memories", response_model=list[MemoryRead])
 def list_memories(
     scope: str | None = None,
     scope_id: str | None = None,
     pinned: bool | None = None,
+    memory_type: str | None = None,
+    memory_status: str = "active",
     db: Session = Depends(get_db),
 ) -> list[Memory]:
     query = select(Memory)
@@ -865,32 +1033,127 @@ def list_memories(
         query = query.where(Memory.scope_id == scope_id)
     if pinned is not None:
         query = query.where(Memory.pinned == pinned)
+    if memory_type:
+        query = query.where(Memory.memory_type == memory_type)
+    if memory_status:
+        query = query.where(Memory.status == memory_status)
     return list(db.scalars(query.order_by(Memory.pinned.desc(), Memory.updated_at.desc())))
 
 
 @router.post("/memories", response_model=MemoryRead, status_code=status.HTTP_201_CREATED)
 def create_memory(payload: MemoryCreate, db: Session = Depends(get_db)) -> Memory:
-    data = payload.model_dump(exclude={"metadata"})
-    item = Memory(extra=payload.metadata, **data)
-    db.add(item)
+    if payload.scope == "workspace" and db.get(Workspace, payload.scope_id) is None:
+        raise HTTPException(status_code=422, detail="scope_id does not reference an existing workspace")
+    if payload.scope == "session" and db.get(ChatSession, payload.scope_id) is None:
+        raise HTTPException(status_code=422, detail="scope_id does not reference an existing session")
+    try:
+        item = store_memory(
+            db,
+            name=payload.name or payload.title,
+            content=payload.content,
+            memory_type=payload.memory_type,
+            description=payload.description,
+            tags=payload.tags,
+            scope=payload.scope,
+            workspace_id=payload.scope_id if payload.scope == "workspace" else None,
+            session_id=payload.scope_id if payload.scope == "session" else None,
+            pinned=payload.pinned,
+            metadata=payload.metadata,
+        )
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="an active memory already uses that name in this scope") from exc
     _commit(db)
     db.refresh(item)
+    refresh_memory_markdown_projection()
     return item
+
+
+@router.get("/memories/search", response_model=list[MemoryRead])
+def search_memories(
+    query: str = Query(..., min_length=1),
+    workspace_id: str | None = None,
+    session_id: str | None = None,
+    limit: int = Query(default=5, ge=1, le=5),
+    db: Session = Depends(get_db),
+) -> list[Memory]:
+    snapshots = recall_memories(
+        db,
+        query,
+        workspace_id=workspace_id,
+        session_id=session_id,
+        limit=limit,
+    )
+    ids = [str(item["id"]) for item in snapshots]
+    rows = {item.id: item for item in db.scalars(select(Memory).where(Memory.id.in_(ids)))}
+    return [rows[item_id] for item_id in ids if item_id in rows]
 
 
 @router.patch("/memories/{memory_id}", response_model=MemoryRead)
 def update_memory(memory_id: str, payload: MemoryUpdate, db: Session = Depends(get_db)) -> Memory:
     item = _require(db, Memory, memory_id, "Memory")
-    _apply(item, payload, field_map={"metadata": "extra"})
+    changes = payload.model_dump(exclude_none=True)
+    requested_status = changes.pop("status", None)
+    if requested_status is not None:
+        if requested_status != "archived" or changes:
+            raise HTTPException(
+                status_code=409,
+                detail="status changes may only archive a memory; create a new version to restore it",
+            )
+        item.status = "archived"
+        _commit(db)
+        db.refresh(item)
+        refresh_memory_markdown_projection()
+        return item
+    if item.status != "active":
+        raise HTTPException(status_code=409, detail="only an active memory can be versioned")
+    if not changes:
+        return item
+    next_name = str(changes.get("name") or changes.get("title") or item.name)
+    renamed = next_name.casefold() != item.name.casefold()
+    if renamed:
+        name_conflict = db.scalar(select(Memory.id).where(
+            Memory.id != item.id,
+            Memory.scope == item.scope,
+            Memory.scope_id.is_(None) if item.scope_id is None else Memory.scope_id == item.scope_id,
+            Memory.status == "active",
+            func.lower(Memory.name) == next_name.casefold(),
+        ))
+        if name_conflict is not None:
+            raise HTTPException(status_code=409, detail="an active memory already uses that name in this scope")
+    try:
+        next_item = store_memory(
+            db,
+            name=next_name,
+            content=str(changes.get("content", item.content)),
+            memory_type=str(changes.get("memory_type", item.memory_type)),
+            description=str(changes.get("description", item.description)),
+            tags=changes.get("tags", item.tags or []),
+            scope=item.scope,
+            workspace_id=item.scope_id if item.scope == "workspace" else None,
+            session_id=(item.scope_id if item.scope == "session" else item.source_session_id),
+            source_turn_id=item.source_turn_id,
+            pinned=bool(changes.get("pinned", item.pinned)),
+            metadata=changes.get("metadata", item.extra or {}),
+            force_new=True,
+        )
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="an active memory already uses that name in this scope") from exc
+    if renamed:
+        item.status = "superseded"
+        item.superseded_by = next_item.id
     _commit(db)
-    db.refresh(item)
-    return item
+    db.refresh(next_item)
+    refresh_memory_markdown_projection()
+    return next_item
 
 
 @router.delete("/memories/{memory_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_memory(memory_id: str, db: Session = Depends(get_db)) -> Response:
-    db.delete(_require(db, Memory, memory_id, "Memory"))
+    _require(db, Memory, memory_id, "Memory").status = "archived"
     _commit(db)
+    refresh_memory_markdown_projection()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -898,11 +1161,12 @@ def delete_memory(memory_id: str, db: Session = Depends(get_db)) -> Response:
 def clear_memories(
     scope: str = Query(...), scope_id: str | None = None, db: Session = Depends(get_db)
 ) -> Response:
-    query = delete(Memory).where(Memory.scope == scope)
+    query = update(Memory).where(Memory.scope == scope)
     if scope_id is None:
         query = query.where(Memory.scope_id.is_(None))
     else:
         query = query.where(Memory.scope_id == scope_id)
-    db.execute(query)
+    db.execute(query.values(status="archived"))
     _commit(db)
+    refresh_memory_markdown_projection()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

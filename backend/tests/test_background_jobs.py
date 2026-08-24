@@ -1,0 +1,538 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import time
+from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException
+
+from app import database
+from app.api.resources import delete_session, list_session_background_jobs
+from app.database import Agent, BackgroundJob, Base, CollaborationEvent, PlanStep, Run, Session, Workspace
+from app.runtime import AgentRuntime, RunOutcome
+from app.services import background_job_service
+from app.services.background_job_service import BackgroundJobManager, BackgroundJobToolStore
+from app.services.run_service import RunCoordinator
+from app.services.task_state import sync_todos_for_run
+from app.tools import create_default_registry
+
+
+def _wait_for_job_status(
+    job_id: str,
+    statuses: set[str],
+    *,
+    timeout: float = 10.0,
+    require_pid: bool = False,
+) -> BackgroundJob:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with database.SessionLocal() as db:
+            job = db.get(BackgroundJob, job_id)
+            if job is not None and job.status in statuses and (not require_pid or job.pid is not None):
+                db.expunge(job)
+                return job
+        time.sleep(0.05)
+    raise AssertionError(f"background job {job_id} did not reach {sorted(statuses)}")
+
+
+@pytest.fixture()
+def background_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    database.configure_database(f"sqlite:///{(tmp_path / 'background.db').as_posix()}")
+    database.init_db()
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    monkeypatch.setattr(
+        background_job_service,
+        "settings",
+        SimpleNamespace(data_dir=tmp_path / "data"),
+        raising=False,
+    )
+    with database.SessionLocal() as db:
+        workspace = Workspace(name="Background", root_path=str(workspace_root))
+        db.add(workspace)
+        db.flush()
+        agent = Agent(name="Coordinator", workspace_id=workspace.id)
+        db.add(agent)
+        db.flush()
+        session = Session(title="Background", workspace_id=workspace.id, agent_id=agent.id)
+        db.add(session)
+        db.flush()
+        run = Run(session_id=session.id, workspace_id=workspace.id, agent_id=agent.id)
+        db.add(run)
+        db.commit()
+        values = (run.id, session.id, workspace.id)
+    manager = BackgroundJobManager()
+    monkeypatch.setattr(background_job_service, "background_job_manager", manager)
+    store = BackgroundJobToolStore(
+        run_id=values[0],
+        session_id=values[1],
+        workspace_id=values[2],
+        workspace_root=str(workspace_root),
+    )
+    yield store, manager
+    manager.shutdown()
+    Base.metadata.drop_all(bind=database.engine)
+
+
+def test_background_job_is_persisted_and_wait_returns_terminal_output(background_store) -> None:
+    store, _manager = background_store
+    started = store.start(
+        command="Start-Sleep -Milliseconds 150; Write-Output durable-result",
+        shell="powershell",
+        timeout=30,
+    )
+    assert started.ok is True
+    job_id = started.metadata["background_job_id"]
+
+    result = store.check(task_id=job_id, wait=True, wait_timeout=10)
+
+    assert result.ok is True
+    assert "durable-result" in result.content
+    with database.SessionLocal() as db:
+        job = db.get(BackgroundJob, job_id)
+        assert job is not None
+        assert job.status == "completed"
+        assert job.exit_code == 0
+        assert job.observed_at is not None
+        log_path = Path(job.log_path).resolve()
+        assert log_path.exists()
+        assert log_path.parent == (Path(store.workspace_root).parent / "data" / "background-jobs").resolve()
+        assert not (Path(store.workspace_root) / ".pgagent").exists()
+
+
+def test_recover_relaunches_queued_job_and_settles_stale_running_job(background_store) -> None:
+    store, manager = background_store
+    with database.SessionLocal() as db:
+        queued = BackgroundJob(
+            run_id=store.run_id,
+            session_id=store.session_id,
+            workspace_id=store.workspace_id,
+            workspace_root=store.workspace_root,
+            command="Write-Output recovered",
+            shell="powershell",
+            status="queued",
+            timeout_seconds=30,
+            log_path=str(Path(store.workspace_root) / ".pgagent" / "background-jobs" / "queued.log"),
+        )
+        stale = BackgroundJob(
+            run_id=store.run_id,
+            session_id=store.session_id,
+            workspace_id=store.workspace_id,
+            workspace_root=store.workspace_root,
+            command="Write-Output stale",
+            shell="powershell",
+            status="running",
+            timeout_seconds=30,
+            log_path=str(Path(store.workspace_root) / ".pgagent" / "background-jobs" / "stale.log"),
+        )
+        db.add_all([queued, stale])
+        db.commit()
+        queued_id, stale_id = queued.id, stale.id
+
+    assert queued_id in manager.recover()
+    result = store.check(task_id=queued_id, wait=True, wait_timeout=10)
+    assert result.ok is True
+    assert "recovered" in result.content
+    with database.SessionLocal() as db:
+        stale = db.get(BackgroundJob, stale_id)
+        assert stale is not None
+        assert stale.status == "failed"
+        assert "restarted" in str(stale.error)
+
+
+def test_shutdown_marks_started_job_failed_instead_of_replaying_it(background_store) -> None:
+    store, manager = background_store
+    sync_todos_for_run(store.run_id, [{
+        "id": "install",
+        "content": "Install environment",
+        "status": "pending",
+        "executor_kind": "background",
+    }])
+    started = store.start(
+        command="Start-Sleep -Seconds 30; Write-Output must-not-replay",
+        shell="powershell",
+        timeout=60,
+        plan_step_id="install",
+    )
+    assert started.ok is True
+    job_id = started.metadata["background_job_id"]
+    running = _wait_for_job_status(job_id, {"running"}, require_pid=True)
+    assert running.pid is not None
+
+    manager.shutdown()
+
+    with database.SessionLocal() as db:
+        job = db.get(BackgroundJob, job_id)
+        step = db.get(PlanStep, job.plan_step_id)
+        assert job.status == "failed"
+        assert "shutdown" in str(job.error)
+        assert step.status == "failed"
+        assert db.query(CollaborationEvent).filter_by(source_id=job_id).count() == 1
+
+
+def test_completion_verifier_rejects_unobserved_background_job(tmp_path: Path) -> None:
+    class Store:
+        active = [{"id": "job-1", "status": "running"}]
+        terminal = []
+        registered = False
+
+        def active_jobs(self):
+            return list(self.active)
+
+        def register_waiter(self):
+            self.registered = True
+            return ["job-1"]
+
+        def observe_terminal_results(self):
+            results = list(self.terminal)
+            self.terminal = []
+            return results
+
+    store = Store()
+    runtime = AgentRuntime(
+        model_call=lambda **_kwargs: None,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+    )
+    RunCoordinator._install_completion_verifier(
+        runtime,
+        {"runtime_binding": {}, "background_store": store},
+    )
+    candidate = {
+        "output": "done",
+        "messages": [{"role": "assistant", "content": "done"}],
+        "tool_calls": 0,
+        "pending_approval": None,
+    }
+
+    rejected = runtime.completion_verifier(candidate)
+    assert rejected.accepted is False
+    assert rejected.defer_until_event is True
+    assert store.registered is True
+    assert rejected.report["background_jobs"] == [{"id": "job-1", "status": "running"}]
+
+    store.active = []
+    assert runtime.completion_verifier(candidate).accepted is True
+
+
+def test_completion_verifier_consumes_terminal_race_instead_of_dead_waiting(tmp_path: Path) -> None:
+    class Store:
+        def active_jobs(self):
+            return [{"id": "job-race", "status": "running"}]
+
+        def register_waiter(self):
+            return []
+
+        def observe_terminal_results(self):
+            return [{"id": "job-race", "status": "completed", "output_preview": "ready"}]
+
+    runtime = AgentRuntime(
+        model_call=lambda **_kwargs: None,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+    )
+    RunCoordinator._install_completion_verifier(
+        runtime,
+        {"runtime_binding": {}, "background_store": Store()},
+    )
+    decision = runtime.completion_verifier({
+        "output": "done",
+        "messages": [{"role": "assistant", "content": "done"}],
+        "tool_calls": 0,
+        "pending_approval": None,
+    })
+
+    assert decision.accepted is False
+    assert decision.defer_until_event is False
+    assert decision.report["background_jobs"] == [{"id": "job-race", "status": "completed"}]
+
+
+def test_terminal_job_writes_durable_collaboration_event(background_store) -> None:
+    store, _manager = background_store
+    started = store.start(command="Write-Output event-result", shell="powershell", timeout=30)
+    job_id = started.metadata["background_job_id"]
+    assert store.check(task_id=job_id, wait=True, wait_timeout=10).ok is True
+
+    with database.SessionLocal() as db:
+        event = db.query(CollaborationEvent).filter_by(
+            source_kind="background_job",
+            source_id=job_id,
+        ).one()
+        assert event.event_type == "background_job_completed"
+        assert "event-result" in event.payload["output"]
+
+
+def test_terminal_event_is_acknowledged_only_with_persisted_model_outcome(background_store) -> None:
+    store, _manager = background_store
+    with database.SessionLocal() as db:
+        job = BackgroundJob(
+            run_id=store.run_id,
+            session_id=store.session_id,
+            workspace_id=store.workspace_id,
+            workspace_root=store.workspace_root,
+            command="Write-Output durable-event",
+            shell="powershell",
+            status="completed",
+            timeout_seconds=30,
+            exit_code=0,
+            output_preview="durable-event",
+            log_path="",
+        )
+        db.add(job)
+        db.flush()
+        event = CollaborationEvent(
+            run_id=store.run_id,
+            source_kind="background_job",
+            source_id=job.id,
+            event_type="background_job_completed",
+            payload={"status": "completed", "output": "durable-event"},
+        )
+        db.add(event)
+        db.commit()
+        job_id, event_id = job.id, event.id
+
+    delivered = store.observe_terminal_results()
+    assert [item["id"] for item in delivered] == [job_id]
+    assert store.observe_terminal_results() == []
+    with database.SessionLocal() as db:
+        assert db.get(BackgroundJob, job_id).observed_at is None
+        assert db.get(CollaborationEvent, event_id).consumed_at is None
+
+    retry_store = BackgroundJobToolStore(
+        run_id=store.run_id,
+        session_id=store.session_id,
+        workspace_id=store.workspace_id,
+        workspace_root=store.workspace_root,
+    )
+    assert [item["id"] for item in retry_store.observe_terminal_results()] == [job_id]
+
+    RunCoordinator._persist_outcome(
+        store.run_id,
+        RunOutcome(
+            status="completed",
+            output="used the durable event",
+            messages=[{"role": "assistant", "content": "used the durable event"}],
+            events=[{"type": "run_completed"}],
+            steps=1,
+            tool_calls=0,
+        ),
+        retry_store.delivered_terminal_ids(),
+    )
+    with database.SessionLocal() as db:
+        job = db.get(BackgroundJob, job_id)
+        event = db.get(CollaborationEvent, event_id)
+        assert job.observed_at is not None and job.observed_by_run_id == store.run_id
+        assert event.consumed_at is not None and event.consumer_run_id == store.run_id
+
+
+def test_background_job_claims_and_settles_a_task_graph_step(background_store) -> None:
+    store, _manager = background_store
+    sync_todos_for_run(store.run_id, [{
+        "id": "download-model",
+        "content": "Download the large model",
+        "status": "pending",
+        "executor_kind": "background",
+    }])
+
+    started = store.start(
+        command="Write-Output model-ready",
+        shell="powershell",
+        timeout=30,
+        plan_step_id="download-model",
+    )
+    assert started.ok
+    with database.SessionLocal() as db:
+        job = db.get(BackgroundJob, started.metadata["background_job_id"])
+        step = db.get(PlanStep, job.plan_step_id)
+        assert step.status == "in_progress"
+        assert step.executor_kind == "background"
+
+    assert store.check(task_id=started.metadata["background_job_id"], wait=True, wait_timeout=10).ok
+    with database.SessionLocal() as db:
+        step = db.get(PlanStep, started.metadata["plan_step_id"])
+        assert step.status == "completed"
+        assert "model-ready" in step.result
+
+
+def test_session_background_job_api_reads_durable_state(background_store) -> None:
+    store, _manager = background_store
+    started = store.start(command="Write-Output api-result", shell="powershell", timeout=30)
+    job_id = started.metadata["background_job_id"]
+    assert store.check(task_id=job_id, wait=True, wait_timeout=10).ok is True
+
+    with database.SessionLocal() as db:
+        rows = list_session_background_jobs(store.session_id, db)
+
+    assert [item.id for item in rows] == [job_id]
+    assert rows[0].status == "completed"
+    assert "api-result" in rows[0].output_preview
+
+
+def test_new_run_in_same_session_can_observe_recovered_job(background_store) -> None:
+    original_store, _manager = background_store
+    started = original_store.start(command="Write-Output inherited", shell="powershell", timeout=30)
+    job_id = started.metadata["background_job_id"]
+
+    with database.SessionLocal() as db:
+        resumed_run = Run(
+            session_id=original_store.session_id,
+            workspace_id=original_store.workspace_id,
+            status="received",
+            run_kind="recovery",
+        )
+        db.add(resumed_run)
+        db.commit()
+        resumed_run_id = resumed_run.id
+    resumed_store = BackgroundJobToolStore(
+        run_id=resumed_run_id,
+        session_id=original_store.session_id,
+        workspace_id=original_store.workspace_id,
+        workspace_root=original_store.workspace_root,
+    )
+
+    result = resumed_store.check(task_id=job_id, wait=True, wait_timeout=10)
+
+    assert result.ok is True
+    assert "inherited" in result.content
+    with database.SessionLocal() as db:
+        job = db.get(BackgroundJob, job_id)
+        assert job is not None
+        assert job.run_id == original_store.run_id
+        assert job.observed_by_run_id == resumed_run_id
+
+
+def test_concurrent_terminal_notifications_queue_only_one_resume(background_store, monkeypatch) -> None:
+    store, _manager = background_store
+    with database.SessionLocal() as db:
+        run = db.get(Run, store.run_id)
+        run.status = "stopped"
+        run.stop_reason = "waiting_background"
+        jobs = [BackgroundJob(
+            run_id=store.run_id,
+            session_id=store.session_id,
+            workspace_id=store.workspace_id,
+            workspace_root=store.workspace_root,
+            command="Write-Output done",
+            shell="powershell",
+            status="completed",
+            timeout_seconds=30,
+            log_path="",
+            waiting_run_id=store.run_id,
+        ) for _ in range(2)]
+        db.add_all(jobs)
+        db.commit()
+        job_ids = [job.id for job in jobs]
+
+    local_coordinator = RunCoordinator()
+    scheduled: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        local_coordinator,
+        "_schedule_background_continuation",
+        lambda run_id, job_id: scheduled.append((run_id, job_id)),
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(local_coordinator.notify_background_terminal, job_ids))
+
+    assert sorted(outcomes) == [False, True]
+    assert len(scheduled) == 1
+    with database.SessionLocal() as db:
+        run = db.get(Run, store.run_id)
+        assert run.status == "received"
+        assert db.query(database.RunEvent).filter_by(
+            run_id=store.run_id,
+            event_type="background_continuation_queued",
+        ).count() == 1
+
+
+def test_user_can_stop_a_run_while_it_waits_for_background_work(background_store) -> None:
+    store, _manager = background_store
+    started = store.start(
+        command="Start-Sleep -Seconds 30; Write-Output should-be-cancelled",
+        shell="powershell",
+        timeout=60,
+    )
+    job_id = started.metadata["background_job_id"]
+    running = _wait_for_job_status(job_id, {"running"}, require_pid=True)
+    assert running.pid is not None
+    with database.SessionLocal() as db:
+        run = db.get(Run, store.run_id)
+        run.status = "stopped"
+        run.stop_reason = "waiting_background"
+        db.commit()
+
+    stopped = RunCoordinator().stop(store.run_id)
+
+    assert stopped is not None
+    assert stopped.status == "stopped"
+    assert stopped.stop_reason == "user_interrupted"
+    cancelled = _wait_for_job_status(job_id, {"cancelled"}, timeout=5)
+    assert cancelled.pid is None
+
+
+def test_session_delete_rejects_active_background_job(background_store) -> None:
+    store, _manager = background_store
+    with database.SessionLocal() as db:
+        run = db.get(Run, store.run_id)
+        run.status = "stopped"
+        run.stop_reason = "waiting_background"
+        db.add(BackgroundJob(
+            run_id=store.run_id,
+            session_id=store.session_id,
+            workspace_id=store.workspace_id,
+            workspace_root=store.workspace_root,
+            command="Write-Output queued",
+            shell="powershell",
+            status="queued",
+            timeout_seconds=30,
+            log_path="",
+        ))
+        db.commit()
+
+        with pytest.raises(HTTPException) as error:
+            delete_session(store.session_id, db)
+
+        assert error.value.status_code == 409
+        assert "background" in str(error.value.detail).lower()
+
+
+def test_sibling_child_completion_only_sees_its_own_background_jobs(background_store) -> None:
+    first_store, _manager = background_store
+    with database.SessionLocal() as db:
+        sibling_run = Run(
+            session_id=first_store.session_id,
+            workspace_id=first_store.workspace_id,
+            status="running",
+        )
+        db.add(sibling_run)
+        db.flush()
+        sibling_job = BackgroundJob(
+            run_id=sibling_run.id,
+            session_id=first_store.session_id,
+            workspace_id=first_store.workspace_id,
+            workspace_root=first_store.workspace_root,
+            command="Write-Output sibling",
+            shell="powershell",
+            status="running",
+            timeout_seconds=30,
+            log_path=str(Path(first_store.workspace_root) / ".pgagent" / "background-jobs" / "sibling.log"),
+        )
+        db.add(sibling_job)
+        db.commit()
+
+    assert first_store.unresolved_jobs() == []
+    recovery_store = BackgroundJobToolStore(
+        run_id=first_store.run_id,
+        session_id=first_store.session_id,
+        workspace_id=first_store.workspace_id,
+        workspace_root=first_store.workspace_root,
+        include_session_jobs=True,
+    )
+    assert [item["id"] for item in recovery_store.unresolved_jobs()] == [sibling_job.id]
+
+
+def test_background_wait_is_not_part_of_generic_parallel_read_batch(tmp_path: Path) -> None:
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["read", "check_background"],
+    )
+    assert registry.can_execute_batch_in_parallel(["read", "check_background"]) is False

@@ -20,6 +20,8 @@ from app.api import capabilities, connections, resources, runtime, system, usage
 from app.config import PROJECT_ROOT, settings
 from app.database import init_db
 from app.services.run_service import coordinator
+from app.services.background_job_service import background_job_manager
+from app.services.memory_service import import_workspace_memory_files, refresh_memory_markdown_projection
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,9 @@ async def _delivery_watchdog() -> None:
         try:
             coordinator.reconcile_orphaned_runs()
             coordinator.reconcile_terminal_deliveries(include_legacy=False)
+            coordinator.reconcile_waiting_background_runs()
+            for job_id in coordinator.pending_memory_job_ids(recover_running=True):
+                coordinator.launch_memory_job(job_id)
         except Exception:
             # A temporary database failure must not permanently disable later
             # repair attempts. The exception remains available in local logs.
@@ -44,13 +49,21 @@ async def lifespan(_app: FastAPI):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.workspaces_dir.mkdir(parents=True, exist_ok=True)
     init_db()
+    import_workspace_memory_files()
+    refresh_memory_markdown_projection()
     continuation_run_ids = coordinator.reconcile_interrupted_runs()
+    memory_job_ids = coordinator.pending_memory_job_ids()
     coordinator.reconcile_terminal_deliveries()
     async with AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_path)) as saver:
         await saver.setup()
         coordinator.set_checkpointer(saver)
+        background_job_manager.set_terminal_listener(coordinator.notify_background_terminal)
+        background_job_manager.recover()
+        coordinator.reconcile_waiting_background_runs()
         for run_id in continuation_run_ids:
             coordinator.launch_delegated_child_continuation(run_id)
+        for job_id in memory_job_ids:
+            coordinator.launch_memory_job(job_id)
         watchdog = asyncio.create_task(_delivery_watchdog(), name="pgagent-delivery-watchdog")
         try:
             yield
@@ -58,6 +71,8 @@ async def lifespan(_app: FastAPI):
             watchdog.cancel()
             with suppress(asyncio.CancelledError):
                 await watchdog
+            background_job_manager.set_terminal_listener(None)
+            background_job_manager.shutdown()
             await coordinator.shutdown()
             coordinator.set_checkpointer(None)
 

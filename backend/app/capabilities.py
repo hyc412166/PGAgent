@@ -215,11 +215,11 @@ _REFERENCE_NETWORK = {"WebFetch", "WebSearch", "RemoteTrigger", "MCP", "McpAuth"
 _REFERENCE_EXECUTION = {"PowerShell", "REPL", "background_run"}
 _REFERENCE_FILESYSTEM = {
     "read_file", "write_file", "edit_file", "glob_search", "grep_search",
-    "NotebookEdit", "MemoryWrite", "MemoryRead", "MemoryList",
+    "NotebookEdit", "MemoryWrite", "MemoryRead", "MemoryList", "MemorySearch",
 }
 _REFERENCE_HIGH_RISK = {
     "write_file", "edit_file", "NotebookEdit", "PowerShell", "REPL", "RemoteTrigger",
-    "MCP", "MemoryWrite", "background_run", "CronCreate", "CronDelete",
+    "MCP", "MemoryWrite", "background_run", "integrate_teammate", "CronCreate", "CronDelete",
 }
 
 # The reference projects expose a broad built-in contract.  These entries are

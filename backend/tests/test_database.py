@@ -27,6 +27,8 @@ from app.database import (
     ChatMessage,
     ConversationCompaction,
     ConversationTurn,
+    DurableTask,
+    PlanStep,
     Run,
     Session,
     configure_database,
@@ -55,6 +57,8 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
         "sessions",
         "chat_messages",
         "conversation_turns",
+        "durable_tasks",
+        "plan_steps",
         "runs",
         "draft_launches",
         "run_events",
@@ -88,6 +92,43 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
 
     assert unique_cover_count("chat_messages", "terminal_for_turn_id") == 1
     assert unique_cover_count("runs", "turn_id") == 1
+    run_columns = {column["name"] for column in inspect(database.engine).get_columns("runs")}
+    assert {"task_id", "plan_step_id", "run_kind", "resumed_from_run_id"}.issubset(run_columns)
+
+
+def test_session_task_api_returns_ordered_durable_plan(client: TestClient) -> None:
+    session_id = client.post("/api/sessions", json={}).json()["id"]
+    with database.SessionLocal() as db:
+        task = DurableTask(session_id=session_id, goal="完成持久化恢复", status="needs_recovery")
+        db.add(task)
+        db.flush()
+        first = PlanStep(
+            task_id=task.id,
+            external_id="inspect",
+            position=1,
+            title="核验已有结果",
+            status="needs_recovery",
+            next_action="检查工作区实际状态",
+        )
+        second = PlanStep(
+            task_id=task.id,
+            external_id="finish",
+            position=2,
+            title="完成剩余实现",
+            status="pending",
+        )
+        db.add_all([second, first])
+        db.flush()
+        task.active_step_id = first.id
+        db.commit()
+
+    active = client.get(f"/api/sessions/{session_id}/active-task")
+    history = client.get(f"/api/sessions/{session_id}/tasks")
+    assert active.status_code == 200
+    assert active.json()["goal"] == "完成持久化恢复"
+    assert [step["external_id"] for step in active.json()["steps"]] == ["inspect", "finish"]
+    assert history.status_code == 200
+    assert [item["id"] for item in history.json()] == [active.json()["id"]]
 
 
 def test_turn_schema_enforces_one_terminal_reply_per_accepted_message(tmp_path: Path) -> None:
@@ -158,6 +199,7 @@ def test_init_removes_retired_team_collaboration_tables(tmp_path: Path) -> None:
     assert "team_tasks" not in tables
     assert "agent_messages" not in tables
     assert "delegated_tasks" in tables
+    assert "background_jobs" in tables
 
 
 def test_retired_team_collaboration_routes_are_absent(client: TestClient) -> None:
@@ -281,6 +323,29 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     assert response.status_code == 409
 
 
+def test_init_adds_background_waiter_column_to_the_owning_table(tmp_path: Path) -> None:
+    database_path = tmp_path / "background-migration.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE background_jobs (
+                id VARCHAR(36) PRIMARY KEY,
+                observed_by_run_id VARCHAR(36),
+                plan_step_id VARCHAR(36)
+            );
+            """
+        )
+
+    configure_database(f"sqlite:///{database_path.as_posix()}")
+    init_db()
+    inspector = inspect(database.engine)
+    background_columns = {column["name"] for column in inspector.get_columns("background_jobs")}
+    run_columns = {column["name"] for column in inspector.get_columns("runs")}
+
+    assert "waiting_run_id" in background_columns
+    assert "waiting_run_id" not in run_columns
+
+
 def test_core_resource_crud_and_dashboard(client: TestClient, tmp_path: Path) -> None:
     workspace_response = client.post(
         "/api/workspaces",
@@ -353,7 +418,7 @@ def test_core_resource_crud_and_dashboard(client: TestClient, tmp_path: Path) ->
 
     dashboard = client.get("/api/dashboard").json()
     assert dashboard["workspaces"] == 2
-    assert dashboard["agents"] == 2
+    assert dashboard["agents"] == 1
     assert dashboard["sessions"] == 1
     assert dashboard["active_runs"] == 1
     assert dashboard["pending_approvals"] == 1
@@ -789,6 +854,67 @@ def test_non_global_memory_requires_scope_id(client: TestClient) -> None:
         "/api/memories", json={"scope": "workspace", "content": "Missing workspace id"}
     )
     assert response.status_code == 422
+
+
+def test_memory_api_validates_scope_and_versions_updates(client: TestClient, tmp_path: Path) -> None:
+    workspace = client.post(
+        "/api/workspaces", json={"name": "Memory project", "root_path": str(tmp_path / "memory-project")}
+    ).json()
+    invalid = client.post(
+        "/api/memories",
+        json={"scope": "workspace", "scope_id": "missing-workspace", "name": "x", "content": "content"},
+    )
+    invalid_global = client.post(
+        "/api/memories",
+        json={"scope": "global", "scope_id": workspace["id"], "name": "x", "content": "content"},
+    )
+    assert invalid.status_code == 422
+    assert invalid_global.status_code == 422
+
+    created = client.post(
+        "/api/memories",
+        json={
+            "scope": "workspace", "scope_id": workspace["id"], "name": "Test command",
+            "content": "Use pytest.", "memory_type": "project",
+        },
+    ).json()
+    updated = client.patch(
+        f"/api/memories/{created['id']}", json={"content": "Use pytest -q."},
+    )
+    assert updated.status_code == 200
+    replacement = updated.json()
+    assert replacement["id"] != created["id"]
+    with database.SessionLocal() as db:
+        old = db.get(database.Memory, created["id"])
+        assert old is not None and old.status == "superseded"
+        assert old.superseded_by == replacement["id"]
+
+    renamed_response = client.patch(
+        f"/api/memories/{replacement['id']}", json={"name": "Renamed command"},
+    )
+    assert renamed_response.status_code == 200
+    renamed = renamed_response.json()
+    assert renamed["id"] != replacement["id"]
+    with database.SessionLocal() as db:
+        replaced = db.get(database.Memory, replacement["id"])
+        assert replaced is not None and replaced.status == "superseded"
+        assert replaced.superseded_by == renamed["id"]
+
+    conflicting = client.post(
+        "/api/memories",
+        json={
+            "scope": "workspace", "scope_id": workspace["id"], "name": "Existing name",
+            "content": "Another active record.",
+        },
+    ).json()
+    collision = client.patch(
+        f"/api/memories/{renamed['id']}", json={"name": conflicting["name"]},
+    )
+    assert collision.status_code == 409
+
+    assert client.patch(
+        f"/api/memories/{created['id']}", json={"status": "active"},
+    ).status_code == 409
 
 
 def test_deleting_session_cascades_messages(client: TestClient) -> None:
