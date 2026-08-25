@@ -96,7 +96,7 @@ export function CapabilityMultiSelect({
         : items.length ? <div className="capability-options">{items.map((item) => {
           const selected = selectedIds.includes(item.id)
           return <button key={item.id} type="button" className={selected ? 'selected' : ''} aria-pressed={selected} disabled={item.enabled === false} onClick={() => onToggle(item.id)}>
-            <span className="capability-check">{selected && <Check size={12} />}</span>
+            <span className="capability-check"><Check size={12} aria-hidden="true" /></span>
             <span><strong>{item.name}</strong>{item.description && <small>{item.description}</small>}</span>
           </button>
         })}</div>
