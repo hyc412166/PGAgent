@@ -388,6 +388,42 @@ def install_local_skill(
         raise
 
 
+def uninstall_skill(db: Session, skill_id: str) -> None:
+    """Remove one managed Skill package and detach it from live configurations."""
+
+    item = db.get(Skill, skill_id)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill not found")
+
+    managed_root = _skills_root().resolve()
+    skill_root = Path(item.root_path).resolve(strict=False)
+    if skill_root == managed_root or not _is_within(skill_root, managed_root):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Skill files are outside PGAgent-managed storage and cannot be deleted",
+        )
+    if skill_root.exists() and (not skill_root.is_dir() or skill_root.is_symlink()):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Managed Skill path is not a directory")
+
+    staged_root: Path | None = None
+    if skill_root.exists():
+        staged_root = managed_root / f".{item.slug}.{uuid.uuid4().hex}.deleting"
+        skill_root.replace(staged_root)
+    try:
+        db.execute(delete(AgentSkill).where(AgentSkill.skill_id == skill_id))
+        db.execute(delete(SessionSkill).where(SessionSkill.skill_id == skill_id))
+        db.delete(item)
+        db.commit()
+    except Exception:
+        db.rollback()
+        if staged_root is not None and staged_root.exists() and not skill_root.exists():
+            staged_root.replace(skill_root)
+        raise
+
+    if staged_root is not None and staged_root.exists():
+        shutil.rmtree(staged_root)
+
+
 def _static_market_token() -> str | None:
     return os.getenv("SKILLS_SH_API_TOKEN") or os.getenv("PGAGENT_SKILLS_SH_API_TOKEN")
 

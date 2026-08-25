@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -28,6 +28,7 @@ from app.services.skill_service import (
     preview_market_skill,
     search_market,
     tool_catalog_payload,
+    uninstall_skill,
 )
 
 
@@ -51,6 +52,14 @@ def import_local_skill(payload: SkillImportRequest, db: Session = Depends(get_db
     """Copy a user-selected local SKILL.md folder into PGAgent data storage."""
 
     return install_local_skill(db, payload.source_path)
+
+
+@router.delete("/skills/{skill_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_skill(skill_id: str, db: Session = Depends(get_db)) -> Response:
+    """Uninstall a PGAgent-managed Skill and remove it from Agent/session selections."""
+
+    uninstall_skill(db, skill_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/skills/market/status", response_model=SkillMarketSearchRead)

@@ -136,6 +136,54 @@ def test_local_skill_import_copies_files_without_execution_and_lists_metadata(
     assert duplicate.status_code == 409
 
 
+def test_delete_skill_removes_managed_files_and_capability_bindings(
+    client: tuple[TestClient, dict[str, list]], tmp_path: Path
+) -> None:
+    test_client, _launched = client
+    skill = _import_skill(test_client, tmp_path)
+    installed_root = Path(skill["root_path"])
+    agent = test_client.post(
+        "/api/agents",
+        json={"name": "Skill owner", "skill_ids": [skill["id"]]},
+    ).json()
+    chat_session = test_client.post(
+        "/api/sessions",
+        json={"title": "Skill session", "skill_ids": [skill["id"]]},
+    ).json()
+
+    response = test_client.delete(f"/api/skills/{skill['id']}")
+
+    assert response.status_code == 204, response.text
+    assert not installed_root.exists()
+    assert test_client.get("/api/skills").json() == []
+    assert test_client.get(f"/api/agents/{agent['id']}").json()["skill_ids"] == []
+    assert test_client.get(f"/api/sessions/{chat_session['id']}").json()["skill_ids"] == []
+
+
+def test_delete_skill_refuses_to_remove_files_outside_managed_storage(
+    client: tuple[TestClient, dict[str, list]], tmp_path: Path
+) -> None:
+    test_client, _launched = client
+    outside_root = tmp_path / "outside-skill"
+    outside_root.mkdir()
+    with database.SessionLocal() as db:
+        item = Skill(
+            slug="outside-skill",
+            name="Outside Skill",
+            description="Not managed by PGAgent",
+            root_path=str(outside_root),
+        )
+        db.add(item)
+        db.commit()
+        skill_id = item.id
+
+    response = test_client.delete(f"/api/skills/{skill_id}")
+
+    assert response.status_code == 409
+    assert outside_root.exists()
+    assert [item["id"] for item in test_client.get("/api/skills").json()] == [skill_id]
+
+
 def test_agent_and_session_capability_relations_persist_through_api(
     client: tuple[TestClient, dict[str, list]], tmp_path: Path
 ) -> None:
