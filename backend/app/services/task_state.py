@@ -276,6 +276,19 @@ def todo_state_for_run(db: Any, run: Run) -> list[dict[str, Any]]:
     ]
 
 
+def task_checkpoint_for_run(run_id: str) -> dict[str, Any]:
+    """Read the latest durable task facts for compaction from a fresh transaction."""
+
+    with database_module.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        if run is None or not run.task_id:
+            return {}
+        task = db.get(DurableTask, run.task_id)
+        if task is None:
+            return {}
+        return json.loads(json.dumps(task_payload(db, task), ensure_ascii=False, default=str))
+
+
 def recovery_prompt(db: Any, run: Run) -> str:
     if not run.task_id:
         return ""

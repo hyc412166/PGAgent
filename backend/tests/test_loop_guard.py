@@ -7,7 +7,7 @@ import time
 import pytest
 
 from app.runtime.context import ContextManager
-from app.runtime.context_service import ConversationCompactor
+from app.runtime.context_service import COMPACTION_SECTION_TITLES, ConversationCompactor
 from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage
 from app.runtime.errors import APIErrorKind, call_with_retry, classify_api_error
 from app.runtime.guards import LoopGuard
@@ -698,7 +698,7 @@ async def test_full_compaction_keeps_current_request_through_approval_resume(tmp
         messages = kwargs["messages"]
         continuations = [
             item for item in messages
-            if str(item.get("content") or "").startswith("<compacted-context>")
+            if str(item.get("content") or "").startswith("<continuation-summary")
         ]
         assert len(continuations) == 1
         assert task in continuations[0]["content"]
@@ -736,7 +736,10 @@ async def test_full_compaction_keeps_current_request_through_approval_resume(tmp
         context_manager=ContextManager(max_tokens=560),
         conversation_compactor=ConversationCompactor(
             model_call=lambda **_kwargs: {
-                "choices": [{"message": {"content": "Old read completed; approved report remains."}}]
+                "choices": [{"message": {"content": "\n".join(
+                    f"## {index}. {title}\nOld read completed; approved report remains."
+                    for index, title in enumerate(COMPACTION_SECTION_TITLES, start=1)
+                )}}]
             },
             preserve_recent_messages=2,
         ),

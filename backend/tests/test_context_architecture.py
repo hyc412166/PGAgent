@@ -10,6 +10,26 @@ from app.runtime.context_service import (
 )
 
 
+NINE_SECTION_SUMMARY = """## 1. Primary Request and Intent
+finish the cache refactor
+## 2. User Corrections and Constraints
+None recorded.
+## 3. Completed Work
+Implemented the first half; step 1 is completed.
+## 4. Current Work
+Step 2 test is in_progress.
+## 5. Pending Tasks
+Complete tests.
+## 6. Files and Code Sections
+Cache implementation.
+## 7. Technical Decisions and Problem Solving
+Keep an atomic recent tail.
+## 8. Errors and Fixes
+None recorded.
+## 9. Optional Next Step
+Run tests."""
+
+
 def test_uncompacted_history_is_append_only_and_keeps_one_cache_namespace() -> None:
     assembler = ContextAssembler(max_tokens=10_000, output_reserve_tokens=0, safety_buffer_tokens=0)
     stable = assembler.stable_prefix(
@@ -87,7 +107,7 @@ def test_compaction_preserves_exact_request_todos_and_atomic_tool_tail() -> None
 
     async def model_call(**kwargs):
         calls.append(kwargs)
-        return {"choices": [{"message": {"content": "Implemented the first half; tests remain."}}]}
+        return {"choices": [{"message": {"content": NINE_SECTION_SUMMARY}}]}
 
     messages = [
         {"role": "user", "content": "old discussion"},
@@ -122,8 +142,9 @@ def test_compaction_preserves_exact_request_todos_and_atomic_tool_tail() -> None
     continuation = result.messages[0]
     assert continuation["role"] == "user"
     assert "finish the cache refactor" in continuation["content"]
-    assert '"status":"in_progress"' in continuation["content"]
-    assert "Implemented the first half" in continuation["content"]
+    assert "Authoritative current task state" in continuation["content"]
+    assert '"id":"2","content":"test","status":"in_progress"' in continuation["content"]
+    assert '"id":"1","content":"implement","status":"completed"' in continuation["content"]
     assert "artifact:" in continuation["content"]
     assert result.messages[-3:] == messages[-3:]
     assert calls[0]["tools"] == []

@@ -264,14 +264,14 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
     assert outcome.status == "completed", f"{outcome.error}; events={outcome.events}"
     assert outcome.output == "主控已收到子 Agent 的检查结果。"
     assert child_calls == 2
-    assert observed_child_tools == ["read"]
+    assert observed_child_tools == ["read", "read_artifact"]
 
     with database.SessionLocal() as db:
         task = db.scalar(select(DelegatedTask))
         assert task is not None and task.status == "completed"
         assert task.child_agent_id == delegated_run["child_id"]
         assert task.result["binding"]["model_id"] == "child-model"
-        assert task.result["binding"]["allowed_tool_names"] == ["read"]
+        assert task.result["binding"]["allowed_tool_names"] == ["read", "read_artifact"]
         assert task.result["binding"]["recursive_task_enabled"] is False
         assert task.result["child_run_id"]
         child_run = db.get(Run, task.result["child_run_id"])
@@ -285,7 +285,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         assert frozen["workspace_root"] == delegated_run["parent_root"]
         assert frozen["workspace_root"] != delegated_run["child_root"]
         assert frozen["model_id"] == "child-model"
-        assert frozen["allowed_tool_names"] == ["read"]
+        assert frozen["allowed_tool_names"] == ["read", "read_artifact"]
 
 
 @pytest.mark.asyncio

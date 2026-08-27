@@ -14,15 +14,16 @@ and dynamic-preamble design.
 3. The latest ordinary user message is the active request. No task anchor is
    inserted during an uncompacted conversation.
 4. Large tool output is persisted before its first provider exposure. The model
-   sees an immutable preview plus an artifact reference from the beginning.
+   sees an immutable preview plus an artifact reference from the beginning and
+   can page through the full current-session payload with `read_artifact`.
 5. Tool calls and all of their results form one atomic protocol group.
 6. Full compaction is the only operation allowed to replace seen history. It
    saves the full transcript, creates one continuation message, and keeps a
    recent verbatim tail without splitting a tool group.
-7. A continuation message contains the exact active request and exact TodoWrite
-   snapshot at compaction time. Its prose summary is reference data, not a new
-   instruction. Any later ordinary user message supersedes the request recorded
-   by an older continuation.
+7. A continuation message is one fixed nine-section checkpoint. The exact
+   active request and canonical `DurableTask`/`PlanStep` state are merged into
+   those sections; they are not emitted as separate task-anchor or todo tags.
+   Any later ordinary user message is the new active request.
 8. Persistent memories live in SQLite and are recalled only for a new user or
    delegated-task message. The selected records are rendered as background data
    inside that message and frozen in its provider payload before first model
@@ -56,10 +57,55 @@ message and never changes the stable prefix.
 After compaction:
 
 1. The same stable prefix.
-2. One user-role continuation message containing the exact active request,
-   exact todo snapshot, summary, and transcript artifact reference.
+2. One user-role continuation message containing the nine-section summary and
+   full-transcript artifact reference.
 3. Recent original messages, retained verbatim in atomic protocol groups.
 4. Messages appended after compaction.
+
+The compaction model request itself is assembled as follows:
+
+1. The exact original stable system prefix, without an added compactor identity
+   or controller system message.
+2. Only the old atomic conversation prefix selected for replacement, preserving
+   its original user/assistant/tool roles and order.
+3. One final user message instructing the model not to alter the system prompt,
+   not to execute the conversation task, and to return exactly these sections:
+   `Primary Request and Intent`, `User Corrections and Constraints`, `Completed
+   Work`, `Current Work`, `Pending Tasks`, `Files and Code Sections`, `Technical
+   Decisions and Problem Solving`, `Errors and Fixes`, and `Optional Next Step`.
+
+The recent retained tail is never sent to the compaction model. The final user
+instruction also supplies authoritative current task metadata. PGAgent validates
+the exact nine-section shape, rejects extra Markdown headings or wrapper
+delimiters, and mechanically rebuilds the current task-bearing sections from
+the authoritative goal/status and full completed, in-progress, and
+pending/recovery step records. With no current durable plan, sections 4 and 5
+explicitly say that no inherited board is active. Therefore a fluent but stale
+model summary cannot override the SQLite task checkpoint.
+
+The configured compaction threshold is passed through `RuntimeConfig` and
+clamped to the available input budget. Production compaction retains a suffix
+of complete message groups within the configured 8,000-token budget. The newest
+group is always retained even when that one group exceeds the budget; an
+assistant tool-call batch is never split from any of its tool results.
+
+## Artifact retrieval
+
+1. Each runtime binds one `FilesystemArtifactStore` rooted at
+   `data/artifacts/<session-id>/`; the context budgeter and `read_artifact` use
+   the same store instance.
+2. `read_artifact` accepts only an artifact id plus character `offset` and
+   `limit`. It never exposes or accepts a server filesystem path.
+3. A requested page is limited to 24,000 characters. PGAgent may return fewer
+   characters when JSON escaping would otherwise push the serialized tool
+   result to the 30,000-character externalization threshold. Response metadata
+   reports the actual `next_offset`, `total_chars`, and `eof` for deterministic
+   pagination.
+4. An id absent from the current session store returns `artifact_not_found`.
+   Workspace file tools remain unable to access PGAgent's internal data tree.
+5. `read_artifact` is read-only and may execute in parallel with other
+   read-only tools. Adding its schema causes the expected one-time stable tool
+   cache namespace change.
 
 ## Cache contract
 
@@ -67,6 +113,36 @@ The cache namespace changes only when stable system instructions, workspace
 rules, permission rules, enabled tool schemas, or selected Skill catalog change.
 Todo updates, memories, user messages, tool results, and compaction summaries do
 not change the namespace. They extend or replace only the dynamic suffix.
+
+The compaction request uses the same stable cache namespace and original system
+prefix. Its old conversation diverges only after that stable prefix; replacing
+the main conversation with a summary necessarily starts a new dynamic suffix
+but does not invalidate the stable system/tool namespace.
+
+## Durable task-state alignment
+
+1. `DurableTask` and ordered `PlanStep` rows in SQLite are the recovery source
+   of truth. They retain the goal, task status, stable external step IDs,
+   dependencies, executor assignment, completed/remaining work, next action,
+   evidence and errors.
+2. A successful `TodoWrite` updates the runtime board and synchronously projects
+   it into those durable rows. Completed steps cannot be reopened by a later
+   stale write.
+3. During compaction, the runtime opens a fresh database transaction and reads
+   the latest durable checkpoint. It does not rely on the `todo_state` frozen at
+   Run creation. If that read fails, the compaction is rejected and the original
+   messages remain in place rather than creating a degraded checkpoint.
+4. Approval resume keeps the same Run and frozen runtime configuration, but a
+   root Run with a durable task reloads its todo board from SQLite. The frozen
+   todo snapshot remains only as compatibility data for legacy runs without a
+   durable task.
+5. A new ordinary user turn starts with an empty task board. It never inherits
+   the previous Run's runtime snapshot. An explicit continuation turn binds to
+   the latest resumable durable task and receives the backend-generated recovery
+   packet.
+6. At a terminal/interrupted boundary, Run status is projected back to the
+   durable task. Interrupted active steps become `needs_recovery`; the next
+   recovery Run must inspect real evidence before completing or retrying them.
 
 Adding or removing a memory tool schema is a normal capability change and causes
 one namespace change. Creating, updating, recalling, or consolidating memory

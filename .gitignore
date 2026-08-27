@@ -17,6 +17,7 @@ data/*.db-*
 data/backups/
 data/*.log
 data/background-jobs/
+data/artifacts/
 data/workspaces/*
 !data/workspaces/.gitkeep
 data/skills/

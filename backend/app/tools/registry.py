@@ -38,6 +38,18 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["path"],
         },
     },
+    "read_artifact": {
+        "description": "Read one bounded page from an artifact owned by the current session.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 24000},
+            },
+            "required": ["artifact_id"],
+        },
+    },
     "write": {
         "description": "创建或覆盖工作区内文本文件。",
         "parameters": {
@@ -260,6 +272,7 @@ TOOL_SCHEMAS.update(ADVANCED_TOOL_SCHEMAS)
 PUBLIC_TOOL_NAMES: tuple[str, ...] = (
     "bash",
     "read",
+    "read_artifact",
     "write",
     "delete",
     "edit",
@@ -293,6 +306,7 @@ _CANONICAL_MEMORY_TOOL_NAMES = frozenset({"MemoryWrite", "MemoryRead", "MemoryLi
 # assistant's original tool-call order before messages are appended.
 PARALLEL_READ_ONLY_TOOL_NAMES = frozenset({
     "read",
+    "read_artifact",
     "glob",
     "grep",
     "webfetch",
@@ -410,6 +424,7 @@ class ToolRegistry:
         todo_state: Iterable[Mapping[str, Any]] | None = None,
         todo_change_sink: Callable[[list[dict[str, Any]]], None] | None = None,
         memory_store: Any | None = None,
+        artifact_store: Any | None = None,
         background_store: Any | None = None,
         team_store: Any | None = None,
         task_store: Any | None = None,
@@ -422,6 +437,7 @@ class ToolRegistry:
         self._task_delegate = task_delegate
         self._todo_change_sink = todo_change_sink
         self._memory_store = memory_store
+        self._artifact_store = artifact_store
         self._background_store = background_store
         self._team_store = team_store
         self._task_store = task_store
@@ -442,6 +458,8 @@ class ToolRegistry:
         for name in selected:
             if name in _CANONICAL_MEMORY_TOOL_NAMES and self._memory_store is None:
                 continue
+            if name == "read_artifact" and self._artifact_store is None:
+                continue
             self._register_default(name)
 
     def _write_todos(self, sandbox: WorkspaceSandbox, todos: list[dict[str, Any]]) -> ToolResult:
@@ -454,6 +472,7 @@ class ToolRegistry:
         mapping: dict[str, Callable[..., ToolResult]] = {
             "bash": builtins.run_command,
             "read": builtins.read_file,
+            "read_artifact": lambda _sandbox, **kwargs: self._artifact_store.read(**kwargs),
             "write": builtins.write_file,
             "delete": builtins.delete_file,
             "edit": builtins.edit_file,
@@ -867,6 +886,7 @@ def create_default_registry(
     todo_state: Iterable[Mapping[str, Any]] | None = None,
     todo_change_sink: Callable[[list[dict[str, Any]]], None] | None = None,
     memory_store: Any | None = None,
+    artifact_store: Any | None = None,
     background_store: Any | None = None,
     team_store: Any | None = None,
     task_store: Any | None = None,
@@ -882,6 +902,7 @@ def create_default_registry(
         todo_state=todo_state,
         todo_change_sink=todo_change_sink,
         memory_store=memory_store,
+        artifact_store=artifact_store,
         background_store=background_store,
         team_store=team_store,
         task_store=task_store,

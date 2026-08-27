@@ -22,6 +22,7 @@ from app.services.task_state import (
     is_continuation_request,
     recovery_prompt,
     sync_todos_for_run,
+    task_checkpoint_for_run,
     todo_state_for_run,
     transition_run_task,
 )
@@ -185,6 +186,32 @@ def test_failed_graph_step_is_retained_for_model_recovery(task_db) -> None:
         run = db.get(Run, run_id)
         failed = db.query(PlanStep).filter_by(task_id=run.task_id, external_id="failed-step").one()
         assert failed.status == "in_progress"
+
+
+def test_compaction_checkpoint_preserves_recovery_evidence_and_dependencies(task_db) -> None:
+    _session_id, run_id = _stage("Resume the durable plan")
+    sync_todos_for_run(run_id, [
+        {"id": "inspect", "content": "Inspect current state", "status": "in_progress"},
+        {"id": "test", "content": "Run tests", "status": "pending", "depends_on": ["inspect"]},
+    ])
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        inspect = db.query(PlanStep).filter_by(task_id=run.task_id, external_id="inspect").one()
+        inspect.status = "needs_recovery"
+        inspect.next_action = "Verify the partially written file"
+        inspect.evidence = ["git diff shows a partial edit"]
+        inspect.error = "process interrupted"
+        db.commit()
+
+    checkpoint = task_checkpoint_for_run(run_id)
+
+    assert checkpoint["goal"] == "Resume the durable plan"
+    inspect_state, test_state = checkpoint["steps"]
+    assert inspect_state["status"] == "needs_recovery"
+    assert inspect_state["next_action"] == "Verify the partially written file"
+    assert inspect_state["evidence"] == ["git diff shows a partial edit"]
+    assert inspect_state["error"] == "process interrupted"
+    assert test_state["depends_on"] == ["inspect"]
 
 
 def test_restart_marks_active_step_for_recovery_and_continuation_binds_new_run(task_db) -> None:

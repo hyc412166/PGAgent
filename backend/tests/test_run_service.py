@@ -26,6 +26,7 @@ from app.database import (
 )
 from app.runtime import RunOutcome
 from app.services.run_service import RunCoordinator, _prepare_session_history
+from app.services.task_state import sync_todos_for_run
 from app.services import instruction_service
 from app.runtime import AgentRuntime, decide_deterministic_completion
 from app.tools import create_default_registry
@@ -456,7 +457,7 @@ def test_single_compaction_is_persisted_and_transcript_tail_is_loaded(
         steps=1,
         tool_calls=0,
         compaction_state={
-            "schema": "claude_compaction_v1",
+            "schema": "pgagent_nine_section_v2",
             "base_sequence": 1,
             "source_delta_count": 0,
             "source_sequence": 1,
@@ -465,7 +466,7 @@ def test_single_compaction_is_persisted_and_transcript_tail_is_loaded(
             "summary": "request was answered",
             "messages": [{
                 "role": "user",
-                "content": "<compacted-context>request was answered</compacted-context>",
+                "content": '<continuation-summary format="pgagent-nine-section-v1" transcript-artifact="artifact:test">\nrequest was answered\n</continuation-summary>',
             }],
             "transcript_artifact": {},
             "artifact_refs": [],
@@ -479,8 +480,34 @@ def test_single_compaction_is_persisted_and_transcript_tail_is_loaded(
         assert session is not None
         assert db.query(ConversationCompaction).filter_by(session_id=session_id).count() == 1
         assert _prepare_session_history(db, session) == [
-            {"role": "user", "content": "<compacted-context>request was answered</compacted-context>"},
+            {"role": "user", "content": '<continuation-summary format="pgagent-nine-section-v1" transcript-artifact="artifact:test">\nrequest was answered\n</continuation-summary>'},
             {"role": "assistant", "content": "new answer"},
+        ]
+
+
+def test_legacy_compaction_row_still_reconstructs_provider_history(
+    seeded_run: tuple[str, str],
+) -> None:
+    _run_id, session_id = seeded_run
+    legacy = "<compacted-context>legacy continuation</compacted-context>"
+    with database.SessionLocal() as db:
+        session = db.get(Session, session_id)
+        db.add(ConversationCompaction(
+            session_id=session_id,
+            source_sequence=1,
+            active_request="legacy task",
+            continuation_messages=[{"role": "user", "content": legacy}],
+        ))
+        db.add(ChatMessage(
+            session_id=session_id,
+            role="assistant",
+            content="tail answer",
+            sequence=2,
+        ))
+        db.commit()
+        assert _prepare_session_history(db, session) == [
+            {"role": "user", "content": legacy},
+            {"role": "assistant", "content": "tail answer"},
         ]
 
 
@@ -947,6 +974,13 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
         assert agent is not None
         agent.description = "UI metadata, not a model prompt"
         agent.thinking_level = "high"
+        db.add(RunEvent(
+            run_id=run_id,
+            event_type="runtime_snapshot",
+            payload={"runtime_binding": {"todo_state": [
+                {"id": "old", "content": "previous task", "status": "in_progress"},
+            ]}},
+        ))
         db.commit()
         connection_id = connection.id
 
@@ -957,6 +991,7 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
     # child profile can no longer override its model/thinking configuration;
     # it is only surfaced as safe capability metadata for the task tool.
     assert context["provider"].thinking_level == "low"
+    assert context["todo_state"] == []
     assert agent.id in context["agent_instructions"]
     assert "Builder" in context["agent_instructions"]
 
@@ -989,6 +1024,34 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
 
     with pytest.raises(RuntimeError, match="模型连接配置在审批等待期间已改变"):
         RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
+
+
+def test_durable_todo_state_wins_over_conflicting_frozen_binding(
+    seeded_run: tuple[str, str],
+) -> None:
+    run_id, _session_id = seeded_run
+    with database.SessionLocal() as db:
+        db.add(ModelConnection(
+            name="Durable state connection",
+            provider="openai_compatible",
+            base_url="https://example.test/v1",
+            secret_ref="durable-state-secret",
+            default_model="durable-state-model",
+            status="connected",
+        ))
+        db.commit()
+    sync_todos_for_run(run_id, [
+        {"id": "canonical", "content": "Canonical step", "status": "in_progress"},
+    ])
+    _runtime, initial = RunCoordinator._resolve_runtime(run_id)
+    binding = dict(initial["runtime_binding"])
+    binding["todo_state"] = [
+        {"id": "stale", "content": "Stale frozen step", "status": "pending"},
+    ]
+
+    _runtime, resumed = RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
+
+    assert [item["id"] for item in resumed["todo_state"]] == ["canonical"]
 
 
 def test_runtime_freezes_global_and_project_agents_instructions(
@@ -1033,6 +1096,32 @@ def test_runtime_freezes_global_and_project_agents_instructions(
     assert "personal version one" in resumed["workspace_rules"]
     assert "project version one" in resumed["workspace_rules"]
     assert "version two" not in resumed["workspace_rules"]
+
+
+def test_resolved_runtime_can_read_its_session_artifacts(
+    seeded_run: tuple[str, str],
+) -> None:
+    run_id, _session_id = seeded_run
+    with database.SessionLocal() as db:
+        db.add(ModelConnection(
+            name="Artifact reader connection",
+            provider="openai_compatible",
+            base_url="https://example.test/v1",
+            secret_ref="artifact-reader-secret",
+            default_model="artifact-reader-model",
+            status="connected",
+        ))
+        db.commit()
+
+    runtime, _context = RunCoordinator._resolve_runtime(run_id)
+    ref = runtime.context_assembler.artifact_store.put("full persisted output")
+    result = asyncio.run(runtime.tool_registry.execute_async(
+        "read_artifact",
+        {"artifact_id": ref.artifact_id},
+    ))
+
+    assert "read_artifact" in runtime.tool_registry.enabled_tool_names
+    assert result.ok and result.content == "full persisted output"
 
 
 def test_fallback_connection_does_not_reuse_model_from_disabled_connection(

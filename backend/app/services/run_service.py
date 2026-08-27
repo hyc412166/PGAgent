@@ -55,12 +55,14 @@ from app.runtime import (
     normalize_usage,
 )
 from app.runtime.context import message_tokens
+from app.runtime.context_service import COMPACTION_SCHEMA, CONTINUATION_PREFIX
 from app.tools import create_default_registry
 from app.tools.registry import TOOL_SCHEMAS
 from app.tools.types import ToolResult
 
 from . import background_job_service
 from .model_gateway import ModelConfigurationError, ProviderConfig, build_model_call
+from .artifact_service import ArtifactToolStore
 from .background_job_service import BackgroundJobToolStore
 from .memory_service import (
     MemoryToolStore,
@@ -76,7 +78,13 @@ from .memory_service import (
 )
 from .instruction_service import load_instruction_chain, render_workspace_rules
 from .run_stream import run_stream_broker
-from .task_state import recovery_prompt, sync_todos_for_run, todo_state_for_run, transition_run_task
+from .task_state import (
+    recovery_prompt,
+    sync_todos_for_run,
+    task_checkpoint_for_run,
+    todo_state_for_run,
+    transition_run_task,
+)
 from .task_graph import TaskGraphToolStore, ready_steps, refresh_task_state, settle_step, upsert_delegated_graph
 from .team_service import TeamToolStore, teammate_context
 from .turn_delivery import (
@@ -226,15 +234,17 @@ def _compaction_from_db(db: Any, session: Session) -> dict[str, Any]:
     )
     if compaction is None:
         return {}
+    continuation_messages = _json_safe(compaction.continuation_messages or [])
+    first_content = str(continuation_messages[0].get("content") or "") if continuation_messages else ""
     return {
-        "schema": "claude_compaction_v1",
+        "schema": COMPACTION_SCHEMA if first_content.startswith(CONTINUATION_PREFIX) else "claude_compaction_v1",
         "id": compaction.id,
         "session_id": session.id,
         "source_sequence": int(compaction.source_sequence or 0),
         "active_request": str(compaction.active_request or ""),
         "todo_state": _json_safe(compaction.todo_state or []),
         "summary": str(compaction.summary or ""),
-        "messages": _json_safe(compaction.continuation_messages or []),
+        "messages": continuation_messages,
         "transcript_artifact": _json_safe(compaction.transcript_artifact or {}),
         "artifact_refs": _json_safe(compaction.artifact_refs or []),
         "reason": str(compaction.reason or "threshold"),
@@ -453,7 +463,7 @@ def _persist_conversation_compaction(
     *,
     source_sequence_valid: bool | None = None,
 ) -> None:
-    """Persist one immutable Claude-style full-compaction replacement."""
+    """Persist one immutable full-compaction replacement."""
 
     compaction = dict(outcome.compaction_state or {})
     all_artifact_refs = [
@@ -461,7 +471,7 @@ def _persist_conversation_compaction(
         *list(compaction.get("artifact_refs") or []),
     ]
     _persist_artifact_refs(db, session.id, all_artifact_refs)
-    if not compaction or compaction.get("schema") != "claude_compaction_v1":
+    if not compaction or compaction.get("schema") not in {"claude_compaction_v1", COMPACTION_SCHEMA}:
         return
 
     source_sequence = max(0, int(compaction.get("source_sequence") or 0))
@@ -506,7 +516,8 @@ def _persist_conversation_compaction(
         for message in compaction.get("messages") or []
         if isinstance(message, dict)
     ]
-    if not messages or not str(messages[0].get("content") or "").startswith("<compacted-context>"):
+    first_content = str(messages[0].get("content") or "") if messages else ""
+    if not messages or not first_content.startswith(("<compacted-context>", CONTINUATION_PREFIX)):
         db.add(RunEvent(
             run_id=run_id,
             event_type="context_compaction_rejected",
@@ -689,24 +700,6 @@ def _read_selected_skill_instructions(db: Any, skill_ids: list[str]) -> list[dic
             }
         )
     return items
-
-
-def _session_todo_state(db: Any, session_id: str | None) -> list[dict[str, Any]]:
-    """Carry the last durable todo snapshot into a follow-up session run."""
-
-    if not session_id:
-        return []
-    event = db.scalar(
-        select(RunEvent)
-        .join(Run, RunEvent.run_id == Run.id)
-        .where(Run.session_id == session_id, RunEvent.event_type == "runtime_snapshot")
-        .order_by(RunEvent.created_at.desc(), RunEvent.id.desc())
-    )
-    if event is None or not isinstance(event.payload, dict):
-        return []
-    binding = event.payload.get("runtime_binding")
-    todos = binding.get("todo_state") if isinstance(binding, dict) else None
-    return list(todos) if isinstance(todos, list) else []
 
 
 def _single_line(value: object, *, limit: int) -> str:
@@ -1067,6 +1060,8 @@ class _SubagentTaskDelegate:
             for tool_name in _allowed_runtime_tool_names(list(getattr(child, "tool_ids", []) or []))
             if tool_name in parent_allowed and tool_name not in _CHILD_FORBIDDEN_ORCHESTRATION_TOOLS
         ]
+        if "read_artifact" in parent_allowed and "read_artifact" not in child_tools:
+            child_tools.append("read_artifact")
         child_skill_ids = list(getattr(child, "skill_ids", []) or [])
         skill_instructions = _read_selected_skill_instructions(db, child_skill_ids)
         workspace_root = str(
@@ -1408,6 +1403,9 @@ class _SubagentTaskDelegate:
             workspace_root=str(child_binding["workspace_root"]),
             actor_worker_id=teammate_id,
         ) if teammate_id else None
+        child_artifact_store = FilesystemArtifactStore(
+            settings.data_dir / "artifacts" / str(child_run.session_id or child_run.id)
+        )
         child_registry = create_default_registry(
             str(child_binding["workspace_root"]),
             allowed_tool_names=child_binding["allowed_tool_names"],
@@ -1418,6 +1416,7 @@ class _SubagentTaskDelegate:
                 workspace_id=child_run.workspace_id,
                 session_id=child_run.session_id,
             ),
+            artifact_store=ArtifactToolStore(child_artifact_store),
             background_store=child_background_store,
             team_store=child_team_store,
             # Deliberately omit task_delegate: task was removed from the
@@ -1432,12 +1431,14 @@ class _SubagentTaskDelegate:
             model_call=build_model_call(provider_config),
             tool_registry=child_registry,
             context_manager=ContextManager(max_tokens=settings.context_limit_tokens),
+            artifact_store=child_artifact_store,
             event_sink=RunCoordinator._event_sink(child_run_id),
             config=RuntimeConfig(
                 max_steps=settings.max_steps,
                 max_tool_calls=settings.max_tool_calls,
                 identical_call_limit=settings.max_identical_calls,
                 no_progress_limit=settings.no_progress_limit,
+                context_compaction_threshold_tokens=settings.compact_threshold_tokens,
                 model_timeout_seconds=min(
                     float(settings.model_timeout_seconds),
                     child_max_run_seconds,
@@ -2653,7 +2654,11 @@ class RunCoordinator:
             permission_mode = str(getattr(session, "permission_mode", "smart") or "smart")
             allowed_tool_names = _allowed_runtime_tool_names(agent_tool_ids)
             skill_instructions = _read_selected_skill_instructions(db, configured_skill_ids)
-            todo_state = todo_state_for_run(db, run) or _session_todo_state(db, session.id if session else None)
+            # A new ordinary user turn starts with no previous task board. A
+            # recovery run reads its canonical plan from DurableTask/PlanStep;
+            # approval resume may use its frozen binding below only for legacy
+            # runs that predate durable task state.
+            todo_state = todo_state_for_run(db, run)
             effective_system_prompt = agent.system_prompt
             agents_instructions = ""
             agents_instruction_sources: list[str] = []
@@ -2720,7 +2725,7 @@ class RunCoordinator:
                     ]
                 else:
                     skill_instructions = _read_selected_skill_instructions(db, configured_skill_ids)
-                if isinstance(frozen_binding.get("todo_state"), list):
+                if isinstance(frozen_binding.get("todo_state"), list) and not run.task_id:
                     todo_state = list(frozen_binding["todo_state"])
                 if "agent_system_prompt" in frozen_binding:
                     effective_system_prompt = str(frozen_binding["agent_system_prompt"] or "")
@@ -2760,6 +2765,8 @@ class RunCoordinator:
                 ) or "auto"
                 workspace_root = workspace.root_path
                 agents_instructions, agents_instruction_sources = load_instruction_chain(workspace_root)
+                if "read_artifact" not in allowed_tool_names:
+                    allowed_tool_names.append("read_artifact")
                 provider_config = ProviderConfig(
                     provider=connection.provider,
                     base_url=connection.base_url,
@@ -2905,6 +2912,9 @@ class RunCoordinator:
         task_store = None if context["runtime_binding"].get("delegation_version") else TaskGraphToolStore(
             run_id=run_id
         )
+        runtime_artifact_store = FilesystemArtifactStore(
+            settings.data_dir / "artifacts" / str(session.id if session else run.id)
+        )
         registry = create_default_registry(
             context["workspace_root"],
             allowed_tool_names=context["allowed_tool_names"],
@@ -2919,6 +2929,7 @@ class RunCoordinator:
                 workspace_id=workspace.id,
                 session_id=session.id if session else None,
             ),
+            artifact_store=ArtifactToolStore(runtime_artifact_store),
             background_store=background_store,
             team_store=team_store,
             task_store=task_store,
@@ -2930,9 +2941,7 @@ class RunCoordinator:
             model_call=build_model_call(context["provider"]),
             tool_registry=registry,
             context_manager=ContextManager(max_tokens=settings.context_limit_tokens),
-            artifact_store=FilesystemArtifactStore(
-                settings.data_dir / "artifacts" / str(session.id if session else run.id)
-            ),
+            artifact_store=runtime_artifact_store,
             event_sink=RunCoordinator._event_sink(run_id),
             stream_sink=RunCoordinator._stream_sink(run_id),
             config=RuntimeConfig(
@@ -2940,10 +2949,15 @@ class RunCoordinator:
                 max_tool_calls=settings.max_tool_calls,
                 identical_call_limit=settings.max_identical_calls,
                 no_progress_limit=settings.no_progress_limit,
+                context_compaction_threshold_tokens=settings.compact_threshold_tokens,
                 model_timeout_seconds=settings.model_timeout_seconds,
                 max_run_seconds=context["max_run_seconds"],
             ),
             checkpointer=coordinator.checkpointer,
+            task_state_provider=(
+                (lambda key=run_id: task_checkpoint_for_run(key))
+                if not context["runtime_binding"].get("delegation_version") else None
+            ),
         )
         return runtime, context
 
