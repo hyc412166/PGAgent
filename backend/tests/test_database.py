@@ -10,10 +10,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 
-from app.api.resources import router as resources_router
-from app.api import resources as resources_api
-from app import database
-from app.database import (
+from src.api.routes import router as resources_router
+from src.api import routes as resources_api
+from src.persistence import database
+from src.persistence.database import (
     Base,
     DEFAULT_AGENT_ID,
     DEFAULT_AGENT_DESCRIPTION,

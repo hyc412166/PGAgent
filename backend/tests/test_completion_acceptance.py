@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.runtime import (
+from src.agent import (
     AgentRuntime,
     CompletionDecision,
     decide_deterministic_completion,
@@ -14,7 +14,7 @@ from app.runtime import (
     RuntimeConfig,
     verify_deterministic_completion,
 )
-from app.tools import create_default_registry
+from src.tools import create_default_registry
 
 
 SCENARIO_PATH = Path(__file__).with_name("acceptance_scenarios.json")

@@ -11,7 +11,7 @@
 
 ## 新的视觉层
 
-`frontend/src/styles/pgagent-ui.css` 是独立的 Penguin Coast visual layer，避免把业务逻辑继续堆进 `App.tsx`。通用状态、空状态、抽屉和能力选择在 `frontend/src/components/ui.tsx`，会话消息/子 Agent/思考时间线在 `frontend/src/features/sessions/presentation.tsx`，企鹅标识在 `frontend/src/components/penguin.tsx`：
+`frontend/src/styles/index.css` 按固定顺序聚合分域的 Penguin Coast visual layer，避免把样式和业务逻辑继续堆进单一文件或 `App.tsx`。通用状态、空状态、抽屉和能力选择在 `frontend/src/components/ui.tsx`，会话消息/子 Agent/思考时间线在 `frontend/src/features/sessions/presentation.tsx`，企鹅标识在 `frontend/src/components/penguin.tsx`。完整目录边界见 `docs/MODULE_LAYOUT.md`：
 
 - 以企鹅黑、围巾红、喙橙为品牌锚点，辅以海洋深蓝和冰面浅蓝；视觉层使用实心表面、细边框和克制阴影。
 - 深海色侧栏承载导航，冰色聊天区承载阅读；企鹅标识在品牌、会话标题和 Agent 消息头像中保持一致。

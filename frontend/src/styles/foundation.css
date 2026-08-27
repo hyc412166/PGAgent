@@ -1,0 +1,141 @@
+/*
+ * PGAgent / Penguin Ice House
+ *
+ * Compact, rounded and readable. Frosted ice is reserved for navigation,
+ * guidance and controls; dense data stays on calm opaque surfaces.
+ */
+
+:root {
+  --bg: #eaf8fd;
+  --surface: #fbfeff;
+  --surface-soft: #f1fbff;
+  --surface-deep: #dff3fa;
+  --ink: #12324a;
+  --muted: #46687c;
+  --muted-2: #5b7989;
+  --line: #cce4ed;
+  --line-strong: #add2df;
+  --ocean-950: #062438;
+  --ocean-900: #0a3048;
+  --ocean-800: #0e4562;
+  --ocean-700: #17617f;
+  --ocean-500: #2e8eb3;
+  --ice: #e9f9ff;
+  --ice-strong: #cdeefa;
+  --penguin: #152f40;
+  --scarf: #e94f5e;
+  --scarf-dark: #c93e4c;
+  --scarf-soft: #ffe9ec;
+  --beak: #f6b94a;
+  --beak-soft: #fff3d6;
+  --orange: var(--scarf);
+  --orange-dark: var(--scarf-dark);
+  --orange-soft: var(--scarf-soft);
+  --green: #218b78;
+  --green-soft: #e2f6f1;
+  --yellow: #b87913;
+  --yellow-soft: var(--beak-soft);
+  --red: var(--scarf-dark);
+  --red-soft: var(--scarf-soft);
+  --violet: #317aa2;
+  --violet-soft: #e3f4fb;
+  --blue: #247ea8;
+  --blue-soft: #e3f4fb;
+  --glass: rgb(247 253 255 / 72%);
+  --glass-strong: rgb(238 250 255 / 86%);
+  --shadow-sm: 0 5px 16px rgb(20 76 105 / 7%);
+  --shadow-md: 0 20px 48px rgb(7 49 73 / 16%);
+  --display-font: ui-rounded, "Arial Rounded MT Bold", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color-scheme: light;
+}
+
+:root[data-theme='dark'],
+.theme-dark {
+  --bg: #071d2b;
+  --surface: #0d2b3e;
+  --surface-soft: #12364b;
+  --surface-deep: #19455b;
+  --ink: #effbff;
+  --muted: #abc9d6;
+  --muted-2: #91afbc;
+  --line: #24536a;
+  --line-strong: #367089;
+  --ocean-950: #03141f;
+  --ocean-900: #06243a;
+  --ocean-800: #0b3952;
+  --ice: #e3f8ff;
+  --ice-strong: #bfeaf7;
+  --scarf-soft: #4a2631;
+  --beak-soft: #4a3a1b;
+  --green-soft: #173f3d;
+  --violet-soft: #163d56;
+  --blue-soft: #163d56;
+  --glass: rgb(13 43 62 / 76%);
+  --glass-strong: rgb(15 48 68 / 90%);
+  --shadow-sm: 0 7px 20px rgb(0 0 0 / 20%);
+  --shadow-md: 0 24px 58px rgb(0 0 0 / 34%);
+  color-scheme: dark;
+}
+
+html,
+body {
+  color: var(--ink);
+  background: var(--bg);
+}
+
+body {
+  font-family: var(--display-font);
+  background-image:
+    radial-gradient(circle at 87% 7%, rgb(255 255 255 / 58%) 0 4%, transparent 18%),
+    linear-gradient(145deg, var(--bg), var(--surface-soft));
+}
+
+body::before {
+  position: fixed;
+  z-index: -1;
+  inset: 0;
+  pointer-events: none;
+  content: '';
+  opacity: .42;
+  background-image: radial-gradient(circle, rgb(52 139 177 / 18%) 0 1.2px, transparent 1.5px);
+  background-size: 34px 34px;
+  mask-image: linear-gradient(to bottom, #000, transparent 62%);
+}
+
+button,
+a,
+input,
+textarea,
+select {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 3px solid rgb(233 79 94 / 24%);
+  outline-offset: 2px;
+}
+
+.button,
+.nav-item,
+.new-draft-button,
+.project-row,
+.tree-session-item,
+.run-row,
+.approval-compact,
+.child-task-list > button,
+.composer-tool-button,
+.session-settings-trigger,
+.send-button,
+.context-usage,
+.agent-template-card,
+.stat-card,
+.entity-card,
+.connection-card,
+.skill-card {
+  transition: color .15s ease, background-color .15s ease, border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+}

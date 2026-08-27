@@ -6,15 +6,15 @@ import subprocess
 
 import pytest
 
-from app import database
-from app.services import team_service
-from app.api.resources import (
+from src.persistence import database
+from src.agents import collaboration as team_service
+from src.api.routes import (
     delete_session,
     list_session_collaboration_events,
     list_session_collaboration_messages,
     list_session_teammates,
 )
-from app.database import (
+from src.persistence.database import (
     Agent,
     Base,
     CollaborationMessage,
@@ -28,8 +28,8 @@ from app.database import (
     TeammateWorker,
     Workspace,
 )
-from app.services.team_service import TeamToolStore, teammate_context
-from app.tools import create_default_registry
+from src.agents.collaboration import TeamToolStore, teammate_context
+from src.tools import create_default_registry
 
 
 @pytest.fixture()

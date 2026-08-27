@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from app import database
-from app.database import (
+from src.persistence import database
+from src.persistence.database import (
     Base,
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
@@ -16,8 +16,8 @@ from app.database import (
     configure_database,
     init_db,
 )
-from app.services.run_service import RunCoordinator
-from app.services.task_state import (
+from src.runs.service import RunCoordinator
+from src.tasks.state import (
     bind_recovery_task,
     is_continuation_request,
     recovery_prompt,
@@ -26,7 +26,7 @@ from app.services.task_state import (
     todo_state_for_run,
     transition_run_task,
 )
-from app.services.turn_delivery import stage_user_turn
+from src.sessions.delivery import stage_user_turn
 
 
 @pytest.fixture()

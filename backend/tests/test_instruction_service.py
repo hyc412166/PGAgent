@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services import instruction_service
+from src.context import instructions as instruction_service
 
 
 @pytest.fixture()

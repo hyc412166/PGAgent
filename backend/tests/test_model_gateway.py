@@ -4,8 +4,8 @@ import asyncio
 
 import pytest
 
-from app.services import model_gateway
-from app.services.model_gateway import ModelConfigurationError, ProviderConfig, _litellm_model, build_model_call
+from src.model import gateway as model_gateway
+from src.model.gateway import ModelConfigurationError, ProviderConfig, _litellm_model, build_model_call
 
 
 def test_gateway_keeps_namespaced_openrouter_models_on_openrouter() -> None:

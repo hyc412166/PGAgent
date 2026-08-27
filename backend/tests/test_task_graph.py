@@ -7,15 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from app import database
-from app.database import Base, DEFAULT_AGENT_ID, DEFAULT_WORKSPACE_ID, DurableTask, PlanStep, Session
-from app.services.task_graph import TaskGraphToolStore, claim_step, dependency_map, ready_steps, settle_step, upsert_delegated_graph
-from app.services.task_state import sync_todos_for_run
-from app.services.turn_delivery import stage_user_turn
-from app.tools import builtins
-from app.tools import create_default_registry
-from app.tools.sandbox import WorkspaceSandbox
-from app.tools.types import ToolResult
+from src.persistence import database
+from src.persistence.database import Base, DEFAULT_AGENT_ID, DEFAULT_WORKSPACE_ID, DurableTask, PlanStep, Session
+from src.tasks.graph import TaskGraphToolStore, claim_step, dependency_map, ready_steps, settle_step, upsert_delegated_graph
+from src.tasks.state import sync_todos_for_run
+from src.sessions.delivery import stage_user_turn
+from src.tools import builtins
+from src.tools import create_default_registry
+from src.tools.sandbox import WorkspaceSandbox
+from src.tools.types import ToolResult
 
 
 @pytest.fixture()

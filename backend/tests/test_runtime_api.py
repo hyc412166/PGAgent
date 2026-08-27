@@ -8,9 +8,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from app import database
-from app.api.runtime import _stream_event_is_terminal, router
-from app.database import (
+from src.persistence import database
+from src.api.runtime import _stream_event_is_terminal, router
+from src.persistence.database import (
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
     Agent,
@@ -30,9 +30,9 @@ from app.database import (
     configure_database,
     init_db,
 )
-from app.services.run_service import RunCoordinator, coordinator
-from app.services.run_stream import run_stream_broker
-from app.services.task_state import sync_todos_for_run, transition_run_task
+from src.runs.service import RunCoordinator, coordinator
+from src.runs.stream import run_stream_broker
+from src.tasks.state import sync_todos_for_run, transition_run_task
 
 
 @pytest.fixture()
