@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
-from app import database
-from app.database import (
+from src.persistence import database
+from src.persistence.database import (
     Agent,
     Approval,
     Artifact,
@@ -24,12 +24,12 @@ from app.database import (
     UsageRecord,
     Workspace,
 )
-from app.runtime import RunOutcome
-from app.services.run_service import RunCoordinator, _prepare_session_history
-from app.services.task_state import sync_todos_for_run
-from app.services import instruction_service
-from app.runtime import AgentRuntime, decide_deterministic_completion
-from app.tools import create_default_registry
+from src.agent import RunOutcome
+from src.runs.service import RunCoordinator, _prepare_session_history
+from src.tasks.state import sync_todos_for_run
+from src.context import instructions as instruction_service
+from src.agent import AgentRuntime, decide_deterministic_completion
+from src.tools import create_default_registry
 
 
 @pytest.mark.asyncio

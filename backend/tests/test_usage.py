@@ -7,9 +7,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app import database
-from app.api.usage import router
-from app.database import Base, Run, Session as ChatSession, UsageRecord, Workspace, configure_database, init_db
+from src.persistence import database
+from src.api.usage import router
+from src.persistence.database import Base, Run, Session as ChatSession, UsageRecord, Workspace, configure_database, init_db
 
 
 @pytest.fixture()

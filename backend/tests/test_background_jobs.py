@@ -8,15 +8,15 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from app import database
-from app.api.resources import delete_session, list_session_background_jobs
-from app.database import Agent, BackgroundJob, Base, CollaborationEvent, PlanStep, Run, Session, Workspace
-from app.runtime import AgentRuntime, RunOutcome
-from app.services import background_job_service
-from app.services.background_job_service import BackgroundJobManager, BackgroundJobToolStore
-from app.services.run_service import RunCoordinator
-from app.services.task_state import sync_todos_for_run
-from app.tools import create_default_registry
+from src.persistence import database
+from src.api.routes import delete_session, list_session_background_jobs
+from src.persistence.database import Agent, BackgroundJob, Base, CollaborationEvent, PlanStep, Run, Session, Workspace
+from src.agent import AgentRuntime, RunOutcome
+from src.tasks import background as background_job_service
+from src.tasks.background import BackgroundJobManager, BackgroundJobToolStore
+from src.runs.service import RunCoordinator
+from src.tasks.state import sync_todos_for_run
+from src.tools import create_default_registry
 
 
 def _wait_for_job_status(

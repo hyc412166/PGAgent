@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from app.runtime.context_service import (
+from src.context.assembly import (
     ContextAssembler,
     ConversationCompactor,
     FilesystemArtifactStore,
@@ -11,9 +11,9 @@ from app.runtime.context_service import (
     atomic_message_groups,
     retain_recent_atomic_tail,
 )
-from app.runtime.context import ContextManager
-from app.runtime.engine import AgentRuntime, RuntimeConfig
-from app.tools.registry import create_default_registry
+from src.context.window import ContextManager
+from src.agent.engine import AgentRuntime, RuntimeConfig
+from src.tools.registry import create_default_registry
 
 
 def test_filesystem_artifact_store_survives_a_new_store_instance(tmp_path) -> None:
@@ -146,7 +146,7 @@ Step test is in progress.
 ## 5. Pending Tasks
 Finish tests.
 ## 6. Files and Code Sections
-backend/app/runtime/context_service.py
+backend/src/context/assembly.py
 ## 7. Technical Decisions and Problem Solving
 Retain an atomic recent tail.
 ## 8. Errors and Fixes

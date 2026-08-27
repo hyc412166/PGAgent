@@ -65,7 +65,7 @@ $env:PYTHONPATH = Join-Path $ProjectRoot 'backend'
 Write-Host "PGAgent is starting at $Url" -ForegroundColor Cyan
 Write-Host 'Press Ctrl+C to stop the local service.'
 try {
-    & $PythonPath -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8765
+    & $PythonPath -m uvicorn src.main:app --app-dir backend --host 127.0.0.1 --port 8765
 } finally {
     Stop-Job -Job $BrowserJob -ErrorAction SilentlyContinue
     Remove-Job -Job $BrowserJob -Force -ErrorAction SilentlyContinue

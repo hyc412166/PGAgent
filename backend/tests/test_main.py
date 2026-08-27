@@ -4,7 +4,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from app.main import app, frontend
+from src.main import app, frontend
 
 
 def test_unknown_api_path_is_not_served_as_spa() -> None:

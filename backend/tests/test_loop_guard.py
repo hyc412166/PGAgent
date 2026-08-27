@@ -6,13 +6,13 @@ import time
 
 import pytest
 
-from app.runtime.context import ContextManager
-from app.runtime.context_service import COMPACTION_SECTION_TITLES, ConversationCompactor
-from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage
-from app.runtime.errors import APIErrorKind, call_with_retry, classify_api_error
-from app.runtime.guards import LoopGuard
-from app.tools import create_default_registry
-from app.tools.types import ToolResult
+from src.context.window import ContextManager
+from src.context.assembly import COMPACTION_SECTION_TITLES, ConversationCompactor
+from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage
+from src.agent.errors import APIErrorKind, call_with_retry, classify_api_error
+from src.agent.guards import LoopGuard
+from src.tools import create_default_registry
+from src.tools.types import ToolResult
 
 
 class StatusError(RuntimeError):

@@ -7,10 +7,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app import database, secrets
-from app.api import connections
-from app.api.connections import router as connections_router
-from app.database import Base, configure_database, init_db
+from src.persistence import database
+from src.model import credentials as secrets
+from src.api import connections
+from src.api.connections import router as connections_router
+from src.persistence.database import Base, configure_database, init_db
 
 
 class FakeHttpClient:

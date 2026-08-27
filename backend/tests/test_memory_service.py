@@ -8,9 +8,10 @@ import threading
 import pytest
 from sqlalchemy import select
 
-from app import database
-from app.database import Base, ChatMessage, Memory, MemoryJob, ModelConnection, Session, UsageRecord, Workspace
-from app.services.memory_service import (
+from src.persistence import database
+from src.runs import service as run_service
+from src.persistence.database import Base, ChatMessage, Memory, MemoryJob, ModelConnection, Session, UsageRecord, Workspace
+from src.memory.service import (
     MemoryToolStore,
     ensure_user_memory_snapshot,
     export_memory_markdown,
@@ -22,8 +23,8 @@ from app.services.memory_service import (
     render_memory_snapshot,
     store_memory,
 )
-from app.services.run_service import RunCoordinator, _message_payload
-from app.tools import create_default_registry
+from src.runs.service import RunCoordinator, _message_payload
+from src.tools import create_default_registry
 
 
 @pytest.fixture()
@@ -327,7 +328,7 @@ def test_refresh_never_relabels_a_committed_write_as_failed(monkeypatch: pytest.
     def fail_export(**_kwargs):
         raise TypeError("invalid derived record")
 
-    monkeypatch.setattr("app.services.memory_service.export_memory_markdown", fail_export)
+    monkeypatch.setattr("src.memory.service.export_memory_markdown", fail_export)
     assert not refresh_memory_markdown_projection()
 
 
@@ -337,7 +338,7 @@ def test_projection_serializes_exports_without_blocking_sqlite_writes(
 ) -> None:
     root, workspace_id, session_id = memory_db
     output_dir = root / "projection"
-    import app.services.memory_service as memory_service_module
+    import src.memory.service as memory_service_module
 
     entered_write = threading.Event()
     release_write = threading.Event()
@@ -411,7 +412,7 @@ def test_memory_framing_escapes_delimiters_and_extraction_rejects_transient_scop
     assert "\\u003c/current-request\\u003e" in rendered
 
     candidates = parse_extraction_response('{"candidates":['
-        '{"scope":"persistent","target_scope":"workspace","name":"next","memory_type":"project","description":"","content":"Next step is edit backend/app/x.py tomorrow.","tags":[]},'
+        '{"scope":"persistent","target_scope":"workspace","name":"next","memory_type":"project","description":"","content":"Next step is edit backend/src/x.py tomorrow.","tags":[]},'
         '{"scope":"persistent","target_scope":"global","name":"project","memory_type":"project","description":"","content":"All builds use make release.","tags":[]}'
         ']}')
     assert candidates == []
@@ -459,7 +460,7 @@ async def test_durable_extraction_usage_is_separate_from_conversation_usage(memo
             "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
         }
 
-    monkeypatch.setattr("app.services.run_service.build_model_call", lambda _config: fake_call)
+    monkeypatch.setattr(run_service, "build_model_call", lambda _config: fake_call)
     coordinator = RunCoordinator()
     await asyncio.gather(
         coordinator._process_memory_job(job_id),
@@ -516,7 +517,7 @@ async def test_expired_memory_worker_is_fenced_from_late_commit(memory_db, monke
             "usage": {"total_tokens": 1},
         }
 
-    monkeypatch.setattr("app.services.run_service.build_model_call", lambda _config: fake_call)
+    monkeypatch.setattr(run_service, "build_model_call", lambda _config: fake_call)
     coordinator = RunCoordinator()
     stale_task = asyncio.create_task(coordinator._process_memory_job(job_id))
     await first_started.wait()

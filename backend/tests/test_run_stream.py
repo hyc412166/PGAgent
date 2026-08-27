@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from app.services.run_stream import RunStreamBroker, TERMINAL_EVENT_TYPES
+from src.runs.stream import RunStreamBroker, TERMINAL_EVENT_TYPES
 
 
 @pytest.mark.asyncio

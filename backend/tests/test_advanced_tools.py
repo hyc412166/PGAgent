@@ -5,7 +5,7 @@ import json
 import time
 from types import SimpleNamespace
 
-from app.tools import create_default_registry
+from src.tools import create_default_registry
 
 
 CLAW_TOOL_NAMES = {

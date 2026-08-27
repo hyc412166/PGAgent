@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from app.runtime.context_service import (
+from src.context.assembly import (
     ContextAssembler,
     ConversationCompactor,
     InMemoryArtifactStore,

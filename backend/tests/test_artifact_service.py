@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 
-from app.runtime.context_service import FilesystemArtifactStore, ToolOutputBudgeter
-from app.services.artifact_service import ArtifactToolStore
-from app.tools.registry import create_default_registry
+from src.context.assembly import FilesystemArtifactStore, ToolOutputBudgeter
+from src.artifacts.storage import ArtifactToolStore
+from src.tools.registry import create_default_registry
 
 
 def test_artifact_reader_returns_bounded_character_pages(tmp_path) -> None:

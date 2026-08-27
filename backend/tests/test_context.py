@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.runtime.context import ContextManager, estimate_tokens, message_tokens
+from src.context.window import ContextManager, estimate_tokens, message_tokens
 
 
 def test_default_context_limit_is_100k() -> None:

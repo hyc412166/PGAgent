@@ -1,0 +1,92 @@
+/* Frosted panels and form controls */
+
+.overlay {
+  background: rgb(5 35 51 / 28%);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.motion-panel {
+  opacity: 1;
+  pointer-events: none;
+  animation: none;
+  transition: none;
+}
+
+.motion-panel.is-open {
+  pointer-events: auto;
+}
+
+.slide-panel {
+  width: min(500px, 100%);
+  padding: 24px;
+  border-left: 1px solid rgb(255 255 255 / 66%);
+  border-radius: 28px 0 0 28px;
+  background:
+    radial-gradient(circle, rgb(255 255 255 / 24%) 0 .7px, transparent .9px) 0 0 / 6px 6px,
+    linear-gradient(155deg, rgb(247 253 255 / 98%), rgb(224 245 252 / 97%));
+  box-shadow: inset 1px 0 0 rgb(255 255 255 / 82%), var(--shadow-md);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  animation: none;
+  opacity: 1;
+  transform: translate3d(100%, 0, 0);
+  backface-visibility: hidden;
+  will-change: transform;
+  transition: transform .2s ease;
+}
+
+.motion-panel.is-open .slide-panel { transform: translate3d(0, 0, 0); }
+
+@starting-style {
+  .motion-panel.is-open .slide-panel { transform: translate3d(100%, 0, 0); }
+}
+
+.slide-panel > header { border-bottom-color: var(--line); }
+.slide-panel h2 { color: var(--ink); font-size: 1.25rem; }
+.slide-panel header p:not(.eyebrow) { color: var(--muted); font-size: 0.625rem; }
+.panel-form { gap: 14px; }
+
+.field { color: var(--ink); font-size: 0.625rem; }
+.field small { color: var(--muted-2); }
+
+.field input,
+.field textarea,
+.field select,
+.skill-search,
+.usage-date-inputs input {
+  border-color: var(--line-strong);
+  border-radius: 11px 11px 11px 5px;
+  color: var(--ink);
+  background: rgb(255 255 255 / 72%);
+}
+
+.field input:focus,
+.field textarea:focus,
+.field select:focus,
+.skill-search:focus-within,
+.usage-date-inputs input:focus {
+  border-color: #e9a4ad;
+  box-shadow: 0 0 0 3px var(--scarf-soft);
+}
+
+.capability-select,
+.market-browser {
+  border-color: var(--line);
+  border-radius: 13px 13px 13px 6px;
+  background: rgb(255 255 255 / 52%);
+}
+
+.capability-options > button {
+  border-color: var(--line);
+  border-radius: 10px 10px 10px 4px;
+  background: var(--surface);
+}
+
+.capability-options > button.selected {
+  color: var(--scarf-dark);
+  border-color: #ebb1b9;
+  background: var(--scarf-soft);
+}
+
+.selected .capability-check { border-color: var(--scarf); background: var(--scarf); }

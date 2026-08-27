@@ -3,8 +3,8 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.api import system
-from app.services import instruction_service
+from src.api import system
+from src.context import instructions as instruction_service
 
 
 def _client() -> TestClient:
@@ -15,20 +15,22 @@ def _client() -> TestClient:
 
 def test_select_folder_returns_mocked_native_result(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr(system.platform, "system", lambda: "Windows")
+    selected_titles: list[str] = []
     monkeypatch.setattr(
         system,
-        "_run_folder_dialog",
-        lambda: {"path": r"C:\Users\demo\workspace", "cancelled": False},
+        "show_folder_picker",
+        lambda title: selected_titles.append(title) or r"C:\Users\demo\workspace",
     )
     with _client() as client:
-        response = client.post("/api/system/select-folder")
+        response = client.post("/api/system/select-folder", json={"title": "Select Project Root"})
     assert response.status_code == 200
     assert response.json() == {"path": r"C:\Users\demo\workspace", "cancelled": False}
+    assert selected_titles == ["Select Project Root"]
 
 
 def test_select_folder_reports_cancel_and_non_windows(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr(system.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(system, "_run_folder_dialog", lambda: {"path": None, "cancelled": True})
+    monkeypatch.setattr(system, "show_folder_picker", lambda _title: None)
     with _client() as client:
         cancelled = client.post("/api/system/select-folder")
     assert cancelled.json() == {"path": None, "cancelled": True}

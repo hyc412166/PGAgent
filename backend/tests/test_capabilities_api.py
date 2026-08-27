@@ -9,12 +9,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from app import database
-from app.api.capabilities import router as capabilities_router
-from app.api.resources import router as resources_router
-from app.api.runtime import router as runtime_router
-from app.capabilities import BUILTIN_TOOL_IDS
-from app.database import (
+from src.persistence import database
+from src.api.capabilities import router as capabilities_router
+from src.api.routes import router as resources_router
+from src.api.runtime import router as runtime_router
+from src.tools.catalog import BUILTIN_TOOL_IDS
+from src.persistence.database import (
     DEFAULT_AGENT_ID,
     Agent,
     Base,
@@ -26,8 +26,8 @@ from app.database import (
     configure_database,
     init_db,
 )
-from app.services import skill_service
-from app.services.run_service import coordinator
+from src.skills import registry as skill_service
+from src.runs.service import coordinator
 
 
 @pytest.fixture()

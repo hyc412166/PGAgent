@@ -4,11 +4,11 @@ import json
 
 import pytest
 
-from app.runtime.context import ContextManager
-from app.runtime.context_service import COMPACTION_SECTION_TITLES, ContextAssembler, ConversationCompactor
-from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig
-from app.tools import create_default_registry
-from app.tools.policy import assess_tool_call
+from src.context.window import ContextManager
+from src.context.assembly import COMPACTION_SECTION_TITLES, ContextAssembler, ConversationCompactor
+from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig
+from src.tools import create_default_registry
+from src.tools.policy import assess_tool_call
 
 
 def test_registry_exposes_only_selected_tools_and_enforces_permission_modes(tmp_path) -> None:
@@ -55,7 +55,7 @@ def test_registry_exposes_only_selected_tools_and_enforces_permission_modes(tmp_
 
 def test_smart_mode_allows_routine_code_edits_but_escalates_sensitive_or_broad_writes(tmp_path) -> None:
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "app.py").write_text("print('before')\n", encoding="utf-8")
+    (tmp_path / "src" / "src.py").write_text("print('before')\n", encoding="utf-8")
     (tmp_path / "large.txt").write_text("x" * 70_000, encoding="utf-8")
     registry = create_default_registry(
         str(tmp_path),
@@ -65,10 +65,10 @@ def test_smart_mode_allows_routine_code_edits_but_escalates_sensitive_or_broad_w
 
     routine_edit = registry.execute(
         "edit",
-        {"path": "src/app.py", "old_string": "before", "new_string": "after"},
+        {"path": "src/src.py", "old_string": "before", "new_string": "after"},
     )
     assert routine_edit.ok
-    assert (tmp_path / "src" / "app.py").read_text(encoding="utf-8") == "print('after')\n"
+    assert (tmp_path / "src" / "src.py").read_text(encoding="utf-8") == "print('after')\n"
 
     routine_write = registry.execute("write", {"path": "src/new.py", "content": "print('ok')\n"})
     assert routine_write.ok
@@ -119,7 +119,7 @@ def test_smart_mode_classifies_commands_by_exact_arguments(tmp_path) -> None:
 
 
 def test_permission_modes_keep_their_distinct_boundaries_for_the_same_write(tmp_path) -> None:
-    arguments = {"path": "src/app.py", "content": "print('ok')\n"}
+    arguments = {"path": "src/src.py", "content": "print('ok')\n"}
 
     ask = create_default_registry(str(tmp_path), allowed_tool_names=["write"], permission_mode="ask")
     assert ask.execute("write", arguments).approval_required
@@ -295,7 +295,7 @@ async def test_task_delegate_is_not_started_until_parent_approval(tmp_path) -> N
 
     async def delegate(task: str, *, agent_id: str, call_id: str | None = None):  # type: ignore[no-untyped-def]
         invoked.append((task, agent_id, call_id))
-        from app.tools.types import ToolResult
+        from src.tools.types import ToolResult
 
         return ToolResult("task", True, "child done")
 

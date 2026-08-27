@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 
-from app.tools.builtins import (
+from src.tools.builtins import (
     delete_file,
     delegate_task_async,
     file_info,
@@ -20,8 +20,8 @@ from app.tools.builtins import (
     search_files,
     write_file,
 )
-from app.tools.sandbox import SandboxViolation, WorkspaceSandbox
-from app.tools.types import ToolResult
+from src.tools.sandbox import SandboxViolation, WorkspaceSandbox
+from src.tools.types import ToolResult
 
 
 def test_task_batch_runs_child_delegates_concurrently(tmp_path: Path) -> None:

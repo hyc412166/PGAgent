@@ -8,9 +8,9 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
-from app import database
-from app.api.resources import list_session_delegations
-from app.database import (
+from src.persistence import database
+from src.api.routes import list_session_delegations
+from src.persistence.database import (
     Agent,
     AgentTool,
     Approval,
@@ -25,11 +25,12 @@ from app.database import (
     Session,
     Workspace,
 )
-from app.runtime import RunOutcome
-from app.runtime.engine import ModelToolCall, ModelTurn
-from app.services import run_service
-from app.services.background_job_service import background_job_manager
-from app.services.run_service import RunCoordinator
+from src.agent import RunOutcome
+from src.agent.engine import ModelToolCall, ModelTurn
+from src.runs import service as run_service
+from src.runs import delegation as delegation_module
+from src.tasks.background import background_job_manager
+from src.runs.service import RunCoordinator
 
 
 def test_session_delegations_include_legacy_child_run_history(
@@ -587,7 +588,7 @@ async def test_child_timeout_is_limited_to_the_parent_remaining_budget(
             )
 
     monkeypatch.setattr(run_service.settings, "max_run_seconds", 10.0)
-    monkeypatch.setattr(run_service, "AgentRuntime", FakeChildRuntime)
+    monkeypatch.setattr(delegation_module, "AgentRuntime", FakeChildRuntime)
     result = await delegate("bounded", agent_id=delegated_run["child_id"], call_id="budget-child")
     assert result.ok
     assert len(captured_limits) == 1
