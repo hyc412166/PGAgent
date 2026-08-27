@@ -12,7 +12,6 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from src import __version__
@@ -54,27 +53,24 @@ async def lifespan(_app: FastAPI):
     continuation_run_ids = coordinator.reconcile_interrupted_runs()
     memory_job_ids = coordinator.pending_memory_job_ids()
     coordinator.reconcile_terminal_deliveries()
-    async with AsyncSqliteSaver.from_conn_string(str(settings.checkpoint_path)) as saver:
-        await saver.setup()
-        coordinator.set_checkpointer(saver)
-        background_job_manager.set_terminal_listener(coordinator.notify_background_terminal)
-        background_job_manager.recover()
-        coordinator.reconcile_waiting_background_runs()
-        for run_id in continuation_run_ids:
-            coordinator.launch_delegated_child_continuation(run_id)
-        for job_id in memory_job_ids:
-            coordinator.launch_memory_job(job_id)
-        watchdog = asyncio.create_task(_delivery_watchdog(), name="pgagent-delivery-watchdog")
-        try:
-            yield
-        finally:
-            watchdog.cancel()
-            with suppress(asyncio.CancelledError):
-                await watchdog
-            background_job_manager.set_terminal_listener(None)
-            background_job_manager.shutdown()
-            await coordinator.shutdown()
-            coordinator.set_checkpointer(None)
+    coordinator.start()
+    background_job_manager.set_terminal_listener(coordinator.notify_background_terminal)
+    background_job_manager.recover()
+    coordinator.reconcile_waiting_background_runs()
+    for run_id in continuation_run_ids:
+        coordinator.launch_delegated_child_continuation(run_id)
+    for job_id in memory_job_ids:
+        coordinator.launch_memory_job(job_id)
+    watchdog = asyncio.create_task(_delivery_watchdog(), name="pgagent-delivery-watchdog")
+    try:
+        yield
+    finally:
+        watchdog.cancel()
+        with suppress(asyncio.CancelledError):
+            await watchdog
+        background_job_manager.set_terminal_listener(None)
+        background_job_manager.shutdown()
+        await coordinator.shutdown()
 
 
 _LOCAL_BROWSER_HOSTS = frozenset({"127.0.0.1", "localhost"})

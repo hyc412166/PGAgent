@@ -36,9 +36,4 @@ class Settings(BaseSettings):
     def workspaces_dir(self) -> Path:
         return self.data_dir / "workspaces"
 
-    @property
-    def checkpoint_path(self) -> Path:
-        return self.data_dir / "langgraph_checkpoints.db"
-
-
 settings = Settings()

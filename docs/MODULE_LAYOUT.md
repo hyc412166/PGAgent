@@ -13,7 +13,8 @@ backend/                              # 完整后端核心，对应 codex-rs/cor
 │   ├── main.py                       # FastAPI 组装与进程生命周期入口
 │   ├── agent/                        # 单个 Agent 的执行内核
 │   │   ├── engine.py                 # 模型/工具循环
-│   │   ├── graph.py                  # LangGraph 状态图
+│   │   ├── loop.py                   # 显式 Agent 生命周期循环
+│   │   ├── state.py                  # 单次运行状态结构
 │   │   ├── completion.py             # 确定性完成判定
 │   │   ├── guards.py                 # 循环和无进展检测
 │   │   └── errors.py                 # 模型调用错误分类与重试

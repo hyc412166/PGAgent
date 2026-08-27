@@ -779,7 +779,6 @@ class _SubagentTaskDelegate:
                 ) if child_max_run_seconds is not None else settings.model_timeout_seconds,
                 max_run_seconds=child_max_run_seconds,
             ),
-            checkpointer=self.coordinator.checkpointer,
         )
         type(self.coordinator)._install_completion_verifier(
             child_runtime,
@@ -804,7 +803,6 @@ class _SubagentTaskDelegate:
                 ),
                 recent_messages=[{"role": "user", "content": str(child_binding["rendered_task"])}],
                 mode="auto",
-                thread_id=child_run_id,
             )
         except asyncio.CancelledError:
             type(self.coordinator)._persist_failure(child_run_id, RuntimeError("Delegated child execution was cancelled"))

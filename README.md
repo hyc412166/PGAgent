@@ -2,7 +2,7 @@
 
 > 主 Agent 的候选结果在发送给用户前只经过本地确定性运行链路检查，不会额外调用模型评分。检查失败会驱动主 Agent 修订，默认最多 3 次；未通过的候选不会写入聊天记录或发布 run_completed。确定性场景清单位于 backend/tests/acceptance_scenarios.json。
 
-PGAgent 是一个本地优先、单用户的 Agent 工作台。它参考了视频中 TWork 的产品形态，以及 Claude Code 的 harness 思路：模型在一个简洁的工具循环里动态安排工作，外层由 LangGraph 管理阶段、checkpoint、人工审批和安全停止。
+PGAgent 是一个本地优先、单用户的 Agent 工作台。它参考了视频中 TWork 的产品形态，以及 Claude Code 的 harness 思路：模型在 `AgentRuntime` 的显式工具循环里动态安排工作，`RunCoordinator` 负责运行调度、人工审批、恢复和安全停止。
 
 当前版本以“项目 + 会话”组织本地任务：可接入模型、选择本机目录作为项目、聊天执行任务、审批写文件/命令工具、统计 Token 与成本，并由固定主控按需调用独立上下文中的专业子 Agent。
 
@@ -58,7 +58,6 @@ API Key 不写入 SQLite，保存到 Windows Credential Manager；数据库只�
 ## 数据目录
 
 - `data/pgagent.db`：工作区、Agent、会话、消息、运行、事件、审批、记忆、模型连接、Token 用量以及子 Agent 委派记录。
-- `data/langgraph_checkpoints.db`：LangGraph checkpoint。
 - `data/workspaces/default/`：一次性任务的默认工作区；也可以在会话页项目区或草稿输入框中通过原生目录窗口选择其他本地目录。
 - `data/skills/{slug}/`：通过 API 导入并由 PGAgent 管理的 Skill 文件副本。原始本地目录不会被修改；GitHub/skills.sh 来源必须先预览文件清单，再以 `confirm=true` 明确复制。
 
