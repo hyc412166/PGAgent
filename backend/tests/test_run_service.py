@@ -33,6 +33,21 @@ from src.tools import create_default_registry
 
 
 @pytest.mark.asyncio
+async def test_coordinator_start_and_shutdown_bind_the_active_event_loop() -> None:
+    coordinator = RunCoordinator()
+
+    coordinator.start()
+
+    assert coordinator._event_loop is asyncio.get_running_loop()
+    assert not coordinator._shutting_down
+
+    await coordinator.shutdown()
+
+    assert coordinator._event_loop is None
+    assert coordinator._shutting_down
+
+
+@pytest.mark.asyncio
 async def test_resume_is_queued_until_the_original_run_task_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

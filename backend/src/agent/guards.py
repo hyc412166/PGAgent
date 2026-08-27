@@ -103,7 +103,7 @@ class LoopGuard:
         }
 
     def restore(self, snapshot: dict[str, Any] | None) -> None:
-        """Restore counters from a persisted approval/checkpoint boundary."""
+        """Restore counters from a persisted approval or runtime snapshot."""
 
         if not snapshot:
             return

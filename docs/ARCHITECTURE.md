@@ -1,11 +1,10 @@
 # PGAgent v0.1 架构契约
 
-PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 React + Vite + TypeScript，后端采用 FastAPI，运行数据与 LangGraph checkpoint 分别保存在两个 SQLite 文件中。
+PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 React + Vite + TypeScript，后端采用 FastAPI，业务和可恢复运行状态统一保存在应用 SQLite 中。
 
 ## 固定目录
 
 - `data/pgagent.db`：工作区、会话、消息、模型连接、运行、审批、记忆、Token 用量和会话级子 Agent 委派记录。
-- `data/langgraph_checkpoints.db`：LangGraph checkpoint。
 - `data/workspaces/{workspace_id}/`：工具可以访问的工作目录。所有路径必须经过 resolve 后仍位于对应工作区。
 - `data/skills/{slug}/`：由 Skill registry 管理的 Skill 源文件副本；导入流程只复制和解析，不自动执行其中的脚本、命令或网络请求。
 
@@ -37,7 +36,7 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 
 主 Agent 给出候选答复后必须经过本地确定性完成门禁。门禁使用显式的当前 Run 轨迹检查非空答复、最终 assistant 对齐、工具调用 ID 唯一、每次调用恰有一个同名结构化结果、计数一致且没有待审批项。该过程不调用第二个模型，也不做主观语义评分；普通无工具回答只产生主 Agent 自身的一次模型请求。确定性检查拒绝时，反馈只在内存中回灌主 Agent 继续修订，不写入用户会话；默认最多 3 次，全部失败后以 acceptance_failed 停止。只有通过后候选文本才作为成功答复发布；失败或停止则由对话交付层持久化确定性终态说明。等待用户澄清使用 needs_user_input，不冒充任务完成。
 
-模型以 `auto` 模式自行判断任务是否需要内部规划。外层运行时负责重复调用、无进展、超时、取消、审批与 checkpoint，不再用任意的总步数或总工具次数截断长任务。
+模型以 `auto` 模式自行判断任务是否需要内部规划。`AgentRuntime` 的显式循环负责重复调用、无进展、超时和完成验证；`RunCoordinator` 负责取消、审批和基于应用运行快照的恢复，不再用任意的总步数或总工具次数截断长任务。
 
 ## 工具与审批
 
@@ -72,7 +71,7 @@ Skill registry 仅管理本地副本和元数据：`SKILL.md` 必须为 UTF-8，
 - 同一工具与规范化参数连续出现 3 次即停止。
 - 连续 4 步没有新文件、任务状态或有效输出即停止。
 - 401/403 和无效 API Key 不重试；429、连接失败和 5xx 采用有抖动的指数退避，最多 3 次。
-- 所有停止原因写入运行事件，允许用户从最后 checkpoint 继续或修改配置后重试。
+- 所有停止原因写入运行事件，允许用户从最后运行快照继续或修改配置后重试。
 
 ## 子 Agent 委派
 

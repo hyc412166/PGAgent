@@ -1,4 +1,4 @@
-"""Claude-Code-style tool loop wrapped in PGAgent's LangGraph lifecycle."""
+"""Claude-Code-style model and tool execution runtime."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
-from uuid import uuid4
 
 from src.context.window import ContextManager, message_tokens
 from .completion import CompletionDecision
@@ -24,8 +23,9 @@ from src.context.assembly import (
     InMemoryArtifactStore,
 )
 from .errors import APIErrorKind, call_with_retry
-from .graph import RunGraphState, build_outer_graph
 from .guards import GuardDecision, LoopGuard
+from .loop import run_agent_loop
+from .state import RunState
 from ..tools import ToolRegistry
 from ..tools.builtins import MAX_PARALLEL_DELEGATED_TASKS, normalize_delegate_requests
 from ..tools.types import ToolResult
@@ -353,9 +353,6 @@ class RuntimeConfig:
     max_run_seconds: float | None = 1_800.0
     observation_history_limit: int = 100_000
     event_sink_timeout_seconds: float = 5.0
-    # LangGraph requires a recursion ceiling. Keep it outside any realistic
-    # task size; application stopping is governed by the anti-loop signals.
-    recursion_limit: int = 1_000_000
     # Context budgeting reserves room for the model response and provider
     # overhead.  Semantic compaction is bounded per run to prevent retry loops.
     context_output_reserve_tokens: int = 8_000
@@ -412,7 +409,6 @@ class AgentRuntime:
         event_sink: EventSink | None = None,
         stream_sink: EventSink | None = None,
         config: RuntimeConfig | None = None,
-        checkpointer: Any | None = None,
         clock: Callable[[], float] = time.monotonic,
         context_assembler: ContextAssembler | None = None,
         conversation_compactor: ConversationCompactor | None = None,
@@ -447,7 +443,6 @@ class AgentRuntime:
         self.event_sink = event_sink
         self.stream_sink = stream_sink
         self.config = config or RuntimeConfig()
-        self.checkpointer = checkpointer
         self.clock = clock
         self.completion_verifier = completion_verifier
         self.task_state_provider = task_state_provider
@@ -468,7 +463,7 @@ class AgentRuntime:
             artifact_store=artifact_store,
         )
 
-    async def _publish(self, state: RunGraphState, event_type: str, **payload: Any) -> list[dict[str, Any]]:
+    async def _publish(self, state: RunState, event_type: str, **payload: Any) -> list[dict[str, Any]]:
         event = {"type": event_type, **payload}
         events = [*state.get("events", []), event]
         if self.event_sink is not None:
@@ -538,7 +533,7 @@ class AgentRuntime:
         }, refs
 
     @staticmethod
-    def _stop_state(state: RunGraphState, decision: GuardDecision) -> RunGraphState:
+    def _stop_state(state: RunState, decision: GuardDecision) -> RunState:
         return {
             **state,
             "status": "stopped",
@@ -573,7 +568,6 @@ class AgentRuntime:
         agent_instructions: str | None = None,
         workspace_rules: str | None = None,
         mode: str = "auto",
-        thread_id: str | None = None,
         prepared_messages: Sequence[Mapping[str, Any]] | None = None,
         prior_events: Sequence[Mapping[str, Any]] | None = None,
         guard_snapshot: Mapping[str, Any] | None = None,
@@ -675,11 +669,11 @@ class AgentRuntime:
             return f"{stable_key}:tools-{tool_fingerprint}"
 
         async def compact_state(
-            state: RunGraphState,
+            state: RunState,
             *,
             reason: str,
             phase: str,
-        ) -> RunGraphState:
+        ) -> RunState:
             stable, transcript = split_prompt(state.get("messages", []))
             if not transcript:
                 return state
@@ -771,7 +765,7 @@ class AgentRuntime:
                 )
                 return failed
 
-        async def prepare_node(state: RunGraphState) -> RunGraphState:
+        async def prepare_node(state: RunState) -> RunState:
             if state.get("messages"):
                 events = await self._publish(
                     state,
@@ -844,7 +838,7 @@ class AgentRuntime:
                 "prompt_cache_key": prompt_cache_key,
             }
 
-        async def act_node(state: RunGraphState) -> RunGraphState:
+        async def act_node(state: RunState) -> RunState:
             nonlocal active_started_at
             time_decision = self._run_time_decision(active_elapsed_base, active_started_at)
             if time_decision.stop:
@@ -909,7 +903,7 @@ class AgentRuntime:
                     error_type=type(error).__name__,
                 )
 
-            async def recover_from_context_overflow(current_state: RunGraphState) -> RunGraphState | None:
+            async def recover_from_context_overflow(current_state: RunState) -> RunState | None:
                 """Perform one full transcript compaction after provider overflow."""
 
                 if int(current_state.get("context_overflow_retries", 0) or 0) >= 1:
@@ -1602,7 +1596,7 @@ class AgentRuntime:
                 "seen_observations": seen[-observation_limit:],
             }
 
-        async def observe_node(state: RunGraphState) -> RunGraphState:
+        async def observe_node(state: RunState) -> RunState:
             decision = guard.record_progress(bool(state.get("current_made_progress")))
             if decision.stop:
                 stopped = self._stop_state(state, decision)
@@ -1610,17 +1604,10 @@ class AgentRuntime:
                 return stopped
             return {**state, "status": "acting", "current_made_progress": False}
 
-        graph = build_outer_graph(
-            prepare_context=prepare_node,
-            act=act_node,
-            observe=observe_node,
-            checkpointer=self.checkpointer,
-        )
-        initial: RunGraphState = {
+        initial: RunState = {
             "status": "received",
-            # Explicitly reset per-turn ephemeral fields when LangGraph
-            # resumes the same thread.  A previous approval checkpoint must
-            # not leak its pending call/error into the newly approved turn.
+            # Resume paths pass only durable fields explicitly. Per-turn
+            # approval and error state always starts empty.
             "output": None,
             "error": None,
             "stop_reason": None,
@@ -1650,10 +1637,12 @@ class AgentRuntime:
             "completion_verification_attempts": max(0, int(prior_completion_verification_attempts or 0)),
             "acceptance_report": dict(prior_acceptance_report or {}),
         }
-        graph_config: dict[str, Any] = {"recursion_limit": self.config.recursion_limit}
-        if self.checkpointer is not None:
-            graph_config["configurable"] = {"thread_id": thread_id or str(uuid4())}
-        final: RunGraphState = await graph.ainvoke(initial, config=graph_config)
+        final = await run_agent_loop(
+            initial,
+            prepare_context=prepare_node,
+            act=act_node,
+            observe=observe_node,
+        )
         return RunOutcome(
             status=final.get("status", "failed"),
             output=final.get("output"),
@@ -1680,7 +1669,6 @@ class AgentRuntime:
         self,
         prior: RunOutcome,
         *,
-        thread_id: str | None = None,
         runtime_context: Mapping[str, Any] | None = None,
     ) -> RunOutcome:
         """Execute the exact persisted pending call, then continue from its messages."""
@@ -1749,7 +1737,7 @@ class AgentRuntime:
                 completion_verification_attempts=prior.completion_verification_attempts,
             )
 
-        resume_state: RunGraphState = {"events": list(prior.events)}
+        resume_state: RunState = {"events": list(prior.events)}
         timed_out = await timeout_outcome(list(prior.events), list(prior.messages))
         if timed_out is not None:
             return timed_out
@@ -2101,7 +2089,6 @@ class AgentRuntime:
             workspace_rules=resumed_context.get("workspace_rules"),
             recent_messages=[],
             mode=prior.mode,
-            thread_id=thread_id,
             prepared_messages=messages,
             prior_events=events,
             guard_snapshot=restored.snapshot(),
@@ -2183,7 +2170,6 @@ class AgentRuntime:
         self,
         prior: RunOutcome,
         *,
-        thread_id: str | None = None,
         runtime_context: Mapping[str, Any] | None = None,
     ) -> RunOutcome:
         """Continue a parent after a delegated child reaches a terminal state.
@@ -2351,7 +2337,6 @@ class AgentRuntime:
             workspace_rules=resumed_context.get("workspace_rules"),
             recent_messages=[],
             mode=prior.mode,
-            thread_id=thread_id,
             prepared_messages=messages,
             prior_events=events,
             guard_snapshot=restored.snapshot(),

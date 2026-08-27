@@ -205,7 +205,6 @@ class RunCoordinator:
     _MAX_PARTIAL_CHARS = 100_000
 
     def __init__(self) -> None:
-        self.checkpointer: Any | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._memory_tasks: dict[str, asyncio.Task[None]] = {}
         self._tool_cancellers: dict[str, Callable[[], None]] = {}
@@ -213,13 +212,11 @@ class RunCoordinator:
         self._shutting_down = False
         self._event_loop: asyncio.AbstractEventLoop | None = None
 
-    def set_checkpointer(self, checkpointer: Any | None) -> None:
-        self.checkpointer = checkpointer
-        if checkpointer is not None:
-            self._shutting_down = False
-            self._event_loop = asyncio.get_running_loop()
-        else:
-            self._event_loop = None
+    def start(self) -> None:
+        """Bind in-process scheduling to the active application event loop."""
+
+        self._shutting_down = False
+        self._event_loop = asyncio.get_running_loop()
 
     def register_tool_canceller(self, run_id: str, callback: Callable[[], None]) -> None:
         self._tool_cancellers[run_id] = callback
@@ -980,6 +977,7 @@ class RunCoordinator:
 
     async def shutdown(self) -> None:
         self._shutting_down = True
+        self._event_loop = None
         self._queued_resumes.clear()
         tasks = [
             task
@@ -1637,7 +1635,6 @@ class RunCoordinator:
                 model_timeout_seconds=settings.model_timeout_seconds,
                 max_run_seconds=context["max_run_seconds"],
             ),
-            checkpointer=owner.checkpointer,
             task_state_provider=(
                 (lambda key=run_id: task_checkpoint_for_run(key))
                 if not context["runtime_binding"].get("delegation_version") else None
@@ -2285,7 +2282,6 @@ class RunCoordinator:
                 workspace_rules=context["workspace_rules"],
                 recent_messages=context["recent_messages"],
                 mode=context["mode"],
-                thread_id=run_id,
                 compaction_state=context.get("compaction_state"),
                 permission_policy=context.get("permission_policy"),
                 session_id=context.get("session_id"),
@@ -2333,7 +2329,6 @@ class RunCoordinator:
                     workspace_rules=context["workspace_rules"],
                     recent_messages=[],
                     mode=prior.mode,
-                    thread_id=run_id,
                     prepared_messages=prior.messages,
                     prior_events=prior.events,
                     guard_snapshot=prior.guard_snapshot,
@@ -2352,7 +2347,6 @@ class RunCoordinator:
             else:
                 outcome = await runtime.resume_after_approval(
                     prior,
-                    thread_id=run_id,
                     runtime_context=context,
                 )
             outcome.runtime_binding = {
@@ -2394,7 +2388,6 @@ class RunCoordinator:
             self._install_completion_verifier(runtime, context)
             outcome = await runtime.resume_after_delegated_child(
                 prior,
-                thread_id=run_id,
                 runtime_context=context,
             )
             outcome.runtime_binding = {

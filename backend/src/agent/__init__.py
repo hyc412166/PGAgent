@@ -1,4 +1,4 @@
-"""Agent loop, completion checks, retry behavior, guards, and graph lifecycle."""
+"""Agent execution loop, completion checks, retry behavior, and guards."""
 
 from .completion import CompletionDecision, DeterministicAcceptanceReport, DeterministicCheck, decide_deterministic_completion, verify_deterministic_completion
 from .engine import AgentRuntime, ModelToolCall, ModelTurn, RunOutcome, RuntimeConfig, empty_usage, merge_usage, normalize_usage

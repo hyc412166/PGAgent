@@ -259,7 +259,6 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         workspace_rules=context["workspace_rules"],
         recent_messages=context["recent_messages"],
         mode=context["mode"],
-        thread_id=delegated_run["run_id"],
     )
 
     assert outcome.status == "completed", f"{outcome.error}; events={outcome.events}"
@@ -350,7 +349,6 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
         workspace_rules=context["workspace_rules"],
         recent_messages=context["recent_messages"],
         mode=context["mode"],
-        thread_id=delegated_run["run_id"],
     )
     assert parent_outcome.status == "stopped"
     assert parent_outcome.stop_reason == "delegated_child_awaiting_approval"
@@ -664,7 +662,6 @@ async def test_delegated_child_uses_durable_background_job_and_must_observe_it(
             workspace_rules=context["workspace_rules"],
             recent_messages=context["recent_messages"],
             mode=context["mode"],
-            thread_id=delegated_run["run_id"],
         )
 
         assert outcome.status == "stopped"
