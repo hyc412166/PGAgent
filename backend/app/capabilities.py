@@ -53,6 +53,17 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
         runtime_tool_id="read",
     ),
     BuiltinTool(
+        id="read_artifact",
+        name="read_artifact",
+        label="读取上下文 Artifact",
+        description="按字符分页读取当前会话拥有的工具输出或压缩对话 Artifact，不暴露服务器文件路径。",
+        category="filesystem",
+        risk_level="low",
+        enabled=True,
+        availability="available",
+        runtime_tool_id="read_artifact",
+    ),
+    BuiltinTool(
         id="write",
         name="write",
         label="写入文件",

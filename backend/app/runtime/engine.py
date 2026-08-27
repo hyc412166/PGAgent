@@ -18,6 +18,7 @@ from .context import ContextManager, message_tokens
 from .acceptance import CompletionDecision
 from .context_service import (
     ArtifactStore,
+    COMPACTION_SCHEMA,
     ContextAssembler,
     ConversationCompactor,
     InMemoryArtifactStore,
@@ -359,6 +360,7 @@ class RuntimeConfig:
     # overhead.  Semantic compaction is bounded per run to prevent retry loops.
     context_output_reserve_tokens: int = 8_000
     context_safety_buffer_tokens: int = 2_000
+    context_compaction_threshold_tokens: int | None = None
     context_compaction_retain_tokens: int = 8_000
     max_compactions_per_run: int = 2
     max_completion_verification_attempts: int = 3
@@ -395,6 +397,7 @@ class RunOutcome:
 ModelCall = Callable[..., Any | Awaitable[Any]]
 EventSink = Callable[[dict[str, Any]], Any | Awaitable[Any]]
 CompletionVerifier = Callable[[dict[str, Any]], CompletionDecision | Awaitable[CompletionDecision]]
+TaskStateProvider = Callable[[], Mapping[str, Any] | Awaitable[Mapping[str, Any]]]
 
 
 class AgentRuntime:
@@ -415,6 +418,7 @@ class AgentRuntime:
         conversation_compactor: ConversationCompactor | None = None,
         artifact_store: ArtifactStore | None = None,
         completion_verifier: CompletionVerifier | None = None,
+        task_state_provider: TaskStateProvider | None = None,
     ) -> None:
         self.model_call = model_call
         try:
@@ -446,11 +450,13 @@ class AgentRuntime:
         self.checkpointer = checkpointer
         self.clock = clock
         self.completion_verifier = completion_verifier
+        self.task_state_provider = task_state_provider
         artifact_store = artifact_store or InMemoryArtifactStore()
         self.context_assembler = context_assembler or ContextAssembler(
             max_tokens=self.context_manager.max_tokens,
             output_reserve_tokens=self.config.context_output_reserve_tokens,
             safety_buffer_tokens=self.config.context_safety_buffer_tokens,
+            compaction_threshold_tokens=self.config.context_compaction_threshold_tokens,
             artifact_store=artifact_store,
         )
         # Full compaction uses the current conversation model by default.
@@ -646,7 +652,12 @@ class AgentRuntime:
                 if not isinstance(content, str):
                     continue
                 text = content.strip()
-                if not text or text.startswith("<compacted-context>") or text.startswith("[内部验收反馈"):
+                if (
+                    not text
+                    or text.startswith("<compacted-context>")
+                    or text.startswith("<continuation-summary")
+                    or text.startswith("[内部验收反馈")
+                ):
                     continue
                 return text
             return str(fallback or "").strip()
@@ -688,22 +699,33 @@ class AgentRuntime:
                 previous_compaction.get("active_request") or context.get("current_user_message"),
             )
             try:
+                task_state: Mapping[str, Any] = {}
+                if self.task_state_provider is not None:
+                    provided = self.task_state_provider()
+                    if inspect.isawaitable(provided):
+                        provided = await provided
+                    if isinstance(provided, Mapping):
+                        task_state = provided
                 result = await self.conversation_compactor.compact(
                     transcript,
+                    stable_prefix=stable,
                     session_id=str(context.get("session_id") or ""),
                     active_request=active_request,
                     todo_state=self.tool_registry.runtime_state().get("todo_state", []),
+                    task_state=task_state,
                     reason=reason,
+                    prompt_cache_key=cache_namespace(stable),
                     artifact_refs=state.get("context_artifact_refs", []),
                 )
                 effective = not result.ineffective and result.removed_message_count > 0
                 compacted_messages = [*stable, *result.messages] if effective else [dict(item) for item in state.get("messages", [])]
                 compaction_state = {
-                    "schema": "claude_compaction_v1",
+                    "schema": COMPACTION_SCHEMA,
                     "summary": result.summary,
                     "messages": result.messages,
                     "active_request": active_request,
                     "todo_state": self.tool_registry.runtime_state().get("todo_state", []),
+                    "task_state": dict(task_state),
                     "transcript_artifact": result.transcript_artifact.to_dict(),
                     "artifact_refs": [ref.to_dict() for ref in result.artifact_refs],
                     "base_sequence": int(context.get("context_sequence") or 0),

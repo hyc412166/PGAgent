@@ -5,7 +5,7 @@ import json
 import pytest
 
 from app.runtime.context import ContextManager
-from app.runtime.context_service import ContextAssembler, ConversationCompactor
+from app.runtime.context_service import COMPACTION_SECTION_TITLES, ContextAssembler, ConversationCompactor
 from app.runtime.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig
 from app.tools import create_default_registry
 from app.tools.policy import assess_tool_call
@@ -435,11 +435,9 @@ async def test_threshold_full_compaction_builds_exact_continuation(tmp_path) -> 
         calls.append(mode)
         if mode == "compaction":
             return ModelTurn(
-                content=(
-                    '{"objective":"preserve the task","constraints":[],"decisions":[],'
-                    '"facts":["a fact"],"evidence":[],"files_changed":[],'
-                    '"completed_work":[],"pending_work":["continue"],"errors":[],'
-                    '"tool_state":{},"approval_state":{},"next_action":"continue"}'
+                content="\n".join(
+                    f"## {index}. {title}\nPreserved continuation fact {index}."
+                    for index, title in enumerate(COMPACTION_SECTION_TITLES, start=1)
                 )
             )
         model_messages.extend(kwargs["messages"])
@@ -476,10 +474,44 @@ async def test_threshold_full_compaction_builds_exact_continuation(tmp_path) -> 
     assert outcome.output == "compacted answer"
     assert "compaction" in calls
     rendered = "\n".join(str(item.get("content") or "") for item in model_messages)
-    assert "<compacted-context>" in rendered
-    assert "<active-request>important task</active-request>" in rendered
+    assert "<continuation-summary" in rendered
+    assert "Authoritative current task facts" in rendered
     assert "important task" in rendered
     assert any(event["type"] == "context_compaction_finished" and event.get("effective") for event in outcome.events)
+
+
+@pytest.mark.asyncio
+async def test_task_checkpoint_failure_keeps_original_messages_instead_of_degraded_compaction(tmp_path) -> None:
+    modes: list[str] = []
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        modes.append(str(kwargs.get("mode") or "auto"))
+        return ModelTurn(content="answer from original context")
+
+    def unavailable_checkpoint():
+        raise RuntimeError("database temporarily unavailable")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+        context_manager=ContextManager(max_tokens=4_096),
+        context_assembler=ContextAssembler(
+            max_tokens=4_096,
+            compaction_threshold_tokens=300,
+            output_reserve_tokens=0,
+            safety_buffer_tokens=0,
+        ),
+        task_state_provider=unavailable_checkpoint,
+    )
+    outcome = await runtime.run(
+        system_prompt="stable rules",
+        recent_messages=[{"role": "user", "content": "keep this " + ("x" * 4_000)}],
+    )
+
+    assert outcome.status == "completed"
+    assert modes == ["auto"]
+    assert any(event["type"] == "context_compaction_failed" for event in outcome.events)
+    assert all(not str(item.get("content") or "").startswith("<continuation-summary") for item in outcome.messages)
 
 
 @pytest.mark.asyncio
