@@ -7,6 +7,7 @@ export interface DraftLaunchSettings {
   thinking_level: ThinkingLevel
   skill_ids: string[]
   permission_mode: PermissionMode
+  use_memories: boolean
 }
 
 export interface DraftLaunchPayload {
@@ -19,6 +20,7 @@ export interface DraftLaunchPayload {
   thinking_level: ThinkingLevel
   skill_ids: string[]
   permission_mode: PermissionMode
+  use_memories: boolean
 }
 
 export function createDraftIdempotencyKey(randomId?: () => string): string {
@@ -53,5 +55,6 @@ export function buildDraftLaunchPayload(
     thinking_level: settings.thinking_level,
     skill_ids: [...new Set(settings.skill_ids)],
     permission_mode: settings.permission_mode,
+    use_memories: settings.use_memories,
   }
 }

@@ -75,7 +75,9 @@ T = TypeVar("T")
 _ACTIVE_SESSION_RUN_STATUSES = frozenset(
     {"received", "preparing_context", "planning", "acting", "observing", "running", "awaiting_approval"}
 )
-_SESSION_RUNTIME_SETTING_FIELDS = frozenset({"model_connection_id", "model_id", "thinking_level"})
+_SESSION_RUNTIME_SETTING_FIELDS = frozenset({
+    "model_connection_id", "model_id", "thinking_level", "use_memories",
+})
 _PUBLIC_RUN_EVENT_TYPES = frozenset({
     "approval_rejected",
     "approval_requested",

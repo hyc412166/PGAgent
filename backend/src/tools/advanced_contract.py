@@ -79,7 +79,7 @@ ADVANCED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "GitShow": _schema("Read a Git commit, object, or path.", {"commit": _STRING, "path": _STRING, "stat": _BOOL, "format": _STRING}, ("commit",)),
     "GitBlame": _schema("Read Git blame for a path and optional line range.", {"path": _STRING, "start_line": _INTEGER, "end_line": _INTEGER}, ("path",)),
     "MemoryWrite": _schema("Write a durable memory to the canonical database.", {"name": _STRING, "body": _STRING, "memory_type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]}, "description": _STRING, "scope": {"type": "string", "enum": ["global", "workspace", "session"]}, "tags": _STRINGS, "pinned": _BOOL}, ("name", "body")),
-    "MemoryRead": {"description": "Read one visible durable memory by id or name.", "parameters": {"type": "object", "properties": {"name": _STRING, "memory_id": _STRING}, "anyOf": [{"required": ["name"]}, {"required": ["memory_id"]}]}},
+    "MemoryRead": {"description": "Read one visible durable memory by id/name, one supporting rollout summary, or one promoted memory skill.", "parameters": {"type": "object", "properties": {"name": _STRING, "memory_id": _STRING, "rollout_id": _STRING, "skill_id": _STRING}, "oneOf": [{"required": ["name"]}, {"required": ["memory_id"]}, {"required": ["rollout_id"]}, {"required": ["skill_id"]}]}},
     "MemoryList": _schema("List active visible durable memory metadata.", {}),
     "MemorySearch": _schema("Search visible durable memories relevant to a query.", {"query": _STRING, "limit": _INTEGER}, ("query",)),
 

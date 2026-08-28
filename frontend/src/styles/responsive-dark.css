@@ -192,6 +192,30 @@
 .personalization-warning span { color: var(--muted); font-size: .78rem; overflow-wrap: anywhere; }
 .personalization-actions { display: flex; align-items: center; justify-content: flex-end; gap: .65rem; margin-top: 1rem; }
 .personalization-saved { display: inline-flex; align-items: center; gap: .35rem; margin-right: auto; color: var(--success); font-size: .78rem; }
+.personalization-memory-card { width: min(960px, 100%); padding: 0; }
+.memory-global-setting { display: flex; align-items: center; justify-content: space-between; gap: 1.25rem; padding: 1rem 1.25rem 1.25rem; }
+.memory-global-copy { min-width: 0; display: grid; gap: .3rem; }
+.memory-global-copy strong { color: var(--ink); font-size: .82rem; }
+.memory-global-copy p { max-width: 70ch; margin: 0; color: var(--muted); font-size: .78rem; line-height: 1.55; }
+.memory-global-control { display: flex; align-items: center; gap: .45rem; flex: 0 0 auto; }
+.memory-global-status { color: var(--muted-2); font-size: .72rem; font-weight: 750; }
+.memory-global-status.is-on { color: var(--action-strong); }
+.memory-global-feedback { display: flex; align-items: center; gap: .7rem; padding: 0 1.25rem 1.1rem; }
+.memory-global-feedback .inline-error { margin: 0; }
+.toggle-switch-button { position: relative; width: 48px; height: 44px; display: grid; place-items: center; flex: 0 0 48px; padding: 0; border: 0; border-radius: 999px; color: var(--action-strong); background: transparent; }
+.toggle-switch-track,
+.session-memory-switch { position: relative; width: 44px; height: 24px; display: block; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface-deep); transition: background-color .15s ease, border-color .15s ease; }
+.toggle-switch-track > span,
+.session-memory-switch > span { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--surface); box-shadow: 0 1px 4px rgb(6 36 56 / 22%); transition: transform .15s ease; }
+.toggle-switch-button.is-on .toggle-switch-track,
+.session-memory-setting[aria-checked='true'] .session-memory-switch { border-color: var(--action-fill); background: var(--action-fill); }
+.toggle-switch-button.is-on .toggle-switch-track > span,
+.session-memory-setting[aria-checked='true'] .session-memory-switch > span { transform: translateX(20px); }
+.toggle-switch-button:hover:not(:disabled) .toggle-switch-track { border-color: var(--action); }
+.toggle-switch-button:focus-visible { outline: 3px solid var(--focus-outline); outline-offset: 2px; }
+.toggle-switch-button:disabled { cursor: not-allowed; opacity: .58; }
+.toggle-switch-spinner { position: absolute; color: var(--action-strong); pointer-events: none; }
+.toggle-switch-button.is-on .toggle-switch-spinner { color: #fff; }
 .memory-create-card, .memory-list-card { padding: 1.25rem; }
 .memory-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .9rem; }
 .memory-form > :has(textarea), .memory-form-actions { grid-column: 1 / -1; }
@@ -215,4 +239,4 @@
 .memory-recall-list article div { display: grid; gap: .25rem; min-width: 0; }
 .memory-recall-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .memory-recall-list small, .memory-recall-list p { color: var(--muted); font-size: .78rem; overflow-wrap: anywhere; }
-@media (max-width: 760px) { .memory-form { grid-template-columns: 1fr; } .memory-form > * { grid-column: 1; } .memory-list-card .card-heading { align-items: stretch; flex-direction: column; } .memory-search { min-width: 0; } .personalization-actions { align-items: stretch; flex-direction: column; } .personalization-saved { margin-right: 0; } }
+@media (max-width: 760px) { .memory-form { grid-template-columns: 1fr; } .memory-form > * { grid-column: 1; } .memory-list-card .card-heading { align-items: stretch; flex-direction: column; } .memory-search { min-width: 0; } .personalization-actions { align-items: stretch; flex-direction: column; } .personalization-saved { margin-right: 0; } .memory-global-setting { align-items: flex-start; flex-direction: column; } .memory-global-control { width: 100%; justify-content: space-between; } .memory-global-feedback { align-items: flex-start; flex-direction: column; } }

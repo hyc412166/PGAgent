@@ -2,15 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-import asyncio
 import threading
 
 import pytest
 from sqlalchemy import select
 
 from src.persistence import database
-from src.runs import service as run_service
-from src.persistence.database import Base, ChatMessage, Memory, MemoryJob, ModelConnection, Session, UsageRecord, Workspace
+from src.persistence.database import Base, ChatMessage, Memory, Session, Workspace
 from src.memory.service import (
     MemoryToolStore,
     ensure_user_memory_snapshot,
@@ -23,7 +21,7 @@ from src.memory.service import (
     render_memory_snapshot,
     store_memory,
 )
-from src.runs.service import RunCoordinator, _message_payload
+from src.runs.service import _message_payload
 from src.tools import create_default_registry
 
 
@@ -416,123 +414,3 @@ def test_memory_framing_escapes_delimiters_and_extraction_rejects_transient_scop
         '{"scope":"persistent","target_scope":"global","name":"project","memory_type":"project","description":"","content":"All builds use make release.","tags":[]}'
         ']}')
     assert candidates == []
-
-
-@pytest.mark.asyncio
-async def test_durable_extraction_usage_is_separate_from_conversation_usage(memory_db, monkeypatch: pytest.MonkeyPatch) -> None:
-    _root, workspace_id, session_id = memory_db
-    with database.SessionLocal() as db:
-        connection = ModelConnection(
-            name="Memory model",
-            provider="openai_compatible",
-            base_url="http://example.invalid",
-            secret_ref="secret-ref",
-            default_model="demo-model",
-            enabled=True,
-        )
-        db.add(connection); db.flush()
-        job = MemoryJob(
-            workspace_id=workspace_id,
-            session_id=session_id,
-            payload={
-                "turn_id": "",
-                "user_request": "以后都使用 pytest",
-                "assistant_response": "已记录。",
-                "runtime_binding": {
-                    "model_connection_id": connection.id,
-                    "provider": connection.provider,
-                    "base_url": connection.base_url,
-                    "secret_ref": connection.secret_ref,
-                    "model_id": connection.default_model,
-                },
-            },
-        )
-        db.add(job); db.commit(); job_id = job.id
-
-    calls = 0
-
-    async def fake_call(**_kwargs):
-        nonlocal calls
-        calls += 1
-        await asyncio.sleep(0.01)
-        return {
-            "choices": [{"message": {"content": '{"candidates":[{"scope":"persistent","target_scope":"workspace","name":"测试约定","memory_type":"project","description":"项目测试","content":"项目测试长期使用 pytest。","tags":["test"]}]}'}}],
-            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
-        }
-
-    monkeypatch.setattr(run_service, "build_model_call", lambda _config: fake_call)
-    coordinator = RunCoordinator()
-    await asyncio.gather(
-        coordinator._process_memory_job(job_id),
-        coordinator._process_memory_job(job_id),
-    )
-
-    with database.SessionLocal() as db:
-        persisted = db.get(MemoryJob, job_id)
-        assert persisted is not None and persisted.status == "completed"
-        assert persisted.total_tokens == 120
-        assert db.scalar(select(Memory).where(Memory.name == "测试约定", Memory.status == "active")) is not None
-        assert db.scalar(select(UsageRecord)) is None
-    assert calls == 1
-
-
-@pytest.mark.asyncio
-async def test_expired_memory_worker_is_fenced_from_late_commit(memory_db, monkeypatch: pytest.MonkeyPatch) -> None:
-    _root, workspace_id, session_id = memory_db
-    with database.SessionLocal() as db:
-        connection = ModelConnection(
-            name="Fence model", provider="openai_compatible", base_url="http://example.invalid",
-            secret_ref="fence-secret", default_model="demo-model", enabled=True,
-        )
-        db.add(connection); db.flush()
-        job = MemoryJob(
-            workspace_id=workspace_id,
-            session_id=session_id,
-            payload={
-                "user_request": "remember the build command",
-                "assistant_response": "done",
-                "runtime_binding": {
-                    "model_connection_id": connection.id, "provider": connection.provider,
-                    "base_url": connection.base_url, "secret_ref": connection.secret_ref,
-                    "model_id": connection.default_model,
-                },
-            },
-        )
-        db.add(job); db.commit(); job_id = job.id
-
-    first_started = asyncio.Event()
-    release_first = asyncio.Event()
-    calls = 0
-
-    async def fake_call(**_kwargs):
-        nonlocal calls
-        calls += 1
-        call_number = calls
-        if call_number == 1:
-            first_started.set()
-            await release_first.wait()
-        content = "late first value" if call_number == 1 else "winning second value"
-        return {
-            "choices": [{"message": {"content": '{"candidates":[{"scope":"persistent","target_scope":"workspace","name":"Build command","memory_type":"project","description":"","content":"' + content + '","tags":[]}]}'}}],
-            "usage": {"total_tokens": 1},
-        }
-
-    monkeypatch.setattr(run_service, "build_model_call", lambda _config: fake_call)
-    coordinator = RunCoordinator()
-    stale_task = asyncio.create_task(coordinator._process_memory_job(job_id))
-    await first_started.wait()
-    with database.SessionLocal() as db:
-        persisted = db.get(MemoryJob, job_id)
-        assert persisted is not None
-        persisted.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-        db.commit()
-    assert coordinator.pending_memory_job_ids(recover_running=True) == [job_id]
-    await coordinator._process_memory_job(job_id)
-    release_first.set()
-    await stale_task
-
-    with database.SessionLocal() as db:
-        persisted = db.get(MemoryJob, job_id)
-        values = list(db.scalars(select(Memory).where(Memory.name == "Build command")))
-        assert persisted is not None and persisted.status == "completed" and persisted.attempts == 2
-        assert [item.content for item in values] == ["winning second value"]

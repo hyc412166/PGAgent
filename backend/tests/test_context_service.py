@@ -97,6 +97,87 @@ def test_runtime_config_propagates_explicit_compaction_threshold(tmp_path) -> No
     assert runtime.context_assembler.compaction_threshold == 700
 
 
+def test_memory_index_is_late_system_context_without_changing_cache_namespace(tmp_path) -> None:
+    calls: list[dict] = []
+
+    async def model_call(**kwargs):
+        calls.append(kwargs)
+        return {"choices": [{"message": {"content": "done"}}]}
+
+    async def execute(index: str):
+        runtime = AgentRuntime(
+            model_call=model_call,
+            tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+        )
+        return await runtime.run(
+            system_prompt="system",
+            workspace_rules="workspace",
+            memory_index=index,
+            recent_messages=[{"role": "user", "content": "question"}],
+        )
+
+    first = asyncio.run(execute("- Memory A"))
+    second = asyncio.run(execute("- Memory B"))
+
+    first_key = next(event["prompt_cache_key"] for event in first.events if event["type"] == "context_prepared")
+    second_key = next(event["prompt_cache_key"] for event in second.events if event["type"] == "context_prepared")
+    assert first_key == second_key
+    assert calls[0]["messages"][-2]["role"] == "system"
+    assert "Memory A" in calls[0]["messages"][-2]["content"]
+    assert calls[0]["messages"][-1] == {"role": "user", "content": "question"}
+
+
+def test_runtime_strips_memory_citation_before_accepting_reply(tmp_path) -> None:
+    async def model_call(**_kwargs):
+        return {"choices": [{"message": {"content": (
+            'Visible answer.\n<pgagent-memory-citation>{"memory_ids":["m1"],'
+            '"rollout_ids":[],"note":"used"}</pgagent-memory-citation>'
+        )}}]}
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+    )
+    outcome = asyncio.run(runtime.run(
+        system_prompt="system",
+        recent_messages=[{"role": "user", "content": "question"}],
+    ))
+
+    assert outcome.output == "Visible answer."
+    assert outcome.messages[-1]["content"] == "Visible answer."
+    assert outcome.memory_citation["memory_ids"] == ["m1"]
+    assert outcome.memory_citation["skill_ids"] == []
+
+
+def test_runtime_strips_premature_memory_citation_from_tool_call_text(tmp_path) -> None:
+    calls = 0
+
+    async def model_call(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"choices": [{"message": {
+                "content": 'working<pgagent-memory-citation>{"memory_ids":["m1"]}</pgagent-memory-citation>',
+                "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "get_current_time", "arguments": "{}"},
+                }],
+            }}]}
+        return {"choices": [{"message": {"content": "done"}}]}
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=["get_current_time"]),
+    )
+    outcome = asyncio.run(runtime.run(
+        system_prompt="system",
+        recent_messages=[{"role": "user", "content": "question"}],
+    ))
+
+    assert outcome.status == "completed"
+    assert all("pgagent-memory-citation" not in str(message.get("content") or "") for message in outcome.messages)
+
+
 def test_atomic_groups_keep_complete_parallel_tool_batch() -> None:
     messages = [
         {"role": "user", "content": "inspect"},

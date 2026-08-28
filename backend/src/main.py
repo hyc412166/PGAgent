@@ -21,6 +21,7 @@ from src.persistence.database import init_db
 from src.runs.service import coordinator
 from src.tasks.background import background_job_manager
 from src.memory.service import import_workspace_memory_files, refresh_memory_markdown_projection
+from src.memory.pipeline import activate_deferred_memory_jobs
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ async def _delivery_watchdog() -> None:
             coordinator.reconcile_orphaned_runs()
             coordinator.reconcile_terminal_deliveries(include_legacy=False)
             coordinator.reconcile_waiting_background_runs()
+            activate_deferred_memory_jobs()
             for job_id in coordinator.pending_memory_job_ids(recover_running=True):
                 coordinator.launch_memory_job(job_id)
         except Exception:
@@ -50,6 +52,7 @@ async def lifespan(_app: FastAPI):
     init_db()
     import_workspace_memory_files()
     refresh_memory_markdown_projection()
+    activate_deferred_memory_jobs()
     continuation_run_ids = coordinator.reconcile_interrupted_runs()
     memory_job_ids = coordinator.pending_memory_job_ids()
     coordinator.reconcile_terminal_deliveries()

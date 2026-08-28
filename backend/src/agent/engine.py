@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from src.context.window import ContextManager, message_tokens
+from src.memory.protocol import memory_system_message, split_memory_citation
 from .completion import CompletionDecision
 from src.context.assembly import (
     ArtifactStore,
@@ -389,6 +390,7 @@ class RunOutcome:
     verification_trace: list[dict[str, Any]] = field(default_factory=list)
     acceptance_report: dict[str, Any] = field(default_factory=dict)
     completion_verification_attempts: int = 0
+    memory_citation: dict[str, Any] = field(default_factory=dict)
 
 
 ModelCall = Callable[..., Any | Awaitable[Any]]
@@ -567,6 +569,7 @@ class AgentRuntime:
         recent_messages: Sequence[Mapping[str, Any]],
         agent_instructions: str | None = None,
         workspace_rules: str | None = None,
+        memory_index: str | None = None,
         mode: str = "auto",
         prepared_messages: Sequence[Mapping[str, Any]] | None = None,
         prior_events: Sequence[Mapping[str, Any]] | None = None,
@@ -615,11 +618,14 @@ class AgentRuntime:
             return f"{rendered}\n{skill_catalog}" if skill_catalog else rendered
 
         def render_stable_prefix(context: Mapping[str, Any]) -> list[dict[str, Any]]:
+            extra_messages = [{"role": "system", "content": render_instructions(context)}]
+            if str(context.get("memory_index") or "").strip():
+                extra_messages.append(memory_system_message(str(context["memory_index"])))
             return ContextAssembler.stable_prefix(
                 system_rules=context.get("system_prompt"),
                 workspace_rules=context.get("workspace_rules"),
                 permission_policy=context.get("permission_policy"),
-                extra_messages=[{"role": "system", "content": render_instructions(context)}],
+                extra_messages=extra_messages,
             )
 
         def split_prompt(messages: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -657,7 +663,11 @@ class AgentRuntime:
             return str(fallback or "").strip()
 
         def cache_namespace(stable: Sequence[Mapping[str, Any]]) -> str:
-            stable_key = self.context_assembler.assemble(stable_prefix=stable).cache_key
+            cacheable = [
+                dict(message) for message in stable
+                if not str(message.get("content") or "").startswith("# Persistent memory router")
+            ]
+            stable_key = self.context_assembler.assemble(stable_prefix=cacheable).cache_key
             tool_fingerprint = hashlib.sha256(
                 json.dumps(
                     self.tool_registry.schemas,
@@ -798,11 +808,14 @@ class AgentRuntime:
             skill_catalog = self.tool_registry.skill_catalog_prompt
             if skill_catalog:
                 instructions = f"{instructions}\n{skill_catalog}"
+            extra_messages = [{"role": "system", "content": instructions}]
+            if str(context.get("memory_index") or "").strip():
+                extra_messages.append(memory_system_message(str(context["memory_index"])))
             stable_prefix = ContextAssembler.stable_prefix(
                 system_rules=context["system_prompt"],
                 workspace_rules=context.get("workspace_rules"),
                 permission_policy=context.get("permission_policy"),
-                extra_messages=[{"role": "system", "content": instructions}],
+                extra_messages=extra_messages,
             )
             transcript = list(context.get("recent_messages", []))
             layout = self.context_assembler.assemble(
@@ -1062,7 +1075,9 @@ class AgentRuntime:
                     reason=time_decision.reason,
                 )
                 return stopped
-            assistant_message: dict[str, Any] = {"role": "assistant", "content": turn.content}
+            visible_content, parsed_memory_citation = split_memory_citation(turn.content)
+            memory_citation = parsed_memory_citation if not turn.tool_calls else {}
+            assistant_message: dict[str, Any] = {"role": "assistant", "content": visible_content}
             if turn.reasoning_content:
                 # DeepSeek reasoning models require their exact prior chain in
                 # every following request. Omitting it makes LiteLLM inject a
@@ -1085,7 +1100,7 @@ class AgentRuntime:
                 state["events"] = await self._publish(
                     {**state, "messages": messages},
                     "thought_summary",
-                    summary=_safe_event_text(turn.content, 480),
+                    summary=_safe_event_text(visible_content, 480),
                     phase="model",
                 )
             if not turn.tool_calls:
@@ -1102,7 +1117,7 @@ class AgentRuntime:
                             dict(assistant_message),
                         ]
                         raw_decision = self.completion_verifier({
-                            "output": turn.content,
+                            "output": visible_content,
                             "messages": current_run_messages,
                             "events": state.get("events", []),
                             "tool_calls": guard.calls,
@@ -1211,12 +1226,12 @@ class AgentRuntime:
                     **state,
                     "transcript_delta": [*state.get("transcript_delta", []), dict(assistant_message)],
                 }
-                if self.completion_verifier is not None and turn.content:
+                if self.completion_verifier is not None and visible_content:
                     # Candidate text was buffered while the provider streamed.
                     # Publish it only after deterministic acceptance passes.
                     await self._publish_transient(
                         "assistant_delta",
-                        delta=turn.content,
+                        delta=visible_content,
                         step=guard.steps,
                         accepted=True,
                     )
@@ -1227,15 +1242,16 @@ class AgentRuntime:
                 completed = {
                     **state,
                     "status": "completed",
-                    "output": turn.content,
+                    "output": visible_content,
+                    "memory_citation": memory_citation,
                     "messages": [*clean_history, assistant_message],
                 }
                 completed["events"] = await self._publish(
                     completed,
                     "run_completed",
                     usage=completed["usage"],
-                    has_output=bool(turn.content),
-                    output_chars=len(turn.content),
+                    has_output=bool(visible_content),
+                    output_chars=len(visible_content),
                     elapsed_ms=round((self.clock() - active_started_at) * 1000),
                     thought_duration_ms=round((self.clock() - thought_started_at) * 1000),
                 )
@@ -1622,6 +1638,7 @@ class AgentRuntime:
                 "system_prompt": system_prompt,
                 "agent_instructions": agent_instructions,
                 "workspace_rules": workspace_rules,
+                "memory_index": memory_index,
                 "recent_messages": [dict(item) for item in recent_messages],
                 "compaction_state": dict(compaction_state or {}),
                 "permission_policy": permission_policy,
@@ -1636,6 +1653,7 @@ class AgentRuntime:
             "context_overflow_retries": 0,
             "completion_verification_attempts": max(0, int(prior_completion_verification_attempts or 0)),
             "acceptance_report": dict(prior_acceptance_report or {}),
+            "memory_citation": {},
         }
         final = await run_agent_loop(
             initial,
@@ -1663,6 +1681,7 @@ class AgentRuntime:
             verification_trace=[dict(item) for item in final.get("verification_trace", [])],
             acceptance_report=dict(final.get("acceptance_report") or {}),
             completion_verification_attempts=max(0, int(final.get("completion_verification_attempts") or 0)),
+            memory_citation=dict(final.get("memory_citation") or {}),
         )
 
     async def resume_after_approval(
@@ -2087,6 +2106,7 @@ class AgentRuntime:
             system_prompt=str(resumed_context.get("system_prompt") or ""),
             agent_instructions=resumed_context.get("agent_instructions"),
             workspace_rules=resumed_context.get("workspace_rules"),
+            memory_index=resumed_context.get("memory_index"),
             recent_messages=[],
             mode=prior.mode,
             prepared_messages=messages,
@@ -2335,6 +2355,7 @@ class AgentRuntime:
             system_prompt=str(resumed_context.get("system_prompt") or ""),
             agent_instructions=resumed_context.get("agent_instructions"),
             workspace_rules=resumed_context.get("workspace_rules"),
+            memory_index=resumed_context.get("memory_index"),
             recent_messages=[],
             mode=prior.mode,
             prepared_messages=messages,

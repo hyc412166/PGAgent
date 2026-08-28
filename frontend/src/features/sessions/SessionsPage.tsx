@@ -22,7 +22,7 @@ import { DurableTaskCard } from './components/DurableTaskCard'
 import { useRunTransport } from './hooks/useRunTransport'
 import { activeRunStatuses, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
-import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FolderSelection, Message, PermissionMode, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
+import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FolderSelection, MemorySettings, Message, PermissionMode, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 function SessionsPage() {
   const sessions = useApiData<Session[]>([], () => api.list<Session>('/api/sessions', ['sessions']), [])
@@ -30,6 +30,7 @@ function SessionsPage() {
   const workspaces = useApiData<Workspace[]>([], () => api.list<Workspace>('/api/workspaces', ['workspaces']), [])
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
   const skills = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
+  const memorySettings = useApiData<MemorySettings | null>(null, () => api.get<MemorySettings>('/api/memories/settings'), [])
   const [activeId, setActiveId] = useState('')
   const [composerHasValue, setComposerHasValue] = useState(false)
   const [sending, setSending] = useState(false)
@@ -709,7 +710,7 @@ function SessionsPage() {
     } finally { setDecidingApproval('') }
   }
 
-  async function updateSessionSettings(payload: { model_connection_id?: string | null; model_id?: string | null; thinking_level?: ThinkingLevel | null }) {
+  async function updateSessionSettings(payload: { model_connection_id?: string | null; model_id?: string | null; thinking_level?: ThinkingLevel | null; use_memories?: boolean }) {
     if (settingsLocked || sending) return
     if (draftActive) {
       setDraftSettings((current) => ({
@@ -717,6 +718,7 @@ function SessionsPage() {
         model_connection_id: payload.model_connection_id === undefined ? current.model_connection_id : payload.model_connection_id,
         model_id: payload.model_id === undefined ? current.model_id : payload.model_id,
         thinking_level: payload.thinking_level ?? current.thinking_level,
+        use_memories: payload.use_memories ?? current.use_memories,
       }))
       return
     }
@@ -777,6 +779,8 @@ function SessionsPage() {
 
   const selectedSessionSkillIds = draftActive ? draftSettings.skill_ids : activeSession?.skill_ids ?? []
   const selectedPermissionMode: PermissionMode = draftActive ? draftSettings.permission_mode : activeSession?.permission_mode ?? 'smart'
+  const selectedUseMemories = draftActive ? draftSettings.use_memories : activeSession?.use_memories ?? true
+  const globalMemoriesDisabled = memorySettings.data?.enabled === false
 
   function toggleSessionSkill(skillId: string) {
     void updateSessionCapabilities({ skill_ids: toggleSelectedId(selectedSessionSkillIds, skillId) })
@@ -792,6 +796,7 @@ function SessionsPage() {
     model_connection_id: draftSettings.model_connection_id || undefined,
     model_id: draftSettings.model_id || undefined,
     thinking_level: draftSettings.thinking_level,
+    use_memories: draftSettings.use_memories,
   } : undefined)
   const effectiveSettings = resolveEffectiveModelSettings(connections.data, settingsSession, activeAgent)
   const effectiveConnection = effectiveSettings.connection
@@ -820,6 +825,10 @@ function SessionsPage() {
   function selectThinking(value: ThinkingLevel) {
     closeSettingsMenu()
     void updateSessionSettings({ thinking_level: value })
+  }
+  function toggleSessionMemories() {
+    closeSettingsMenu()
+    void updateSessionSettings({ use_memories: !selectedUseMemories })
   }
   function openSettingsSubmenu(kind: 'model' | 'thinking', focusFirst = false) {
     setSettingsSubmenu(kind)
@@ -969,6 +978,10 @@ function SessionsPage() {
                         <span>{modelButtonLabel}</span><strong>{thinkingLevelLabels[effectiveThinking]}</strong><ChevronRight size={12} aria-hidden="true" />
                       </button>
                       {settingsMenuOpen && <div className="session-settings-popover" role="menu" aria-label="模型和思考设置">
+                        <button type="button" className="session-memory-setting" role="menuitemcheckbox" aria-checked={selectedUseMemories} aria-busy={settingsSaving} disabled={globalMemoriesDisabled || settingsSaving || settingsLocked || sending} onClick={toggleSessionMemories}>
+                          <span><strong>使用已有记忆</strong><small>{globalMemoriesDisabled ? '全局已关闭' : selectedUseMemories ? '此会话会使用已有记忆' : '此会话不会使用已有记忆'}</small></span>
+                          <span className="session-memory-switch" aria-hidden="true"><span /></span>
+                        </button>
                         <button type="button" className={settingsSubmenu === 'model' ? 'active' : ''} role="menuitem" aria-haspopup="menu" aria-expanded={settingsSubmenu === 'model'} onMouseEnter={() => openSettingsSubmenu('model')} onKeyDown={(event) => { if (event.key === 'ArrowRight') { event.preventDefault(); openSettingsSubmenu('model', true) } }} onClick={() => openSettingsSubmenu('model', true)}>
                           <span>模型</span><small>{modelButtonLabel}</small><ChevronRight size={13} aria-hidden="true" />
                         </button>

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { buildDraftLaunchPayload, createDraftIdempotencyKey, createTurnIdempotencyKey } from './draftLaunch'
+import { emptyDraftSettings } from './features/sessions/sessionState'
 
 describe('临时草稿原子启动', () => {
   it('为一个草稿生成可复用的稳定幂等键', () => {
@@ -12,6 +13,7 @@ describe('临时草稿原子启动', () => {
       thinking_level: 'auto',
       skill_ids: [],
       permission_mode: 'smart',
+      use_memories: true,
     })).toEqual({
       idempotency_key: key,
       title: '分析 当前项目',
@@ -19,6 +21,7 @@ describe('临时草稿原子启动', () => {
       thinking_level: 'auto',
       skill_ids: [],
       permission_mode: 'smart',
+      use_memories: true,
     })
   })
 
@@ -29,6 +32,7 @@ describe('临时草稿原子启动', () => {
       thinking_level: 'high',
       skill_ids: ['skill-1', 'skill-1', 'skill-2'],
       permission_mode: 'ask',
+      use_memories: false,
     })).toEqual({
       idempotency_key: 'draft-1',
       title: '执行任务',
@@ -39,6 +43,11 @@ describe('临时草稿原子启动', () => {
       thinking_level: 'high',
       skill_ids: ['skill-1', 'skill-2'],
       permission_mode: 'ask',
+      use_memories: false,
     })
+  })
+
+  it('新草稿默认使用已有记忆', () => {
+    expect(emptyDraftSettings.use_memories).toBe(true)
   })
 })

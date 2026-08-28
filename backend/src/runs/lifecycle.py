@@ -33,8 +33,8 @@ from src.persistence.database import (
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
     ModelConnection,
-    Memory,
     MemoryJob,
+    MemoryRollout,
     PlanStep,
     Run,
     RunEvent,
@@ -63,18 +63,9 @@ from src.tasks import background as background_job_service
 from src.model.gateway import ModelConfigurationError, ProviderConfig
 from src.artifacts.storage import ArtifactToolStore
 from src.tasks.background import BackgroundJobToolStore
-from src.memory.service import (
-    MemoryToolStore,
-    ensure_user_memory_snapshot,
-    extraction_prompt,
-    memory_payload,
-    parse_extraction_response,
-    recall_memories,
-    refresh_memory_markdown_projection,
-    render_memory_snapshot,
-    store_memory,
-    visible_memory_query,
-)
+from src.memory.service import MemoryToolStore
+from src.memory.repository import load_memory_index, record_memory_citations
+from src.memory.preferences import memories_enabled
 from src.context.instructions import load_instruction_chain, render_workspace_rules
 from src.runs.stream import run_stream_broker
 from src.tasks.state import (
@@ -418,6 +409,9 @@ class RunCoordinator:
 
         if self._shutting_down:
             return False
+        with database_module.SessionLocal() as db:
+            if not memories_enabled(db):
+                return False
         current = self._memory_tasks.get(job_id)
         if current is not None and not current.done():
             return False
@@ -438,15 +432,22 @@ class RunCoordinator:
         """Reset process-interrupted workers and return retryable durable jobs."""
 
         with database_module.SessionLocal() as db:
+            if not memories_enabled(db):
+                return []
             if recover_running:
                 now = _utcnow()
                 for job in db.scalars(select(MemoryJob).where(
-                    MemoryJob.status == "running",
+                    MemoryJob.status.in_({"running", "committing"}),
                     or_(MemoryJob.lease_expires_at.is_(None), MemoryJob.lease_expires_at <= now),
                 )):
-                    job.status = "pending"
+                    job.status = "pending" if int(job.attempts or 0) < 3 else "failed"
                     job.error = "worker process restarted before completion"
                     job.lease_expires_at = None
+                    if job.status == "failed":
+                        db.execute(update(MemoryRollout).where(
+                            MemoryRollout.consolidation_job_id == job.id,
+                            MemoryRollout.selected_for_phase2_at.is_(None),
+                        ).values(status="active", consolidation_job_id=None))
             db.commit()
             return list(db.scalars(
                 select(MemoryJob.id)
@@ -455,139 +456,9 @@ class RunCoordinator:
             ))
 
     async def _process_memory_job(self, job_id: str) -> None:
-        with database_module.SessionLocal() as db:
-            lease_seconds = max(300, int(settings.model_timeout_seconds) + 60)
-            claim = db.execute(
-                update(MemoryJob)
-                .where(MemoryJob.id == job_id, MemoryJob.status == "pending", MemoryJob.attempts < 3)
-                .values(
-                    status="running",
-                    attempts=MemoryJob.attempts + 1,
-                    error=None,
-                    lease_expires_at=_utcnow() + timedelta(seconds=lease_seconds),
-                )
-            )
-            if claim.rowcount != 1:
-                db.rollback()
-                return
-            db.commit()
-            job = db.get(MemoryJob, job_id)
-            if job is None:
-                return
-            claim_attempt = int(job.attempts)
-            payload = dict(job.payload or {})
-            binding = dict(payload.get("runtime_binding") or {})
-            connection = db.get(ModelConnection, str(binding.get("model_connection_id") or ""))
-            if connection is None or not connection.enabled:
-                db.execute(
-                    update(MemoryJob)
-                    .where(
-                        MemoryJob.id == job_id,
-                        MemoryJob.status == "running",
-                        MemoryJob.attempts == claim_attempt,
-                    )
-                    .values(status="failed", error="model connection unavailable", lease_expires_at=None)
-                )
-                db.commit()
-                return
-            provider_config = ProviderConfig(
-                provider=str(binding.get("provider") or connection.provider),
-                base_url=str(binding.get("base_url") or connection.base_url),
-                secret_ref=str(binding.get("secret_ref") or connection.secret_ref),
-                model_id=str(binding.get("model_id") or connection.default_model or ""),
-                model_connection_id=connection.id,
-                thinking_level="off",
-                custom_headers=dict(connection.custom_headers or {}),
-            )
-            catalog = [
-                memory_payload(item, include_content=False)
-                for item in db.scalars(visible_memory_query(
-                    workspace_id=job.workspace_id,
-                    session_id=job.session_id,
-                ).order_by(Memory.updated_at.desc()).limit(20))
-            ]
-            messages = extraction_prompt(
-                user_request=str(payload.get("user_request") or ""),
-                assistant_response=str(payload.get("assistant_response") or ""),
-                tool_observations=[
-                    str(item) for item in payload.get("tool_observations") or []
-                ],
-                existing_catalog=catalog,
-            )
-            source_turn_id = str(payload.get("turn_id") or "") or None
+        from src.memory.pipeline import memory_pipeline
 
-        try:
-            response = await asyncio.wait_for(
-                build_model_call(provider_config)(messages=messages, tools=[], mode="memory"),
-                timeout=float(settings.model_timeout_seconds),
-            )
-            raw = dict(response) if isinstance(response, Mapping) else {}
-            choices = raw.get("choices") or []
-            first = choices[0] if isinstance(choices, list) and choices else {}
-            message = first.get("message") if isinstance(first, Mapping) else {}
-            content = str(message.get("content") or "") if isinstance(message, Mapping) else ""
-            candidates = parse_extraction_response(content)
-            usage = normalize_usage(raw.get("usage") if isinstance(raw.get("usage"), Mapping) else {})
-            with database_module.SessionLocal() as db:
-                fence = db.execute(
-                    update(MemoryJob)
-                    .where(
-                        MemoryJob.id == job_id,
-                        MemoryJob.status == "running",
-                        MemoryJob.attempts == claim_attempt,
-                    )
-                    .values(status="committing")
-                )
-                if fence.rowcount != 1:
-                    db.rollback()
-                    return
-                job = db.get(MemoryJob, job_id)
-                if job is None:
-                    return
-                stored: list[str] = []
-                for candidate in candidates:
-                    try:
-                        item = store_memory(
-                            db,
-                            **candidate,
-                            workspace_id=job.workspace_id,
-                            session_id=job.session_id,
-                            source_turn_id=source_turn_id,
-                            metadata={"source": "automatic_extraction", "memory_job_id": job.id},
-                        )
-                    except ValueError:
-                        continue
-                    stored.append(item.id)
-                job.status = "completed"
-                job.lease_expires_at = None
-                job.result = {"candidate_count": len(candidates), "memory_ids": stored}
-                for key in (
-                    "request_count", "input_tokens", "output_tokens", "cache_creation_tokens",
-                    "cache_read_tokens", "total_tokens", "cost_usd",
-                ):
-                    setattr(job, key, usage[key])
-                db.commit()
-            refresh_memory_markdown_projection()
-        except Exception as exc:
-            with database_module.SessionLocal() as db:
-                job = db.get(MemoryJob, job_id)
-                if job is None:
-                    return
-                db.execute(
-                    update(MemoryJob)
-                    .where(
-                        MemoryJob.id == job_id,
-                        MemoryJob.status == "running",
-                        MemoryJob.attempts == claim_attempt,
-                    )
-                    .values(
-                        status="pending" if claim_attempt < 3 else "failed",
-                        error=f"{type(exc).__name__}: {str(exc)[:1000]}",
-                        lease_expires_at=None,
-                    )
-                )
-                db.commit()
-
+        await memory_pipeline.process(job_id)
     def stop(
         self,
         run_id: str,
@@ -979,6 +850,7 @@ class RunCoordinator:
         self._shutting_down = True
         self._event_loop = None
         self._queued_resumes.clear()
+        had_memory_tasks = any(not task.done() for task in self._memory_tasks.values())
         tasks = [
             task
             for task in [*self._tasks.values(), *self._memory_tasks.values()]
@@ -988,6 +860,20 @@ class RunCoordinator:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if had_memory_tasks:
+            with database_module.SessionLocal() as db:
+                for job in db.scalars(select(MemoryJob).where(
+                    MemoryJob.status.in_({"running", "committing"})
+                )):
+                    job.status = "pending" if int(job.attempts or 0) < 3 else "failed"
+                    job.error = "worker cancelled during graceful shutdown"
+                    job.lease_expires_at = None
+                    if job.status == "failed":
+                        db.execute(update(MemoryRollout).where(
+                            MemoryRollout.consolidation_job_id == job.id,
+                            MemoryRollout.selected_for_phase2_at.is_(None),
+                        ).values(status="active", consolidation_job_id=None))
+                db.commit()
         self._tasks.clear()
         self._memory_tasks.clear()
 
@@ -1229,6 +1115,7 @@ class RunCoordinator:
             "verification_trace": outcome.verification_trace,
             "acceptance_report": acceptance_report,
             "completion_verification_attempts": outcome.completion_verification_attempts,
+            "memory_citation": outcome.memory_citation,
         })
 
     @staticmethod
@@ -1260,6 +1147,7 @@ class RunCoordinator:
             ],
             acceptance_report=dict(payload.get("acceptance_report") or {}),
             completion_verification_attempts=max(0, int(payload.get("completion_verification_attempts") or 0)),
+            memory_citation=dict(payload.get("memory_citation") or {}),
         )
 
     @staticmethod
@@ -1304,18 +1192,6 @@ class RunCoordinator:
             if workspace is None:
                 raise ModelConfigurationError("当前 Agent 没有可用工作区")
 
-            if session is not None and run.turn_id and not delegated_child:
-                current_user = db.scalar(select(ChatMessage).where(
-                    ChatMessage.turn_id == run.turn_id,
-                    ChatMessage.role == "user",
-                ))
-                if current_user is not None:
-                    ensure_user_memory_snapshot(
-                        db,
-                        current_user,
-                        workspace_id=workspace.id,
-                        session_id=session.id,
-                    )
             messages = _prepare_session_history(db, session) if session else []
             compaction_state = _compaction_from_db(db, session) if session else {}
             if session:
@@ -1340,6 +1216,24 @@ class RunCoordinator:
             # approval resume may use its frozen binding below only for legacy
             # runs that predate durable task state.
             todo_state = todo_state_for_run(db, run)
+            if frozen_binding:
+                global_memories_enabled = bool(frozen_binding.get("memories_enabled", True))
+                use_memories = bool(frozen_binding.get("use_memories", True))
+                memory_use_enabled = global_memories_enabled and use_memories
+                memory_index = (
+                    str(frozen_binding.get("memory_index") or "")
+                    if memory_use_enabled else ""
+                )
+            else:
+                global_memories_enabled = memories_enabled(db)
+                use_memories = bool(session.use_memories) if session is not None else True
+                memory_use_enabled = global_memories_enabled and use_memories
+                memory_index = ""
+            if not frozen_binding and memory_use_enabled:
+                memory_index = load_memory_index(
+                    workspace_id=workspace.id,
+                    session_id=session.id if session else None,
+                )
             effective_system_prompt = agent.system_prompt
             agents_instructions = ""
             agents_instruction_sources: list[str] = []
@@ -1473,6 +1367,9 @@ class RunCoordinator:
                     "allowed_tool_names": allowed_tool_names,
                     "skill_instructions": skill_instructions,
                     "todo_state": todo_state,
+                    "memories_enabled": global_memories_enabled,
+                    "use_memories": use_memories,
+                    "memory_index": memory_index,
                     # Header values may contain credentials. Persist only a
                     # digest and reject resume if the live values drift.
                     "custom_headers_digest": _configuration_digest(connection.custom_headers or {}),
@@ -1538,6 +1435,7 @@ class RunCoordinator:
                 "agent_instructions": delegate_catalog_prompt,
                 "permission_policy": f"permission_mode={permission_mode}",
                 "workspace_rules": render_workspace_rules(workspace_root, agents_instructions),
+                "memory_index": memory_index,
                 "recent_messages": messages,
                 "mode": "auto",
                 "workspace_root": workspace_root,
@@ -1607,9 +1505,12 @@ class RunCoordinator:
                 (lambda todos, key=run_id: sync_todos_for_run(key, todos))
                 if not context["runtime_binding"].get("delegation_version") else None
             ),
-            memory_store=MemoryToolStore(
-                workspace_id=workspace.id,
-                session_id=session.id if session else None,
+            memory_store=(
+                MemoryToolStore(
+                    workspace_id=workspace.id,
+                    session_id=session.id if session else None,
+                )
+                if memory_use_enabled else None
             ),
             artifact_store=ArtifactToolStore(runtime_artifact_store),
             background_store=background_store,
@@ -2166,11 +2067,28 @@ class RunCoordinator:
                     if terminal_reasoning else None
                 ),
             )
+            cited = (
+                []
+                if outcome.runtime_binding.get("delegation_version")
+                else record_memory_citations(db, run=run, citation=outcome.memory_citation)
+            )
+            if cited:
+                db.add(RunEvent(
+                    run_id=run.id,
+                    event_type="memory_citations_recorded",
+                    payload={
+                        "targets": [
+                            {"type": item.target_type, "id": item.target_id}
+                            for item in cited
+                        ]
+                    },
+                ))
             if (
                 effective_status == "completed"
                 and turn is not None
                 and run.session_id
                 and not outcome.runtime_binding.get("delegation_version")
+                and bool(outcome.runtime_binding.get("memories_enabled", True))
                 and str(outcome.output or "").strip()
             ):
                 existing_job = db.scalar(select(MemoryJob).where(
@@ -2178,22 +2096,19 @@ class RunCoordinator:
                     MemoryJob.kind == "extract",
                 ))
                 if existing_job is None:
-                    user_message = db.get(ChatMessage, turn.user_message_id) if turn.user_message_id else None
+                    db.flush()
+                    source_end_sequence = int(db.scalar(select(func.max(ChatMessage.sequence)).where(
+                        ChatMessage.session_id == run.session_id
+                    )) or 0)
                     candidate_job = MemoryJob(
                         run_id=run.id,
                         session_id=run.session_id,
                         workspace_id=run.workspace_id,
                         kind="extract",
-                        status="pending",
+                        status="deferred",
                         payload={
                             "turn_id": turn.id,
-                            "user_request": user_message.content if user_message is not None else "",
-                            "assistant_response": str(outcome.output or "").strip(),
-                            "tool_observations": [
-                                str(message.get("content") or "")[:1_500]
-                                for message in (outcome.transcript_delta or outcome.messages)
-                                if isinstance(message, Mapping) and message.get("role") == "tool"
-                            ][-8:],
+                            "source_end_sequence": source_end_sequence,
                             "runtime_binding": dict(outcome.runtime_binding or {}),
                         },
                     )
@@ -2207,7 +2122,7 @@ class RunCoordinator:
                             MemoryJob.run_id == run.id,
                             MemoryJob.kind == "extract",
                         ))
-                if existing_job is not None:
+                if existing_job is not None and existing_job.status == "pending":
                     extraction_job_id = existing_job.id
             if run.session_id:
                 session = db.get(Session, run.session_id)
@@ -2280,6 +2195,7 @@ class RunCoordinator:
                 system_prompt=context["system_prompt"],
                 agent_instructions=context["agent_instructions"],
                 workspace_rules=context["workspace_rules"],
+                memory_index=context.get("memory_index"),
                 recent_messages=context["recent_messages"],
                 mode=context["mode"],
                 compaction_state=context.get("compaction_state"),
@@ -2327,6 +2243,7 @@ class RunCoordinator:
                     system_prompt=context["system_prompt"],
                     agent_instructions=context["agent_instructions"],
                     workspace_rules=context["workspace_rules"],
+                    memory_index=context.get("memory_index"),
                     recent_messages=[],
                     mode=prior.mode,
                     prepared_messages=prior.messages,

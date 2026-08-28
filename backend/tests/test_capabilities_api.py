@@ -238,12 +238,14 @@ def test_draft_launch_persists_permission_and_skills_and_binds_them_to_idempoten
         "content": "Please use the configured skill safely.",
         "thinking_level": "high",
         "permission_mode": "ask",
+        "use_memories": False,
         "skill_ids": [skill["id"]],
     }
     first = test_client.post("/api/drafts/launch", json=payload)
     assert first.status_code == 202, first.text
     body = first.json()
     assert body["session"]["permission_mode"] == "ask"
+    assert body["session"]["use_memories"] is False
     assert body["session"]["skill_ids"] == [skill["id"]]
     assert launched["calls"] == [(body["run"]["id"], False)]
 
@@ -255,6 +257,10 @@ def test_draft_launch_persists_permission_and_skills_and_binds_them_to_idempoten
         "/api/drafts/launch", json={**payload, "skill_ids": []}
     )
     assert changed_skills.status_code == 409
+    changed_memories = test_client.post(
+        "/api/drafts/launch", json={**payload, "use_memories": True}
+    )
+    assert changed_memories.status_code == 409
     with database.SessionLocal() as db:
         assert db.query(DraftLaunch).count() == 1
         assert db.query(Session).count() == 1

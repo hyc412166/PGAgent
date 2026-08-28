@@ -72,6 +72,34 @@ export function Field({ label, hint, children }: { label: string; hint?: string;
   return <label className="field"><span>{label}</span>{children}{hint && <small>{hint}</small>}</label>
 }
 
+export function ToggleSwitch({
+  checked,
+  label,
+  busy = false,
+  disabled = false,
+  onChange,
+}: {
+  checked: boolean
+  label: string
+  busy?: boolean
+  disabled?: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return <button
+    type="button"
+    className={`toggle-switch-button ${checked ? 'is-on' : ''}`}
+    role="switch"
+    aria-checked={checked}
+    aria-label={label}
+    aria-busy={busy}
+    disabled={disabled || busy}
+    onClick={() => onChange(!checked)}
+  >
+    <span className="toggle-switch-track" aria-hidden="true"><span /></span>
+    {busy && <LoaderCircle className="toggle-switch-spinner spin" size={14} aria-hidden="true" />}
+  </button>
+}
+
 export function CapabilityMultiSelect({
   label,
   items,

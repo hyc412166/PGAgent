@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, api, describeError } from './api'
+import type { MemorySettings } from './types'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -53,6 +54,27 @@ describe('API 客户端', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/sessions/session-1', expect.objectContaining({
       method: 'PATCH',
       body: JSON.stringify({ model_connection_id: null, model_id: null }),
+    }))
+  })
+
+  it('可以读取和更新全局记忆开关', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ enabled: false }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ))
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ enabled: true }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.get<MemorySettings>('/api/memories/settings')).resolves.toEqual({ enabled: false })
+    await expect(api.put<MemorySettings>('/api/memories/settings', { enabled: true })).resolves.toEqual({ enabled: true })
+
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/memories/settings', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ enabled: true }),
     }))
   })
 

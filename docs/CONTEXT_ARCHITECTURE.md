@@ -24,11 +24,12 @@ and dynamic-preamble design.
    active request and canonical `DurableTask`/`PlanStep` state are merged into
    those sections; they are not emitted as separate task-anchor or todo tags.
    Any later ordinary user message is the new active request.
-8. Persistent memories live in SQLite and are recalled only for a new user or
-   delegated-task message. The selected records are rendered as background data
-   inside that message and frozen in its provider payload before first model
-   exposure. Later memory edits never rewrite an already-seen turn. Skills remain
-   lazy-loaded through tools.
+8. Persistent memory uses a model-routed, progressively disclosed protocol. A
+   lightweight index of every active consolidated memory is frozen into each new
+   root or delegated Run as a late system message. The model decides whether to
+   call `MemorySearch` and `MemoryRead`; no program-selected Top-K is injected
+   into a new user message. Legacy message snapshots remain replayable and are
+   never rewritten. Skills remain lazy-loaded through tools.
 9. Provider overflow performs one full compaction and one retry. It never falls
    back to arbitrary message trimming.
 10. A persistent teammate is a SQLite identity, not a long-lived provider
@@ -48,11 +49,14 @@ Without compaction:
    workspace boundary.
 3. Stable permission rules.
 4. Stable agent instructions and Skill catalog.
-5. Append-only conversation messages in sequence order.
+5. Frozen persistent-memory router instructions and `memory_summary.md` index.
+6. Append-only conversation messages in sequence order.
 
-When relevant persistent memory exists, it is part of the current user message
-at step 5, immediately before the original request. It never becomes a system
-message and never changes the stable prefix.
+The memory router is provider-visible system context but is excluded from the
+stable cache namespace. It is placed after the truly stable system/tool prefix,
+so a newly published index diverges as late as possible. Consolidation is
+asynchronous and ordinary conversation turns do not perform dynamic Top-K
+injection.
 
 After compaction:
 
@@ -111,7 +115,7 @@ assistant tool-call batch is never split from any of its tool results.
 
 The cache namespace changes only when stable system instructions, workspace
 rules, permission rules, enabled tool schemas, or selected Skill catalog change.
-Todo updates, memories, user messages, tool results, and compaction summaries do
+Todo updates, memory index publications, user messages, tool results, and compaction summaries do
 not change the namespace. They extend or replace only the dynamic suffix.
 
 The compaction request uses the same stable cache namespace and original system
@@ -172,21 +176,54 @@ records does not.
 
 ## Persistent-memory lifecycle
 
-1. SQLite `memories` is the canonical store. Legacy `.memory/*.md` files are
-   imported idempotently at startup and are not dual-written afterwards.
-   After committed memory changes, PGAgent regenerates read-only views below
-   `data/memories/`: `memory_summary.md`, `MEMORY.md`, `raw_memories.md`, and
-   per-source-session files. These files never feed back into SQLite and are
-   not used for replay, context assembly, or prompt-cache keys.
-2. Recall searches only active global, current-workspace, and current-session
-   records. Deterministic lexical relevance selects at most five bodies within
-   a bounded character budget.
-3. The accepted public user text remains unchanged. The exact provider rendering
-   and selected record metadata are stored in `ChatMessage.provider_payload`.
-4. Approval resume, transcript replay, and compaction consume that stored
-   rendering. They never re-run recall for an old message.
-5. After a deterministic accepted terminal response, a durable `memory_jobs`
-   row performs auxiliary extraction. Its usage is stored on the job rather than
-   in the conversation `UsageRecord`, so it cannot distort the main cache rate.
-6. Updates create a new active row and mark the previous same-name record
-   `superseded`; automatic consolidation does not physically delete history.
+1. SQLite remains canonical for conversation history, Stage-1 rollout outputs,
+   consolidated memories, jobs, source lineage, citations and usage feedback.
+   Markdown files are individually atomic, read-only human projections and never
+   feed back into SQLite. Runtime routing reads one SQLite snapshot, so it does
+   not depend on cross-file Markdown publication order.
+2. A completed accepted root Run creates a deferred extraction job. Startup and
+   the watchdog activate jobs after the session has been idle for 60 seconds;
+   when several deferred snapshots exist for one session, only the newest is
+   extracted and older snapshots are marked superseded. Extraction never blocks
+   terminal reply delivery and delegated child Runs do not create jobs.
+3. Phase 1 reads the accepted transcript through its frozen end sequence. It
+   keeps real user requests/corrections, assistant actions, tool calls/results,
+   verification and cwd; it excludes injected instructions, runtime metadata,
+   transient state and secrets. The extraction model applies a minimum-signal
+   gate and writes retrieval-oriented `MemoryRollout` records with summary,
+   raw memories, task groups, keywords, outcome and evidence.
+4. Phase 2 consumes unselected Stage-1 records plus the visible existing
+   handbook. The consolidation model merges duplicates, preserves cwd/project
+   boundaries, resolves conflicts from evidence, archives obsolete guidance and
+   records supporting rollout IDs. Program code validates scope and references,
+   commits operations transactionally, then republishes each Markdown view with
+   an atomic file replacement.
+5. `memory_summary.md` is a complete lightweight router for all active memories,
+   not a recent-N mini handbook. `MEMORY.md` contains consolidated bodies,
+   `raw_memories.md` includes Stage-1 evidence, and `rollout_summaries/` contains
+   detailed source recaps.
+6. New root and delegated Runs build their scope-visible router directly from
+   SQLite and freeze that slice as late system context. The global Markdown index
+   remains a complete human-readable projection; it is not injected verbatim,
+   which prevents another workspace or session from leaking into the Run. The
+   model decides whether memory is relevant, chooses discriminative search terms,
+   calls `MemorySearch`, and uses `MemoryRead` only for selected full entries or
+   supporting rollout summaries. Search remains scope-bounded and deterministic;
+   semantic routing belongs to the model.
+7. If an accepted root answer actually used memory, it appends one hidden JSON
+   citation block. Runtime removes it before verification/streaming, validates
+   referenced memory and rollout IDs, stores exactly-once `MemoryCitation` rows,
+   and updates `usage_count`/`last_usage_at`. Child citations receive no usage
+   credit; the accepted parent must cite what affected its answer.
+8. Phase-2 updates create new active versions and mark replaced records
+   `superseded`; archival and forgetting are status transitions rather than
+   physical deletion. Usage is one consolidation signal, not a sufficient rule
+   for deleting new or rarely applicable knowledge.
+9. `memory_settings.enabled` is the global persistent switch. When it is off,
+   new Runs receive neither the memory router nor Memory tools, completed root
+   Runs do not enqueue extraction, and deferred/pending jobs remain paused until
+   it is enabled again. `sessions.use_memories` controls only whether that chat
+   can read existing memory; it does not prevent an accepted chat from becoming
+   future memory. Both values and the resulting router are frozen in the Run's
+   `runtime_binding`, and delegated children inherit them, so an approval resume
+   or an in-flight child cannot silently change policy midway through a Run.

@@ -1073,6 +1073,38 @@ async def test_reasoning_deltas_stream_live_and_finish_as_one_durable_thought(tm
 
 
 @pytest.mark.asyncio
+async def test_tool_step_thought_summary_hides_memory_citation(tmp_path) -> None:
+    durable_events: list[dict] = []
+    calls = 0
+
+    async def model_call(**_kwargs) -> ModelTurn:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelTurn(
+                content=(
+                    "I will inspect the workspace.\n"
+                    '<pgagent-memory-citation>{"memory_ids":["m1"],"note":"used"}'
+                    "</pgagent-memory-citation>"
+                ),
+                tool_calls=[ModelToolCall("list", "list_files", {"path": "."})],
+            )
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+        event_sink=durable_events.append,
+    )
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    summaries = [event["summary"] for event in durable_events if event["type"] == "thought_summary"]
+    assert "I will inspect the workspace." in summaries
+    assert all("pgagent-memory-citation" not in summary for summary in summaries)
+
+
+@pytest.mark.asyncio
 async def test_runtime_keeps_legacy_model_callable_without_delta_keyword_compatible(tmp_path) -> None:
     async def model_call(messages, tools, mode) -> ModelTurn:  # type: ignore[no-untyped-def]
         assert isinstance(messages, list)

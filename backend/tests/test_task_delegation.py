@@ -190,6 +190,11 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
     parent_calls = 0
     child_calls = 0
     observed_child_tools: list[str] = []
+    with database.SessionLocal() as db:
+        session = db.get(Session, delegated_run["session_id"])
+        assert session is not None
+        session.use_memories = False
+        db.commit()
 
     async def parent_model(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal parent_calls
@@ -227,7 +232,11 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
                 assert frozen_binding["delegation_id"] == task_record.id
                 assert frozen_binding["workspace_root"] == delegated_run["parent_root"]
                 assert frozen_binding["rendered_task"]
-                assert "memory_snapshot" in frozen_binding
+                assert "memory_snapshot" not in frozen_binding
+                assert "memory_index" in frozen_binding
+                assert frozen_binding["memory_index"] == ""
+                assert frozen_binding["memories_enabled"] is True
+                assert frozen_binding["use_memories"] is False
                 assert "skill_instructions" in frozen_binding
         # A malicious/buggy provider response that tries to recurse is still
         # rejected by the child registry; the second turn gives a real result.

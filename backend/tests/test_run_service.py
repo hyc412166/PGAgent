@@ -17,6 +17,8 @@ from src.persistence.database import (
     ChatMessage,
     ConversationTurn,
     DelegatedTask,
+    MemoryJob,
+    MemorySettings,
     ModelConnection,
     Run,
     RunEvent,
@@ -26,6 +28,7 @@ from src.persistence.database import (
 )
 from src.agent import RunOutcome
 from src.runs.service import RunCoordinator, _prepare_session_history
+from src.runs import lifecycle as lifecycle_service
 from src.tasks.state import sync_todos_for_run
 from src.context import instructions as instruction_service
 from src.agent import AgentRuntime, decide_deterministic_completion
@@ -1039,6 +1042,114 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
 
     with pytest.raises(RuntimeError, match="模型连接配置在审批等待期间已改变"):
         RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
+
+
+def test_runtime_freezes_global_and_chat_memory_preferences(
+    seeded_run: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id, session_id = seeded_run
+    with database.SessionLocal() as db:
+        db.add(ModelConnection(
+            name="Memory preference connection",
+            provider="openai_compatible",
+            base_url="https://example.test/v1",
+            secret_ref="memory-preference-secret",
+            default_model="memory-preference-model",
+            status="connected",
+        ))
+        settings_row = db.get(MemorySettings, "global")
+        session = db.get(Session, session_id)
+        assert settings_row is not None and session is not None
+        settings_row.enabled = True
+        session.use_memories = True
+        db.commit()
+
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_load_memory_index(*, workspace_id, session_id=None):  # type: ignore[no-untyped-def]
+        calls.append((workspace_id, session_id))
+        return "MEMORY INDEX"
+
+    monkeypatch.setattr(lifecycle_service, "load_memory_index", fake_load_memory_index)
+    runtime, initial = RunCoordinator._resolve_runtime(run_id)
+    binding = dict(initial["runtime_binding"])
+    assert calls
+    assert initial["memory_index"] == "MEMORY INDEX"
+    assert binding["memories_enabled"] is True
+    assert binding["use_memories"] is True
+    assert "MemorySearch" in runtime.tool_registry.enabled_tool_names
+
+    with database.SessionLocal() as db:
+        settings_row = db.get(MemorySettings, "global")
+        session = db.get(Session, session_id)
+        assert settings_row is not None and session is not None
+        settings_row.enabled = False
+        session.use_memories = False
+        db.commit()
+
+    resumed_runtime, resumed = RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
+    assert resumed["memory_index"] == "MEMORY INDEX"
+    assert "MemorySearch" in resumed_runtime.tool_registry.enabled_tool_names
+    assert len(calls) == 1
+
+    with database.SessionLocal() as db:
+        settings_row = db.get(MemorySettings, "global")
+        session = db.get(Session, session_id)
+        assert settings_row is not None and session is not None
+        settings_row.enabled = True
+        session.use_memories = False
+        db.commit()
+
+    chat_disabled_runtime, chat_disabled = RunCoordinator._resolve_runtime(run_id)
+    assert chat_disabled["memory_index"] == ""
+    assert chat_disabled["runtime_binding"]["memories_enabled"] is True
+    assert chat_disabled["runtime_binding"]["use_memories"] is False
+    assert "MemorySearch" not in chat_disabled_runtime.tool_registry.enabled_tool_names
+    assert len(calls) == 1
+
+    with database.SessionLocal() as db:
+        settings_row = db.get(MemorySettings, "global")
+        session = db.get(Session, session_id)
+        assert settings_row is not None and session is not None
+        settings_row.enabled = False
+        session.use_memories = True
+        db.commit()
+
+    globally_disabled_runtime, globally_disabled = RunCoordinator._resolve_runtime(run_id)
+    assert globally_disabled["memory_index"] == ""
+    assert globally_disabled["runtime_binding"]["memories_enabled"] is False
+    assert globally_disabled["runtime_binding"]["use_memories"] is True
+    assert "MemorySearch" not in globally_disabled_runtime.tool_registry.enabled_tool_names
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("global_enabled, expected_jobs", [(False, 0), (True, 1)])
+def test_global_memory_preference_controls_extraction_but_chat_preference_does_not(
+    accepted_run: tuple[str, str], global_enabled: bool, expected_jobs: int
+) -> None:
+    run_id, _session_id = accepted_run
+    with database.SessionLocal() as db:
+        settings_row = db.get(MemorySettings, "global")
+        assert settings_row is not None
+        settings_row.enabled = global_enabled
+        db.commit()
+
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="accepted response",
+        messages=[],
+        events=[],
+        steps=1,
+        tool_calls=0,
+        mode="auto",
+        runtime_binding={
+            "memories_enabled": global_enabled,
+            "use_memories": False,
+        },
+    ))
+
+    with database.SessionLocal() as db:
+        assert db.query(MemoryJob).count() == expected_jobs
 
 
 def test_durable_todo_state_wins_over_conflicting_frozen_binding(
