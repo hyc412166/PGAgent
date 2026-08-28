@@ -53,6 +53,8 @@ from src.api.schemas import (
     DurableTaskRead,
     MemoryCreate,
     MemoryRead,
+    MemorySettingsRead,
+    MemorySettingsUpdate,
     MemoryUpdate,
     RunCreate,
     RunEventCreate,
@@ -67,6 +69,7 @@ from src.api.schemas import (
     WorkspaceRead,
     WorkspaceUpdate,
 )
+from src.memory.preferences import get_memory_settings
 from src.memory.service import recall_memories, refresh_memory_markdown_projection, store_memory
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
 from src.tasks.state import latest_resumable_task, task_payload
@@ -84,6 +87,22 @@ from src.api.routes.shared import (
     _require_enabled_model_connection,
     _workspace_name_from_root,
 )
+
+
+@router.get("/memories/settings", response_model=MemorySettingsRead)
+def read_memory_settings(db: Session = Depends(get_db)) -> MemorySettingsRead:
+    return MemorySettingsRead(enabled=get_memory_settings(db).enabled)
+
+
+@router.put("/memories/settings", response_model=MemorySettingsRead)
+def update_memory_settings(
+    payload: MemorySettingsUpdate,
+    db: Session = Depends(get_db),
+) -> MemorySettingsRead:
+    item = get_memory_settings(db)
+    item.enabled = payload.enabled
+    _commit(db)
+    return MemorySettingsRead(enabled=item.enabled)
 
 @router.get("/memory-recalls")
 def list_memory_recalls(

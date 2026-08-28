@@ -46,7 +46,11 @@ from src.persistence.models import (
     DraftLaunch,
     DurableTask,
     Memory,
+    MemoryCitation,
     MemoryJob,
+    MemoryRollout,
+    MemorySettings,
+    MemorySkill,
     ModelConnection,
     PlanStep,
     PlanStepDependency,
@@ -106,6 +110,7 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "model_id": "VARCHAR(255)",
         "thinking_level": "VARCHAR(16) NOT NULL DEFAULT 'auto'",
         "permission_mode": "VARCHAR(16) NOT NULL DEFAULT 'smart'",
+        "use_memories": "BOOLEAN NOT NULL DEFAULT 1",
         "context_tokens": "INTEGER NOT NULL DEFAULT 0",
     },
     "chat_messages": {
@@ -131,9 +136,15 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "source_session_id": "VARCHAR(36)",
         "source_turn_id": "VARCHAR(36)",
         "superseded_by": "VARCHAR(36)",
+        "usage_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_usage_at": "DATETIME",
+        "consolidated_at": "DATETIME",
     },
     "memory_jobs": {
         "lease_expires_at": "DATETIME",
+    },
+    "memory_rollouts": {
+        "consolidation_job_id": "VARCHAR(36)",
     },
     "background_jobs": {
         "observed_by_run_id": "VARCHAR(36)",
@@ -217,6 +228,21 @@ def _migrate_sqlite_indexes() -> None:
         )
 
     with engine.begin() as connection:
+        if "memory_rollouts" in tables:
+            connection.exec_driver_sql(
+                'CREATE UNIQUE INDEX IF NOT EXISTS "uq_memory_rollouts_session_sequence" '
+                'ON "memory_rollouts" ("source_session_id", "source_end_sequence")'
+            )
+        if "memory_citations" in tables:
+            connection.exec_driver_sql(
+                'CREATE UNIQUE INDEX IF NOT EXISTS "uq_memory_citation_target" '
+                'ON "memory_citations" ("run_id", "target_type", "target_id")'
+            )
+        if "memory_skills" in tables:
+            connection.exec_driver_sql(
+                'CREATE UNIQUE INDEX IF NOT EXISTS "uq_memory_skill_workspace_name" '
+                'ON "memory_skills" ("workspace_id", "name")'
+            )
         if "chat_messages" in tables:
             connection.exec_driver_sql(
                 'CREATE INDEX IF NOT EXISTS "ix_chat_messages_turn_id" ON "chat_messages" ("turn_id")'
@@ -443,6 +469,9 @@ def _seed_defaults() -> None:
         agent.mode = "auto"
         agent.enabled = True
         agent.is_default = True
+
+        if db.get(MemorySettings, "global") is None:
+            db.add(MemorySettings(id="global", enabled=True))
 
         # The system-owned coordinator always advertises the complete built-in
         # catalog.  User-created Agents keep their own persisted selections.

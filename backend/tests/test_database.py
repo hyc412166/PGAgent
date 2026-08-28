@@ -64,6 +64,11 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
         "run_events",
         "approvals",
         "memories",
+        "memory_jobs",
+        "memory_settings",
+        "memory_rollouts",
+        "memory_citations",
+        "memory_skills",
         "model_connections",
         "skills",
         "agent_tools",
@@ -94,6 +99,12 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
     assert unique_cover_count("runs", "turn_id") == 1
     run_columns = {column["name"] for column in inspect(database.engine).get_columns("runs")}
     assert {"task_id", "plan_step_id", "run_kind", "resumed_from_run_id"}.issubset(run_columns)
+    memory_indexes = {index["name"] for index in inspect(database.engine).get_indexes("memory_rollouts")}
+    citation_indexes = {index["name"] for index in inspect(database.engine).get_indexes("memory_citations")}
+    skill_indexes = {index["name"] for index in inspect(database.engine).get_indexes("memory_skills")}
+    assert "uq_memory_rollouts_session_sequence" in memory_indexes
+    assert "uq_memory_citation_target" in citation_indexes
+    assert "uq_memory_skill_workspace_name" in skill_indexes
 
 
 def test_session_task_api_returns_ordered_durable_plan(client: TestClient) -> None:
@@ -306,7 +317,8 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     session_columns = {column["name"] for column in inspector.get_columns("sessions")}
     assert "is_default" in agent_columns
     assert {
-        "model_connection_id", "model_id", "thinking_level", "permission_mode", "context_tokens"
+        "model_connection_id", "model_id", "thinking_level", "permission_mode",
+        "use_memories", "context_tokens",
     }.issubset(session_columns)
     assert "context_summary" not in session_columns
     assert "last_compacted_at" not in session_columns
@@ -631,6 +643,26 @@ def test_session_model_overrides_can_be_patched(client: TestClient) -> None:
     assert updated.json()["thinking_level"] == "high"
 
 
+def test_global_and_session_memory_preferences_persist(client: TestClient) -> None:
+    initial = client.get("/api/memories/settings")
+    assert initial.status_code == 200
+    assert initial.json() == {"enabled": True}
+
+    disabled = client.put("/api/memories/settings", json={"enabled": False})
+    assert disabled.status_code == 200
+    assert disabled.json() == {"enabled": False}
+    assert client.get("/api/memories/settings").json() == {"enabled": False}
+
+    created = client.post("/api/sessions", json={"use_memories": False})
+    assert created.status_code == 201, created.text
+    assert created.json()["use_memories"] is False
+    updated = client.patch(
+        f"/api/sessions/{created.json()['id']}", json={"use_memories": True}
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["use_memories"] is True
+
+
 def test_session_model_connection_must_exist_and_be_enabled(client: TestClient) -> None:
     with database.SessionLocal() as db:
         disabled = ModelConnection(
@@ -838,6 +870,7 @@ def test_active_run_blocks_session_runtime_setting_changes(
         {"model_connection_id": connection_id},
         {"model_id": "provider/changed-model"},
         {"thinking_level": "high"},
+        {"use_memories": False},
     ):
         response = client.patch(f"/api/sessions/{session_id}", json=payload)
         assert response.status_code == 409, (payload, response.text)

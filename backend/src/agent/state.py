@@ -26,4 +26,5 @@ class RunState(TypedDict, total=False):
     context_overflow_retries: int
     completion_verification_attempts: int
     acceptance_report: dict[str, Any]
+    memory_citation: dict[str, Any]
     prompt_cache_key: str

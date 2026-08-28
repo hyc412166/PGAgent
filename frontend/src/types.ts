@@ -44,6 +44,10 @@ export interface PersonalizationSettings {
   max_characters: number
 }
 
+export interface MemorySettings {
+  enabled: boolean
+}
+
 export interface AgentProfile {
   id: string
   name: string
@@ -73,6 +77,7 @@ export interface Session {
   model_connection_id?: string
   model_id?: string
   thinking_level?: ThinkingLevel
+  use_memories?: boolean
   skill_ids?: string[]
   permission_mode?: PermissionMode
   status?: string

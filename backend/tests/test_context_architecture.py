@@ -54,7 +54,7 @@ def test_uncompacted_history_is_append_only_and_keeps_one_cache_namespace() -> N
     assert second.requires_compaction is False
 
 
-def test_memory_snapshot_changes_only_transcript_not_cache_namespace() -> None:
+def test_legacy_memory_snapshot_remains_replayable_without_changing_cache_namespace() -> None:
     assembler = ContextAssembler(max_tokens=10_000, output_reserve_tokens=0, safety_buffer_tokens=0)
     stable = assembler.stable_prefix(system_rules="safe", workspace_rules="repo")
     old = assembler.assemble(stable_prefix=stable, transcript=[{

@@ -212,6 +212,7 @@ class SessionCreate(BaseModel):
     model_id: str | None = None
     thinking_level: ThinkingLevel = "auto"
     permission_mode: PermissionMode = "smart"
+    use_memories: bool = True
     skill_ids: list[str] = Field(default_factory=list, max_length=128)
 
 
@@ -223,6 +224,7 @@ class SessionUpdate(BaseModel):
     model_id: str | None = None
     thinking_level: ThinkingLevel | None = None
     permission_mode: PermissionMode | None = None
+    use_memories: bool | None = None
     skill_ids: list[str] | None = Field(default=None, max_length=128)
     status: str | None = None
 
@@ -236,6 +238,7 @@ class SessionRead(ORMModel):
     model_id: str | None
     thinking_level: str
     permission_mode: str
+    use_memories: bool
     skill_ids: list[str]
     context_tokens: int
     status: str
@@ -368,6 +371,7 @@ class DraftLaunchRequest(BaseModel):
     model_id: str | None = Field(default=None, max_length=255)
     thinking_level: ThinkingLevel = "auto"
     permission_mode: PermissionMode = "smart"
+    use_memories: bool = True
     skill_ids: list[str] = Field(default_factory=list, max_length=128)
 
     @field_validator("idempotency_key", "title", "content")
@@ -435,6 +439,14 @@ class ApprovalRead(ORMModel):
 
 
 MemoryScope = Literal["global", "workspace", "session"]
+
+
+class MemorySettingsRead(BaseModel):
+    enabled: bool
+
+
+class MemorySettingsUpdate(BaseModel):
+    enabled: bool
 
 
 class MemoryCreate(BaseModel):

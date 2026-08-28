@@ -154,6 +154,7 @@ class Session(TimestampMixin, Base):
     model_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     thinking_level: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
     permission_mode: Mapped[str] = mapped_column(String(16), default="smart", nullable=False)
+    use_memories: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     context_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
     skill_bindings: Mapped[list["SessionSkill"]] = relationship(
@@ -582,6 +583,15 @@ class Approval(Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class MemorySettings(TimestampMixin, Base):
+    """The process-wide persistent-memory preference."""
+
+    __tablename__ = "memory_settings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
 class Memory(TimestampMixin, Base):
     __tablename__ = "memories"
 
@@ -605,7 +615,79 @@ class Memory(TimestampMixin, Base):
     superseded_by: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("memories.id", ondelete="SET NULL"), index=True, nullable=True
     )
+    usage_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_usage_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    consolidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     extra: Mapped[dict] = mapped_column("metadata", JSON, default=dict, nullable=False)
+
+
+class MemoryRollout(TimestampMixin, Base):
+    """One Phase-1, retrieval-oriented extraction from an accepted root turn."""
+
+    __tablename__ = "memory_rollouts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    source_session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    source_turn_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("conversation_turns.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    workspace_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    extraction_job_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("memory_jobs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    source_end_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    cwd: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    rollout_slug: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    rollout_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    raw_memories: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    keywords: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    task_groups: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(24), default="uncertain", index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True, nullable=False)
+    usage_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_usage_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    selected_for_phase2_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consolidation_job_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("memory_jobs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+
+
+class MemoryCitation(Base):
+    """An accepted run's durable acknowledgement that it used one memory source."""
+
+    __tablename__ = "memory_citations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    turn_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("conversation_turns.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    target_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class MemorySkill(TimestampMixin, Base):
+    """A repeated, evidence-backed procedure promoted by Phase 2."""
+
+    __tablename__ = "memory_skills"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workspace_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    keywords: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    source_rollout_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True, nullable=False)
+    usage_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_usage_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
 
 
 class MemoryJob(TimestampMixin, Base):

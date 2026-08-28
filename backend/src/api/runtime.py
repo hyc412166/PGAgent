@@ -142,6 +142,7 @@ def _draft_request_fingerprint(payload: DraftLaunchRequest, normalized_root: str
         "model_id": payload.model_id,
         "thinking_level": payload.thinking_level,
         "permission_mode": payload.permission_mode,
+        "use_memories": payload.use_memories,
         "skill_ids": sorted({skill_id.strip() for skill_id in payload.skill_ids}),
     }
     encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -289,6 +290,7 @@ async def launch_draft(
             model_id=payload.model_id,
             thinking_level=payload.thinking_level,
             permission_mode=payload.permission_mode,
+            use_memories=payload.use_memories,
             status="active",
         )
         db.add(chat_session)

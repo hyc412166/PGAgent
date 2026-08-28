@@ -33,8 +33,6 @@ from src.persistence.database import (
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
     ModelConnection,
-    Memory,
-    MemoryJob,
     PlanStep,
     Run,
     RunEvent,
@@ -63,18 +61,8 @@ from src.tasks import background as background_job_service
 from src.model.gateway import ModelConfigurationError, ProviderConfig
 from src.artifacts.storage import ArtifactToolStore
 from src.tasks.background import BackgroundJobToolStore
-from src.memory.service import (
-    MemoryToolStore,
-    ensure_user_memory_snapshot,
-    extraction_prompt,
-    memory_payload,
-    parse_extraction_response,
-    recall_memories,
-    refresh_memory_markdown_projection,
-    render_memory_snapshot,
-    store_memory,
-    visible_memory_query,
-)
+from src.memory.service import MemoryToolStore
+from src.memory.repository import load_memory_index
 from src.context.instructions import load_instruction_chain, render_workspace_rules
 from src.runs.stream import run_stream_broker
 from src.tasks.state import (
@@ -392,7 +380,9 @@ class _SubagentTaskDelegate:
         child_tools = [
             tool_name
             for tool_name in _allowed_runtime_tool_names(list(getattr(child, "tool_ids", []) or []))
-            if tool_name in parent_allowed and tool_name not in _CHILD_FORBIDDEN_ORCHESTRATION_TOOLS
+            if tool_name in parent_allowed
+            and tool_name not in _CHILD_FORBIDDEN_ORCHESTRATION_TOOLS
+            and tool_name != "MemoryWrite"
         ]
         if "read_artifact" in parent_allowed and "read_artifact" not in child_tools:
             child_tools.append("read_artifact")
@@ -476,6 +466,9 @@ class _SubagentTaskDelegate:
         child_binding: dict[str, Any] | None = None
         child_skill_instructions: list[dict[str, str]] = []
         child_max_run_seconds: float | None = None
+        global_memories_enabled = bool(self.parent_binding.get("memories_enabled", True))
+        use_memories = bool(self.parent_binding.get("use_memories", True))
+        child_memory_use_enabled = global_memories_enabled and use_memories
         graph_key = str(graph_call_id or "")
         plan_step_id = self._plan_step_ids.get(graph_key, {}).get(str(plan_step_external_id or ""))
         teammate_id = self._worker_by_external_id.get(graph_key, {}).get(str(plan_step_external_id or ""))
@@ -624,22 +617,25 @@ class _SubagentTaskDelegate:
             child_run.workspace_id = db.scalar(
                 select(Run.workspace_id).where(Run.id == self.parent_run_id)
             )
-            child_memory_snapshot = recall_memories(
-                db,
-                task,
-                workspace_id=child_run.workspace_id,
-                session_id=child_run.session_id,
-            )
-            rendered_child_task = render_memory_snapshot(task, child_memory_snapshot)
+            rendered_child_task = task
             if teammate is not None:
                 rendered_child_task = teammate_context(db, teammate) + "\n\n" + rendered_child_task
+            child_memory_index = (
+                load_memory_index(
+                    workspace_id=child_run.workspace_id,
+                    session_id=None,
+                )
+                if child_memory_use_enabled else ""
+            )
             child_binding = {
                 **child_binding,
                 "delegation_id": delegation.id,
                 "parent_agent_id": self.parent_agent_id,
                 "parent_session_id": child_run.session_id,
                 "max_run_seconds": child_max_run_seconds,
-                "memory_snapshot": child_memory_snapshot,
+                "memories_enabled": global_memories_enabled,
+                "use_memories": use_memories,
+                "memory_index": child_memory_index,
                 "rendered_task": rendered_child_task,
                 "plan_step_id": plan_step_id,
                 "plan_step_external_id": plan_step_external_id,
@@ -746,9 +742,12 @@ class _SubagentTaskDelegate:
             permission_mode=child_binding["permission_mode"],
             skill_instructions=child_skill_instructions,
             todo_state=[],
-            memory_store=MemoryToolStore(
-                workspace_id=child_run.workspace_id,
-                session_id=child_run.session_id,
+            memory_store=(
+                MemoryToolStore(
+                    workspace_id=child_run.workspace_id,
+                    session_id=None,
+                )
+                if child_memory_use_enabled else None
             ),
             artifact_store=ArtifactToolStore(child_artifact_store),
             background_store=child_background_store,
@@ -801,6 +800,7 @@ class _SubagentTaskDelegate:
                     str(child_binding["workspace_root"]),
                     str(child_binding.get("agents_instructions") or ""),
                 ),
+                memory_index=str(child_binding.get("memory_index") or ""),
                 recent_messages=[{"role": "user", "content": str(child_binding["rendered_task"])}],
                 mode="auto",
             )

@@ -7,10 +7,10 @@ export type OwnedSessionMessages = { ownerSessionId: string; items: Message[] }
 export type OwnedSessionRuns = { ownerSessionId: string; items: Run[] }
 export type OwnedSessionDelegations = { ownerSessionId: string; items: DelegatedTask[] }
 export type ProjectHoverCard = { id: string; name: string; path: string; conversationCount: number; left: number; top: number }
-export type DraftSessionSettings = { model_connection_id: string | null; model_id: string | null; thinking_level: ThinkingLevel; skill_ids: string[]; permission_mode: PermissionMode }
+export type DraftSessionSettings = { model_connection_id: string | null; model_id: string | null; thinking_level: ThinkingLevel; skill_ids: string[]; permission_mode: PermissionMode; use_memories: boolean }
 export type DraftLaunchResponse = { session: Session; run: Run; workspace?: Workspace }
 
-export const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'medium', skill_ids: [], permission_mode: 'smart' }
+export const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'medium', skill_ids: [], permission_mode: 'smart', use_memories: true }
 export const emptyDraftContext: SessionContext = { used_tokens: 0, limit_tokens: 100_000, compact_threshold_tokens: 90_000, percent: 0 }
 export const noDelegatedTasks: DelegatedTask[] = []
 export const noTeammates: Teammate[] = []
