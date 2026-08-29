@@ -9,6 +9,7 @@ from src.context.assembly import (
     InMemoryArtifactStore,
     ToolOutputBudgeter,
     atomic_message_groups,
+    compact_tool_results_for_model,
     retain_recent_atomic_tail,
 )
 from src.context.window import ContextManager
@@ -47,6 +48,140 @@ def test_small_tool_output_remains_verbatim_without_artifact() -> None:
 
     assert prepared.content == "hello"
     assert prepared.artifact_ref is None
+
+
+def test_tool_results_below_aggregate_trigger_keep_the_same_message_list() -> None:
+    messages = [
+        {"role": "user", "content": "work"},
+        {"role": "tool", "tool_call_id": "small", "name": "read", "content": "x" * 300_000},
+    ]
+    store = InMemoryArtifactStore()
+
+    result = compact_tool_results_for_model(
+        messages,
+        budgeter=ToolOutputBudgeter(store),
+    )
+
+    assert result.messages is messages
+    assert result.changed is False
+    assert result.before_chars == result.after_chars == 300_000
+    assert result.artifact_refs == []
+
+
+def test_tool_results_are_externalized_largest_first_until_target() -> None:
+    contents = ["a" * 150_000, "b" * 100_000, "c" * 60_001]
+    messages = [
+        {"role": "tool", "tool_call_id": f"call-{index}", "name": "read", "content": content}
+        for index, content in enumerate(contents)
+    ]
+    store = InMemoryArtifactStore()
+
+    result = compact_tool_results_for_model(
+        messages,
+        budgeter=ToolOutputBudgeter(store),
+        keep_recent_tool_results=0,
+    )
+
+    assert result.changed is True
+    assert result.compacted_count == 2
+    assert result.before_chars == 310_001
+    assert result.after_chars <= 150_000
+    assert result.messages[0]["content"].startswith("<persisted-tool-output>")
+    assert result.messages[1]["content"].startswith("<persisted-tool-output>")
+    assert result.messages[2]["content"] == contents[2]
+    assert messages[0]["content"] == contents[0]
+    assert [store.get(ref.artifact_id) for ref in result.artifact_refs] == [
+        contents[0].encode(),
+        contents[1].encode(),
+    ]
+
+
+def test_two_most_recent_tool_results_remain_verbatim() -> None:
+    contents = ["a" * 160_000, "b" * 80_000, "c" * 70_000]
+    messages = [
+        {"role": "tool", "tool_call_id": f"call-{index}", "name": "read", "content": content}
+        for index, content in enumerate(contents)
+    ]
+
+    result = compact_tool_results_for_model(
+        messages,
+        budgeter=ToolOutputBudgeter(InMemoryArtifactStore()),
+    )
+
+    assert result.messages[0]["content"].startswith("<persisted-tool-output>")
+    assert result.messages[1]["content"] == contents[1]
+    assert result.messages[2]["content"] == contents[2]
+    assert result.compacted_count == 1
+    assert result.target_reached is False
+
+
+def test_small_aggregate_results_pass_through_when_preview_cannot_reduce() -> None:
+    messages = [
+        {"role": "tool", "tool_call_id": f"call-{index}", "name": "read", "content": "x" * 1_001}
+        for index in range(301)
+    ]
+
+    result = compact_tool_results_for_model(
+        messages,
+        budgeter=ToolOutputBudgeter(InMemoryArtifactStore()),
+        keep_recent_tool_results=0,
+    )
+
+    assert result.before_chars > 300_000
+    assert result.after_chars == result.before_chars
+    assert result.compacted_count == 0
+    assert result.target_reached is False
+    assert result.artifact_refs == []
+    assert result.messages == messages
+
+
+def test_existing_artifact_previews_are_not_shortened_again() -> None:
+    budgeter = ToolOutputBudgeter(InMemoryArtifactStore())
+    previews = [
+        budgeter.externalize(
+            tool_call_id=f"call-{index}",
+            tool_name="read",
+            output=f"result-{index}-" + ("x" * 4_000),
+        ).content
+        for index in range(151)
+    ]
+    messages = [
+        {"role": "tool", "tool_call_id": f"call-{index}", "name": "read", "content": content}
+        for index, content in enumerate(previews)
+    ]
+
+    result = compact_tool_results_for_model(
+        messages,
+        budgeter=budgeter,
+        keep_recent_tool_results=0,
+    )
+
+    assert result.before_chars > 300_000
+    assert result.after_chars == result.before_chars
+    assert result.target_reached is False
+    assert result.artifact_refs == []
+    assert result.messages == messages
+
+
+def test_medium_results_keep_full_previews_when_target_is_unreachable() -> None:
+    messages = [
+        {"role": "tool", "tool_call_id": f"call-{index}", "name": "read", "content": "x" * 4_000}
+        for index in range(76)
+    ]
+
+    result = compact_tool_results_for_model(
+        messages,
+        budgeter=ToolOutputBudgeter(InMemoryArtifactStore()),
+        keep_recent_tool_results=0,
+    )
+
+    assert result.before_chars == 304_000
+    assert result.after_chars > 150_000
+    assert result.target_reached is False
+    assert result.compacted_count == 76
+    previews = [str(item["content"]) for item in result.messages]
+    assert all("preview:\n" + ("x" * 2_000) in content for content in previews)
+    assert all("preview:\n\n</persisted-tool-output>" not in content for content in previews)
 
 
 def test_assembler_has_stable_cache_namespace_and_append_only_transcript() -> None:

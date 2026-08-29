@@ -22,6 +22,7 @@ from src.context.assembly import (
     ContextAssembler,
     ConversationCompactor,
     InMemoryArtifactStore,
+    compact_tool_results_for_model,
 )
 from .errors import APIErrorKind, call_with_retry
 from .guards import GuardDecision, LoopGuard
@@ -519,20 +520,12 @@ class AgentRuntime:
         result: ToolResult,
         artifact_refs: Sequence[Mapping[str, Any]],
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        prepared = self.context_assembler.tool_output_budgeter.prepare(
-            tool_call_id=tool_call_id,
-            tool_name=tool_name,
-            output=json.dumps(result.to_dict(), ensure_ascii=False),
-        )
-        refs = [dict(item) for item in artifact_refs]
-        if prepared.artifact_ref is not None:
-            refs.append(prepared.artifact_ref.to_dict())
         return {
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
-            "content": prepared.content,
-        }, refs
+            "content": json.dumps(result.to_dict(), ensure_ascii=False),
+        }, [dict(item) for item in artifact_refs]
 
     @staticmethod
     def _stop_state(state: RunState, decision: GuardDecision) -> RunState:
@@ -677,6 +670,28 @@ class AgentRuntime:
                 ).encode("utf-8")
             ).hexdigest()[:24]
             return f"{stable_key}:tools-{tool_fingerprint}"
+
+        def budget_tool_results(state: RunState) -> RunState:
+            messages = state.get("messages", [])
+            if not isinstance(messages, list):
+                messages = [dict(item) for item in messages]
+            result = compact_tool_results_for_model(
+                messages,
+                budgeter=self.context_assembler.tool_output_budgeter,
+            )
+            if not result.changed:
+                return state
+            refs = [dict(item) for item in state.get("context_artifact_refs", [])]
+            known_ids = {str(item.get("artifact_id") or "") for item in refs}
+            for ref in result.artifact_refs:
+                if ref.artifact_id not in known_ids:
+                    refs.append(ref.to_dict())
+                    known_ids.add(ref.artifact_id)
+            return {
+                **state,
+                "messages": result.messages,
+                "context_artifact_refs": refs,
+            }
 
         async def compact_state(
             state: RunState,
@@ -829,8 +844,10 @@ class AgentRuntime:
                 "prompt_cache_key": prompt_cache_key,
                 "context_artifact_refs": [dict(item) for item in state.get("context_artifact_refs", [])],
             }
+            state = budget_tool_results(state)
+            estimated_tokens = sum(message_tokens(item) for item in state.get("messages", []))
             if (
-                layout.requires_compaction
+                estimated_tokens >= self.context_assembler.compaction_threshold
                 and int(state.get("compaction_count", 0) or 0) < self.config.max_compactions_per_run
                 and len(transcript) > 2
             ):
@@ -893,6 +910,7 @@ class AgentRuntime:
             )
             state = {**state, "events": events}
 
+            state = budget_tool_results(state)
             current_tokens = sum(message_tokens(item) for item in state.get("messages", []))
             forced_reason = str(state.get("force_compaction_reason") or "").strip()
             if forced_reason:
@@ -2290,13 +2308,6 @@ class AgentRuntime:
                 duration_ms=round((self.clock() - tool_started_at) * 1000),
                 elapsed_ms=elapsed_ms(),
             )
-            prepared = self.context_assembler.tool_output_budgeter.prepare(
-                tool_call_id=call_id,
-                tool_name=tool_name,
-                output=json.dumps(result.to_dict(), ensure_ascii=False),
-            )
-            if prepared.artifact_ref is not None:
-                delegated_artifact_refs.append(prepared.artifact_ref.to_dict())
             # The earlier assistant/tool pair was already provider-visible.
             # Never replace that cached result or append a duplicate result for
             # the same call id. A normal user-role observation carries the
@@ -2306,7 +2317,7 @@ class AgentRuntime:
                 "content": (
                     "<delegated-task-update>\n"
                     f"tool_call_id: {call_id}\n"
-                    f"{prepared.content}\n"
+                    f"{json.dumps(result.to_dict(), ensure_ascii=False)}\n"
                     "</delegated-task-update>"
                 ),
             }

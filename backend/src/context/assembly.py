@@ -1,8 +1,8 @@
-"""Append-only context windows and Claude-Code-style transcript compaction.
+"""Context assembly, aggregate tool-result budgeting, and transcript compaction.
 
-The provider-visible transcript is immutable between full compactions. Large
-tool results are externalized before their first exposure; old messages are
-never rewritten merely to save tokens or to rebuild a dynamic preamble.
+Ordinary turns append provider-visible messages. Before a model turn, aggregate
+tool-result pressure may replace the largest old results with durable artifact
+previews; full nine-section compaction remains the transcript-level mechanism.
 """
 
 from __future__ import annotations
@@ -182,7 +182,7 @@ class PreparedToolOutput:
 
 
 class ToolOutputBudgeter:
-    """Externalize a large result before the model sees it for the first time."""
+    """Persist selected tool results and render bounded provider previews."""
 
     def __init__(
         self,
@@ -208,14 +208,73 @@ class ToolOutputBudgeter:
         text = str(output)
         if len(text) <= self.max_chars:
             return PreparedToolOutput(content=text)
+        return self.externalize(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            output=text,
+        )
+
+    def externalize(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        output: str,
+        source_sequence: int | None = None,
+        preview_chars: int | None = None,
+    ) -> PreparedToolOutput:
+        """Persist one result regardless of its individual size."""
+
+        text = str(output)
         ref = self.artifact_store.put(
             text,
             kind="tool_output",
             mime_type="text/plain",
             source_sequence=source_sequence,
         )
-        preview = text[: self.preview_chars].rstrip()
-        content = (
+        content = self._render_preview(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            text=text,
+            ref=ref,
+            preview_chars=preview_chars,
+        )
+        return PreparedToolOutput(content=content, artifact_ref=ref)
+
+    def externalized_content_length(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        output: str,
+    ) -> int:
+        """Return the exact provider wrapper length without writing an artifact."""
+
+        text = str(output)
+        placeholder = ArtifactRef(
+            artifact_id="artifact_" + ("0" * 24),
+            size=len(text.encode("utf-8")),
+        )
+        return len(self._render_preview(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            text=text,
+            ref=placeholder,
+            preview_chars=None,
+        ))
+
+    def _render_preview(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        text: str,
+        ref: ArtifactRef,
+        preview_chars: int | None,
+    ) -> str:
+        preview_limit = self.preview_chars if preview_chars is None else max(0, int(preview_chars))
+        preview = text[:preview_limit].rstrip()
+        return (
             "<persisted-tool-output>\n"
             f"tool: {tool_name}\n"
             f"tool_call_id: {tool_call_id}\n"
@@ -224,7 +283,105 @@ class ToolOutputBudgeter:
             f"preview:\n{preview}\n"
             "</persisted-tool-output>"
         )
-        return PreparedToolOutput(content=content, artifact_ref=ref)
+
+
+@dataclass(slots=True)
+class ToolResultCompaction:
+    messages: list[Message]
+    artifact_refs: list[ArtifactRef] = field(default_factory=list)
+    before_chars: int = 0
+    after_chars: int = 0
+    compacted_count: int = 0
+    target_reached: bool = True
+
+    @property
+    def changed(self) -> bool:
+        return self.compacted_count > 0
+
+
+def compact_tool_results_for_model(
+    messages: list[Message],
+    *,
+    budgeter: ToolOutputBudgeter,
+    trigger_chars: int = 300_000,
+    target_chars: int = 150_000,
+    keep_recent_tool_results: int = 2,
+) -> ToolResultCompaction:
+    """Externalize the largest historical tool results only after aggregate pressure.
+
+    The common path returns the original list unchanged. Once the aggregate
+    provider-visible tool-result content exceeds ``trigger_chars``, raw results
+    that can be shortened with a full preview are processed from largest to
+    smallest, excluding the newest ``keep_recent_tool_results`` observations.
+    Existing artifact previews are not shortened or nested. If these
+    replacements cannot reach ``target_chars``, the bounded result is passed
+    through and normal transcript-compaction thresholds remain authoritative.
+    """
+
+    if trigger_chars <= target_chars or target_chars < 0 or keep_recent_tool_results < 0:
+        raise ValueError("tool result character budgets are invalid")
+    tool_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "tool" and isinstance(message.get("content"), str)
+    ]
+    before_chars = sum(len(str(messages[index].get("content") or "")) for index in tool_indexes)
+    if before_chars <= trigger_chars:
+        return ToolResultCompaction(
+            messages=messages,
+            before_chars=before_chars,
+            after_chars=before_chars,
+        )
+
+    compacted_messages = list(messages)
+    refs: list[ArtifactRef] = []
+    current_chars = before_chars
+    compacted_count = 0
+    protected_indexes = set(
+        tool_indexes[-keep_recent_tool_results:]
+        if keep_recent_tool_results
+        else []
+    )
+    candidates = sorted(
+        (
+            index for index in tool_indexes
+            if index not in protected_indexes
+            if not str(messages[index].get("content") or "").startswith("<persisted-tool-output>")
+        ),
+        key=lambda index: (-len(str(messages[index].get("content") or "")), index),
+    )
+    for index in candidates:
+        if current_chars <= target_chars:
+            break
+        message = messages[index]
+        content = str(message.get("content") or "")
+        tool_call_id = str(message.get("tool_call_id") or "")
+        tool_name = str(message.get("name") or "tool")
+        if budgeter.externalized_content_length(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            output=content,
+        ) >= len(content):
+            continue
+        prepared = budgeter.externalize(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            output=content,
+        )
+        compacted_messages[index] = {**message, "content": prepared.content}
+        current_chars += len(prepared.content) - len(content)
+        if prepared.artifact_ref is not None:
+            refs.append(prepared.artifact_ref)
+        compacted_count += 1
+
+    return ToolResultCompaction(
+        messages=compacted_messages,
+        artifact_refs=refs,
+        before_chars=before_chars,
+        after_chars=current_chars,
+        compacted_count=compacted_count,
+        target_reached=current_chars <= target_chars,
+    )
 
 
 def _tool_call_ids(message: Mapping[str, Any]) -> list[str]:

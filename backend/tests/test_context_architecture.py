@@ -86,7 +86,7 @@ def test_assembler_never_trims_seen_history_when_over_budget() -> None:
     assert layout.truncated is False
 
 
-def test_large_tool_output_is_bounded_before_first_model_exposure() -> None:
+def test_selected_tool_output_is_persisted_with_a_bounded_preview() -> None:
     store = InMemoryArtifactStore()
     budgeter = ToolOutputBudgeter(store, max_chars=1_000, preview_chars=200)
     output = "important-output\n" * 2_000
