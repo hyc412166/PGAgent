@@ -52,12 +52,6 @@ from src.agent import (
     decide_deterministic_completion,
     normalize_usage,
 )
-from src.context import ContextManager, FilesystemArtifactStore
-from src.context.window import message_tokens
-from src.context.assembly import COMPACTION_SCHEMA, CONTINUATION_PREFIX
-from src.tools import create_default_registry
-from src.tools.registry import TOOL_SCHEMAS
-from src.tools.types import ToolResult
 
 from src.tasks import background as background_job_service
 from src.model.gateway import ModelConfigurationError, ProviderConfig, build_model_call

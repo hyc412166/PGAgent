@@ -9,9 +9,21 @@ from typing import Any
 
 from . import advanced, builtins
 from .advanced_contract import ADVANCED_TOOL_SCHEMAS, CLAW_TOOL_NAMES, LEARN_TOOL_NAMES
-from .policy import assess_tool_call, normalize_permission_mode
+from .policy import normalize_permission_mode
+from .invocation import ToolInvocation
+from .name import ToolName
+from .pipeline import InvocationPipeline
+from .router import ToolRouter
+from .runtime import (
+    ToolExecutionMetadata,
+    ToolIdentity,
+    ToolOrigin,
+    ToolPresentation,
+    ToolRuntime,
+)
 from .sandbox import WorkspaceSandbox
-from .types import ApprovalRequest, ToolResult
+from .types import ToolResult
+from .validation import InvocationValidationHook
 
 
 # The familiar Claude-Code-style names are the public API.  Legacy names stay
@@ -352,18 +364,6 @@ PARALLEL_READ_ONLY_TOOL_NAMES = frozenset({
 })
 
 
-def _approval(tool_name: str, arguments: dict[str, Any], reason: str) -> ToolResult:
-    request = ApprovalRequest(tool_name=tool_name, arguments=arguments, reason=reason)
-    return ToolResult(
-        tool_name=tool_name,
-        ok=False,
-        content=reason,
-        approval_required=True,
-        approval_request=request,
-        error_code="approval_required",
-    )
-
-
 def _normalize_skill_instructions(value: Iterable[Mapping[str, Any] | str] | None) -> dict[str, dict[str, Any]]:
     catalog: dict[str, dict[str, Any]] = {}
     for index, raw in enumerate(value or (), start=1):
@@ -433,16 +433,13 @@ class ToolRegistry:
         self.sandbox = sandbox
         self.permission_mode = normalize_permission_mode(permission_mode)
         self._tools: dict[str, Callable[..., ToolResult]] = {}
-        self._async_tools: dict[str, Callable[[dict[str, Any]], Awaitable[ToolResult]]] = {}
         self._schemas: dict[str, dict[str, Any]] = dict(TOOL_SCHEMAS)
-        self._external_read_only: dict[str, bool] = {}
-        self._parallel_external_tools: set[str] = set()
-        self._approval_exempt_external_tools: set[str] = set()
-        self._deferred_model_tools: set[str] = set()
         self._activated_deferred_tools: set[str] = set()
-        self._hidden_model_tools: set[str] = set()
         self._external_state: dict[str, Any] = {}
         self._known_tools = set(TOOL_SCHEMAS)
+        self._runtimes: dict[ToolName, ToolRuntime] = {}
+        self._wire_index: dict[str, ToolName] = {}
+        self._known_wire_names = set(TOOL_SCHEMAS)
         self._task_delegate = task_delegate
         self._todo_change_sink = todo_change_sink
         self._memory_store = memory_store
@@ -463,13 +460,21 @@ class ToolRegistry:
                 normalized = []
             self._todo_state[:] = normalized
         source_names = ALL_TOOL_NAMES if allowed_tool_names is None else allowed_tool_names
-        selected = tuple(str(name).strip() for name in source_names if str(name).strip())
+        selected = tuple(dict.fromkeys(
+            str(name).strip() for name in source_names if str(name).strip()
+        ))
         for name in selected:
             if name in _CANONICAL_MEMORY_TOOL_NAMES and self._memory_store is None:
                 continue
             if name == "read_artifact" and self._artifact_store is None:
                 continue
             self._register_default(name)
+        self.pipeline = InvocationPipeline(
+            workspace_root=str(self.sandbox.root),
+            permission_mode=self.permission_mode,
+            prepare_hooks=(InvocationValidationHook(),),
+        )
+        self.router = ToolRouter(self, self.pipeline)
 
     def _write_todos(self, sandbox: WorkspaceSandbox, todos: list[dict[str, Any]]) -> ToolResult:
         result = builtins.todo_write(sandbox, todos=todos, todo_state=self._todo_state)
@@ -661,7 +666,21 @@ class ToolRegistry:
     def register(self, name: str, function: Callable[..., ToolResult]) -> None:
         if name not in self._schemas:
             raise ValueError(f"工具没有 provider schema: {name}")
+        runtime = ToolRuntime(
+            identity=ToolIdentity(ToolName.builtin(name), name),
+            origin=ToolOrigin(owner="pgagent", trusted=True, source="builtin"),
+            schema=dict(TOOL_SCHEMAS[name]),
+            presentation=ToolPresentation.direct(),
+            execution=ToolExecutionMetadata(
+                read_only=name in PARALLEL_READ_ONLY_TOOL_NAMES,
+                supports_parallel=name in PARALLEL_READ_ONLY_TOOL_NAMES,
+            ),
+            executor=lambda invocation, selected=name: self._invoke_builtin_runtime(selected, invocation),
+        )
+        self.register_runtime(runtime)
         self._tools[name] = function
+        self._schemas[name] = dict(TOOL_SCHEMAS[name])
+        self._activated_deferred_tools.discard(name)
 
     def register_external(
         self,
@@ -673,29 +692,110 @@ class ToolRegistry:
         parallel: bool,
         exposure: str = "direct",
         approval_exempt: bool = False,
+        owner: str = "external",
+        raw_name: str | None = None,
+        trusted: bool = False,
+        replace_existing: bool = False,
     ) -> None:
         """Register one discovered asynchronous integration tool."""
 
         if exposure not in {"direct", "deferred", "hidden"}:
             raise ValueError(f"unsupported tool exposure: {exposure}")
 
+        presentation = {
+            "direct": ToolPresentation.direct(),
+            "deferred": ToolPresentation.deferred(),
+            "hidden": ToolPresentation.hidden(),
+        }[exposure]
+        runtime = ToolRuntime(
+            identity=ToolIdentity(ToolName.external(owner, raw_name or name), name),
+            origin=ToolOrigin(owner=owner, trusted=trusted, source="external"),
+            schema=dict(schema),
+            presentation=presentation,
+            execution=ToolExecutionMetadata(
+                read_only=bool(read_only),
+                supports_parallel=bool(parallel),
+                approval_exempt=bool(approval_exempt),
+            ),
+            executor=lambda invocation, selected=function: self._invoke_external_runtime(invocation, selected),
+        )
+        self.register_runtime(runtime, replace_existing=replace_existing)
         self._schemas[name] = dict(schema)
         self._known_tools.add(name)
-        self._async_tools[name] = function
-        self._external_read_only[name] = bool(read_only)
-        if approval_exempt:
-            self._approval_exempt_external_tools.add(name)
-        else:
-            self._approval_exempt_external_tools.discard(name)
-        self._deferred_model_tools.discard(name)
         self._activated_deferred_tools.discard(name)
-        self._hidden_model_tools.discard(name)
-        if exposure == "deferred":
-            self._deferred_model_tools.add(name)
-        elif exposure == "hidden":
-            self._hidden_model_tools.add(name)
-        if parallel:
-            self._parallel_external_tools.add(name)
+
+    def register_runtime(
+        self,
+        runtime: ToolRuntime,
+        *,
+        replace_existing: bool = False,
+    ) -> None:
+        """Register one runtime with deterministic trusted/external collision handling."""
+
+        canonical = runtime.identity.canonical_name
+        wire_name = runtime.identity.wire_name
+        wire_names = tuple(dict.fromkeys((wire_name, *runtime.identity.aliases)))
+        conflicts: dict[ToolName, ToolRuntime] = {}
+        canonical_existing = self._runtimes.get(canonical)
+        if canonical_existing is not None:
+            conflicts[canonical_existing.identity.canonical_name] = canonical_existing
+        for candidate in wire_names:
+            owner = self._wire_index.get(candidate)
+            if owner is not None:
+                conflicts[owner] = self._runtimes[owner]
+
+        if conflicts:
+            if replace_existing:
+                for existing in conflicts.values():
+                    self._remove_runtime(existing)
+            elif any(existing.origin.trusted for existing in conflicts.values()) and not runtime.origin.trusted:
+                existing = next(item for item in conflicts.values() if item.origin.trusted)
+                raise ValueError(
+                    f"external tool {canonical} conflicts with trusted tool "
+                    f"{existing.identity.canonical_name} on the provider wire surface"
+                )
+            elif runtime.origin.trusted and all(
+                not existing.origin.trusted for existing in conflicts.values()
+            ):
+                for existing in conflicts.values():
+                    self._remove_runtime(existing)
+            else:
+                existing_names = ", ".join(
+                    str(existing.identity.canonical_name) for existing in conflicts.values()
+                )
+                raise ValueError(
+                    f"tool registration conflict: {existing_names} and {canonical}"
+                )
+
+        self._runtimes[canonical] = runtime
+        for candidate in wire_names:
+            self._wire_index[candidate] = canonical
+        self._known_wire_names.add(wire_name)
+
+    def _remove_runtime(self, runtime: ToolRuntime) -> None:
+        canonical = runtime.identity.canonical_name
+        self._runtimes.pop(canonical, None)
+        for wire_name, owner in tuple(self._wire_index.items()):
+            if owner == canonical:
+                self._wire_index.pop(wire_name, None)
+
+    def resolve(self, name: ToolName) -> ToolRuntime | None:
+        return self._runtimes.get(name)
+
+    def resolve_wire_name(self, name: str) -> ToolRuntime | None:
+        canonical = self._wire_index.get(str(name))
+        return self._runtimes.get(canonical) if canonical is not None else None
+
+    def knows_wire_name(self, name: str) -> bool:
+        return str(name) in self._known_wire_names
+
+    @property
+    def runtimes(self) -> tuple[ToolRuntime, ...]:
+        return tuple(self._runtimes.values())
+
+    @property
+    def activated_tool_names(self) -> tuple[str, ...]:
+        return tuple(sorted(self._activated_deferred_tools))
 
     def schema_for(self, name: str) -> dict[str, Any]:
         return dict(self._schemas[name])
@@ -705,12 +805,20 @@ class ToolRegistry:
 
     def hide_model_tool(self, name: str) -> None:
         if name in self.enabled_tool_names:
-            self._hidden_model_tools.add(name)
+            runtime = self.resolve_wire_name(name)
+            if runtime is not None:
+                runtime.presentation = ToolPresentation.hidden()
+            self._activated_deferred_tools.discard(name)
 
     def activate_deferred_tools(self, names: Iterable[str]) -> tuple[str, ...]:
         activated = tuple(
             name for name in names
-            if name in self._deferred_model_tools
+            if (
+                (runtime := self.resolve_wire_name(name)) is not None
+                and not runtime.presentation.advertise_by_default
+                and runtime.presentation.discoverable
+                and runtime.presentation.model_callable
+            )
         )
         self._activated_deferred_tools.update(activated)
         self._external_state["mcp_active_tools"] = sorted(self._activated_deferred_tools)
@@ -718,31 +826,37 @@ class ToolRegistry:
 
     @property
     def enabled_tool_names(self) -> tuple[str, ...]:
-        return (*self._tools, *(name for name in self._async_tools if name not in self._tools))
+        return tuple(runtime.identity.wire_name for runtime in self._runtimes.values())
 
     @property
     def model_visible_tool_names(self) -> tuple[str, ...]:
         return tuple(
-            name for name in self.enabled_tool_names
-            if name not in self._hidden_model_tools
+            runtime.identity.wire_name for runtime in self._runtimes.values()
+            if runtime.presentation.model_callable
             and (
-                name not in self._deferred_model_tools
-                or name in self._activated_deferred_tools
+                runtime.presentation.advertise_by_default
+                or runtime.identity.wire_name in self._activated_deferred_tools
             )
         )
 
     def can_execute_batch_in_parallel(self, names: Iterable[str]) -> bool:
         normalized = tuple(str(name) for name in names)
         return len(normalized) > 1 and all(
-            (name in self._tools or name in self._async_tools)
-            and (name in PARALLEL_READ_ONLY_TOOL_NAMES or name in self._parallel_external_tools)
+            (runtime := self.resolve_wire_name(name)) is not None
+            and runtime.execution.supports_parallel
             for name in normalized
         )
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
         return [
-            {"type": "function", "function": {"name": name, **self._schemas[name]}}
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    **dict(self.resolve_wire_name(name).schema),
+                },
+            }
             for name in self.model_visible_tool_names
         ]
 
@@ -803,6 +917,53 @@ class ToolRegistry:
         for event in events:
             event.set()
 
+    async def _invoke_builtin_runtime(
+        self,
+        name: str,
+        invocation: ToolInvocation,
+    ) -> ToolResult:
+        return await self._execute_async_legacy(
+            name,
+            invocation.arguments,
+            approved=True,
+            call_id=invocation.call_id,
+        )
+
+    async def _invoke_external_runtime(
+        self,
+        invocation: ToolInvocation,
+        function: Callable[[dict[str, Any]], Awaitable[ToolResult]],
+    ) -> ToolResult:
+        kwargs = dict(invocation.arguments)
+        if "_raw" in kwargs or "_invalid_json" in kwargs:
+            return ToolResult(
+                invocation.wire_name,
+                False,
+                "MCP 工具参数不是有效的 JSON 对象",
+                error_code="invalid_tool_arguments",
+            )
+        runtime = self.resolve(invocation.tool_name)
+        if (
+            runtime is not None
+            and not runtime.execution.read_only
+            and advanced.plan_mode_enabled(self.sandbox)
+        ):
+            return ToolResult(
+                invocation.wire_name,
+                False,
+                "Plan mode is active; mutating external tools are disabled until ExitPlanMode.",
+                error_code="plan_mode_read_only",
+            )
+        try:
+            return await function(kwargs)
+        except TypeError as exc:
+            return ToolResult(
+                invocation.wire_name,
+                False,
+                f"外部工具参数无效: {exc}",
+                error_code="invalid_arguments",
+            )
+
     @staticmethod
     def _rename_result(result: ToolResult, tool_name: str) -> ToolResult:
         """Keep provider call, ToolResult and approval resume names identical."""
@@ -812,7 +973,7 @@ class ToolRegistry:
             result.approval_request.tool_name = tool_name
         return result
 
-    def execute(
+    def _execute_builtin_legacy(
         self,
         name: str,
         arguments: dict[str, Any] | None = None,
@@ -852,18 +1013,8 @@ class ToolRegistry:
         # no-op first.
         if name in {"task", "Agent"} and self._task_delegate is None:
             return self._rename_result(function(self.sandbox, **kwargs), name)
-        decision = assess_tool_call(
-            name,
-            self.permission_mode,
-            arguments=kwargs,
-            approved=approved,
-            workspace_root=self.sandbox.root,
-        )
-        if decision.requires_approval:
-            return _approval(name, kwargs, decision.reason)
-        # Side-effecting builtins retain their own approval primitive for direct
-        # callers.  The registry is the only runtime entry point and passes the
-        # effective grant after policy has checked it.
+        # Authorization has already completed in InvocationPipeline. Built-ins
+        # keep their local primitive only as an execution-level safety API.
         if name in {"write", "write_file", "edit", "edit_file", "delete", "bash", "run_command"}:
             kwargs["approved"] = True
         if _cancel_event is not None and name in {"bash", "run_command", "check_background"}:
@@ -878,7 +1029,7 @@ class ToolRegistry:
         except Exception as exc:  # A tool failure must never crash the model loop.
             return ToolResult(name, False, f"工具执行失败: {type(exc).__name__}", error_code="tool_error")
 
-    async def execute_async(
+    async def _execute_async_legacy(
         self,
         name: str,
         arguments: dict[str, Any] | None = None,
@@ -886,56 +1037,7 @@ class ToolRegistry:
         approved: bool = False,
         call_id: str | None = None,
     ) -> ToolResult:
-        """Execute a tool without blocking a child-Agent model invocation.
-
-        All ordinary built-ins remain synchronous and retain the exact policy
-        path in :meth:`execute`.  ``task`` is the one exception: a genuine
-        delegate needs to await another ``AgentRuntime``.  Keeping that async
-        boundary here avoids nesting an event loop or faking a background
-        result while preserving the same approval checks.
-        """
-
-        external = self._async_tools.get(name)
-        if external is not None:
-            kwargs = dict(arguments or {})
-            if "_raw" in kwargs or "_invalid_json" in kwargs:
-                return ToolResult(
-                    name,
-                    False,
-                    "MCP 工具参数不是有效的 JSON 对象",
-                    error_code="invalid_tool_arguments",
-                )
-            read_only = self._external_read_only.get(name, False)
-            if not read_only and advanced.plan_mode_enabled(self.sandbox):
-                return ToolResult(
-                    name,
-                    False,
-                    "Plan mode is active; mutating MCP tools are disabled until ExitPlanMode.",
-                    error_code="plan_mode_read_only",
-                )
-            if name not in self._approval_exempt_external_tools and not approved and (
-                self.permission_mode == "ask"
-                or (self.permission_mode == "smart" and not read_only)
-            ):
-                reason = (
-                    "请求批准模式：MCP 调用会越过本地 Agent 边界，执行前需要你确认。"
-                    if self.permission_mode == "ask"
-                    else "该 MCP 工具未声明为只读，可能修改外部或本地状态，需要你确认。"
-                )
-                return _approval(name, kwargs, reason)
-            try:
-                return self._rename_result(await external(kwargs), name)
-            except TypeError as exc:
-                return ToolResult(name, False, f"MCP 工具参数无效: {exc}", error_code="invalid_arguments")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                return ToolResult(
-                    name,
-                    False,
-                    f"MCP 工具执行失败: {type(exc).__name__}: {exc}",
-                    error_code="mcp_tool_error",
-                )
+        """Invoke an already-authorized built-in without blocking the event loop."""
 
         if name not in {"task", "Agent"}:
             # Built-in tools are synchronous (filesystem, subprocess and
@@ -950,7 +1052,7 @@ class ToolRegistry:
                 self._active_cancel_events[cancel_key] = cancel_event
             try:
                 return await asyncio.to_thread(
-                    self.execute,
+                    self._execute_builtin_legacy,
                     name,
                     dict(arguments or {}),
                     approved=approved,
@@ -989,15 +1091,6 @@ class ToolRegistry:
                 return self._rename_result(function(self.sandbox, **provider_kwargs), name)
             except TypeError as exc:
                 return ToolResult(name, False, f"工具参数无效: {exc}", error_code="invalid_arguments")
-        decision = assess_tool_call(
-            name,
-            self.permission_mode,
-            arguments=provider_kwargs,
-            approved=approved,
-            workspace_root=self.sandbox.root,
-        )
-        if decision.requires_approval:
-            return _approval(name, provider_kwargs, decision.reason)
         try:
             result = await builtins.delegate_task_async(
                 self.sandbox,
@@ -1010,6 +1103,64 @@ class ToolRegistry:
             return ToolResult(name, False, f"工具参数无效: {exc}", error_code="invalid_arguments")
         except Exception as exc:  # Delegate faults must obey normal loop recovery.
             return ToolResult(name, False, f"工具执行失败: {type(exc).__name__}", error_code="tool_error")
+
+    def execute(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        approved: bool = False,
+        _cancel_event: threading.Event | None = None,
+    ) -> ToolResult:
+        """Synchronous compatibility facade over the unified async router."""
+
+        if _cancel_event is not None:
+            return self._execute_builtin_legacy(
+                name,
+                arguments,
+                approved=approved,
+                _cancel_event=_cancel_event,
+            )
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.execute_async(name, arguments, approved=approved))
+
+        result: list[ToolResult] = []
+        error: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                result.append(asyncio.run(self.execute_async(name, arguments, approved=approved)))
+            except BaseException as exc:
+                error.append(exc)
+
+        worker = threading.Thread(target=run, name=f"pgagent-sync-tool-{name}")
+        worker.start()
+        worker.join()
+        if error:
+            raise error[0]
+        return result[0]
+
+    async def execute_async(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        approved: bool = False,
+        call_id: str | None = None,
+    ) -> ToolResult:
+        """Compatibility facade routed through the unified invocation pipeline."""
+
+        effective_call_id = str(call_id or f"tool-{id(arguments)}")
+        outcome = await self.router.dispatch(
+            name,
+            arguments,
+            call_id=effective_call_id,
+            approved=approved,
+            source="legacy-api",
+        )
+        return self.router.result(outcome)
 
 
 def create_default_registry(

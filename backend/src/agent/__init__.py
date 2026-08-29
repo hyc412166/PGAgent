@@ -4,9 +4,10 @@ from .completion import CompletionDecision, DeterministicAcceptanceReport, Deter
 from .engine import AgentRuntime, ModelToolCall, ModelTurn, RunOutcome, RuntimeConfig, empty_usage, merge_usage, normalize_usage
 from .errors import APIErrorKind, call_with_retry, classify_api_error
 from .guards import GuardDecision, LoopGuard
+from .step_context import AgentStepContext
 
 __all__ = [
-    "APIErrorKind", "AgentRuntime", "CompletionDecision", "DeterministicAcceptanceReport",
+    "APIErrorKind", "AgentRuntime", "AgentStepContext", "CompletionDecision", "DeterministicAcceptanceReport",
     "DeterministicCheck", "GuardDecision", "LoopGuard", "ModelToolCall", "ModelTurn",
     "RunOutcome", "RuntimeConfig", "call_with_retry", "classify_api_error",
     "decide_deterministic_completion", "empty_usage", "merge_usage", "normalize_usage",

@@ -26,6 +26,7 @@ from src.context.assembly import (
 )
 from .errors import APIErrorKind, call_with_retry
 from .guards import GuardDecision, LoopGuard
+from .step_context import AgentStepContext
 from .loop import run_agent_loop
 from .state import RunState
 from ..tools import ToolRegistry
@@ -442,6 +443,7 @@ class AgentRuntime:
             self._model_accepts_thought_delta = False
             self._model_accepts_prompt_cache_key = False
         self.tool_registry = tool_registry
+        self.tool_router = tool_registry.router
         self.context_manager = context_manager or ContextManager()
         self.event_sink = event_sink
         self.stream_sink = stream_sink
@@ -465,6 +467,23 @@ class AgentRuntime:
             retain_tokens=self.config.context_compaction_retain_tokens,
             artifact_store=artifact_store,
         )
+
+    async def _dispatch_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        approved: bool,
+        call_id: str,
+    ) -> ToolResult:
+        outcome = await self.tool_router.dispatch(
+            name,
+            arguments,
+            approved=approved,
+            call_id=call_id,
+            source="model",
+        )
+        return self.tool_router.result(outcome)
 
     async def _publish(self, state: RunState, event_type: str, **payload: Any) -> list[dict[str, Any]]:
         event = {"type": event_type, **payload}
@@ -986,7 +1005,11 @@ class AgentRuntime:
                             step=guard.steps,
                         )
 
-                    model_tools = self.tool_registry.schemas
+                    step_context = AgentStepContext(
+                        step_number=guard.steps,
+                        tool_plan=self.tool_router.capture_plan(),
+                    )
+                    model_tools = list(step_context.tool_plan.model_specs)
                     offered_tool_names = frozenset(
                         str(item.get("function", {}).get("name") or "")
                         for item in model_tools
@@ -1316,20 +1339,13 @@ class AgentRuntime:
                 )
                 turn_delegate_count += len(requests)
             turn_delegate_limit_exceeded = turn_delegate_count > MAX_PARALLEL_DELEGATED_TASKS
-            # Parallelize only an all-read-only batch, or an all-task batch in
-            # a non-interactive permission mode. Mixed/mutating batches stay
-            # ordered because later calls may depend on earlier side effects.
-            all_task_calls = len(turn.tool_calls) > 1 and all(
-                call.name in {"task", "Agent"} for call in turn.tool_calls
-            )
             parallel_tool_turn = (
                 all(call.name in offered_tool_names for call in turn.tool_calls)
-                and (
-                    self.tool_registry.can_execute_batch_in_parallel(
-                        call.name for call in turn.tool_calls
-                    )
-                    or (self.tool_registry.permission_mode != "ask" and all_task_calls)
-                )
+                and self.tool_router.scheduler.plan(
+                    (call.name for call in turn.tool_calls),
+                    registry=self.tool_registry,
+                    permission_mode=self.tool_router.pipeline.permission_mode,
+                ).parallel
             )
             if parallel_tool_turn:
                 for call in turn.tool_calls:
@@ -1378,7 +1394,7 @@ class AgentRuntime:
                 else:
                     raw_parallel_results = await asyncio.gather(
                         *(
-                            self.tool_registry.execute_async(
+                            self._dispatch_tool(
                                 call.name,
                                 call.arguments,
                                 approved=False,
@@ -1443,7 +1459,7 @@ class AgentRuntime:
                             error_code="delegate_parallel_limit",
                         )
                     else:
-                        result = await self.tool_registry.execute_async(
+                        result = await self._dispatch_tool(
                             call.name,
                             call.arguments,
                             approved=False,
@@ -1820,7 +1836,7 @@ class AgentRuntime:
             **safe_tool_argument_summary(tool_name, arguments),
             elapsed_ms=elapsed_ms(),
         )
-        result = await self.tool_registry.execute_async(
+        result = await self._dispatch_tool(
             tool_name,
             arguments,
             approved=True,
@@ -1946,7 +1962,7 @@ class AgentRuntime:
                 **safe_tool_argument_summary(call.name, call.arguments),
                 elapsed_ms=elapsed_ms(),
             )
-            remaining_result = await self.tool_registry.execute_async(
+            remaining_result = await self._dispatch_tool(
                 call.name,
                 call.arguments,
                 approved=False,
@@ -2311,7 +2327,7 @@ class AgentRuntime:
             # ``approved=True`` is safe here: it does not start new work. The
             # exact task already passed parent approval, and the idempotent
             # delegate returns the persisted child state for this call id.
-            result = await self.tool_registry.execute_async(
+            result = await self._dispatch_tool(
                 tool_name,
                 arguments,
                 approved=True,
