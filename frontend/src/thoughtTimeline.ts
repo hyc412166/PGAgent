@@ -286,20 +286,41 @@ const contextActivityTypes = new Set(['context_prepared', 'context_resumed', 'co
 function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): ThoughtActivityItem | null {
   const type = firstString(event.type, event.event_type).toLowerCase()
   const progress = safeProgressText(event)
-  if (type === 'mcp_connecting') {
+  if (type === 'mcp_catalog_loading') {
     return {
-      id: 'mcp-connection',
+      id: 'mcp-catalog',
+      kind: 'event',
+      icon: 'generic',
+      title: '正在准备 MCP 工具目录',
+      detail: safeMcpServerNames(event) || '正在读取缓存或发现可用工具',
+      status: 'running',
+    }
+  }
+  if (type === 'mcp_connecting') {
+    const servers = safeMcpServerNames(event)
+    return {
+      id: `mcp-server-${servers || itemIndex}`,
       kind: 'event',
       icon: 'generic',
       title: '正在连接 MCP 服务',
-      detail: safeMcpServerNames(event) || '正在启动并发现可用工具',
+      detail: servers || '正在启动 MCP 服务',
       status: 'running',
+    }
+  }
+  if (type === 'mcp_server_ready') {
+    return {
+      id: `mcp-server-${firstString(event.server) || itemIndex}`,
+      kind: 'event',
+      icon: 'generic',
+      title: 'MCP 服务已按需连接',
+      detail: firstString(event.server) || '连接已经就绪',
+      status: 'completed',
     }
   }
   if (type === 'mcp_ready') {
     const toolCount = mcpToolCount(event)
     return {
-      id: 'mcp-connection',
+      id: 'mcp-catalog',
       kind: 'event',
       icon: 'generic',
       title: 'MCP 已就绪',

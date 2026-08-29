@@ -409,9 +409,9 @@ PLAN_MODE_MUTATING_TOOLS = frozenset({
 class ToolRegistry:
     """One run's explicit capability boundary.
 
-    A registry instance is immutable in its list of enabled tools.  It owns
-    only small, JSON-serializable state (the todo list), which the coordinator
-    can freeze into a run snapshot before an approval pause.
+    Executable tools remain stable for a run, while model exposure may expand
+    when a deferred integration tool is selected by tool search.  That small
+    exposure state is frozen with the rest of the runtime binding.
     """
 
     def __init__(
@@ -437,6 +437,10 @@ class ToolRegistry:
         self._schemas: dict[str, dict[str, Any]] = dict(TOOL_SCHEMAS)
         self._external_read_only: dict[str, bool] = {}
         self._parallel_external_tools: set[str] = set()
+        self._approval_exempt_external_tools: set[str] = set()
+        self._deferred_model_tools: set[str] = set()
+        self._activated_deferred_tools: set[str] = set()
+        self._hidden_model_tools: set[str] = set()
         self._external_state: dict[str, Any] = {}
         self._known_tools = set(TOOL_SCHEMAS)
         self._task_delegate = task_delegate
@@ -667,13 +671,29 @@ class ToolRegistry:
         *,
         read_only: bool,
         parallel: bool,
+        exposure: str = "direct",
+        approval_exempt: bool = False,
     ) -> None:
         """Register one discovered asynchronous integration tool."""
+
+        if exposure not in {"direct", "deferred", "hidden"}:
+            raise ValueError(f"unsupported tool exposure: {exposure}")
 
         self._schemas[name] = dict(schema)
         self._known_tools.add(name)
         self._async_tools[name] = function
         self._external_read_only[name] = bool(read_only)
+        if approval_exempt:
+            self._approval_exempt_external_tools.add(name)
+        else:
+            self._approval_exempt_external_tools.discard(name)
+        self._deferred_model_tools.discard(name)
+        self._activated_deferred_tools.discard(name)
+        self._hidden_model_tools.discard(name)
+        if exposure == "deferred":
+            self._deferred_model_tools.add(name)
+        elif exposure == "hidden":
+            self._hidden_model_tools.add(name)
         if parallel:
             self._parallel_external_tools.add(name)
 
@@ -683,9 +703,33 @@ class ToolRegistry:
     def set_external_state(self, key: str, value: Any) -> None:
         self._external_state[key] = value
 
+    def hide_model_tool(self, name: str) -> None:
+        if name in self.enabled_tool_names:
+            self._hidden_model_tools.add(name)
+
+    def activate_deferred_tools(self, names: Iterable[str]) -> tuple[str, ...]:
+        activated = tuple(
+            name for name in names
+            if name in self._deferred_model_tools
+        )
+        self._activated_deferred_tools.update(activated)
+        self._external_state["mcp_active_tools"] = sorted(self._activated_deferred_tools)
+        return activated
+
     @property
     def enabled_tool_names(self) -> tuple[str, ...]:
         return (*self._tools, *(name for name in self._async_tools if name not in self._tools))
+
+    @property
+    def model_visible_tool_names(self) -> tuple[str, ...]:
+        return tuple(
+            name for name in self.enabled_tool_names
+            if name not in self._hidden_model_tools
+            and (
+                name not in self._deferred_model_tools
+                or name in self._activated_deferred_tools
+            )
+        )
 
     def can_execute_batch_in_parallel(self, names: Iterable[str]) -> bool:
         normalized = tuple(str(name) for name in names)
@@ -699,7 +743,7 @@ class ToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return [
             {"type": "function", "function": {"name": name, **self._schemas[name]}}
-            for name in self.enabled_tool_names
+            for name in self.model_visible_tool_names
         ]
 
     @property
@@ -713,6 +757,24 @@ class ToolRegistry:
             description = str(item.get("description") or "").strip().replace("\n", " ")[:300]
             suffix = f" — {description}" if description else ""
             lines.append(f"- {item['id']}: {item['name']}{suffix}")
+        return "\n".join(lines)
+
+    @property
+    def deferred_tool_catalog_prompt(self) -> str:
+        sources = self._external_state.get("mcp_namespaces")
+        if not isinstance(sources, list) or not sources:
+            return ""
+        lines = [
+            "MCP tools are loaded on demand. Use McpToolSearch before attempting an MCP operation.",
+            "Available MCP namespaces:",
+        ]
+        for source in sources:
+            if not isinstance(source, Mapping):
+                continue
+            namespace = str(source.get("namespace") or "").strip()
+            count = source.get("tool_count")
+            if namespace:
+                lines.append(f"- {namespace}: {count} tools")
         return "\n".join(lines)
 
     def runtime_state(self) -> dict[str, Any]:
@@ -851,7 +913,7 @@ class ToolRegistry:
                     "Plan mode is active; mutating MCP tools are disabled until ExitPlanMode.",
                     error_code="plan_mode_read_only",
                 )
-            if not approved and (
+            if name not in self._approval_exempt_external_tools and not approved and (
                 self.permission_mode == "ask"
                 or (self.permission_mode == "smart" and not read_only)
             ):

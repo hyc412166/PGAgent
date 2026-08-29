@@ -87,35 +87,52 @@ describe('实时 Thought 时间线', () => {
     expect(verifying.activeItemId).toBe('verify-1')
   })
 
-  it('从 MCP 启动开始就显示可见进度，并在连接完成后收口', () => {
-    const connecting = updateThoughtTimeline(emptyThoughtTimeline, {
-      type: 'mcp_connecting',
+  it('分别展示 MCP 目录准备和按需连接进度', () => {
+    const loading = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'mcp_catalog_loading',
       servers: ['playwright'],
     }, 1_000)
-    const ready = updateThoughtTimeline(connecting, {
+    const ready = updateThoughtTimeline(loading, {
       type: 'mcp_ready',
       tool_count: 24,
       failed_servers: [],
     }, 15_000)
 
-    expect(connecting.items).toEqual([
+    expect(loading.items).toEqual([
       expect.objectContaining({
-        id: 'mcp-connection',
-        title: '正在连接 MCP 服务',
+        id: 'mcp-catalog',
+        title: '正在准备 MCP 工具目录',
         detail: 'playwright',
         status: 'running',
       }),
     ])
-    expect(connecting.activeItemId).toBe('mcp-connection')
+    expect(loading.activeItemId).toBe('mcp-catalog')
     expect(ready.items).toEqual([
       expect.objectContaining({
-        id: 'mcp-connection',
+        id: 'mcp-catalog',
         title: 'MCP 已就绪',
         detail: '已发现 24 个工具',
         status: 'completed',
       }),
     ])
     expect(ready.activeItemId).toBeUndefined()
+
+    const connecting = updateThoughtTimeline(ready, {
+      type: 'mcp_connecting',
+      servers: ['playwright'],
+      trigger: 'tool_call',
+    }, 16_000)
+    const connected = updateThoughtTimeline(connecting, {
+      type: 'mcp_server_ready',
+      server: 'playwright',
+    }, 17_000)
+    expect(connecting.activeItemId).toBe('mcp-server-playwright')
+    expect(connected.items.at(-1)).toMatchObject({
+      id: 'mcp-server-playwright',
+      title: 'MCP 服务已按需连接',
+      status: 'completed',
+    })
+    expect(connected.activeItemId).toBeUndefined()
   })
 
   it('中断后用服务端快照补齐可能漏掉的最后一段思考', () => {

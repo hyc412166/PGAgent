@@ -73,6 +73,8 @@
 .mcp-runtime-status::before { width: 6px; height: 6px; border-radius: 50%; content: ''; background: var(--muted-2); }
 .mcp-runtime-status.status-ready { color: var(--success); }
 .mcp-runtime-status.status-ready::before { background: var(--success); box-shadow: 0 0 0 3px rgb(49 164 119 / 12%); }
+.mcp-runtime-status.status-dormant { color: var(--blue); }
+.mcp-runtime-status.status-dormant::before { background: var(--blue); box-shadow: 0 0 0 3px rgb(36 126 168 / 12%); }
 .mcp-runtime-status.status-degraded,
 .mcp-runtime-status.status-failed { color: var(--red); }
 .mcp-runtime-status.status-degraded::before,

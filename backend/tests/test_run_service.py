@@ -1062,6 +1062,7 @@ def test_runtime_freezes_global_and_chat_memory_preferences(
         assert settings_row is not None and session is not None
         settings_row.enabled = True
         session.use_memories = True
+        session.mcp_server_names = ["filesystem", "github"]
         db.commit()
 
     calls: list[tuple[str | None, str | None]] = []
@@ -1077,6 +1078,7 @@ def test_runtime_freezes_global_and_chat_memory_preferences(
     assert initial["memory_index"] == "MEMORY INDEX"
     assert binding["memories_enabled"] is True
     assert binding["use_memories"] is True
+    assert binding["mcp_server_names"] == ["filesystem", "github"]
     assert "MemorySearch" in runtime.tool_registry.enabled_tool_names
 
     with database.SessionLocal() as db:
@@ -1085,10 +1087,12 @@ def test_runtime_freezes_global_and_chat_memory_preferences(
         assert settings_row is not None and session is not None
         settings_row.enabled = False
         session.use_memories = False
+        session.mcp_server_names = []
         db.commit()
 
     resumed_runtime, resumed = RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
     assert resumed["memory_index"] == "MEMORY INDEX"
+    assert resumed["runtime_binding"]["mcp_server_names"] == ["filesystem", "github"]
     assert "MemorySearch" in resumed_runtime.tool_registry.enabled_tool_names
     assert len(calls) == 1
 

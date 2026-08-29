@@ -46,6 +46,7 @@ from src.runs.service import (
     coordinator,
 )
 from src.runs.stream import TERMINAL_EVENT_TYPES, run_stream_broker
+from src.mcp.config import load_mcp_config_source, validate_mcp_server_names
 from src.skills.registry import replace_session_skills, validate_skill_ids
 from src.tasks.state import (
     bind_recovery_task,
@@ -149,6 +150,7 @@ def _draft_request_fingerprint(payload: DraftLaunchRequest, normalized_root: str
         "permission_mode": payload.permission_mode,
         "use_memories": payload.use_memories,
         "skill_ids": sorted({skill_id.strip() for skill_id in payload.skill_ids}),
+        "mcp_server_names": sorted({name.strip() for name in payload.mcp_server_names}),
     }
     encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -270,6 +272,13 @@ async def launch_draft(
         # Validate before any workspace/session/message/run row is staged so
         # an invalid or disabled Skill leaves an unsent draft fully ephemeral.
         skill_ids = validate_skill_ids(db, payload.skill_ids)
+        try:
+            mcp_server_names = validate_mcp_server_names(
+                load_mcp_config_source(settings.mcp_config_file),
+                payload.mcp_server_names,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         if normalized_root is None:
             workspace = db.get(Workspace, DEFAULT_WORKSPACE_ID)
@@ -296,6 +305,7 @@ async def launch_draft(
             thinking_level=payload.thinking_level,
             permission_mode=payload.permission_mode,
             use_memories=payload.use_memories,
+            mcp_server_names=mcp_server_names,
             status="active",
         )
         db.add(chat_session)

@@ -76,7 +76,7 @@ _ACTIVE_SESSION_RUN_STATUSES = frozenset(
     {"received", "preparing_context", "planning", "acting", "observing", "running", "awaiting_approval"}
 )
 _SESSION_RUNTIME_SETTING_FIELDS = frozenset({
-    "model_connection_id", "model_id", "thinking_level", "use_memories",
+    "model_connection_id", "model_id", "thinking_level", "use_memories", "mcp_server_names",
 })
 _PUBLIC_RUN_EVENT_TYPES = frozenset({
     "approval_rejected",
@@ -100,7 +100,9 @@ _PUBLIC_RUN_EVENT_TYPES = frozenset({
     "model_failed",
     "model_retry",
     "model_step_started",
+    "mcp_catalog_loading",
     "mcp_connecting",
+    "mcp_server_ready",
     "mcp_ready",
     "mcp_degraded",
     "completion_verification_started",
@@ -341,7 +343,7 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
             if request_public:
                 public["request"] = request_public
 
-    if event_type == "mcp_connecting":
+    if event_type in {"mcp_catalog_loading", "mcp_connecting"}:
         servers = source.get("servers")
         if isinstance(servers, list):
             public["servers"] = [
@@ -360,6 +362,17 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
                 for item in failed_servers
                 if isinstance(item, dict)
             ]
+        for key in ("dormant_servers", "connected_servers"):
+            values = source.get(key)
+            if isinstance(values, list):
+                public[key] = [
+                    text for item in values
+                    if (text := _public_event_text(item, limit=100)) is not None
+                ]
+    if event_type == "mcp_server_ready":
+        server = _public_event_text(source.get("server"), limit=100)
+        if server is not None:
+            public["server"] = server
 
     if event_type == "terminal_response_persisted":
         for key in ("turn_id", "message_id", "trace_id", "status", "error_code", "source"):

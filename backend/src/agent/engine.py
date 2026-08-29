@@ -823,6 +823,9 @@ class AgentRuntime:
             skill_catalog = self.tool_registry.skill_catalog_prompt
             if skill_catalog:
                 instructions = f"{instructions}\n{skill_catalog}"
+            deferred_tool_catalog = self.tool_registry.deferred_tool_catalog_prompt
+            if deferred_tool_catalog:
+                instructions = f"{instructions}\n{deferred_tool_catalog}"
             extra_messages = [{"role": "system", "content": instructions}]
             if str(context.get("memory_index") or "").strip():
                 extra_messages.append(memory_system_message(str(context["memory_index"])))
@@ -956,8 +959,10 @@ class AgentRuntime:
             try:
                 buffered_candidate_deltas: list[str] = []
                 streamed_thought_deltas: list[str] = []
+                offered_tool_names: frozenset[str] = frozenset()
 
                 async def model_attempt() -> Any:
+                    nonlocal offered_tool_names
                     buffered_candidate_deltas.clear()
 
                     async def on_delta(delta: str) -> None:
@@ -981,9 +986,15 @@ class AgentRuntime:
                             step=guard.steps,
                         )
 
+                    model_tools = self.tool_registry.schemas
+                    offered_tool_names = frozenset(
+                        str(item.get("function", {}).get("name") or "")
+                        for item in model_tools
+                        if isinstance(item, dict) and isinstance(item.get("function"), dict)
+                    )
                     kwargs = {
                         "messages": state.get("messages", []),
-                        "tools": self.tool_registry.schemas,
+                        "tools": model_tools,
                         "mode": state.get("mode", "auto"),
                     }
                     if self._model_accepts_delta:
@@ -1312,10 +1323,13 @@ class AgentRuntime:
                 call.name in {"task", "Agent"} for call in turn.tool_calls
             )
             parallel_tool_turn = (
-                self.tool_registry.can_execute_batch_in_parallel(
-                    call.name for call in turn.tool_calls
+                all(call.name in offered_tool_names for call in turn.tool_calls)
+                and (
+                    self.tool_registry.can_execute_batch_in_parallel(
+                        call.name for call in turn.tool_calls
+                    )
+                    or (self.tool_registry.permission_mode != "ask" and all_task_calls)
                 )
-                or (self.tool_registry.permission_mode != "ask" and all_task_calls)
             )
             if parallel_tool_turn:
                 for call in turn.tool_calls:
@@ -1414,7 +1428,14 @@ class AgentRuntime:
 
                     # Approval is never inferred from a model-controlled call id. The
                     # only grant path is resume_after_approval's persisted exact call.
-                    if call.name in {"task", "Agent"} and turn_delegate_limit_exceeded:
+                    if call.name not in offered_tool_names:
+                        result = ToolResult(
+                            call.name,
+                            False,
+                            "Tool was not offered to the model in this step; search or load it first.",
+                            error_code="tool_not_offered",
+                        )
+                    elif call.name in {"task", "Agent"} and turn_delegate_limit_exceeded:
                         result = ToolResult(
                             call.name,
                             False,

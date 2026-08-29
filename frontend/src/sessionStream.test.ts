@@ -95,7 +95,9 @@ describe('会话 SSE 事件', () => {
   })
 
   it('shows MCP startup before the first model thought', () => {
-    expect(runStreamPhase({ type: 'mcp_connecting' })).toBe('正在连接 MCP 服务…')
+    expect(runStreamPhase({ type: 'mcp_catalog_loading' })).toBe('正在准备 MCP 工具目录…')
+    expect(runStreamPhase({ type: 'mcp_connecting' })).toBe('正在按需连接 MCP 服务…')
+    expect(runStreamPhase({ type: 'mcp_server_ready' })).toBe('MCP 服务已按需连接')
     expect(runStreamPhase({ type: 'mcp_ready', tool_count: 24 })).toBe('MCP 已就绪（24 个工具）')
     expect(runStreamPhase({ type: 'mcp_degraded', tool_count: 12 })).toBe('部分 MCP 服务不可用，本轮继续使用已连接工具')
     expect(runStreamPhase({ type: 'mcp_degraded' })).toBe('部分 MCP 服务不可用，本轮继续使用已连接工具')

@@ -8,6 +8,7 @@ persistence imports used by application code.
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 from typing import Generator
 
@@ -111,6 +112,7 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "thinking_level": "VARCHAR(16) NOT NULL DEFAULT 'auto'",
         "permission_mode": "VARCHAR(16) NOT NULL DEFAULT 'smart'",
         "use_memories": "BOOLEAN NOT NULL DEFAULT 1",
+        "mcp_server_names": "JSON NOT NULL DEFAULT '[]'",
         "context_tokens": "INTEGER NOT NULL DEFAULT 0",
     },
     "chat_messages": {
@@ -201,6 +203,21 @@ def _migrate_sqlite_columns() -> None:
                         'UPDATE chat_messages SET sequence = ? WHERE id = ?',
                         (counters[key], row_id),
                     )
+            if table_name == "sessions" and "mcp_server_names" not in existing:
+                # Before per-session selection existed every conversation used
+                # every enabled MCP server. Preserve that behavior for historic
+                # rows while newly created sessions explicitly default to none.
+                from src.config import settings
+                from src.mcp.config import load_mcp_config_source
+
+                config = load_mcp_config_source(settings.mcp_config_file)
+                enabled_names = sorted(
+                    name for name, server in config.servers.items() if server.enabled
+                )
+                connection.exec_driver_sql(
+                    "UPDATE sessions SET mcp_server_names = ?",
+                    (json.dumps(enabled_names, ensure_ascii=False),),
+                )
             if table_name == "memories" and "name" not in existing:
                 connection.exec_driver_sql(
                     "UPDATE memories SET name = title WHERE title IS NOT NULL AND title != ''"

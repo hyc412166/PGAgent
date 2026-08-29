@@ -53,9 +53,13 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 
 ### MCP 工具运行时
 
-启用内置 `MCP` 能力后，`McpRuntimePool` 以 PGAgent Session 为清理边界、以 `(session, resolved workspace root)` 为连接集合身份惰性创建客户端；因此共享工作区的 Run 复用连接，worktree 子 Agent 和切换后的工作区不会错误复用父目录 cwd。stdio server 由 SDK 作为子进程启动，Streamable HTTP 使用同一异步 Client 接口且不跟随 HTTP 重定向。每个 server 独立完成协议协商和 `tools/list`，`required` server 失败会阻止本次运行，可选 server 失败只记录状态。目录刷新失败时保留该连接最后一次成功发现的工具，并标记为 degraded。
+启用内置 `MCP` 能力后，`McpRuntimePool` 以 PGAgent Session 为统一清理边界，并以 `(session, runtime scope, resolved workspace root)` 区分连接集合。主 Agent 的 scope 是会话，使用 `eager` 策略；每个委派 SubAgent 以自己的 Run ID 持有独立 scope，使用 `lazy_when_cached`，不会与父 Agent 或其他 SubAgent 共享连接状态。stdio server 由 SDK 作为子进程启动，Streamable HTTP 使用同一异步 Client 接口且不跟随 HTTP 重定向。每个 server 独立完成协议协商和 `tools/list`；required server 在没有缓存且启动失败时阻止本次运行，可选 server 失败只记录状态。目录刷新失败时保留该连接最后一次成功发现的工具，并标记为 degraded。
 
-发现结果保留原始 `(server_name, tool_name)` 路由身份，另生成符合模型函数名约束且跨 server 唯一的 `mcp__server__tool` 名称。`ToolRegistry` 在模型调用前注册异步适配器，因此 Agent loop 不区分本地工具和 MCP 工具。当前工具定义连同输入 schema、只读标记和模型名写入 `runtime_binding`；审批或后台等待恢复时若定义已变化，旧 Run 会拒绝继续，避免已批准调用落到不同能力。`readOnlyHint=true` 只影响审批与安全并行资格，不改变 MCP server 自身权限。
+`McpRuntimePool` 持有独立于连接的进程级 Tool Catalog Cache，采用 32 项 LRU 和 30 分钟 TTL。目录身份包含 server 名称、展开后的连接配置和工作区；SubAgent 命中非空、已通过 server tool filter 的缓存目录时，以 `dormant` 状态发布，不创建 stdio 子进程或 HTTP 连接。主 Agent 始终 eager；SubAgent 在缓存缺失、过期、配置身份变化或目录为空时立即启动。required server 有合格缓存时同样可以休眠，没有缓存时仍按 fail-closed 语义验证启动。休眠连接只会在具体工具或资源调用时由对应 server 的 startup lock 唤醒；并发调用共享一次启动。握手后的 live catalog 若与本轮缓存不同，会更新缓存并拒绝按旧 schema 执行。
+
+发现结果保留原始 `(server_name, tool_name)` 路由身份，另生成符合模型函数名约束且跨 server 唯一的 `mcp__server__tool` 名称。`ToolRegistry` 将可执行注册与模型暴露分离：通用 `MCP` 路由保持隐藏，`McpToolSearch` 直接可见，具体 MCP 工具以 deferred 状态注册；搜索按 server、原始名称、模型名和描述排序，命中项在下一模型轮次加入 function schema。系统提示只公布可搜索 namespace 和工具数量，不展开完整 schema。Agent loop 仍不区分已加载的本地工具和 MCP 工具。运行事件将目录准备、缓存休眠、按需连接和单 server 就绪分开记录。
+
+完整工具定义、输入 schema、只读标记、模型名和本 Run 已激活的 deferred 工具写入 `runtime_binding`；审批、后台等待或恢复时重建相同暴露集合，若目录定义变化则拒绝让旧 Run 继续，避免已批准调用落到不同能力。`readOnlyHint=true` 只影响审批与安全并行资格，不改变 MCP server 自身权限。
 
 所有连接在会话删除或应用 shutdown 时统一关闭。`GET /api/mcp` 状态接口只返回传输类型、状态和稳定错误类型，不序列化 command、Header、环境变量值或原始传输异常；工作台使用独立的 `/api/mcp/servers` 配置接口读写用户明确管理的名称、STDIO command、args 与 enabled。配置写入以临时文件替换完成：仍有 Agent 运行、审批或后台等待时返回 409；空闲时由 `McpRuntimePool` 的配置代次锁串行化持久化与连接启动，淘汰旧缓存连接，启动途中若代次变化则丢弃旧快照并以新配置重试。当前版本只实现 MCP Client，不提供控制 PGAgent 的 MCP Server 接口。
 

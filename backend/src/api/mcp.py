@@ -18,7 +18,7 @@ from src.mcp.config import (
     save_mcp_config,
 )
 from src.mcp.runtime import mcp_runtime_pool
-from src.persistence.database import Run, get_db
+from src.persistence.database import Run, Session as ChatSession, get_db
 
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
@@ -67,10 +67,13 @@ class McpServerToggle(BaseModel):
 def _editable_server(name: str, server: McpServerConfig) -> McpServerRead:
     runtime_status = "inactive"
     tool_count = 0
+    status_priority = {"inactive": 0, "dormant": 1, "ready": 2, "degraded": 3, "failed": 4}
     for session in mcp_runtime_pool.statuses():
         for current in session["servers"]:
             if current["name"] == name:
-                runtime_status = current["status"]
+                candidate = str(current["status"])
+                if status_priority.get(candidate, 0) > status_priority.get(runtime_status, 0):
+                    runtime_status = candidate
                 tool_count = max(tool_count, int(current["tool_count"]))
     return McpServerRead(
         name=name,
@@ -106,6 +109,31 @@ def _persist(config: McpConfig) -> None:
         save_mcp_config(settings.mcp_config_file, config)
     except OSError as exc:
         raise HTTPException(status_code=500, detail="无法保存 MCP 配置文件") from exc
+
+
+def _replace_session_selection(
+    db: Session,
+    server_name: str,
+    replacement: str | None,
+) -> None:
+    for chat_session in db.scalars(select(ChatSession)):
+        selected = list(chat_session.mcp_server_names or [])
+        if server_name not in selected:
+            continue
+        chat_session.mcp_server_names = list(dict.fromkeys(
+            replacement if name == server_name and replacement else name
+            for name in selected
+            if name != server_name or replacement
+        ))
+
+
+async def _commit_session_selection(db: Session, previous_config: McpConfig) -> None:
+    try:
+        db.commit()
+    except BaseException:
+        db.rollback()
+        await mcp_runtime_pool.apply_configuration(lambda: _persist(previous_config))
+        raise
 
 
 @router.get("")
@@ -170,9 +198,10 @@ async def update_mcp_server(
     db: Session = Depends(get_db),
 ) -> McpServerRead:
     async with _config_write_lock:
-        def change() -> McpServerConfig:
+        def change() -> tuple[McpServerConfig, McpConfig]:
             _require_no_active_run(db)
             config = _source_config()
+            previous_config = config.model_copy(deep=True)
             existing = config.servers.get(server_name)
             if existing is None:
                 raise HTTPException(status_code=404, detail="MCP 服务器不存在")
@@ -194,9 +223,14 @@ async def update_mcp_server(
             else:
                 config.servers[server_name] = server
             _persist(config)
-            return server
+            return server, previous_config
 
-        server = await mcp_runtime_pool.apply_configuration(change)
+        server, previous_config = await mcp_runtime_pool.apply_configuration(change)
+        if payload.name != server_name:
+            _replace_session_selection(db, server_name, payload.name if payload.enabled else None)
+        elif not payload.enabled:
+            _replace_session_selection(db, server_name, None)
+        await _commit_session_selection(db, previous_config)
         return _editable_server(payload.name, server)
 
 
@@ -207,31 +241,39 @@ async def toggle_mcp_server(
     db: Session = Depends(get_db),
 ) -> McpServerRead:
     async with _config_write_lock:
-        def change() -> McpServerConfig:
+        def change() -> tuple[McpServerConfig, McpConfig]:
             _require_no_active_run(db)
             config = _source_config()
+            previous_config = config.model_copy(deep=True)
             existing = config.servers.get(server_name)
             if existing is None:
                 raise HTTPException(status_code=404, detail="MCP 服务器不存在")
             server = existing.model_copy(update={"enabled": payload.enabled})
             config.servers[server_name] = server
             _persist(config)
-            return server
+            return server, previous_config
 
-        server = await mcp_runtime_pool.apply_configuration(change)
+        server, previous_config = await mcp_runtime_pool.apply_configuration(change)
+        if not payload.enabled:
+            _replace_session_selection(db, server_name, None)
+        await _commit_session_selection(db, previous_config)
         return _editable_server(server_name, server)
 
 
 @router.delete("/servers/{server_name:path}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_mcp_server(server_name: str, db: Session = Depends(get_db)) -> Response:
     async with _config_write_lock:
-        def change() -> None:
+        def change() -> McpConfig:
             _require_no_active_run(db)
             config = _source_config()
+            previous_config = config.model_copy(deep=True)
             if server_name not in config.servers:
                 raise HTTPException(status_code=404, detail="MCP 服务器不存在")
             del config.servers[server_name]
             _persist(config)
+            return previous_config
 
-        await mcp_runtime_pool.apply_configuration(change)
+        previous_config = await mcp_runtime_pool.apply_configuration(change)
+        _replace_session_selection(db, server_name, None)
+        await _commit_session_selection(db, previous_config)
         return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -12,7 +12,7 @@ export interface McpServer {
   args: string[]
   enabled: boolean
   transport: 'stdio' | 'streamable_http'
-  runtime_status: 'inactive' | 'ready' | 'degraded' | 'failed'
+  runtime_status: 'inactive' | 'dormant' | 'ready' | 'degraded' | 'failed'
   tool_count: number
 }
 
@@ -89,6 +89,7 @@ export interface Session {
   thinking_level?: ThinkingLevel
   use_memories?: boolean
   skill_ids?: string[]
+  mcp_server_names?: string[]
   permission_mode?: PermissionMode
   status?: string
   created_at?: string

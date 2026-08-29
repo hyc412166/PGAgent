@@ -29,9 +29,11 @@ const eventTitles: Record<string, string> = {
   delegated_child_stopped: '子 Agent 已停止',
   failed: '运行失败',
   integration_failed: '运行集成失败',
+  mcp_catalog_loading: '正在准备 MCP 工具目录',
   mcp_connecting: '正在连接 MCP 服务',
   mcp_degraded: '部分 MCP 服务不可用',
   mcp_ready: 'MCP 服务已就绪',
+  mcp_server_ready: 'MCP 服务已按需连接',
   model_failed: '模型调用失败',
   model_retry: '正在重试模型',
   model_step_started: '开始模型步骤',
@@ -206,11 +208,16 @@ function eventDetail(type: string, payload: ApiRecord): string {
   if (type === 'context_prepared' || type === 'context_resumed') {
     return message ? `用户消息：${message}` : '已整理本轮模型需要的消息和系统上下文'
   }
+  if (type === 'mcp_catalog_loading') {
+    const servers = formatFactValue('servers', payload.servers)
+    return servers === '无' ? '正在读取缓存或发现 MCP 工具' : `正在准备：${servers}`
+  }
   if (type === 'mcp_connecting') {
     const servers = formatFactValue('servers', payload.servers)
     return servers === '无' ? '正在启动并发现 MCP 工具' : `正在连接：${servers}`
   }
   if (type === 'mcp_ready') return 'MCP 工具目录已经可以使用'
+  if (type === 'mcp_server_ready') return `${text(payload.server) || 'MCP 服务'} 已完成按需连接`
   if (type === 'mcp_degraded') return '本轮将继续使用已经连接的 MCP 工具'
   if (type === 'thought_summary') return truncate(text(payload.summary) || '模型已更新处理思路')
   if (['progress', 'agent_progress', 'activity_update'].includes(type)) {

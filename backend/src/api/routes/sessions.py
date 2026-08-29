@@ -67,6 +67,9 @@ from src.api.schemas import (
     WorkspaceUpdate,
 )
 from src.memory.service import recall_memories, refresh_memory_markdown_projection, store_memory
+from src.config import settings
+from src.mcp.config import load_mcp_config_source, validate_mcp_server_names
+from src.mcp.runtime import mcp_runtime_pool
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
 from src.tasks.state import cancel_durable_task, latest_resumable_task, task_payload
 from src.agents.collaboration import cleanup_session_worktrees
@@ -103,6 +106,13 @@ def list_sessions(
 def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> ChatSession:
     data = payload.model_dump()
     skill_ids = data.pop("skill_ids", [])
+    try:
+        data["mcp_server_names"] = validate_mcp_server_names(
+            load_mcp_config_source(settings.mcp_config_file),
+            data.get("mcp_server_names", []),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     data["workspace_id"] = data.get("workspace_id") or DEFAULT_WORKSPACE_ID
     # Keep the field in the public schema for old clients, but all
     # conversations are coordinated by the built-in PGAgent master.
@@ -323,13 +333,25 @@ def list_session_collaboration_events(
 
 
 @router.patch("/sessions/{session_id}", response_model=SessionRead)
-def update_session(
+async def update_session(
     session_id: str, payload: SessionUpdate, db: Session = Depends(get_db)
 ) -> ChatSession:
     item = _require(db, ChatSession, session_id, "Session")
     updates = payload.model_dump(exclude_unset=True)
+    mcp_selection_changed = (
+        "mcp_server_names" in updates
+        and list(item.mcp_server_names or []) != updates["mcp_server_names"]
+    )
     skill_ids_supplied = "skill_ids" in updates
     skill_ids = updates.pop("skill_ids", None)
+    if "mcp_server_names" in updates:
+        try:
+            updates["mcp_server_names"] = validate_mcp_server_names(
+                load_mcp_config_source(settings.mcp_config_file),
+                updates["mcp_server_names"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     if "model_connection_id" in updates:
         _require_enabled_model_connection(db, updates["model_connection_id"])
     runtime_settings_changed = any(
@@ -356,6 +378,8 @@ def update_session(
     item.agent_id = DEFAULT_AGENT_ID
     _commit(db)
     db.refresh(item)
+    if mcp_selection_changed:
+        await mcp_runtime_pool.close_session(session_id)
     refresh_memory_markdown_projection()
     return item
 

@@ -1219,6 +1219,9 @@ class RunCoordinator:
             agent_skill_ids = list(getattr(agent, "skill_ids", []) or [])
             session_skill_ids = list(getattr(session, "skill_ids", []) or []) if session else []
             configured_skill_ids = session_skill_ids or agent_skill_ids
+            configured_mcp_server_names = (
+                list(getattr(session, "mcp_server_names", []) or []) if session else []
+            )
             permission_mode = str(getattr(session, "permission_mode", "smart") or "smart")
             allowed_tool_names = _allowed_runtime_tool_names(agent_tool_ids)
             skill_instructions = _read_selected_skill_instructions(db, configured_skill_ids)
@@ -1295,6 +1298,10 @@ class RunCoordinator:
                     agent_tool_ids = [str(item) for item in frozen_binding["tool_ids"]]
                 if isinstance(frozen_binding.get("skill_ids"), list):
                     configured_skill_ids = [str(item) for item in frozen_binding["skill_ids"]]
+                if isinstance(frozen_binding.get("mcp_server_names"), list):
+                    configured_mcp_server_names = [
+                        str(item) for item in frozen_binding["mcp_server_names"]
+                    ]
                 if str(frozen_binding.get("permission_mode") or "").strip():
                     permission_mode = str(frozen_binding["permission_mode"])
                 if isinstance(frozen_binding.get("allowed_tool_names"), list):
@@ -1374,6 +1381,7 @@ class RunCoordinator:
                     "thinking_level": thinking_level,
                     "permission_mode": permission_mode,
                     "skill_ids": configured_skill_ids,
+                    "mcp_server_names": configured_mcp_server_names,
                     "tool_ids": agent_tool_ids,
                     "allowed_tool_names": allowed_tool_names,
                     "skill_instructions": skill_instructions,
@@ -1459,6 +1467,7 @@ class RunCoordinator:
                 # from a catalog selection.
                 "permission_mode": permission_mode,
                 "skill_ids": configured_skill_ids,
+                "mcp_server_names": configured_mcp_server_names,
                 "tool_ids": agent_tool_ids,
                 "allowed_tool_names": allowed_tool_names,
                 "skill_instructions": skill_instructions,
@@ -2205,7 +2214,19 @@ class RunCoordinator:
                 runtime.tool_registry,
                 session_key=str(context.get("session_id") or run_id),
                 workspace_root=str(context["workspace_root"]),
+                agent_kind=(
+                    "subagent"
+                    if context["runtime_binding"].get("delegation_version")
+                    else "main"
+                ),
+                runtime_scope=(
+                    run_id
+                    if context["runtime_binding"].get("delegation_version")
+                    else None
+                ),
+                selected_server_names=context["runtime_binding"].get("mcp_server_names"),
                 frozen_tools=context["runtime_binding"].get("mcp_tools"),
+                frozen_active_tools=context["runtime_binding"].get("mcp_active_tools"),
                 progress_sink=self._event_sink(run_id),
             )
             self._install_completion_verifier(runtime, context)
@@ -2259,7 +2280,19 @@ class RunCoordinator:
                 runtime.tool_registry,
                 session_key=str(context.get("session_id") or run_id),
                 workspace_root=str(context["workspace_root"]),
+                agent_kind=(
+                    "subagent"
+                    if context["runtime_binding"].get("delegation_version")
+                    else "main"
+                ),
+                runtime_scope=(
+                    run_id
+                    if context["runtime_binding"].get("delegation_version")
+                    else None
+                ),
+                selected_server_names=context["runtime_binding"].get("mcp_server_names"),
                 frozen_tools=context["runtime_binding"].get("mcp_tools"),
+                frozen_active_tools=context["runtime_binding"].get("mcp_active_tools"),
                 progress_sink=self._event_sink(run_id),
             )
             self._install_completion_verifier(runtime, context)
@@ -2331,7 +2364,10 @@ class RunCoordinator:
                 runtime.tool_registry,
                 session_key=str(context.get("session_id") or run_id),
                 workspace_root=str(context["workspace_root"]),
+                agent_kind="main",
+                selected_server_names=context["runtime_binding"].get("mcp_server_names"),
                 frozen_tools=context["runtime_binding"].get("mcp_tools"),
+                frozen_active_tools=context["runtime_binding"].get("mcp_active_tools"),
                 progress_sink=self._event_sink(run_id),
             )
             self._install_completion_verifier(runtime, context)

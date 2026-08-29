@@ -6,6 +6,7 @@ export interface DraftLaunchSettings {
   model_id: string | null
   thinking_level: ThinkingLevel
   skill_ids: string[]
+  mcp_server_names: string[]
   permission_mode: PermissionMode
   use_memories: boolean
 }
@@ -19,6 +20,7 @@ export interface DraftLaunchPayload {
   model_id?: string
   thinking_level: ThinkingLevel
   skill_ids: string[]
+  mcp_server_names: string[]
   permission_mode: PermissionMode
   use_memories: boolean
 }
@@ -54,6 +56,7 @@ export function buildDraftLaunchPayload(
     ...(settings.model_id ? { model_id: settings.model_id } : {}),
     thinking_level: settings.thinking_level,
     skill_ids: [...new Set(settings.skill_ids)],
+    mcp_server_names: [...new Set(settings.mcp_server_names)],
     permission_mode: settings.permission_mode,
     use_memories: settings.use_memories,
   }
