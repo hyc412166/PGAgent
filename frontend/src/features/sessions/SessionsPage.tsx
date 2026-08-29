@@ -1,4 +1,4 @@
-import { AlertCircle, ArrowUp, BookOpen, Check, ChevronRight, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Pencil, Plus, ShieldCheck, Square, Trash2, X } from 'lucide-react'
+import { AlertCircle, ArrowUp, BookOpen, Cable, Check, ChevronRight, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Pencil, Plus, ShieldCheck, Square, Trash2, X } from 'lucide-react'
 import { Fragment, type FormEvent, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, describeError } from '../../api'
@@ -22,7 +22,7 @@ import { DurableTaskCard } from './components/DurableTaskCard'
 import { useRunTransport } from './hooks/useRunTransport'
 import { activeRunStatuses, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
-import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FolderSelection, MemorySettings, Message, PermissionMode, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
+import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 function SessionsPage() {
   const sessions = useApiData<Session[]>([], () => api.list<Session>('/api/sessions', ['sessions']), [])
@@ -30,6 +30,7 @@ function SessionsPage() {
   const workspaces = useApiData<Workspace[]>([], () => api.list<Workspace>('/api/workspaces', ['workspaces']), [])
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
   const skills = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
+  const mcpServers = useApiData<McpServer[]>([], () => api.list<McpServer>('/api/mcp/servers', ['mcp-servers']), [])
   const memorySettings = useApiData<MemorySettings | null>(null, () => api.get<MemorySettings>('/api/memories/settings'), [])
   const [activeId, setActiveId] = useState('')
   const [composerHasValue, setComposerHasValue] = useState(false)
@@ -43,6 +44,7 @@ function SessionsPage() {
   const [settingsSubmenu, setSettingsSubmenu] = useState<'model' | 'thinking' | null>(null)
   const [addMenuOpen, setAddMenuOpen] = useState(false)
   const [skillSubmenuOpen, setSkillSubmenuOpen] = useState(false)
+  const [mcpSubmenuOpen, setMcpSubmenuOpen] = useState(false)
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false)
   const [capabilitySaving, setCapabilitySaving] = useState(false)
   const settingsMenuRef = useRef<HTMLDivElement>(null)
@@ -123,6 +125,7 @@ function SessionsPage() {
       if (addMenuOpen && !addMenuRef.current?.contains(target)) {
         setAddMenuOpen(false)
         setSkillSubmenuOpen(false)
+        setMcpSubmenuOpen(false)
       }
       if (permissionMenuOpen && !permissionMenuRef.current?.contains(target)) setPermissionMenuOpen(false)
     }
@@ -130,6 +133,7 @@ function SessionsPage() {
       if (event.key !== 'Escape') return
       setAddMenuOpen(false)
       setSkillSubmenuOpen(false)
+      setMcpSubmenuOpen(false)
       setPermissionMenuOpen(false)
     }
     document.addEventListener('pointerdown', closeOnPointerDown)
@@ -142,7 +146,7 @@ function SessionsPage() {
 
   useEffect(() => {
     setSettingsMenuOpen(false); setSettingsSubmenu(null)
-    setAddMenuOpen(false); setSkillSubmenuOpen(false); setPermissionMenuOpen(false)
+    setAddMenuOpen(false); setSkillSubmenuOpen(false); setMcpSubmenuOpen(false); setPermissionMenuOpen(false)
     setSelectedChildTaskId('')
   }, [activeId])
 
@@ -362,6 +366,7 @@ function SessionsPage() {
       setSettingsSubmenu(null)
       setAddMenuOpen(false)
       setSkillSubmenuOpen(false)
+      setMcpSubmenuOpen(false)
       setPermissionMenuOpen(false)
     }
   }, [sending, settingsLocked])
@@ -747,12 +752,13 @@ function SessionsPage() {
     catch (error) { setActionError(describeError(error)) } finally { setSettingsSaving(false) }
   }
 
-  async function updateSessionCapabilities(payload: { skill_ids?: string[]; permission_mode?: PermissionMode }) {
+  async function updateSessionCapabilities(payload: { skill_ids?: string[]; mcp_server_names?: string[]; permission_mode?: PermissionMode }) {
     if (settingsLocked || sending || capabilitySaving) return
     if (draftActive) {
       setDraftSettings((current) => ({
         ...current,
         skill_ids: payload.skill_ids ?? current.skill_ids,
+        mcp_server_names: payload.mcp_server_names ?? current.mcp_server_names,
         permission_mode: payload.permission_mode ?? current.permission_mode,
       }))
       return
@@ -797,12 +803,18 @@ function SessionsPage() {
   }
 
   const selectedSessionSkillIds = draftActive ? draftSettings.skill_ids : activeSession?.skill_ids ?? []
+  const availableMcpServers = mcpServers.data.filter((server) => server.enabled)
+  const selectedSessionMcpNames = draftActive ? draftSettings.mcp_server_names : activeSession?.mcp_server_names ?? []
   const selectedPermissionMode: PermissionMode = draftActive ? draftSettings.permission_mode : activeSession?.permission_mode ?? 'smart'
   const selectedUseMemories = draftActive ? draftSettings.use_memories : activeSession?.use_memories ?? true
   const globalMemoriesDisabled = memorySettings.data?.enabled === false
 
   function toggleSessionSkill(skillId: string) {
     void updateSessionCapabilities({ skill_ids: toggleSelectedId(selectedSessionSkillIds, skillId) })
+  }
+
+  function toggleSessionMcp(serverName: string) {
+    void updateSessionCapabilities({ mcp_server_names: toggleSelectedId(selectedSessionMcpNames, serverName) })
   }
 
   function selectPermissionMode(mode: PermissionMode) {
@@ -961,12 +973,12 @@ function SessionsPage() {
                 <div className="composer-toolbar">
                   <div className="composer-left-actions">
                     <div className="session-capability-picker" ref={addMenuRef}>
-                      <button type="button" className="composer-tool-button composer-plus-button" aria-label="添加能力" aria-haspopup="menu" aria-expanded={addMenuOpen} aria-busy={capabilitySaving} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setAddMenuOpen((open) => !open); setSkillSubmenuOpen(false); setPermissionMenuOpen(false) }}>
+                      <button type="button" className="composer-tool-button composer-plus-button" aria-label="添加能力" aria-haspopup="menu" aria-expanded={addMenuOpen} aria-busy={capabilitySaving} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setAddMenuOpen((open) => !open); setSkillSubmenuOpen(false); setMcpSubmenuOpen(false); setPermissionMenuOpen(false) }}>
                         <Plus size={15} />
-                        {!!selectedSessionSkillIds.length && <b>{selectedSessionSkillIds.length}</b>}
+                        {!!(selectedSessionSkillIds.length + selectedSessionMcpNames.length) && <b>{selectedSessionSkillIds.length + selectedSessionMcpNames.length}</b>}
                       </button>
                       {addMenuOpen && <div className="capability-popover capability-level-two" role="menu" aria-label="添加能力">
-                        <button type="button" className={skillSubmenuOpen ? 'active' : ''} role="menuitem" aria-haspopup="menu" aria-expanded={skillSubmenuOpen} onMouseEnter={() => setSkillSubmenuOpen(true)} onClick={() => setSkillSubmenuOpen((open) => !open)}><BookOpen size={14} /><span>Skill</span><small>{selectedSessionSkillIds.length ? `已选 ${selectedSessionSkillIds.length}` : '未选择'}</small><ChevronRight size={13} /></button>
+                        <button type="button" className={skillSubmenuOpen ? 'active' : ''} role="menuitem" aria-haspopup="menu" aria-expanded={skillSubmenuOpen} onMouseEnter={() => { setSkillSubmenuOpen(true); setMcpSubmenuOpen(false) }} onClick={() => { setSkillSubmenuOpen((open) => !open); setMcpSubmenuOpen(false) }}><BookOpen size={14} /><span>Skill</span><small>{selectedSessionSkillIds.length ? `已选 ${selectedSessionSkillIds.length}` : '未选择'}</small><ChevronRight size={13} /></button>
                         {skillSubmenuOpen && <div className="capability-popover capability-level-three" role="menu" aria-label="选择 Skill">
                           <p>可用 Skill</p>
                           {skills.error ? <div className="capability-menu-state error"><AlertCircle size={13} /><span>{skills.error}</span><button type="button" onClick={() => void skills.reload()}>重试</button></div>
@@ -976,10 +988,21 @@ function SessionsPage() {
                                 return <button key={skill.id} type="button" role="menuitemcheckbox" aria-checked={selected} className={selected ? 'selected' : ''} disabled={skill.enabled === false || capabilitySaving} onClick={() => toggleSessionSkill(skill.id)}><span><strong>{skill.name}</strong><small>{skill.description || skill.slug || 'Skill'}</small></span><Check className="selection-check" size={14} aria-hidden="true" /></button>
                               }) : <div className="capability-menu-state">技能库中暂无 Skill。</div>}
                         </div>}
+                        <button type="button" className={mcpSubmenuOpen ? 'active' : ''} role="menuitem" aria-haspopup="menu" aria-expanded={mcpSubmenuOpen} onMouseEnter={() => { setMcpSubmenuOpen(true); setSkillSubmenuOpen(false) }} onClick={() => { setMcpSubmenuOpen((open) => !open); setSkillSubmenuOpen(false) }}><Cable size={14} /><span>MCP</span><small>{selectedSessionMcpNames.length ? `已选 ${selectedSessionMcpNames.length}` : '不使用'}</small><ChevronRight size={13} /></button>
+                        {mcpSubmenuOpen && <div className="capability-popover capability-level-three" role="menu" aria-label="选择 MCP">
+                          <p>当前会话使用的 MCP</p>
+                          <button type="button" role="menuitem" className={!selectedSessionMcpNames.length ? 'selected' : ''} disabled={capabilitySaving} onClick={() => void updateSessionCapabilities({ mcp_server_names: [] })}><span><strong>不使用 MCP</strong><small>本会话不连接任何 MCP 服务器</small></span><Check className="selection-check" size={14} aria-hidden="true" /></button>
+                          {mcpServers.error ? <div className="capability-menu-state error"><AlertCircle size={13} /><span>{mcpServers.error}</span><button type="button" onClick={() => void mcpServers.reload()}>重试</button></div>
+                            : mcpServers.loading ? <div className="capability-menu-state"><LoaderCircle className="spin" size={13} />正在读取…</div>
+                              : availableMcpServers.length ? availableMcpServers.map((server) => {
+                                const selected = selectedSessionMcpNames.includes(server.name)
+                                return <button key={server.name} type="button" role="menuitemcheckbox" aria-checked={selected} className={selected ? 'selected' : ''} disabled={capabilitySaving} onClick={() => toggleSessionMcp(server.name)}><span><strong>{server.name}</strong><small>{server.transport === 'stdio' ? [server.command, ...server.args].filter(Boolean).join(' ') : 'Streamable HTTP'}</small></span><Check className="selection-check" size={14} aria-hidden="true" /></button>
+                              }) : <div className="capability-menu-state">暂无已启用的 MCP 服务器</div>}
+                        </div>}
                       </div>}
                     </div>
                     <div className="session-capability-picker permission-picker" ref={permissionMenuRef}>
-                      <button type="button" className="composer-tool-button permission-trigger" aria-label={`权限模式：${permissionLabel(selectedPermissionMode)}`} aria-haspopup="menu" aria-expanded={permissionMenuOpen} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setPermissionMenuOpen((open) => !open); setAddMenuOpen(false); setSkillSubmenuOpen(false) }}><ShieldCheck size={14} /><span>{permissionLabel(selectedPermissionMode)}</span><ChevronRight size={12} /></button>
+                      <button type="button" className="composer-tool-button permission-trigger" aria-label={`权限模式：${permissionLabel(selectedPermissionMode)}`} aria-haspopup="menu" aria-expanded={permissionMenuOpen} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setPermissionMenuOpen((open) => !open); setAddMenuOpen(false); setSkillSubmenuOpen(false); setMcpSubmenuOpen(false) }}><ShieldCheck size={14} /><span>{permissionLabel(selectedPermissionMode)}</span><ChevronRight size={12} /></button>
                       {permissionMenuOpen && <div className="capability-popover permission-popover" role="menu" aria-label="权限模式">
                         <p>权限</p>
                         {permissionOptions.map((option) => <button key={option.value} type="button" role="menuitemradio" aria-checked={selectedPermissionMode === option.value} className={selectedPermissionMode === option.value ? 'selected' : ''} onClick={() => selectPermissionMode(option.value)}><span>{option.label}</span><Check className="selection-check" size={14} aria-hidden="true" /></button>)}

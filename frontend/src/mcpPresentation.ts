@@ -2,6 +2,7 @@ import type { McpServer } from './types'
 
 export function mcpStatusLabel(server: McpServer) {
   if (!server.enabled) return '已停用'
+  if (server.runtime_status === 'dormant') return '缓存就绪，等待调用'
   if (server.runtime_status === 'ready') return '已连接'
   if (server.runtime_status === 'degraded') return '连接异常'
   if (server.runtime_status === 'failed') return '连接失败'

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,8 @@ from sqlalchemy.exc import IntegrityError
 from src.api.routes import router as resources_router
 from src.api import routes as resources_api
 from src.api.routes.sessions import cancel_session_task
+from src.config import settings
+from src.mcp.runtime import mcp_runtime_pool
 from src.persistence import database
 from src.persistence.database import (
     Base,
@@ -326,6 +329,12 @@ def test_compaction_persistence_round_trip_and_cascade(tmp_path: Path) -> None:
 
 def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path: Path) -> None:
     database_path = tmp_path / "legacy.db"
+    settings.mcp_config_file.write_text(json.dumps({
+        "mcpServers": {
+            "filesystem": {"command": "npx", "args": ["server-filesystem"], "enabled": True},
+            "disabled": {"command": "npx", "args": ["disabled"], "enabled": False},
+        }
+    }), encoding="utf-8")
     with sqlite3.connect(database_path) as connection:
         connection.executescript(
             """
@@ -364,6 +373,11 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
             VALUES
                 ('legacy-workspace', 'Keep me', '', 'C:/legacy', 1,
                  '2026-01-01 00:00:00', '2026-01-01 00:00:00');
+            INSERT INTO sessions
+                (id, title, workspace_id, agent_id, context_summary, status, created_at, updated_at)
+            VALUES
+                ('legacy-session', 'Legacy MCP session', 'legacy-workspace', NULL, '', 'active',
+                 '2026-01-01 00:00:00', '2026-01-01 00:00:00');
             """
         )
 
@@ -375,12 +389,13 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     assert "is_default" in agent_columns
     assert {
         "model_connection_id", "model_id", "thinking_level", "permission_mode",
-        "use_memories", "context_tokens",
+        "use_memories", "mcp_server_names", "context_tokens",
     }.issubset(session_columns)
     assert "context_summary" not in session_columns
     assert "last_compacted_at" not in session_columns
     with database.SessionLocal() as db:
         assert db.get(database.Workspace, "legacy-workspace") is not None
+        assert db.get(database.Session, "legacy-session").mcp_server_names == ["filesystem"]
         assert db.get(database.Workspace, DEFAULT_WORKSPACE_ID) is not None
         assert db.get(database.Agent, DEFAULT_AGENT_ID) is not None
     migration_app = FastAPI()
@@ -718,6 +733,43 @@ def test_global_and_session_memory_preferences_persist(client: TestClient) -> No
     )
     assert updated.status_code == 200, updated.text
     assert updated.json()["use_memories"] is True
+
+
+def test_session_mcp_selection_persists_and_rejects_unavailable_servers(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed_sessions: list[str] = []
+
+    async def close_session(session_id: str) -> None:
+        closed_sessions.append(session_id)
+
+    monkeypatch.setattr(mcp_runtime_pool, "close_session", close_session)
+    settings.mcp_config_file.write_text(json.dumps({
+        "mcpServers": {
+            "filesystem": {"command": "npx", "args": ["server-filesystem"], "enabled": True},
+            "disabled": {"command": "npx", "args": ["disabled"], "enabled": False},
+        }
+    }), encoding="utf-8")
+
+    created = client.post("/api/sessions", json={"mcp_server_names": ["filesystem"]})
+    assert created.status_code == 201, created.text
+    assert created.json()["mcp_server_names"] == ["filesystem"]
+
+    cleared = client.patch(
+        f"/api/sessions/{created.json()['id']}", json={"mcp_server_names": []}
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["mcp_server_names"] == []
+    assert closed_sessions == [created.json()["id"]]
+    assert client.patch(
+        f"/api/sessions/{created.json()['id']}",
+        json={"mcp_server_names": ["disabled"]},
+    ).status_code == 409
+    assert client.patch(
+        f"/api/sessions/{created.json()['id']}",
+        json={"mcp_server_names": ["missing"]},
+    ).status_code == 409
 
 
 def test_session_model_connection_must_exist_and_be_enabled(client: TestClient) -> None:

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from src.api.mcp import router
 from src.config import settings
 from src.persistence import database
-from src.persistence.database import Base, Run, configure_database, init_db
+from src.persistence.database import Base, Run, Session, configure_database, init_db
 
 
 @pytest.fixture()
@@ -45,6 +45,11 @@ def test_stdio_server_crud_persists_workbench_fields(client: tuple[TestClient, P
         "runtime_status": "inactive",
         "tool_count": 0,
     }
+    with database.SessionLocal() as db:
+        chat_session = Session(mcp_server_names=["docs"])
+        db.add(chat_session)
+        db.commit()
+        session_id = chat_session.id
 
     updated = test_client.put("/api/mcp/servers/docs", json={
         "name": "docs-local",
@@ -54,10 +59,14 @@ def test_stdio_server_crud_persists_workbench_fields(client: tuple[TestClient, P
     })
     assert updated.status_code == 200
     assert updated.json()["name"] == "docs-local"
+    with database.SessionLocal() as db:
+        assert db.get(Session, session_id).mcp_server_names == ["docs-local"]
 
     disabled = test_client.patch("/api/mcp/servers/docs-local", json={"enabled": False})
     assert disabled.status_code == 200
     assert disabled.json()["enabled"] is False
+    with database.SessionLocal() as db:
+        assert db.get(Session, session_id).mcp_server_names == []
     assert test_client.get("/api/mcp/servers").json()[0]["args"] == ["docs-mcp"]
 
     persisted = json.loads(config_file.read_text(encoding="utf-8"))

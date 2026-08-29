@@ -21,6 +21,7 @@ describe('MCP workbench presentation', () => {
 
   it('prioritizes the disabled state over runtime state', () => {
     expect(mcpStatusLabel({ ...server, enabled: false, runtime_status: 'ready' })).toBe('已停用')
+    expect(mcpStatusLabel({ ...server, runtime_status: 'dormant' })).toBe('缓存就绪，等待调用')
     expect(mcpStatusLabel({ ...server, runtime_status: 'ready' })).toBe('已连接')
   })
 })

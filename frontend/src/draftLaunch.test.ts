@@ -12,6 +12,7 @@ describe('临时草稿原子启动', () => {
       model_id: null,
       thinking_level: 'auto',
       skill_ids: [],
+      mcp_server_names: [],
       permission_mode: 'smart',
       use_memories: true,
     })).toEqual({
@@ -20,6 +21,7 @@ describe('临时草稿原子启动', () => {
       content: '分析   当前项目',
       thinking_level: 'auto',
       skill_ids: [],
+      mcp_server_names: [],
       permission_mode: 'smart',
       use_memories: true,
     })
@@ -31,6 +33,7 @@ describe('临时草稿原子启动', () => {
       model_id: 'model-1',
       thinking_level: 'high',
       skill_ids: ['skill-1', 'skill-1', 'skill-2'],
+      mcp_server_names: ['filesystem', 'filesystem', 'github'],
       permission_mode: 'ask',
       use_memories: false,
     })).toEqual({
@@ -42,6 +45,7 @@ describe('临时草稿原子启动', () => {
       model_id: 'model-1',
       thinking_level: 'high',
       skill_ids: ['skill-1', 'skill-2'],
+      mcp_server_names: ['filesystem', 'github'],
       permission_mode: 'ask',
       use_memories: false,
     })

@@ -66,6 +66,19 @@ class McpConfig(BaseModel):
     servers: dict[str, McpServerConfig] = Field(default_factory=dict, alias="mcpServers")
 
 
+def validate_mcp_server_names(config: McpConfig, names: list[str]) -> list[str]:
+    """Return a stable session selection or reject unavailable servers."""
+
+    selected = list(dict.fromkeys(name.strip() for name in names if name.strip()))
+    unavailable = [
+        name for name in selected
+        if name not in config.servers or not config.servers[name].enabled
+    ]
+    if unavailable:
+        raise ValueError(f"MCP servers are missing or disabled: {', '.join(unavailable)}")
+    return selected
+
+
 def _expand_environment(value: object) -> object:
     if isinstance(value, str):
         def replace(match: re.Match[str]) -> str:

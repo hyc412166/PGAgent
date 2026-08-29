@@ -155,6 +155,7 @@ class Session(TimestampMixin, Base):
     thinking_level: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
     permission_mode: Mapped[str] = mapped_column(String(16), default="smart", nullable=False)
     use_memories: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    mcp_server_names: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     context_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
     skill_bindings: Mapped[list["SessionSkill"]] = relationship(

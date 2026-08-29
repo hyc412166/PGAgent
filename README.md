@@ -100,7 +100,9 @@ PGAgent 现在只实现 MCP Client，不把 Agent 自身暴露为 MCP Server。�
 }
 ```
 
-启用 `MCP` 能力的 Agent 会在会话第一次运行时连接 server。发现到的工具以 `mcp__server__tool` 形式直接进入模型工具表，实际调用仍使用原始 `(server, tool)` 身份。`required=true` 的 server 启动失败会阻止运行；可选 server 失败不会移除其他 server。`smart` 权限下，仅声明 `readOnlyHint=true` 的 MCP 工具可直接执行，其余调用进入现有人工审批流程；`ask` 下所有 MCP 调用都要审批。携带自定义 Header 的 HTTP 连接不自动跟随重定向，避免把凭据带到另一来源。会话删除或 PGAgent 关闭时会关闭连接并终止 stdio 子进程。工作台只在仍有 Agent 运行或等待恢复时阻止修改；保存会淘汰空闲连接，新运行直接使用新配置。直接手改 JSON 时建议重启 PGAgent。
+启用 `MCP` 能力后，启动策略由运行身份自动选择：主 Agent 使用 `eager`，在准备运行时连接 server；每个委派 SubAgent 拥有独立 MCP Runtime，并使用 `lazy_when_cached`。SubAgent 没有合格工具目录缓存时仍会连接 server、完成 `initialize` 和 `tools/list`；命中缓存时先保持 `dormant`，由 `McpToolSearch` 查询缓存，直到模型真正调用该 server 的工具才建立连接。缓存最多保存 32 项、有效期 30 分钟；PGAgent 重启、缓存过期、配置/工作区身份变化或缓存为空时会立即连接。`required=true` 的 server 在拥有缓存时也可以休眠，但缓存缺失时启动失败仍会阻止运行。Server 可通过实验能力 `codex/tool-catalog-cache: {"cacheable": false}` 禁止复用目录。
+
+发现到的工具保留原始 `(server, tool)` 路由身份，并生成 `mcp__server__tool` 模型名；具体工具默认延迟暴露，模型最初只看到 `McpToolSearch`，搜索命中的工具才从下一轮开始进入模型工具表。这避免每轮携带整个 MCP schema 目录，同时仍让 Agent loop 把已加载 MCP 工具当作普通 function tool 调用。搜索只读缓存，不会唤醒 server；审批尚未通过时也不会启动连接。若休眠 server 唤醒后发现工具定义与本轮冻结目录不同，本次调用返回 `mcp_catalog_changed`，更新后的目录供新运行使用，不会用旧 schema 静默调用新接口。搜索结果与当前已加载工具写入运行快照，审批、后台等待或恢复后保持一致。`required=true` 的 server 启动失败会阻止运行；可选 server 失败不会移除其他 server。具体 MCP 工具在 `smart` 权限下仅有声明 `readOnlyHint=true` 的调用可直接执行，其余调用进入现有人工审批流程，`ask` 下所有具体 MCP 工具调用都要审批。携带自定义 Header 的 HTTP 连接不自动跟随重定向，避免把凭据带到另一来源。会话删除或 PGAgent 关闭时会关闭连接并终止 stdio 子进程。工作台只在仍有 Agent 运行或等待恢复时阻止修改；保存会淘汰空闲连接，新运行直接使用新配置。直接手改 JSON 时建议重启 PGAgent。
 
 ## 开发与验证
 

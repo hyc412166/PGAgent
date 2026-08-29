@@ -424,6 +424,7 @@ class _SubagentTaskDelegate:
             "tool_ids": list(getattr(child, "tool_ids", []) or []),
             "allowed_tool_names": child_tools,
             "skill_ids": child_skill_ids,
+            "mcp_server_names": list(self.parent_binding.get("mcp_server_names") or []),
             "skill_instructions": skill_instructions,
             "todo_state": [],
             "custom_headers_digest": _configuration_digest(connection.custom_headers or {}),
@@ -442,6 +443,7 @@ class _SubagentTaskDelegate:
             "permission_mode": str(binding.get("permission_mode") or "smart"),
             "allowed_tool_names": list(binding.get("allowed_tool_names") or []),
             "skill_ids": list(binding.get("skill_ids") or []),
+            "mcp_server_names": list(binding.get("mcp_server_names") or []),
             "workspace_mode": str(binding.get("workspace_mode") or "shared"),
             "workspace_inherited": str(binding.get("workspace_mode") or "shared") == "shared",
             "recursive_task_enabled": False,
@@ -765,6 +767,9 @@ class _SubagentTaskDelegate:
             child_registry,
             session_key=str(child_run.session_id or child_run_id),
             workspace_root=str(child_binding["workspace_root"]),
+            agent_kind="subagent",
+            runtime_scope=child_run_id,
+            selected_server_names=child_binding.get("mcp_server_names", []),
             frozen_tools=child_binding.get("mcp_tools"),
         )
         child_runtime = AgentRuntime(

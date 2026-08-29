@@ -54,7 +54,9 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'context_compacted': return '正在准备上下文…'
     case 'model_step_started':
     case 'model_retry': return '思考中…'
-    case 'mcp_connecting': return '正在连接 MCP 服务…'
+    case 'mcp_catalog_loading': return '正在准备 MCP 工具目录…'
+    case 'mcp_connecting': return '正在按需连接 MCP 服务…'
+    case 'mcp_server_ready': return 'MCP 服务已按需连接'
     case 'mcp_ready': return Number(event.tool_count || 0) > 0
       ? `MCP 已就绪（${Number(event.tool_count)} 个工具）`
       : 'MCP 已连接'

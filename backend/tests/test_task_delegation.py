@@ -248,7 +248,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
                 {"task": "must not run", "agent_id": delegated_run["child_id"]},
             )])
         nested_results = [item for item in kwargs["messages"] if item.get("role") == "tool"]
-        assert json.loads(nested_results[-1]["content"])["error_code"] == "tool_not_enabled"
+        assert json.loads(nested_results[-1]["content"])["error_code"] == "tool_not_offered"
         return ModelTurn(content="子 Agent 已完成检查。")
 
     def fake_build_model_call(config):  # type: ignore[no-untyped-def]

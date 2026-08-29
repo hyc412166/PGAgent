@@ -8,7 +8,7 @@ import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Literal, TypeVar
 
 import httpx2
 from mcp import Client
@@ -19,11 +19,13 @@ from src.config import settings
 from src.tools.types import ToolResult
 
 from .config import McpConfig, McpServerConfig, load_mcp_config
+from .tool_catalog_cache import CachedMcpTool, McpToolCatalogCache, ToolCatalogIdentity
 
 
 _INVALID_TOOL_NAME = re.compile(r"[^A-Za-z0-9_-]+")
 _MAX_MODEL_TOOL_NAME = 64
 _ConfigurationResult = TypeVar("_ConfigurationResult")
+McpStartupPolicy = Literal["eager", "lazy_when_cached"]
 
 
 def _model_dump(value: object) -> object:
@@ -84,10 +86,24 @@ class ConnectedMcpServer:
     server_info: dict[str, Any] | None = None
     tools: list[object] = field(default_factory=list)
     call_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    startup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    catalog_identity: ToolCatalogIdentity | None = None
+    cached_tools: tuple[CachedMcpTool, ...] = ()
+    dormant: bool = False
+    catalog_changed: bool = False
+    catalog_cacheable: bool = True
+    ready: bool = False
+    closed: bool = False
     _close_event: asyncio.Event | None = None
     _owner_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
+        if self.closed:
+            raise RuntimeError(f"MCP server {self.name!r} is closed")
+        self.dormant = False
+        self.ready = False
+        self.error = None
+        self.error_kind = None
         ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         close_event = asyncio.Event()
         self._close_event = close_event
@@ -115,6 +131,24 @@ class ConnectedMcpServer:
                 # could interrupt AsyncExitStack.aclose() and leak stdio.
                 await asyncio.gather(task, return_exceptions=True)
             raise
+
+    async def ensure_started(self, accept_catalog: Callable[[], None]) -> None:
+        if self.closed:
+            raise RuntimeError(f"MCP server {self.name!r} is closed")
+        if self.ready:
+            return
+        async with self.startup_lock:
+            if self.closed:
+                raise RuntimeError(f"MCP server {self.name!r} is closed")
+            if self.ready:
+                return
+            await asyncio.wait_for(self.start(), timeout=self.config.startup_timeout_sec)
+            if self.closed:
+                raise RuntimeError(f"MCP server {self.name!r} was closed during startup")
+            if self.client is None:
+                raise RuntimeError(f"MCP server {self.name!r} finished startup without a client")
+            accept_catalog()
+            self.ready = True
 
     async def _run_connection(
         self,
@@ -146,6 +180,12 @@ class ConnectedMcpServer:
             info = client.server_info
             dumped_info = _model_dump(info) if info is not None else None
             self.server_info = dumped_info if isinstance(dumped_info, dict) else None
+            capabilities = getattr(client, "server_capabilities", None)
+            experimental = getattr(capabilities, "experimental", None) or {}
+            cache_capability = experimental.get("codex/tool-catalog-cache", {})
+            self.catalog_cacheable = not (
+                isinstance(cache_capability, dict) and cache_capability.get("cacheable") is False
+            )
             await self.refresh_tools()
             ready.set_result(None)
             await close_event.wait()
@@ -157,6 +197,7 @@ class ConnectedMcpServer:
                 self.error_kind = type(exc).__name__
             raise
         finally:
+            self.ready = False
             self.client = None
             await stack.aclose()
 
@@ -173,22 +214,55 @@ class ConnectedMcpServer:
                 break
         self.tools = [tool for tool in discovered if self.config.allows_tool(str(getattr(tool, "name", "")))]
 
+    def current_catalog(self) -> tuple[CachedMcpTool, ...]:
+        if self.client is None:
+            return self.cached_tools
+        items = [
+            CachedMcpTool(
+                raw_name=str(getattr(tool, "name", "")),
+                description=str(getattr(tool, "description", "") or f"MCP tool {self.name}/{getattr(tool, 'name', '')}"),
+                input_schema=(
+                    dumped if isinstance((dumped := _model_dump(getattr(tool, "input_schema", None))), dict)
+                    else {"type": "object", "properties": {}}
+                ),
+                read_only=bool(getattr(getattr(tool, "annotations", None), "read_only_hint", False)),
+            )
+            for tool in self.tools
+        ]
+        return tuple(sorted(items, key=lambda item: item.raw_name))
+
     async def close(self) -> None:
-        event, self._close_event = self._close_event, None
-        task, self._owner_task = self._owner_task, None
-        if event is not None:
-            event.set()
-        if task is not None:
-            await asyncio.gather(task, return_exceptions=True)
+        self.closed = True
+        async with self.startup_lock:
+            event, self._close_event = self._close_event, None
+            task, self._owner_task = self._owner_task, None
+            if event is not None:
+                event.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+            self.ready = False
+            self.client = None
 
 
 class McpSessionRuntime:
     """Connections and the latest catalog owned by one PGAgent session."""
 
-    def __init__(self, session_key: str, workspace_root: Path, config: McpConfig) -> None:
+    def __init__(
+        self,
+        session_key: str,
+        workspace_root: Path,
+        config: McpConfig,
+        tool_catalog_cache: McpToolCatalogCache | None = None,
+        *,
+        startup_policy: McpStartupPolicy = "eager",
+        runtime_scope: str | None = None,
+    ) -> None:
         self.session_key = session_key
+        self.runtime_scope = runtime_scope or session_key
         self.workspace_root = workspace_root
         self.config = config
+        self.startup_policy = startup_policy
+        self.tool_catalog_cache = tool_catalog_cache if tool_catalog_cache is not None else McpToolCatalogCache()
         self.servers: dict[str, ConnectedMcpServer] = {}
 
     async def start(self) -> None:
@@ -197,59 +271,76 @@ class McpSessionRuntime:
             for name, config in sorted(self.config.servers.items())
             if config.enabled
         ]
-        servers = [ConnectedMcpServer(name, config, self.workspace_root) for name, config in enabled]
+        servers: list[ConnectedMcpServer] = []
+        eager_servers: list[ConnectedMcpServer] = []
+        for name, server_config in enabled:
+            identity = ToolCatalogIdentity.create(name, server_config, self.workspace_root)
+            cached_tools = self.tool_catalog_cache.get(identity)
+            server = ConnectedMcpServer(
+                name,
+                server_config,
+                self.workspace_root,
+                catalog_identity=identity,
+                cached_tools=cached_tools or (),
+            )
+            can_defer = (
+                self.startup_policy == "lazy_when_cached"
+                and bool(cached_tools)
+            )
+            server.dormant = can_defer
+            servers.append(server)
+            if not can_defer:
+                eager_servers.append(server)
         results = await asyncio.gather(
-            *(asyncio.wait_for(server.start(), timeout=server.config.startup_timeout_sec) for server in servers),
+            *(asyncio.wait_for(server.start(), timeout=server.config.startup_timeout_sec) for server in eager_servers),
             return_exceptions=True,
         )
         required_errors: list[str] = []
-        for server, result in zip(servers, results, strict=True):
+        for server in servers:
             self.servers[server.name] = server
+        for server, result in zip(eager_servers, results, strict=True):
             if isinstance(result, BaseException):
                 server.error = str(result) or type(result).__name__
                 server.error_kind = type(result).__name__
                 if server.config.required:
                     required_errors.append(f"{server.name}: {server.error}")
+            else:
+                self._accept_started_server(server, server.cached_tools)
+                server.ready = server.client is not None
         if required_errors:
             await self.close()
             raise RuntimeError("required MCP servers failed to initialize: " + "; ".join(required_errors))
 
-    async def refresh_tools(self, *, reconnect_failed: bool = False) -> list[McpToolBinding]:
-        if reconnect_failed:
-            for name, server in list(self.servers.items()):
-                if server.client is not None:
-                    continue
-                replacement = ConnectedMcpServer(name, server.config, self.workspace_root)
-                try:
-                    await asyncio.wait_for(replacement.start(), timeout=replacement.config.startup_timeout_sec)
-                except BaseException as exc:
-                    replacement.error = str(exc) or type(exc).__name__
-                    replacement.error_kind = type(exc).__name__
-                    if replacement.config.required:
-                        raise RuntimeError(
-                            f"required MCP server {name!r} could not reconnect: {replacement.error}"
-                        ) from exc
-                self.servers[name] = replacement
+    def _publish_server_catalog(self, server: ConnectedMcpServer) -> None:
+        catalog = server.current_catalog()
+        server.cached_tools = catalog
+        if server.catalog_identity is not None:
+            if server.catalog_cacheable:
+                self.tool_catalog_cache.put(server.catalog_identity, catalog)
+            else:
+                self.tool_catalog_cache.remove(server.catalog_identity)
+
+    def _accept_started_server(
+        self,
+        server: ConnectedMcpServer,
+        previous_catalog: tuple[CachedMcpTool, ...],
+    ) -> None:
+        live_catalog = server.current_catalog()
+        server.error = None
+        server.error_kind = None
+        server.catalog_changed = bool(previous_catalog) and live_catalog != previous_catalog
+        self._publish_server_catalog(server)
+
+    def bindings(self) -> list[McpToolBinding]:
+        candidates: list[tuple[ConnectedMcpServer, CachedMcpTool]] = []
         for server in self.servers.values():
-            if server.client is not None:
-                try:
-                    await asyncio.wait_for(server.refresh_tools(), timeout=server.config.startup_timeout_sec)
-                    server.error = None
-                    server.error_kind = None
-                except Exception as exc:
-                    server.error = str(exc) or type(exc).__name__
-                    server.error_kind = type(exc).__name__
-                    if server.config.required:
-                        raise RuntimeError(f"required MCP server {server.name!r} could not refresh: {server.error}") from exc
-        candidates: list[tuple[ConnectedMcpServer, object]] = []
-        for server in self.servers.values():
-            candidates.extend((server, tool) for tool in server.tools)
-        candidates.sort(key=lambda item: (item[0].name, str(getattr(item[1], "name", ""))))
+            candidates.extend((server, tool) for tool in server.current_catalog())
+        candidates.sort(key=lambda item: (item[0].name, item[1].raw_name))
 
         used_names: set[str] = set()
         bindings: list[McpToolBinding] = []
         for server, tool in candidates:
-            raw_name = str(getattr(tool, "name", ""))
+            raw_name = tool.raw_name
             server_part = _sanitize_tool_part(server.name, "server")
             tool_part = _sanitize_tool_part(raw_name, "tool")
             base = f"mcp__{server_part}__{tool_part}"[:_MAX_MODEL_TOOL_NAME]
@@ -260,26 +351,80 @@ class McpSessionRuntime:
                 model_name = base[: _MAX_MODEL_TOOL_NAME - len(marker)] + marker
                 suffix += 1
             used_names.add(model_name)
-            schema = _model_dump(getattr(tool, "input_schema", None))
-            if not isinstance(schema, dict):
-                schema = {"type": "object", "properties": {}}
-            annotations = getattr(tool, "annotations", None)
-            read_only = bool(getattr(annotations, "read_only_hint", False))
             bindings.append(McpToolBinding(
                 server_name=server.name,
                 raw_name=raw_name,
                 model_name=model_name,
-                description=str(getattr(tool, "description", "") or f"MCP tool {server.name}/{raw_name}"),
-                input_schema=schema,
-                read_only=read_only,
-                supports_parallel=server.config.supports_parallel_tool_calls and read_only,
+                description=tool.description,
+                input_schema=tool.input_schema,
+                read_only=tool.read_only,
+                supports_parallel=server.config.supports_parallel_tool_calls and tool.read_only,
             ))
         return bindings
 
-    async def call_tool(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
+    async def refresh_tools(self, *, reconnect_failed: bool = False) -> list[McpToolBinding]:
+        """Return the current catalog, retrying failed clients without refreshing ready ones."""
+
+        if reconnect_failed:
+            for server in self.servers.values():
+                if server.ready or server.dormant:
+                    continue
+                previous_catalog = server.cached_tools
+                try:
+                    await server.ensure_started(
+                        lambda server=server, previous_catalog=previous_catalog: self._accept_started_server(
+                            server,
+                            previous_catalog,
+                        )
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    server.error = str(exc) or type(exc).__name__
+                    server.error_kind = type(exc).__name__
+                    if server.config.required:
+                        raise RuntimeError(
+                            f"required MCP server {server.name!r} could not reconnect: {server.error}"
+                        ) from exc
+        return self.bindings()
+
+    async def ensure_server_started(self, server_name: str) -> ConnectedMcpServer | None:
         server = self.servers.get(server_name)
-        if server is None or server.client is None:
-            return ToolResult(tool_name, False, f"MCP server {server_name!r} is not connected", error_code="mcp_not_connected")
+        if server is None:
+            return None
+        if server.ready and not server.closed:
+            return server
+        previous_catalog = server.cached_tools
+        try:
+            await server.ensure_started(
+                lambda: self._accept_started_server(server, previous_catalog)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            server.error = str(exc) or type(exc).__name__
+            server.error_kind = type(exc).__name__
+            return server
+        return server
+
+    def accept_current_catalog(self) -> None:
+        """A new run may use the refreshed live catalog after an old snapshot was rejected."""
+
+        for server in self.servers.values():
+            server.catalog_changed = False
+
+    async def call_tool(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
+        server = await self.ensure_server_started(server_name)
+        if server is None or server.client is None or not server.ready or server.closed:
+            detail = f": {server.error}" if server is not None and server.error else ""
+            return ToolResult(tool_name, False, f"MCP server {server_name!r} could not start{detail}", error_code="mcp_not_connected")
+        if server.catalog_changed:
+            return ToolResult(
+                tool_name,
+                False,
+                "MCP tool catalog changed while waking the server; start a new run to use the refreshed definitions",
+                error_code="mcp_catalog_changed",
+            )
         if not server.config.allows_tool(tool_name):
             return ToolResult(tool_name, False, f"MCP tool {server_name}/{tool_name} is disabled", error_code="mcp_tool_disabled")
         try:
@@ -314,12 +459,13 @@ class McpSessionRuntime:
         )
 
     async def list_resources(self, server_name: str | None = None) -> ToolResult:
-        selected = [self.servers[server_name]] if server_name in self.servers else (
-            list(self.servers.values()) if server_name is None else []
+        names = [server_name] if server_name in self.servers else (
+            list(self.servers) if server_name is None else []
         )
+        selected = [server for name in names if (server := await self.ensure_server_started(str(name))) is not None]
         resources: list[dict[str, Any]] = []
         for server in selected:
-            if server.client is None:
+            if server.client is None or not server.ready or server.closed:
                 continue
             cursor: str | None = None
             while True:
@@ -335,8 +481,8 @@ class McpSessionRuntime:
     async def read_resource(self, uri: str, server_name: str | None = None) -> ToolResult:
         if not server_name:
             return ToolResult("ReadMcpResource", False, "server is required for a live MCP resource", error_code="invalid_arguments")
-        server = self.servers.get(server_name)
-        if server is None or server.client is None:
+        server = await self.ensure_server_started(server_name)
+        if server is None or server.client is None or not server.ready or server.closed:
             return ToolResult("ReadMcpResource", False, f"MCP server {server_name!r} is not connected", error_code="mcp_not_connected")
         try:
             result = await asyncio.wait_for(server.client.read_resource(uri), timeout=server.config.tool_timeout_sec)
@@ -348,20 +494,28 @@ class McpSessionRuntime:
     def status(self) -> dict[str, Any]:
         return {
             "session_key": self.session_key,
+            "runtime_scope": self.runtime_scope,
+            "startup_policy": self.startup_policy,
             "servers": [
                 {
                     "name": server.name,
                     "transport": server.config.transport,
                     "required": server.config.required,
                     "status": (
-                        "failed" if server.client is None
+                        "dormant" if server.dormant
+                        else "failed" if server.client is None or not server.ready or server.closed
                         else "degraded" if server.error
                         else "ready"
                     ),
                     "error_code": server.error_kind,
                     "protocol_version": server.protocol_version,
                     "server_info": _public_server_info(server.server_info),
-                    "tool_count": len(server.tools),
+                    "tool_count": len(server.current_catalog()),
+                    "catalog_source": (
+                        "live" if server.ready
+                        else "cache" if server.cached_tools
+                        else "unavailable"
+                    ),
                 }
                 for server in self.servers.values()
             ],
@@ -384,20 +538,45 @@ class McpRuntimePool:
     """Application owner for session-scoped MCP runtimes."""
 
     def __init__(self) -> None:
-        self._runtimes: dict[tuple[str, str], McpSessionRuntime] = {}
-        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._runtimes: dict[tuple[str, str, str, McpStartupPolicy, tuple[str, ...] | None], McpSessionRuntime] = {}
+        self._locks: dict[tuple[str, str, str, McpStartupPolicy, tuple[str, ...] | None], asyncio.Lock] = {}
         self._configuration_lock = asyncio.Lock()
         self._configuration_generation = 0
+        self.tool_catalog_cache = McpToolCatalogCache()
 
-    async def get(self, session_key: str, workspace_root: str) -> McpSessionRuntime | None:
-        runtime, _created = await self.acquire(session_key, workspace_root)
+    async def get(
+        self,
+        session_key: str,
+        workspace_root: str,
+        *,
+        runtime_scope: str | None = None,
+        startup_policy: McpStartupPolicy = "eager",
+        selected_server_names: tuple[str, ...] | None = None,
+    ) -> McpSessionRuntime | None:
+        runtime, _created = await self.acquire(
+            session_key,
+            workspace_root,
+            runtime_scope=runtime_scope,
+            startup_policy=startup_policy,
+            selected_server_names=selected_server_names,
+        )
         return runtime
 
-    async def acquire(self, session_key: str, workspace_root: str) -> tuple[McpSessionRuntime | None, bool]:
+    async def acquire(
+        self,
+        session_key: str,
+        workspace_root: str,
+        *,
+        runtime_scope: str | None = None,
+        startup_policy: McpStartupPolicy = "eager",
+        selected_server_names: tuple[str, ...] | None = None,
+    ) -> tuple[McpSessionRuntime | None, bool]:
         """Return a session runtime and whether this call performed its initial startup."""
 
         resolved_root = str(Path(workspace_root).resolve())
-        runtime_key = (session_key, resolved_root)
+        resolved_scope = runtime_scope or session_key
+        selection = tuple(dict.fromkeys(selected_server_names)) if selected_server_names is not None else None
+        runtime_key = (session_key, resolved_scope, resolved_root, startup_policy, selection)
         lock = self._locks.setdefault(runtime_key, asyncio.Lock())
         async with lock:
             while True:
@@ -406,10 +585,23 @@ class McpRuntimePool:
                     if current is not None:
                         return current, False
                     config = load_mcp_config(settings.mcp_config_file)
+                    if selection is not None:
+                        config = McpConfig(servers={
+                            name: config.servers[name]
+                            for name in selection
+                            if name in config.servers
+                        })
                     if not any(server.enabled for server in config.servers.values()):
                         return None, False
                     generation = self._configuration_generation
-                runtime = McpSessionRuntime(session_key, Path(resolved_root), config)
+                runtime = McpSessionRuntime(
+                    session_key,
+                    Path(resolved_root),
+                    config,
+                    self.tool_catalog_cache,
+                    startup_policy=startup_policy,
+                    runtime_scope=resolved_scope,
+                )
                 try:
                     await runtime.start()
                 except Exception:

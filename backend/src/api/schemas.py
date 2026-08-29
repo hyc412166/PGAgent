@@ -214,6 +214,7 @@ class SessionCreate(BaseModel):
     permission_mode: PermissionMode = "smart"
     use_memories: bool = True
     skill_ids: list[str] = Field(default_factory=list, max_length=128)
+    mcp_server_names: list[str] = Field(default_factory=list, max_length=128)
 
 
 class SessionUpdate(BaseModel):
@@ -226,6 +227,7 @@ class SessionUpdate(BaseModel):
     permission_mode: PermissionMode | None = None
     use_memories: bool | None = None
     skill_ids: list[str] | None = Field(default=None, max_length=128)
+    mcp_server_names: list[str] | None = Field(default=None, max_length=128)
     status: str | None = None
 
 
@@ -240,6 +242,7 @@ class SessionRead(ORMModel):
     permission_mode: str
     use_memories: bool
     skill_ids: list[str]
+    mcp_server_names: list[str]
     context_tokens: int
     status: str
     created_at: datetime
@@ -375,6 +378,7 @@ class DraftLaunchRequest(BaseModel):
     permission_mode: PermissionMode = "smart"
     use_memories: bool = True
     skill_ids: list[str] = Field(default_factory=list, max_length=128)
+    mcp_server_names: list[str] = Field(default_factory=list, max_length=128)
 
     @field_validator("idempotency_key", "title", "content")
     @classmethod

@@ -126,13 +126,13 @@ function McpPage() {
       <PageHeader
         eyebrow="工具接入舱"
         title="MCP"
-        description="连接本地 MCP 服务器，让 Agent 在会话中发现并调用它们提供的工具。"
+        description="管理 MCP 服务器；Agent 优先读取缓存目录，只在真正调用工具时按需连接。"
         action={<button className="button button-primary" type="button" disabled={mutationsBusy || servers.loading || Boolean(servers.error)} onClick={() => openPanel()}><Plus size={16} />添加服务器</button>}
       />
 
       <section className="mcp-overview" aria-label="MCP 服务器概览">
         <div className="mcp-overview-mark" aria-hidden="true"><Cable size={21} /></div>
-        <div><strong>{servers.data.length} 个服务器</strong><span>{servers.data.filter((server) => server.enabled).length} 个将在新会话中启用</span></div>
+        <div><strong>{servers.data.length} 个服务器</strong><span>{servers.data.filter((server) => server.enabled).length} 个可供新运行按需调用</span></div>
         <label className="mcp-search"><Search size={15} aria-hidden="true" /><span className="sr-only">搜索 MCP 服务器</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称、命令或参数" /></label>
       </section>
 
@@ -154,14 +154,14 @@ function McpPage() {
                   </div>
                 </header>
                 <div className="mcp-command-line"><Command size={14} aria-hidden="true" /><code>{server.command || '远程 MCP 服务器'}{server.args.length ? ` ${server.args.join(' ')}` : ''}</code></div>
-                <footer><span>{server.args.length} 个参数</span><span>{server.tool_count ? `${server.tool_count} 个工具` : '工具将在连接后发现'}</span></footer>
+                <footer><span>{server.args.length} 个参数</span><span>{server.tool_count ? `${server.tool_count} 个工具` : '首次冷连接后发现工具'}</span></footer>
                 {deleting && <div className="mcp-delete-confirm" role="alertdialog" aria-label={`确认删除 ${server.name}`} aria-describedby={`mcp-delete-description-${encodeURIComponent(server.name)}`}><AlertCircle size={16} /><span id={`mcp-delete-description-${encodeURIComponent(server.name)}`}>删除后，新会话将无法使用这个服务器。</span><button type="button" className="button button-quiet" disabled={busy} onClick={() => cancelDelete(server.name)}>取消</button><button ref={deleteConfirmButtonRef} type="button" className="button button-danger" disabled={busy} onClick={() => void deleteServer(server)}>{busy && <LoaderCircle className="spin" size={14} />}确认删除</button></div>}
                 {rowErrors[server.name] && <p className="inline-error" role="alert"><AlertCircle size={14} />{rowErrors[server.name]}</p>}
               </div>
             </article>
           })}
         </section>
-      ) : query ? <EmptyState icon={Search} title="没有匹配的服务器" description="换一个名称、命令或参数再试试。" /> : <EmptyState icon={Cable} title="连接第一个 MCP 服务器" description="只需填写名称、启动命令和参数，PGAgent 会在会话开始时自动发现工具。" action={<button className="button button-primary" type="button" onClick={() => openPanel()}><CirclePlus size={16} />添加服务器</button>} />}
+      ) : query ? <EmptyState icon={Search} title="没有匹配的服务器" description="换一个名称、命令或参数再试试。" /> : <EmptyState icon={Cable} title="连接第一个 MCP 服务器" description="只需填写名称、启动命令和参数；首次运行发现工具，之后有缓存时按需连接。" action={<button className="button button-primary" type="button" onClick={() => openPanel()}><CirclePlus size={16} />添加服务器</button>} />}
 
       {panelOpen && <SlidePanel title={editing ? '编辑 MCP 服务器' : '连接至自定义 MCP'} description="当前支持 STDIO。本地命令会由 PGAgent 启动，并通过标准输入输出交换 MCP 消息。" onClose={closePanel}>
         <form key={editing?.name ?? 'new-mcp-server'} className="panel-form mcp-server-form" onSubmit={saveServer} autoComplete="off">
@@ -171,7 +171,7 @@ function McpPage() {
             <div className="mcp-field-heading"><div><strong>参数</strong><small>每个参数单独一行，并按这里的顺序传给启动命令</small></div><button type="button" className="button button-quiet" onClick={() => setArgs((current) => [...current, ''])}><Plus size={14} />添加参数</button></div>
             {args.length ? <div className="mcp-argument-list">{args.map((argument, index) => <div className="mcp-argument-row" key={index}><span aria-hidden="true">{index + 1}</span><input aria-label={`参数 ${index + 1}`} value={argument} placeholder={index === 0 ? '例如：-y' : '输入参数'} spellCheck={false} onChange={(event) => setArgs((current) => current.map((item, itemIndex) => itemIndex === index ? event.target.value : item))} /><button type="button" className="icon-button" aria-label={`删除参数 ${index + 1}`} onClick={() => setArgs((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={15} /></button></div>)}</div> : <button type="button" className="mcp-arguments-empty" onClick={() => setArgs([''])}><Plus size={15} />这个服务器还没有启动参数</button>}
           </div>
-          <div className="mcp-form-enabled"><div><strong>启用服务器</strong><small>启用后，新会话会自动连接并加载工具</small></div><ToggleSwitch checked={enabled} label="启用 MCP 服务器" onChange={setEnabled} /></div>
+          <div className="mcp-form-enabled"><div><strong>启用服务器</strong><small>启用后，新运行会读取工具目录，并在实际调用时按需连接</small></div><ToggleSwitch checked={enabled} label="启用 MCP 服务器" onChange={setEnabled} /></div>
           {formError && <p className="form-error" role="alert">{formError}</p>}
           <div className="form-actions"><button type="button" className="button button-secondary" disabled={saving} onClick={closePanel}>取消</button><button type="submit" className="button button-primary" disabled={saving}>{saving && <LoaderCircle className="spin" size={15} />}{editing ? '保存修改' : '添加服务器'}</button></div>
         </form>
