@@ -6,20 +6,27 @@ and dynamic-preamble design.
 
 ## Invariants
 
-1. Provider-visible history is append-only between full compactions. A message
-   that the model has seen is never edited, shortened, moved, or deduplicated.
+1. Provider-visible history is append-only between context-budget operations.
+   Ordinary turns never edit, move, or deduplicate prior messages. The bounded
+   tool-result pass described below may replace only old `tool` message content
+   with an immutable artifact preview; full compaction may replace an old
+   conversation prefix.
 2. The system prefix and tool schemas have deterministic content and order.
    Prompt-cache keys identify only that stable namespace; conversation state is
    never hashed into the key.
 3. The latest ordinary user message is the active request. No task anchor is
    inserted during an uncompacted conversation.
-4. Large tool output is persisted before its first provider exposure. The model
-   sees an immutable preview plus an artifact reference from the beginning and
-   can page through the full current-session payload with `read_artifact`.
+4. Tool output remains verbatim while aggregate provider-visible tool-result
+   content is at most 300,000 characters. Before every model turn, once that
+   aggregate exceeds 300,000 characters, raw results are sorted largest-first
+   and persisted until the replacement aggregate is at most 150,000 characters.
+   Each replacement contains an approximately 2,000-character preview plus an
+   artifact reference, and the model can page through the full current-session
+   payload with `read_artifact`.
 5. Tool calls and all of their results form one atomic protocol group.
-6. Full compaction is the only operation allowed to replace seen history. It
-   saves the full transcript, creates one continuation message, and keeps a
-   recent verbatim tail without splitting a tool group.
+6. Full compaction is the only operation allowed to replace a conversation
+   prefix. It saves the full transcript, creates one continuation message, and
+   keeps a recent verbatim tail without splitting a tool group.
 7. A continuation message is one fixed nine-section checkpoint. The exact
    active request and canonical `DurableTask`/`PlanStep` state are merged into
    those sections; they are not emitted as separate task-anchor or todo tags.
@@ -111,12 +118,45 @@ assistant tool-call batch is never split from any of its tool results.
    read-only tools. Adding its schema causes the expected one-time stable tool
    cache namespace change.
 
+## Tool-result character budget
+
+1. The pass runs before threshold or provider-overflow full compaction is
+   considered for each model turn. Full nine-section compaction always keeps
+   its existing token threshold, provider-overflow, and explicit-request
+   triggers; exhaustion of the tool-result pass does not force it.
+2. The pass sums only provider `role=tool` content. At or below 300,000
+   characters it returns the existing message list unchanged and creates no
+   artifact.
+3. Above 300,000 characters, unexternalized tool results are ordered by content
+   length descending, excluding the two most recent tool results. Each older
+   result whose complete preview wrapper is genuinely shorter is
+   content-addressed in the session artifact store and replaced without
+   changing its role, call id, name, or protocol position. Processing stops as
+   soon as total tool-result content is at most 150,000 characters.
+4. Every selected result retains up to 2,000 preview characters plus its
+   artifact id. PGAgent does not shorten that preview further. Results too small
+   for the wrapper to reduce aggregate size remain verbatim and create no
+   artifact.
+5. Already externalized previews are not shortened or nested into another
+   artifact. If all effective raw-result replacements are exhausted while the
+   aggregate remains above 150,000 characters, the runtime passes that provider
+   view through unchanged. The append-only `ChatMessage` transcript remains the
+   durable raw source used to rebuild later provider views, and the independent
+   90,000-token context threshold will trigger nine-section compaction when
+   reached.
+6. The two most recent tool results always remain verbatim so the next model
+   turn retains its freshest observations. They still count toward both the
+   300,000-character trigger and the 150,000-character target. If those
+   protected results make the target unreachable, rule 5 passes the maximally
+   externalized view to the normal context-threshold logic.
+
 ## Cache contract
 
 The cache namespace changes only when stable system instructions, workspace
 rules, permission rules, enabled tool schemas, or selected Skill catalog change.
-Todo updates, memory index publications, user messages, tool results, and compaction summaries do
-not change the namespace. They extend or replace only the dynamic suffix.
+Todo updates, memory index publications, user messages, tool results, artifact
+previews, and compaction summaries do not change the namespace. They extend or
+replace only the dynamic suffix.
 
 The compaction request uses the same stable cache namespace and original system
 prefix. Its old conversation diverges only after that stable prefix; replacing

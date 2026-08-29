@@ -481,6 +481,119 @@ async def test_threshold_full_compaction_builds_exact_continuation(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_aggregate_tool_results_are_budgeted_before_nine_section_compaction(tmp_path) -> None:
+    calls: list[str] = []
+    provider_messages: list[dict] = []
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(kwargs.get("mode") or "auto"))
+        if kwargs.get("mode") == "auto":
+            provider_messages.extend(kwargs["messages"])
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+        context_manager=ContextManager(max_tokens=1_000_000),
+        context_assembler=ContextAssembler(
+            max_tokens=1_000_000,
+            compaction_threshold_tokens=150_000,
+            output_reserve_tokens=0,
+            safety_buffer_tokens=0,
+        ),
+    )
+    outcome = await runtime.run(
+        system_prompt="stable rules",
+        recent_messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "large-1", "function": {"name": "read", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "large-1", "name": "read", "content": "a" * 200_000},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "large-2", "function": {"name": "read", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "large-2", "name": "read", "content": "b" * 110_001},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "recent-1", "function": {"name": "read", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "recent-1", "name": "read", "content": "recent-one"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "recent-2", "function": {"name": "read", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "recent-2", "name": "read", "content": "recent-two"},
+            {"role": "user", "content": "continue"},
+        ],
+    )
+
+    assert outcome.status == "completed"
+    assert calls == ["auto"]
+    tool_results = [item for item in provider_messages if item.get("role") == "tool"]
+    assert sum(len(str(item.get("content") or "")) for item in tool_results) <= 150_000
+    assert str(tool_results[0]["content"]).startswith("<persisted-tool-output>")
+    assert tool_results[1]["content"] == "b" * 110_001
+    assert [item["content"] for item in tool_results[-2:]] == ["recent-one", "recent-two"]
+    assert len(outcome.artifact_refs) == 1
+
+
+@pytest.mark.asyncio
+async def test_exhausted_tool_result_budget_passes_to_normal_threshold_logic(tmp_path) -> None:
+    calls: list[str] = []
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        mode = str(kwargs.get("mode") or "auto")
+        calls.append(mode)
+        if mode == "compaction":
+            return ModelTurn(content="\n".join(
+                f"## {index}. {title}\nPreserved fact {index}."
+                for index, title in enumerate(COMPACTION_SECTION_TITLES, start=1)
+            ))
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+        context_manager=ContextManager(max_tokens=1_000_000),
+        context_assembler=ContextAssembler(
+            max_tokens=1_000_000,
+            compaction_threshold_tokens=900_000,
+            output_reserve_tokens=0,
+            safety_buffer_tokens=0,
+        ),
+    )
+    messages: list[dict] = [{"role": "user", "content": "continue"}]
+    for index in range(76):
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": f"medium-{index}", "function": {"name": "read", "arguments": "{}"}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": f"medium-{index}",
+                "name": "read",
+                "content": "x" * 4_000,
+            },
+        ])
+
+    outcome = await runtime.run(system_prompt="stable rules", recent_messages=messages)
+
+    assert outcome.status == "completed"
+    assert calls == ["auto"]
+    finished = [event for event in outcome.events if event.get("type") == "context_compaction_finished"]
+    assert finished == []
+    assert {ref["kind"] for ref in outcome.artifact_refs} == {"tool_output"}
+
+
+@pytest.mark.asyncio
 async def test_task_checkpoint_failure_keeps_original_messages_instead_of_degraded_compaction(tmp_path) -> None:
     modes: list[str] = []
 
