@@ -85,23 +85,65 @@ from src.api.routes.shared import (
     _workspace_name_from_root,
 )
 
+
+def _run_read(
+    run: Run,
+    *,
+    session_titles: dict[str, str] | None = None,
+    agent_names: dict[str, str] | None = None,
+    db: Session | None = None,
+) -> RunRead:
+    if session_titles is None:
+        session = db.get(ChatSession, run.session_id) if db is not None and run.session_id else None
+        session_title = session.title if session is not None else None
+    else:
+        session_title = session_titles.get(run.session_id or "")
+    if agent_names is None:
+        agent = db.get(Agent, run.agent_id) if db is not None and run.agent_id else None
+        agent_name = agent.name if agent is not None else None
+    else:
+        agent_name = agent_names.get(run.agent_id or "")
+    return RunRead.model_validate(run).model_copy(update={
+        "session_title": session_title,
+        "agent_name": agent_name,
+    })
+
+
+def _message_excerpt(content: str, limit: int = 180) -> str:
+    normalized = " ".join(content.replace("\x00", "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1].rstrip() + "…"
+
 @router.get("/runs", response_model=list[RunRead])
 def list_runs(
     session_id: str | None = None,
     run_status: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
-) -> list[Run]:
+) -> list[RunRead]:
     query = select(Run)
     if session_id:
         query = query.where(Run.session_id == session_id)
     if run_status:
         query = query.where(Run.status == run_status)
-    return list(db.scalars(query.order_by(Run.started_at.desc()).limit(limit)))
+    runs = list(db.scalars(query.order_by(Run.started_at.desc()).limit(limit)))
+    session_ids = {run.session_id for run in runs if run.session_id}
+    agent_ids = {run.agent_id for run in runs if run.agent_id}
+    session_titles = dict(db.execute(
+        select(ChatSession.id, ChatSession.title).where(ChatSession.id.in_(session_ids))
+    ).all()) if session_ids else {}
+    agent_names = dict(db.execute(
+        select(Agent.id, Agent.name).where(Agent.id.in_(agent_ids))
+    ).all()) if agent_ids else {}
+    return [
+        _run_read(run, session_titles=session_titles, agent_names=agent_names)
+        for run in runs
+    ]
 
 
 @router.post("/runs", response_model=RunRead, status_code=status.HTTP_201_CREATED)
-def create_run(payload: RunCreate, db: Session = Depends(get_db)) -> Run:
+def create_run(payload: RunCreate, db: Session = Depends(get_db)) -> RunRead:
     data = payload.model_dump()
     if data.get("session_id"):
         chat_session = _require(db, ChatSession, data["session_id"], "Session")
@@ -111,30 +153,47 @@ def create_run(payload: RunCreate, db: Session = Depends(get_db)) -> Run:
     db.add(item)
     _commit(db)
     db.refresh(item)
-    return item
+    return _run_read(item, db=db)
 
 
 @router.get("/runs/{run_id}", response_model=RunRead)
-def get_run(run_id: str, db: Session = Depends(get_db)) -> Run:
-    return _require(db, Run, run_id, "Run")
+def get_run(run_id: str, db: Session = Depends(get_db)) -> RunRead:
+    return _run_read(_require(db, Run, run_id, "Run"), db=db)
 
 
 @router.patch("/runs/{run_id}", response_model=RunRead)
-def update_run(run_id: str, payload: RunUpdate, db: Session = Depends(get_db)) -> Run:
+def update_run(run_id: str, payload: RunUpdate, db: Session = Depends(get_db)) -> RunRead:
     item = _require(db, Run, run_id, "Run")
     _apply(item, payload)
     _commit(db)
     db.refresh(item)
-    return item
+    return _run_read(item, db=db)
 
 
 @router.get("/runs/{run_id}/events", response_model=list[RunEventRead])
 def list_run_events(run_id: str, db: Session = Depends(get_db)) -> list[RunEventRead]:
-    _require(db, Run, run_id, "Run")
+    run = _require(db, Run, run_id, "Run")
+    user_message = db.scalar(
+        select(ChatMessage.content)
+        .where(ChatMessage.turn_id == run.turn_id, ChatMessage.role == "user")
+        .order_by(ChatMessage.sequence.asc(), ChatMessage.created_at.asc())
+        .limit(1)
+    ) if run.turn_id else None
+    message_excerpt = _message_excerpt(user_message) if user_message else None
     events = list(
         db.scalars(select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.created_at.asc()))
     )
-    return [public for event in events if (public := _public_run_event(event)) is not None]
+    public_events: list[RunEventRead] = []
+    for event in events:
+        public = _public_run_event(event)
+        if public is None:
+            continue
+        if message_excerpt and public.event_type in {"context_prepared", "context_resumed"}:
+            public = public.model_copy(update={
+                "payload": {**public.payload, "message_excerpt": message_excerpt},
+            })
+        public_events.append(public)
+    return public_events
 
 
 @router.post(

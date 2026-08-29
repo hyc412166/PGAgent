@@ -23,6 +23,7 @@ export const runStreamEventNames = [
   'run_state', 'run_received', 'context_prepared', 'context_resumed', 'context_compacted',
   'context_compaction_started', 'context_compaction_finished', 'context_compaction_failed',
   'model_step_started', 'model_retry', 'progress', 'agent_progress', 'thought_summary',
+  'mcp_connecting', 'mcp_ready', 'mcp_degraded',
   'thought_delta', 'activity_update', 'assistant_delta', 'tool_started', 'tool_call',
   'tool_finished', 'tool_result', 'completion_verification_started',
   'completion_verification_rejected', 'completion_verification_passed', 'approval_requested',

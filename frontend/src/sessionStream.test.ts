@@ -94,6 +94,13 @@ describe('会话 SSE 事件', () => {
     expect(shouldRefreshConversationAfterApprovalDecision('approve')).toBe(false)
   })
 
+  it('shows MCP startup before the first model thought', () => {
+    expect(runStreamPhase({ type: 'mcp_connecting' })).toBe('正在连接 MCP 服务…')
+    expect(runStreamPhase({ type: 'mcp_ready', tool_count: 24 })).toBe('MCP 已就绪（24 个工具）')
+    expect(runStreamPhase({ type: 'mcp_degraded', tool_count: 12 })).toBe('部分 MCP 服务不可用，本轮继续使用已连接工具')
+    expect(runStreamPhase({ type: 'mcp_degraded' })).toBe('部分 MCP 服务不可用，本轮继续使用已连接工具')
+  })
+
   it('历史会话必须等消息和思考记录完成装载后才启动到底部的平滑滚动', () => {
     expect(shouldStartHistoryScroll(true, false, true)).toBe(false)
     expect(shouldStartHistoryScroll(true, true, false)).toBe(true)

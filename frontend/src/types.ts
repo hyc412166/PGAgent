@@ -6,6 +6,16 @@ export interface Health {
   version?: string
 }
 
+export interface McpServer {
+  name: string
+  command: string
+  args: string[]
+  enabled: boolean
+  transport: 'stdio' | 'streamable_http'
+  runtime_status: 'inactive' | 'ready' | 'degraded' | 'failed'
+  tool_count: number
+}
+
 export interface Workspace {
   id: string
   name: string
@@ -258,6 +268,7 @@ export interface Message {
 
 export interface RunEvent {
   id?: string
+  step?: number
   type?: string
   event_type?: string
   phase?: string
@@ -276,6 +287,7 @@ export interface Run {
   run_kind?: 'initial' | 'continuation' | 'recovery'
   resumed_from_run_id?: string
   agent_name?: string
+  session_title?: string
   title?: string
   status?: string
   phase?: string

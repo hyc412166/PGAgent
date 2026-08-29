@@ -60,6 +60,7 @@ API Key 不写入 SQLite，保存到 Windows Credential Manager；数据库只�
 - `data/pgagent.db`：工作区、Agent、会话、消息、运行、事件、审批、记忆、模型连接、Token 用量以及子 Agent 委派记录。
 - `data/workspaces/default/`：一次性任务的默认工作区；也可以在会话页项目区或草稿输入框中通过原生目录窗口选择其他本地目录。
 - `data/skills/{slug}/`：通过 API 导入并由 PGAgent 管理的 Skill 文件副本。原始本地目录不会被修改；GitHub/skills.sh 来源必须先预览文件清单，再以 `confirm=true` 明确复制。
+- `data/mcp.json`：应用级 MCP server 配置；示例见 `data/mcp.example.json`。配置文件不存在时 MCP 保持关闭。
 
 工具执行前会解析真实路径并检查它仍位于所选工作区；Windows Junction 和符号链接不能用来逃逸工作区。`bash`/兼容的 `run_command` 仍以当前 Windows 用户权限运行，但只接受裸 allowlist 可执行文件且不会通过 shell 解析；即使在 `full` 模式也不会取消这些基础限制。
 
@@ -72,6 +73,34 @@ API Key 不写入 SQLite，保存到 Windows Credential Manager；数据库只�
 - 本地启动会通过已登录且已关联项目的 Vercel CLI 刷新短期 OIDC token；运行中若 skills.sh 返回 401，后端会刷新一次并重试。刷新失败不会阻止 PGAgent 的其他本地功能启动。
 - `POST /api/skills/market/install`：传入 `market_id` 或受限的公开 GitHub 仓库/ZIP `source_url`。默认只返回候选 Skill 与文件预览；再次携带 `confirm=true` 才会复制，不执行任何 Skill 脚本。
 - `AgentCreate/AgentUpdate` 支持 `tool_ids`、`skill_ids`；`SessionCreate/SessionUpdate` 支持 `permission_mode`、`skill_ids`。相应 Read 响应始终返回这些字段。固定 PGAgent 主控展示全套内置工具，不能修改或删除。
+- `GET /api/mcp`：只读查看已配置 server 和当前会话连接状态，不返回 command 参数、HTTP Header 或环境变量值。
+- `GET/POST/PUT/PATCH/DELETE /api/mcp/servers`：供工作台管理 MCP 名称、STDIO 启动命令、参数与启用状态；流式 HTTP 的高级字段仍由 JSON 配置维护。
+
+## 外部 MCP server 配置
+
+PGAgent 现在只实现 MCP Client，不把 Agent 自身暴露为 MCP Server。客户端支持本地 stdio 子进程和远端 Streamable HTTP。常用的 STDIO server 可直接在工作台的 **MCP** 页面添加，只需填写名称、启动命令和参数；页面同时提供搜索、启停、编辑与删除。高级配置可复制 `data/mcp.example.json` 为 `data/mcp.json` 后修改，也可通过 `PGAGENT_MCP_CONFIG_PATH` 指向其他 JSON 文件。启用的 server 会在连接前从 PGAgent 进程环境展开 `${ENV_NAME}`，密钥无需写进配置正文；禁用的 server 不要求其环境变量已经存在。
+
+```json
+{
+  "mcpServers": {
+    "docs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "required": false,
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 120,
+      "enabled_tools": ["echo"]
+    },
+    "remote": {
+      "url": "https://example.com/mcp",
+      "headers": {"Authorization": "Bearer ${EXAMPLE_MCP_TOKEN}"},
+      "enabled": false
+    }
+  }
+}
+```
+
+启用 `MCP` 能力的 Agent 会在会话第一次运行时连接 server。发现到的工具以 `mcp__server__tool` 形式直接进入模型工具表，实际调用仍使用原始 `(server, tool)` 身份。`required=true` 的 server 启动失败会阻止运行；可选 server 失败不会移除其他 server。`smart` 权限下，仅声明 `readOnlyHint=true` 的 MCP 工具可直接执行，其余调用进入现有人工审批流程；`ask` 下所有 MCP 调用都要审批。携带自定义 Header 的 HTTP 连接不自动跟随重定向，避免把凭据带到另一来源。会话删除或 PGAgent 关闭时会关闭连接并终止 stdio 子进程。工作台只在仍有 Agent 运行或等待恢复时阻止修改；保存会淘汰空闲连接，新运行直接使用新配置。直接手改 JSON 时建议重启 PGAgent。
 
 ## 开发与验证
 

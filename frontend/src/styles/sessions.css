@@ -201,8 +201,14 @@
 .step-needs_recovery .plan-step-node { border-color: var(--beak); color: var(--yellow); background: var(--beak-soft); }
 
 .durable-task-summary { margin: 7px 0 0 43px; color: var(--muted); font-size: .5rem; line-height: 1.55; }
-.durable-task-resume { min-height: 28px; display: inline-flex; align-items: center; gap: 5px; margin: 9px 0 0 43px; padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 9px 9px 9px 4px; color: var(--ocean-700); background: var(--ice); font-size: .5rem; font-weight: 800; }
+.durable-task-actions { display: flex; align-items: center; gap: 6px; margin: 9px 0 0 43px; }
+.durable-task-resume,
+.durable-task-cancel { min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 9px 9px 9px 4px; font-size: .5rem; font-weight: 800; }
+.durable-task-resume { color: var(--ocean-700); background: var(--ice); }
 .durable-task-resume:hover { border-color: var(--ocean-500); background: var(--ice-strong); }
+.durable-task-cancel { color: var(--red); background: transparent; }
+.durable-task-cancel:hover { border-color: color-mix(in srgb, var(--red) 55%, var(--line)); background: color-mix(in srgb, var(--red) 7%, transparent); }
+.durable-task-actions button:disabled { cursor: wait; opacity: .58; }
 
 .completed-thought {
   border-color: transparent;

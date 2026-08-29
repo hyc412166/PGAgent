@@ -100,6 +100,9 @@ _PUBLIC_RUN_EVENT_TYPES = frozenset({
     "model_failed",
     "model_retry",
     "model_step_started",
+    "mcp_connecting",
+    "mcp_ready",
+    "mcp_degraded",
     "completion_verification_started",
     "completion_verification_rejected",
     "completion_verification_passed",
@@ -139,6 +142,7 @@ _PUBLIC_EVENT_NUMBER_FIELDS = frozenset({
     "remaining_call_count",
     "step",
     "thought_duration_ms",
+    "tool_count",
 })
 _PUBLIC_EVENT_BOOLEAN_FIELDS = frozenset({
     "accepted", "complete",
@@ -215,7 +219,13 @@ def _public_event_url(value: Any) -> str | None:
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))[:300]
 
 
-def _public_tool_argument_summary(value: Any) -> dict[str, str]:
+_PRIVATE_ARGUMENT_MARKERS = (
+    "api_key", "apikey", "authorization", "token", "secret", "password",
+    "cookie", "content", "old_string", "new_string",
+)
+
+
+def _public_tool_argument_summary(value: Any) -> dict[str, Any]:
     """Expose only a display target from a tool's already-scrubbed summary.
 
     Runtime events are normally written with ``safe_tool_argument_summary``.
@@ -225,14 +235,46 @@ def _public_tool_argument_summary(value: Any) -> dict[str, str]:
 
     if not isinstance(value, dict):
         return {}
-    public: dict[str, str] = {}
-    for key in ("path", "file_path", "target"):
-        text = _public_event_text(value.get(key), limit=300)
-        if text is not None:
-            public[key] = text
-    url = _public_event_url(value.get("url"))
-    if url is not None:
-        public["url"] = url
+    public: dict[str, Any] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key)[:80]
+        lowered = key.casefold()
+        if any(marker in lowered for marker in _PRIVATE_ARGUMENT_MARKERS):
+            continue
+        if key in {"path", "file_path", "target"}:
+            text = _public_event_text(raw_value, limit=300)
+            if text is not None:
+                public[key] = text
+            continue
+        if key == "url":
+            url = _public_event_url(raw_value)
+            if url is not None:
+                public[key] = url
+            continue
+        if key == "command" and isinstance(raw_value, dict):
+            command: dict[str, Any] = {}
+            executable = _public_event_text(raw_value.get("executable"), limit=120)
+            if executable is not None:
+                command["executable"] = executable
+            argument_count = raw_value.get("argument_count")
+            if isinstance(argument_count, int) and not isinstance(argument_count, bool):
+                command["argument_count"] = max(0, argument_count)
+            if command:
+                public[key] = command
+            continue
+        if isinstance(raw_value, dict):
+            metadata = {
+                metadata_key: metadata_value
+                for metadata_key in ("chars", "count", "argument_count", "provided")
+                if isinstance((metadata_value := raw_value.get(metadata_key)), (int, float, bool))
+            }
+            if metadata:
+                public[key] = metadata
+            continue
+        if isinstance(raw_value, str):
+            public[key] = {"chars": len(raw_value)}
+        elif isinstance(raw_value, (int, float, bool)) or raw_value is None:
+            public[key] = raw_value
     return public
 
 
@@ -298,6 +340,26 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
                 request_public["remaining_call_count"] = count
             if request_public:
                 public["request"] = request_public
+
+    if event_type == "mcp_connecting":
+        servers = source.get("servers")
+        if isinstance(servers, list):
+            public["servers"] = [
+                text for item in servers
+                if (text := _public_event_text(item, limit=100)) is not None
+            ]
+    if event_type in {"mcp_ready", "mcp_degraded"}:
+        failed_servers = source.get("failed_servers")
+        if isinstance(failed_servers, list):
+            public["failed_servers"] = [
+                {
+                    key: text
+                    for key in ("name", "error_code")
+                    if (text := _public_event_text(item.get(key), limit=100)) is not None
+                }
+                for item in failed_servers
+                if isinstance(item, dict)
+            ]
 
     if event_type == "terminal_response_persisted":
         for key in ("turn_id", "message_id", "trace_id", "status", "error_code", "source"):

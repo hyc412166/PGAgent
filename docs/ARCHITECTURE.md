@@ -7,6 +7,7 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 - `data/pgagent.db`：工作区、会话、消息、模型连接、运行、审批、记忆、Token 用量和会话级子 Agent 委派记录。
 - `data/workspaces/{workspace_id}/`：工具可以访问的工作目录。所有路径必须经过 resolve 后仍位于对应工作区。
 - `data/skills/{slug}/`：由 Skill registry 管理的 Skill 源文件副本；导入流程只复制和解析，不自动执行其中的脚本、命令或网络请求。
+- `data/mcp.json`：显式启用的 MCP stdio/Streamable HTTP server 配置。配置中的 `${ENV_NAME}` 只在内存展开，不进入运行快照或状态 API。
 
 ## 项目、会话与主控
 
@@ -49,6 +50,14 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 - 子 Agent 继承父运行已经冻结的权限模式；它的工具为“父运行允许工具”与“子 Agent 自己勾选工具”的交集，并强制移除递归委派、团队管理和共享任务板写入工具。子 Run 若需要二次审批会真实进入 `awaiting_approval`，若其后台 Job 未完成则进入事件等待，绝不把未批准或仅入队的操作说成已完成。
 - `ask`：写入、命令、委派与联网均须批准；`smart`：低风险读取和受限公网读取自动执行，写入、命令和委派须批准；`full`：无需批准，但仍保留上述基础安全边界。
 - 事件流提供 `model_step_started`、`tool_started`、`tool_finished` 和终态事件，携带安全参数摘要和耗时；工具结果正文、写入正文、Token/API Key 不写入时间线事件。
+
+### MCP 工具运行时
+
+启用内置 `MCP` 能力后，`McpRuntimePool` 以 PGAgent Session 为清理边界、以 `(session, resolved workspace root)` 为连接集合身份惰性创建客户端；因此共享工作区的 Run 复用连接，worktree 子 Agent 和切换后的工作区不会错误复用父目录 cwd。stdio server 由 SDK 作为子进程启动，Streamable HTTP 使用同一异步 Client 接口且不跟随 HTTP 重定向。每个 server 独立完成协议协商和 `tools/list`，`required` server 失败会阻止本次运行，可选 server 失败只记录状态。目录刷新失败时保留该连接最后一次成功发现的工具，并标记为 degraded。
+
+发现结果保留原始 `(server_name, tool_name)` 路由身份，另生成符合模型函数名约束且跨 server 唯一的 `mcp__server__tool` 名称。`ToolRegistry` 在模型调用前注册异步适配器，因此 Agent loop 不区分本地工具和 MCP 工具。当前工具定义连同输入 schema、只读标记和模型名写入 `runtime_binding`；审批或后台等待恢复时若定义已变化，旧 Run 会拒绝继续，避免已批准调用落到不同能力。`readOnlyHint=true` 只影响审批与安全并行资格，不改变 MCP server 自身权限。
+
+所有连接在会话删除或应用 shutdown 时统一关闭。`GET /api/mcp` 状态接口只返回传输类型、状态和稳定错误类型，不序列化 command、Header、环境变量值或原始传输异常；工作台使用独立的 `/api/mcp/servers` 配置接口读写用户明确管理的名称、STDIO command、args 与 enabled。配置写入以临时文件替换完成：仍有 Agent 运行、审批或后台等待时返回 409；空闲时由 `McpRuntimePool` 的配置代次锁串行化持久化与连接启动，淘汰旧缓存连接，启动途中若代次变化则丢弃旧快照并以新配置重试。当前版本只实现 MCP Client，不提供控制 PGAgent 的 MCP Server 接口。
 
 ## 能力目录、Skill 与权限配置
 

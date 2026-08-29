@@ -232,8 +232,11 @@ export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun
     if (liveRun.thought.finished || liveRun.status === 'terminal') setExpanded(false)
   }, [liveRun.status, liveRun.thought.finished])
   const liveThoughtMs = liveRun.thought.startedAt === null ? 0 : Math.max(0, now - liveRun.thought.startedAt)
+  const operationalPhase = liveRun.phase.startsWith('正在连接 MCP') || liveRun.phase.startsWith('MCP ')
   const phase = liveRun.phase.includes('子 Agent')
     ? liveRun.phase
+    : operationalPhase
+      ? liveRun.phase
     : !liveRun.thought.finished && liveRun.status !== 'awaiting_approval' && liveRun.thinkingStatus
       ? `${liveRun.thinkingStatus} ${formatLiveThinkingDuration(liveThoughtMs)}`
       : liveRun.phase || '已完成'

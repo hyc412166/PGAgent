@@ -310,6 +310,8 @@ class RunRead(ORMModel):
     error_message: str | None
     started_at: datetime
     finished_at: datetime | None
+    session_title: str | None = None
+    agent_name: str | None = None
 
 
 class PlanStepRead(ORMModel):

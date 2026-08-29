@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 
 from src.api.routes import router as resources_router
 from src.api import routes as resources_api
+from src.api.routes.sessions import cancel_session_task
 from src.persistence import database
 from src.persistence.database import (
     Base,
@@ -34,6 +36,7 @@ from src.persistence.database import (
     configure_database,
     init_db,
 )
+from src.runs.service import coordinator
 
 
 @pytest.fixture()
@@ -140,6 +143,60 @@ def test_session_task_api_returns_ordered_durable_plan(client: TestClient) -> No
     assert [step["external_id"] for step in active.json()["steps"]] == ["inspect", "finish"]
     assert history.status_code == 200
     assert [item["id"] for item in history.json()] == [active.json()["id"]]
+
+    cancelled = client.post(f"/api/sessions/{session_id}/tasks/{active.json()['id']}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert all(step["status"] in {"completed", "cancelled"} for step in cancelled.json()["steps"])
+    assert client.get(f"/api/sessions/{session_id}/active-task").json() is None
+
+
+def test_cancel_session_task_rejects_a_stale_task_card(client: TestClient) -> None:
+    session_id = client.post("/api/sessions", json={}).json()["id"]
+    with database.SessionLocal() as db:
+        stale = DurableTask(session_id=session_id, goal="stale", status="paused")
+        current = DurableTask(session_id=session_id, goal="current", status="running")
+        db.add_all([stale, current])
+        db.commit()
+        stale_id = stale.id
+        current_id = current.id
+
+    first = client.post(f"/api/sessions/{session_id}/tasks/{stale_id}/cancel")
+    second = client.post(f"/api/sessions/{session_id}/tasks/{stale_id}/cancel")
+
+    assert first.status_code == 200
+    assert first.json()["id"] == stale_id
+    assert second.status_code == 404
+    with database.SessionLocal() as db:
+        assert db.get(DurableTask, stale_id).status == "cancelled"
+        assert db.get(DurableTask, current_id).status == "running"
+
+
+@pytest.mark.asyncio
+async def test_cancel_session_task_cancels_live_run_on_the_owning_loop(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{(tmp_path / 'live-cancel.db').as_posix()}")
+    init_db()
+    with database.SessionLocal() as db:
+        session = Session(title="Live cancellation")
+        db.add(session)
+        db.flush()
+        task = DurableTask(session_id=session.id, goal="running", status="running")
+        db.add(task)
+        db.flush()
+        run = Run(session_id=session.id, task_id=task.id, status="running")
+        db.add(run)
+        db.commit()
+        session_id, task_id, run_id = session.id, task.id, run.id
+
+        live_task = asyncio.create_task(asyncio.sleep(60))
+        coordinator._tasks[run_id] = live_task
+        try:
+            payload = await cancel_session_task(session_id, task_id, db)
+            assert payload["status"] == "cancelled"
+            with pytest.raises(asyncio.CancelledError):
+                await live_task
+        finally:
+            coordinator._tasks.pop(run_id, None)
 
 
 def test_turn_schema_enforces_one_terminal_reply_per_accepted_message(tmp_path: Path) -> None:
@@ -764,6 +821,16 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
             ),
             database.RunEvent(
                 run_id=run["id"],
+                event_type="mcp_connecting",
+                payload={"servers": ["playwright"], "command": "npx secret-command"},
+            ),
+            database.RunEvent(
+                run_id=run["id"],
+                event_type="mcp_ready",
+                payload={"tool_count": 24, "failed_servers": []},
+            ),
+            database.RunEvent(
+                run_id=run["id"],
                 event_type="thought_summary",
                 step=1,
                 payload={"step": 1, "summary": "line one\n" + ("x" * 20_050), "complete": True},
@@ -779,6 +846,9 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
                     "arguments": {
                         "path": "safe.txt",
                         "url": "https://username:password@example.test/docs?api_key=secret#fragment",
+                        "command": {"executable": "python", "argument_count": 2},
+                        "query": {"chars": 18},
+                        "recursive": True,
                         "content": "private file body",
                         "api_key": "tool-secret",
                     },
@@ -811,7 +881,7 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
     assert response.status_code == 200, response.text
     events = response.json()
     assert {event["event_type"] for event in events} == {
-        "model_step_started", "thought_summary", "tool_started", "tool_finished", "run_completed",
+        "model_step_started", "mcp_connecting", "mcp_ready", "thought_summary", "tool_started", "tool_finished", "run_completed",
     }
     events_by_type = {event["event_type"]: event for event in events}
     assert events_by_type["tool_started"]["payload"] == {
@@ -822,6 +892,9 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
         "arguments": {
             "path": "safe.txt",
             "url": "https://example.test/docs",
+            "command": {"executable": "python", "argument_count": 2},
+            "query": {"chars": 18},
+            "recursive": True,
         },
     }
     assert events_by_type["tool_finished"]["payload"] == {
@@ -837,12 +910,62 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
     assert thought["step"] == 1
     assert "\n" in thought["summary"]
     assert len(thought["summary"]) == 20_000
+    assert events_by_type["mcp_connecting"]["payload"] == {"servers": ["playwright"]}
+    assert events_by_type["mcp_ready"]["payload"] == {"tool_count": 24, "failed_servers": []}
     serialized = str(events)
     for private_value in (
         "private message", "snapshot-secret", "env:secret", "# SKILL.md",
         "private file body", "tool-secret", "private tool output", "private assistant output",
     ):
         assert private_value not in serialized
+
+
+def test_run_reads_include_the_real_session_and_agent_names(client: TestClient) -> None:
+    session = client.post("/api/sessions", json={"title": "调用 Playwright 搜索科比"}).json()
+    run = client.post("/api/runs", json={"session_id": session["id"]}).json()
+
+    listed = client.get("/api/runs").json()
+    selected = next(item for item in listed if item["id"] == run["id"])
+    fetched = client.get(f"/api/runs/{run['id']}").json()
+
+    assert selected["session_title"] == "调用 Playwright 搜索科比"
+    assert selected["agent_name"] == "PGAgent 主控"
+    assert fetched["session_title"] == "调用 Playwright 搜索科比"
+
+
+def test_context_event_includes_a_bounded_user_message_excerpt(client: TestClient) -> None:
+    session = client.post("/api/sessions", json={"title": "Long prompt"}).json()
+    content = "请分析这个很长的任务：" + ("细节" * 120)
+    with database.SessionLocal() as db:
+        turn = ConversationTurn(session_id=session["id"], client_message_id="context-message-turn")
+        db.add(turn)
+        db.flush()
+        message = ChatMessage(
+            session_id=session["id"],
+            turn_id=turn.id,
+            role="user",
+            content=content,
+            sequence=1,
+            message_kind="user_request",
+        )
+        run = Run(session_id=session["id"], turn_id=turn.id)
+        db.add_all([message, run])
+        db.flush()
+        db.add(database.RunEvent(
+            run_id=run.id,
+            event_type="context_prepared",
+            payload={"estimated_tokens": 321, "omitted_messages": 2},
+        ))
+        db.commit()
+        run_id = run.id
+
+    event = client.get(f"/api/runs/{run_id}/events").json()[0]
+    excerpt = event["payload"]["message_excerpt"]
+
+    assert excerpt.startswith("请分析这个很长的任务：")
+    assert excerpt.endswith("…")
+    assert len(excerpt) == 180
+    assert event["payload"]["estimated_tokens"] == 321
 
 
 @pytest.mark.parametrize("run_status", ["received", "awaiting_approval"])

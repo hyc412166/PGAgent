@@ -68,8 +68,9 @@ from src.api.schemas import (
 )
 from src.memory.service import recall_memories, refresh_memory_markdown_projection, store_memory
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
-from src.tasks.state import latest_resumable_task, task_payload
+from src.tasks.state import cancel_durable_task, latest_resumable_task, task_payload
 from src.agents.collaboration import cleanup_session_worktrees
+from src.runs.service import coordinator
 router = APIRouter(prefix="/api", tags=["sessions"])
 
 from src.api.routes.shared import (
@@ -141,6 +142,26 @@ def get_session_active_task(session_id: str, db: Session = Depends(get_db)) -> d
     _require(db, ChatSession, session_id, "Session")
     task = latest_resumable_task(db, session_id)
     return task_payload(db, task) if task is not None else None
+
+
+@router.post("/sessions/{session_id}/tasks/{task_id}/cancel", response_model=DurableTaskRead)
+async def cancel_session_task(session_id: str, task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    _require(db, ChatSession, session_id, "Session")
+    task = db.get(DurableTask, task_id)
+    if task is None or task.session_id != session_id:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status not in {"planning", "running", "waiting", "paused", "needs_recovery", "blocked"}:
+        raise HTTPException(status_code=404, detail="当前会话没有可取消的任务")
+
+    linked_run_ids = list(db.scalars(
+        select(Run.id).where(Run.task_id == task.id).order_by(Run.started_at.desc())
+    ))
+    for run_id in linked_run_ids:
+        coordinator.stop(run_id, db=db, reason="user_interrupted")
+    cancel_durable_task(db, task)
+    db.commit()
+    db.refresh(task)
+    return task_payload(db, task)
 
 
 @router.get("/sessions/{session_id}/background-jobs", response_model=list[BackgroundJobRead])
@@ -392,6 +413,7 @@ def delete_session(session_id: str, db: Session = Depends(get_db)) -> Response:
     db.execute(delete(Memory).where(Memory.scope == "session", Memory.scope_id == session_id))
     db.delete(item)
     _commit(db)
+    coordinator.close_mcp_session(session_id)
     refresh_memory_markdown_projection()
 
     # Runtime artifacts are stored below one server-owned directory per

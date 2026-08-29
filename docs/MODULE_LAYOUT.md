@@ -32,6 +32,7 @@ backend/                              # 完整后端核心，对应 codex-rs/cor
 │   ├── config/                       # 配置、环境变量和路径
 │   ├── context/                      # 上下文装配、窗口、压缩和指令
 │   ├── memory/                       # 长期记忆导入、检索和投影
+│   ├── mcp/                          # MCP Client 配置、会话连接与工具适配
 │   ├── model/                        # 模型网关与凭据适配
 │   ├── native/                       # Windows 原生系统集成
 │   ├── persistence/                  # ORM、数据库生命周期和默认数据
