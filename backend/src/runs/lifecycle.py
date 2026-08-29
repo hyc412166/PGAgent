@@ -48,36 +48,28 @@ from src.agent import (
     AgentRuntime,
     CompletionDecision,
     RunOutcome,
-    RuntimeConfig,
     decide_deterministic_completion,
     normalize_usage,
 )
-from src.context import ContextManager, FilesystemArtifactStore
 from src.context.window import message_tokens
 from src.context.assembly import COMPACTION_SCHEMA, CONTINUATION_PREFIX
-from src.tools import create_default_registry
 from src.tools.registry import TOOL_SCHEMAS
 from src.tools.types import ToolResult
-from src.mcp import attach_mcp_tools, mcp_runtime_pool
+from src.mcp import mcp_runtime_pool
 
 from src.tasks import background as background_job_service
 from src.model.gateway import ModelConfigurationError, ProviderConfig
-from src.artifacts.storage import ArtifactToolStore
-from src.tasks.background import BackgroundJobToolStore
-from src.memory.service import MemoryToolStore
 from src.memory.repository import load_memory_index, record_memory_citations
 from src.memory.preferences import memories_enabled
 from src.context.instructions import load_instruction_chain, render_workspace_rules
 from src.runs.stream import run_stream_broker
 from src.tasks.state import (
     recovery_prompt,
-    sync_todos_for_run,
-    task_checkpoint_for_run,
     todo_state_for_run,
     transition_run_task,
 )
-from src.tasks.graph import TaskGraphToolStore, ready_steps, refresh_task_state, settle_step, upsert_delegated_graph
-from src.agents.collaboration import TeamToolStore, teammate_context
+from src.tasks.graph import ready_steps, refresh_task_state, settle_step, upsert_delegated_graph
+from src.agents.collaboration import teammate_context
 from src.sessions.delivery import (
     classify_error_details,
     classify_exception,
@@ -114,7 +106,9 @@ from .delegation_format import (
     _single_line,
 )
 from .delegation import _SubagentTaskDelegate
-from .dependencies import build_model_call
+from .runtime_factory import RunRuntimeFactory
+from .continuation import RunContinuationCodec
+from .runtime_preparer import RunRuntimePreparer
 
 
 ACTIVE_STATUSES = {"received", "preparing_context", "planning", "acting", "observing", "verifying", "running"}
@@ -1103,63 +1097,11 @@ class RunCoordinator:
 
     @staticmethod
     def _runtime_snapshot(outcome: RunOutcome) -> dict[str, Any]:
-        messages = [] if outcome.stop_reason == "acceptance_failed" else outcome.messages
-        acceptance_report = dict(outcome.acceptance_report)
-        return _json_safe({
-            "status": outcome.status,
-            "output": outcome.output,
-            "messages": messages,
-            "events": outcome.events,
-            "steps": outcome.steps,
-            "tool_calls": outcome.tool_calls,
-            "mode": outcome.mode,
-            "stop_reason": outcome.stop_reason,
-            "error": outcome.error,
-            "pending_approval": outcome.pending_approval,
-            "guard_snapshot": outcome.guard_snapshot,
-            "usage": outcome.usage,
-            "active_elapsed_seconds": outcome.active_elapsed_seconds,
-            "runtime_binding": outcome.runtime_binding,
-            "compaction_state": outcome.compaction_state,
-            "artifact_refs": outcome.artifact_refs,
-            "transcript_delta": outcome.transcript_delta,
-            "verification_trace": outcome.verification_trace,
-            "acceptance_report": acceptance_report,
-            "completion_verification_attempts": outcome.completion_verification_attempts,
-            "memory_citation": outcome.memory_citation,
-        })
+        return RunContinuationCodec.snapshot(outcome)
 
     @staticmethod
     def _outcome_from_snapshot(payload: dict[str, Any]) -> RunOutcome:
-        return RunOutcome(
-            status=str(payload.get("status") or "failed"),
-            output=payload.get("output"),
-            messages=list(payload.get("messages") or []),
-            events=list(payload.get("events") or []),
-            steps=int(payload.get("steps") or 0),
-            tool_calls=int(payload.get("tool_calls") or 0),
-            mode=str(payload.get("mode") or "auto"),
-            stop_reason=payload.get("stop_reason"),
-            error=payload.get("error"),
-            pending_approval=payload.get("pending_approval"),
-            guard_snapshot=dict(payload.get("guard_snapshot") or {}),
-            usage=normalize_usage(payload.get("usage")),
-            active_elapsed_seconds=max(0.0, float(payload.get("active_elapsed_seconds") or 0.0)),
-            runtime_binding=dict(payload.get("runtime_binding") or {}),
-            compaction_state=dict(payload.get("compaction_state") or {}),
-            artifact_refs=[dict(item) for item in payload.get("artifact_refs") or [] if isinstance(item, dict)],
-            transcript_delta=(
-                [dict(item) for item in payload.get("transcript_delta") or [] if isinstance(item, dict)]
-                if "transcript_delta" in payload
-                else None
-            ),
-            verification_trace=[
-                dict(item) for item in payload.get("verification_trace") or [] if isinstance(item, dict)
-            ],
-            acceptance_report=dict(payload.get("acceptance_report") or {}),
-            completion_verification_attempts=max(0, int(payload.get("completion_verification_attempts") or 0)),
-            memory_citation=dict(payload.get("memory_citation") or {}),
-        )
+        return RunContinuationCodec.restore(payload)
 
     @staticmethod
     def _resolve_runtime(
@@ -1474,94 +1416,22 @@ class RunCoordinator:
                 "todo_state": todo_state,
                 "max_run_seconds": runtime_max_run_seconds,
                 "session_id": session.id if session else None,
+                "agent_id": agent.id,
+                "workspace_id": workspace.id,
+                "memory_use_enabled": memory_use_enabled,
+                "terminal_background_job_ids": list(terminal_background_job_ids),
                 "compaction_state": compaction_state,
                 "context_sequence": transcript_sequence,
             }
             db.commit()
 
-        task_delegate = None
-        if not context["runtime_binding"].get("delegation_version"):
-            task_delegate = _SubagentTaskDelegate(
-                coordinator=owner,
-                parent_run_id=run_id,
-                parent_agent_id=agent.id,
-                parent_binding=dict(context["runtime_binding"]),
-                parent_allowed_tool_names=list(context["allowed_tool_names"]),
-                permission_mode=str(context["permission_mode"]),
-            )
-
-        background_store = BackgroundJobToolStore(
+        assembly = RunRuntimeFactory().create(
             run_id=run_id,
-            workspace_id=workspace.id,
-            session_id=session.id if session else None,
-            workspace_root=context["workspace_root"],
-            include_session_jobs=not bool(context["runtime_binding"].get("delegation_version")),
+            context=context,
+            coordinator=owner,
         )
-        background_store.track_terminal_deliveries(terminal_background_job_ids)
-        delegated_teammate_id = str(context["runtime_binding"].get("teammate_id") or "")
-        team_store = (
-            TeamToolStore(
-                run_id=str(context["runtime_binding"].get("parent_run_id") or run_id),
-                session_id=session.id if session else None,
-                workspace_root=context["workspace_root"],
-                actor_worker_id=delegated_teammate_id or None,
-            )
-            if not context["runtime_binding"].get("delegation_version") or delegated_teammate_id
-            else None
-        )
-        task_store = None if context["runtime_binding"].get("delegation_version") else TaskGraphToolStore(
-            run_id=run_id
-        )
-        runtime_artifact_store = FilesystemArtifactStore(
-            settings.data_dir / "artifacts" / str(session.id if session else run.id)
-        )
-        registry = create_default_registry(
-            context["workspace_root"],
-            allowed_tool_names=context["allowed_tool_names"],
-            permission_mode=context["permission_mode"],
-            skill_instructions=context["skill_instructions"],
-            todo_state=context["todo_state"],
-            todo_change_sink=(
-                (lambda todos, key=run_id: sync_todos_for_run(key, todos))
-                if not context["runtime_binding"].get("delegation_version") else None
-            ),
-            memory_store=(
-                MemoryToolStore(
-                    workspace_id=workspace.id,
-                    session_id=session.id if session else None,
-                )
-                if memory_use_enabled else None
-            ),
-            artifact_store=ArtifactToolStore(runtime_artifact_store),
-            background_store=background_store,
-            team_store=team_store,
-            task_store=task_store,
-            task_delegate=task_delegate,
-        )
-        context["background_store"] = background_store
-        owner.register_tool_canceller(run_id, registry.cancel_active)
-        runtime = AgentRuntime(
-            model_call=build_model_call(context["provider"]),
-            tool_registry=registry,
-            context_manager=ContextManager(max_tokens=settings.context_limit_tokens),
-            artifact_store=runtime_artifact_store,
-            event_sink=type(owner)._event_sink(run_id),
-            stream_sink=type(owner)._stream_sink(run_id),
-            config=RuntimeConfig(
-                max_steps=settings.max_steps,
-                max_tool_calls=settings.max_tool_calls,
-                identical_call_limit=settings.max_identical_calls,
-                no_progress_limit=settings.no_progress_limit,
-                context_compaction_threshold_tokens=settings.compact_threshold_tokens,
-                model_timeout_seconds=settings.model_timeout_seconds,
-                max_run_seconds=context["max_run_seconds"],
-            ),
-            task_state_provider=(
-                (lambda key=run_id: task_checkpoint_for_run(key))
-                if not context["runtime_binding"].get("delegation_version") else None
-            ),
-        )
-        return runtime, context
+        context["background_store"] = assembly.background_store
+        return assembly.runtime, context
 
     @staticmethod
     def _delegation_link(
@@ -2210,23 +2080,10 @@ class RunCoordinator:
             if self._stop_requested(run_id):
                 return
             runtime, context = self._resolve_runtime(run_id, coordinator_instance=self)
-            await attach_mcp_tools(
-                runtime.tool_registry,
-                session_key=str(context.get("session_id") or run_id),
-                workspace_root=str(context["workspace_root"]),
-                agent_kind=(
-                    "subagent"
-                    if context["runtime_binding"].get("delegation_version")
-                    else "main"
-                ),
-                runtime_scope=(
-                    run_id
-                    if context["runtime_binding"].get("delegation_version")
-                    else None
-                ),
-                selected_server_names=context["runtime_binding"].get("mcp_server_names"),
-                frozen_tools=context["runtime_binding"].get("mcp_tools"),
-                frozen_active_tools=context["runtime_binding"].get("mcp_active_tools"),
+            await RunRuntimePreparer().prepare(
+                run_id=run_id,
+                runtime=runtime,
+                context=context,
                 progress_sink=self._event_sink(run_id),
             )
             self._install_completion_verifier(runtime, context)
@@ -2242,10 +2099,9 @@ class RunCoordinator:
                 session_id=context.get("session_id"),
                 context_sequence=int(context.get("context_sequence") or 0),
             )
-            outcome.runtime_binding = {
-                **dict(context["runtime_binding"]),
-                **runtime.tool_registry.runtime_state(),
-            }
+            outcome.runtime_binding = RunContinuationCodec.capture_runtime_binding(
+                context["runtime_binding"], runtime
+            )
             self._persist_outcome(
                 run_id,
                 outcome,
@@ -2276,23 +2132,10 @@ class RunCoordinator:
                 runtime_binding=prior.runtime_binding,
                 coordinator_instance=self,
             )
-            await attach_mcp_tools(
-                runtime.tool_registry,
-                session_key=str(context.get("session_id") or run_id),
-                workspace_root=str(context["workspace_root"]),
-                agent_kind=(
-                    "subagent"
-                    if context["runtime_binding"].get("delegation_version")
-                    else "main"
-                ),
-                runtime_scope=(
-                    run_id
-                    if context["runtime_binding"].get("delegation_version")
-                    else None
-                ),
-                selected_server_names=context["runtime_binding"].get("mcp_server_names"),
-                frozen_tools=context["runtime_binding"].get("mcp_tools"),
-                frozen_active_tools=context["runtime_binding"].get("mcp_active_tools"),
+            await RunRuntimePreparer().prepare(
+                run_id=run_id,
+                runtime=runtime,
+                context=context,
                 progress_sink=self._event_sink(run_id),
             )
             self._install_completion_verifier(runtime, context)
@@ -2324,10 +2167,9 @@ class RunCoordinator:
                     prior,
                     runtime_context=context,
                 )
-            outcome.runtime_binding = {
-                **dict(context["runtime_binding"]),
-                **runtime.tool_registry.runtime_state(),
-            }
+            outcome.runtime_binding = RunContinuationCodec.capture_runtime_binding(
+                context["runtime_binding"], runtime
+            )
             self._persist_outcome(
                 run_id,
                 outcome,
@@ -2360,14 +2202,10 @@ class RunCoordinator:
                 runtime_binding=prior.runtime_binding,
                 coordinator_instance=self,
             )
-            await attach_mcp_tools(
-                runtime.tool_registry,
-                session_key=str(context.get("session_id") or run_id),
-                workspace_root=str(context["workspace_root"]),
-                agent_kind="main",
-                selected_server_names=context["runtime_binding"].get("mcp_server_names"),
-                frozen_tools=context["runtime_binding"].get("mcp_tools"),
-                frozen_active_tools=context["runtime_binding"].get("mcp_active_tools"),
+            await RunRuntimePreparer().prepare(
+                run_id=run_id,
+                runtime=runtime,
+                context=context,
                 progress_sink=self._event_sink(run_id),
             )
             self._install_completion_verifier(runtime, context)
@@ -2375,10 +2213,9 @@ class RunCoordinator:
                 prior,
                 runtime_context=context,
             )
-            outcome.runtime_binding = {
-                **dict(context["runtime_binding"]),
-                **runtime.tool_registry.runtime_state(),
-            }
+            outcome.runtime_binding = RunContinuationCodec.capture_runtime_binding(
+                context["runtime_binding"], runtime
+            )
             self._persist_outcome(
                 run_id,
                 outcome,

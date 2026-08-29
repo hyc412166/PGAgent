@@ -42,42 +42,16 @@ from src.persistence.database import (
     UsageRecord,
     Workspace,
 )
-from src.agent import (
-    AgentRuntime,
-    CompletionDecision,
-    RunOutcome,
-    RuntimeConfig,
-    decide_deterministic_completion,
-    normalize_usage,
-)
-from src.context import ContextManager, FilesystemArtifactStore
-from src.context.window import message_tokens
-from src.context.assembly import COMPACTION_SCHEMA, CONTINUATION_PREFIX
-from src.tools import create_default_registry
-from src.tools.registry import TOOL_SCHEMAS
+from src.agent import AgentRuntime, RunOutcome
 from src.tools.types import ToolResult
-from src.mcp import attach_mcp_tools
 
-from src.tasks import background as background_job_service
 from src.model.gateway import ModelConfigurationError, ProviderConfig
-from src.artifacts.storage import ArtifactToolStore
-from src.tasks.background import BackgroundJobToolStore
-from src.memory.service import MemoryToolStore
 from src.memory.repository import load_memory_index
 from src.context.instructions import load_instruction_chain, render_workspace_rules
 from src.runs.stream import run_stream_broker
-from src.tasks.state import (
-    recovery_prompt,
-    sync_todos_for_run,
-    task_checkpoint_for_run,
-    todo_state_for_run,
-    transition_run_task,
-)
-from src.tasks.graph import TaskGraphToolStore, ready_steps, refresh_task_state, settle_step, upsert_delegated_graph
-from src.agents.collaboration import TeamToolStore, teammate_context
+from src.tasks.graph import ready_steps, settle_step, upsert_delegated_graph
+from src.agents.collaboration import teammate_context
 from src.sessions.delivery import (
-    classify_error_details,
-    classify_exception,
     ensure_run_turn,
     is_terminal_delivery,
     persist_terminal_response,
@@ -96,7 +70,9 @@ from .delegation_format import (
     _model_id_for_delegate,
     _single_line,
 )
-from .dependencies import build_model_call
+from .runtime_factory import RunRuntimeFactory
+from .runtime_preparer import RunRuntimePreparer
+from .continuation import RunContinuationCodec
 
 _CHILD_FORBIDDEN_ORCHESTRATION_TOOLS = frozenset({
     "task",
@@ -724,72 +700,42 @@ class _SubagentTaskDelegate:
             "child_agent_name": _single_line(child.name, limit=120),
             "task_title": self._task_title(task),
         })
-        child_background_store = BackgroundJobToolStore(
+        runtime_context = {
+            "runtime_binding": child_binding,
+            "session_id": child_run.session_id,
+            "agent_id": child.id,
+            "workspace_id": child_run.workspace_id,
+            "workspace_root": str(child_binding["workspace_root"]),
+            "allowed_tool_names": list(child_binding["allowed_tool_names"]),
+            "permission_mode": str(child_binding["permission_mode"]),
+            "skill_instructions": child_skill_instructions,
+            "todo_state": [],
+            "memory_use_enabled": child_memory_use_enabled,
+            "memory_session_id": None,
+            "provider": provider_config,
+            "max_run_seconds": child_max_run_seconds,
+            "model_timeout_seconds": (
+                min(float(settings.model_timeout_seconds), child_max_run_seconds)
+                if child_max_run_seconds is not None
+                else settings.model_timeout_seconds
+            ),
+            "terminal_background_job_ids": [],
+            "stream_enabled": False,
+        }
+        assembly = RunRuntimeFactory().create(
             run_id=child_run_id,
-            workspace_id=child_run.workspace_id,
-            session_id=child_run.session_id,
-            workspace_root=str(child_binding["workspace_root"]),
+            context=runtime_context,
+            coordinator=self.coordinator,
+            runtime_type=AgentRuntime,
         )
-        child_team_store = TeamToolStore(
-            run_id=self.parent_run_id,
-            session_id=child_run.session_id,
-            workspace_root=str(child_binding["workspace_root"]),
-            actor_worker_id=teammate_id,
-        ) if teammate_id else None
-        child_artifact_store = FilesystemArtifactStore(
-            settings.data_dir / "artifacts" / str(child_run.session_id or child_run.id)
-        )
-        child_registry = create_default_registry(
-            str(child_binding["workspace_root"]),
-            allowed_tool_names=child_binding["allowed_tool_names"],
-            permission_mode=child_binding["permission_mode"],
-            skill_instructions=child_skill_instructions,
-            todo_state=[],
-            memory_store=(
-                MemoryToolStore(
-                    workspace_id=child_run.workspace_id,
-                    session_id=None,
-                )
-                if child_memory_use_enabled else None
-            ),
-            artifact_store=ArtifactToolStore(child_artifact_store),
-            background_store=child_background_store,
-            team_store=child_team_store,
-            # Deliberately omit task_delegate: task was removed from the
-            # allowlist and a child never obtains a recursive dispatch hook.
-        )
-        # A delegated child runs inside the parent's asyncio task, but its
-        # tools may own subprocesses.  Register its cancellation hook so a
-        # user stop can terminate those side effects as well as the parent
-        # coroutine awaiting the child.
-        self.coordinator.register_tool_canceller(child_run_id, child_registry.cancel_active)
-        await attach_mcp_tools(
-            child_registry,
-            session_key=str(child_run.session_id or child_run_id),
-            workspace_root=str(child_binding["workspace_root"]),
-            agent_kind="subagent",
-            runtime_scope=child_run_id,
-            selected_server_names=child_binding.get("mcp_server_names", []),
-            frozen_tools=child_binding.get("mcp_tools"),
-        )
-        child_runtime = AgentRuntime(
-            model_call=build_model_call(provider_config),
-            tool_registry=child_registry,
-            context_manager=ContextManager(max_tokens=settings.context_limit_tokens),
-            artifact_store=child_artifact_store,
-            event_sink=type(self.coordinator)._event_sink(child_run_id),
-            config=RuntimeConfig(
-                max_steps=settings.max_steps,
-                max_tool_calls=settings.max_tool_calls,
-                identical_call_limit=settings.max_identical_calls,
-                no_progress_limit=settings.no_progress_limit,
-                context_compaction_threshold_tokens=settings.compact_threshold_tokens,
-                model_timeout_seconds=min(
-                    float(settings.model_timeout_seconds),
-                    child_max_run_seconds,
-                ) if child_max_run_seconds is not None else settings.model_timeout_seconds,
-                max_run_seconds=child_max_run_seconds,
-            ),
+        child_runtime = assembly.runtime
+        child_background_store = assembly.background_store
+        await RunRuntimePreparer().prepare(
+            run_id=child_run_id,
+            runtime=child_runtime,
+            context=runtime_context,
+            progress_sink=type(self.coordinator)._event_sink(child_run_id),
+            registry=assembly.registry,
         )
         type(self.coordinator)._install_completion_verifier(
             child_runtime,
@@ -829,10 +775,10 @@ class _SubagentTaskDelegate:
                 message=str(exc) or type(exc).__name__,
             )
 
-        outcome.runtime_binding = {
-            **child_binding,
-            **child_registry.runtime_state(),
-        }
+        outcome.runtime_binding = RunContinuationCodec.capture_registry_binding(
+            child_binding,
+            assembly.registry,
+        )
         type(self.coordinator)._persist_outcome(
             child_run_id,
             outcome,

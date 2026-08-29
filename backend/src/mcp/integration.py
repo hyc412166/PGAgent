@@ -235,6 +235,10 @@ async def attach_mcp_tools(
         read_only=False,
         parallel=False,
         exposure="hidden",
+        owner="pgagent-mcp",
+        raw_name="call",
+        trusted=True,
+        replace_existing=True,
     )
     registry.register_external(
         "McpToolSearch",
@@ -243,6 +247,10 @@ async def attach_mcp_tools(
         read_only=True,
         parallel=False,
         approval_exempt=True,
+        owner="pgagent-mcp",
+        raw_name="search",
+        trusted=True,
+        replace_existing=True,
     )
     if "ListMcpResources" in registry.enabled_tool_names:
         registry.register_external(
@@ -251,6 +259,10 @@ async def attach_mcp_tools(
             list_resources,
             read_only=True,
             parallel=False,
+            owner="pgagent-mcp",
+            raw_name="list_resources",
+            trusted=True,
+            replace_existing=True,
         )
     if "ReadMcpResource" in registry.enabled_tool_names:
         resource_schema = registry.schema_for("ReadMcpResource")
@@ -263,6 +275,10 @@ async def attach_mcp_tools(
             read_resource,
             read_only=True,
             parallel=False,
+            owner="pgagent-mcp",
+            raw_name="read_resource",
+            trusted=True,
+            replace_existing=True,
         )
 
     for binding in bindings:
@@ -284,6 +300,8 @@ async def attach_mcp_tools(
             read_only=binding.read_only,
             parallel=binding.supports_parallel,
             exposure="deferred",
+            owner=binding.server_name,
+            raw_name=binding.raw_name,
         )
     active_tools = [str(item) for item in frozen_active_tools] if isinstance(frozen_active_tools, list) else []
     if frozen_tools is not None and frozen_active_tools is None:
