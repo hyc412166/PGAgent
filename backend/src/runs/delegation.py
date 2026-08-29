@@ -56,6 +56,7 @@ from src.context.assembly import COMPACTION_SCHEMA, CONTINUATION_PREFIX
 from src.tools import create_default_registry
 from src.tools.registry import TOOL_SCHEMAS
 from src.tools.types import ToolResult
+from src.mcp import attach_mcp_tools
 
 from src.tasks import background as background_job_service
 from src.model.gateway import ModelConfigurationError, ProviderConfig
@@ -760,6 +761,12 @@ class _SubagentTaskDelegate:
         # user stop can terminate those side effects as well as the parent
         # coroutine awaiting the child.
         self.coordinator.register_tool_canceller(child_run_id, child_registry.cancel_active)
+        await attach_mcp_tools(
+            child_registry,
+            session_key=str(child_run.session_id or child_run_id),
+            workspace_root=str(child_binding["workspace_root"]),
+            frozen_tools=child_binding.get("mcp_tools"),
+        )
         child_runtime = AgentRuntime(
             model_call=build_model_call(provider_config),
             tool_registry=child_registry,

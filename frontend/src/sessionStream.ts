@@ -54,6 +54,11 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'context_compacted': return '正在准备上下文…'
     case 'model_step_started':
     case 'model_retry': return '思考中…'
+    case 'mcp_connecting': return '正在连接 MCP 服务…'
+    case 'mcp_ready': return Number(event.tool_count || 0) > 0
+      ? `MCP 已就绪（${Number(event.tool_count)} 个工具）`
+      : 'MCP 已连接'
+    case 'mcp_degraded': return '部分 MCP 服务不可用，本轮继续使用已连接工具'
     case 'assistant_delta': return '正在回复…'
     case 'tool_started':
     case 'tool_call': return event.tool_name ? `正在调用 ${event.tool_name}…` : '正在调用工具…'

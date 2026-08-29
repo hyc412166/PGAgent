@@ -137,6 +137,36 @@ def test_continue_turn_binds_latest_interrupted_durable_task(
     assert launched["calls"] == [(initial_run_id, False), (payload["id"], False)]
 
 
+def test_explicit_cancel_turn_terminates_the_durable_task_before_model_launch(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, launched = client
+    _workspace_id, _agent_id, session_id = _seed()
+    initial = test_client.post(f"/api/sessions/{session_id}/run", json={"content": "Build a durable feature"})
+    initial_run_id = initial.json()["id"]
+    sync_todos_for_run(initial_run_id, [
+        {"id": "done", "content": "Completed work", "status": "completed"},
+        {"id": "active", "content": "Active work", "status": "in_progress"},
+    ])
+
+    cancelled = test_client.post(
+        f"/api/sessions/{session_id}/run",
+        json={"content": "取消这个任务"},
+    )
+
+    assert cancelled.status_code == 202, cancelled.text
+    assert cancelled.json()["task_id"] is None
+    with database.SessionLocal() as db:
+        initial_run = db.get(Run, initial_run_id)
+        task = db.get(DurableTask, initial_run.task_id)
+        steps = list(db.query(PlanStep).filter_by(task_id=task.id).order_by(PlanStep.position))
+        assert initial_run.status == "stopped"
+        assert task.status == "cancelled"
+        assert task.active_step_id is None
+        assert [step.status for step in steps] == ["completed", "cancelled"]
+    assert launched["calls"] == [(initial_run_id, False), (cancelled.json()["id"], False)]
+
+
 def test_session_run_idempotency_reuses_the_same_accepted_turn(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:

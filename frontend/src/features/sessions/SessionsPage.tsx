@@ -35,6 +35,7 @@ function SessionsPage() {
   const [composerHasValue, setComposerHasValue] = useState(false)
   const [sending, setSending] = useState(false)
   const [stoppingRunId, setStoppingRunId] = useState('')
+  const [cancellingTaskId, setCancellingTaskId] = useState('')
   const [deletingSessionId, setDeletingSessionId] = useState('')
   const [interruptedRunId, setInterruptedRunId] = useState('')
   const [settingsSaving, setSettingsSaving] = useState(false)
@@ -670,6 +671,24 @@ function SessionsPage() {
     }
   }
 
+  async function cancelDurableTask(taskId: string) {
+    const sessionId = activeIdRef.current
+    if (!sessionId || !taskId || cancellingTaskId) return
+    setCancellingTaskId(taskId)
+    setActionError('')
+    try {
+      await api.post(
+        `/api/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/cancel`,
+      )
+      if (activeIdRef.current !== sessionId) return
+      await Promise.all([durableTask.refresh(), runs.refresh()])
+    } catch (error) {
+      if (activeIdRef.current === sessionId) setActionError(describeError(error))
+    } finally {
+      setCancellingTaskId('')
+    }
+  }
+
   function editInterruptedPrompt() {
     const content = lastSubmittedContentRef.current.trim()
     if (!content || !canEditInterrupted) return
@@ -909,10 +928,15 @@ function SessionsPage() {
                   return <Fragment key={message.id}>{completedThought && <CompletedThoughtTimeline runId={messageRunId} timeline={completedThought} />}<MessageBubble message={message} /></Fragment>
                 }) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
                 {!draftActive && messages.error && !!visibleMessages.length && <p className="inline-error" role="alert">消息同步失败：{messages.error}</p>}
-                {!draftActive && durableTask.data && <DurableTaskCard task={durableTask.data} onResume={() => {
-                  composerInputRef.current?.setValue('继续刚刚的工作')
-                  composerInputRef.current?.focus()
-                }} />}
+                {!draftActive && durableTask.data && <DurableTaskCard
+                  task={durableTask.data}
+                  cancelling={cancellingTaskId === durableTask.data.id}
+                  onResume={() => {
+                    composerInputRef.current?.setValue('继续刚刚的工作')
+                    composerInputRef.current?.focus()
+                  }}
+                  onCancel={() => void cancelDurableTask(durableTask.data!.id)}
+                />}
                 {!draftActive && stoppedRunNotices.map((run) => <div key={`run-notice:${run.id}`} className="stopped-run-notice" role="status"><AlertCircle size={16} /><div><strong>{run.status === 'failed' ? '本次运行失败，未生成最终回复' : '本次运行已停止，未生成最终回复'}</strong><p>{run.error_message || run.stop_reason || 'Agent 未能继续执行，请调整指令后重试。'}</p></div></div>)}
                 {liveRun.status !== 'idle'
                   && (!completedThoughtsByRun[liveRun.runId] || (canEditInterrupted && liveRun.runId === interruptedRunId))

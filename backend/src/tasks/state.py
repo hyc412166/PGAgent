@@ -18,6 +18,10 @@ _CONTINUATION_PHRASES = frozenset({
     "继续", "继续工作", "继续任务", "继续刚刚的工作", "继续之前的工作", "接着做", "恢复任务",
     "continue", "continue the task", "continue the previous task", "resume", "resume task",
 })
+_CANCELLATION_PHRASES = frozenset({
+    "取消任务", "取消这个任务", "取消当前任务", "终止任务", "终止这个任务", "终止当前任务",
+    "不要继续这个任务", "不用继续这个任务", "cancel task", "cancel this task", "cancel the task",
+})
 
 
 def utcnow() -> datetime:
@@ -40,12 +44,35 @@ def is_continuation_request(content: str) -> bool:
     )
 
 
+def is_task_cancellation_request(content: str) -> bool:
+    normalized = " ".join(content.strip().casefold().split()).rstrip("。?!？！")
+    return normalized in _CANCELLATION_PHRASES
+
+
 def steps_for_task(db: Any, task_id: str) -> list[PlanStep]:
     return list(db.scalars(
         select(PlanStep)
         .where(PlanStep.task_id == task_id)
         .order_by(PlanStep.position.asc(), PlanStep.created_at.asc(), PlanStep.id.asc())
     ))
+
+
+def cancel_durable_task(db: Any, task: DurableTask) -> DurableTask:
+    """Make a durable task terminal while retaining its completed evidence."""
+
+    if task.status == "cancelled":
+        return task
+    now = utcnow()
+    for step in steps_for_task(db, task.id):
+        if step.status != "completed":
+            step.status = "cancelled"
+            step.next_action = ""
+            step.completed_at = now
+    task.status = "cancelled"
+    task.active_step_id = None
+    task.completed_at = now
+    task.resume_summary = "用户已取消此任务。"
+    return task
 
 
 def latest_resumable_task(db: Any, session_id: str) -> DurableTask | None:

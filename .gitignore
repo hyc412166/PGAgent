@@ -16,6 +16,7 @@ data/*.db
 data/*.db-*
 data/backups/
 data/*.log
+data/mcp.json
 data/background-jobs/
 data/artifacts/
 data/workspaces/*

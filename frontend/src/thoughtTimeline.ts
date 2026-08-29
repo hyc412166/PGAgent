@@ -209,6 +209,25 @@ function safeProgressText(event: RunStreamEvent): string {
   ), 240)
 }
 
+function safeMcpServerNames(event: RunStreamEvent): string {
+  const payload = record(event.payload)
+  const rawServers = Array.isArray(event.servers)
+    ? event.servers
+    : Array.isArray(payload?.servers) ? payload.servers : []
+  const names = rawServers
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => cleanActivityText(value, 48))
+    .filter(Boolean)
+  if (names.length <= 3) return names.join('、')
+  return `${names.slice(0, 3).join('、')} 等 ${names.length} 个服务`
+}
+
+function mcpToolCount(event: RunStreamEvent): number {
+  const payload = record(event.payload)
+  const value = typeof event.tool_count === 'number' ? event.tool_count : payload?.tool_count
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+}
+
 function verificationReason(event: RunStreamEvent, type: string): string {
   if (!type.startsWith('completion_verification_')) return ''
   const payload = record(event.payload)
@@ -267,6 +286,38 @@ const contextActivityTypes = new Set(['context_prepared', 'context_resumed', 'co
 function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): ThoughtActivityItem | null {
   const type = firstString(event.type, event.event_type).toLowerCase()
   const progress = safeProgressText(event)
+  if (type === 'mcp_connecting') {
+    return {
+      id: 'mcp-connection',
+      kind: 'event',
+      icon: 'generic',
+      title: '正在连接 MCP 服务',
+      detail: safeMcpServerNames(event) || '正在启动并发现可用工具',
+      status: 'running',
+    }
+  }
+  if (type === 'mcp_ready') {
+    const toolCount = mcpToolCount(event)
+    return {
+      id: 'mcp-connection',
+      kind: 'event',
+      icon: 'generic',
+      title: 'MCP 已就绪',
+      detail: toolCount ? `已发现 ${toolCount} 个工具` : '服务已连接',
+      status: 'completed',
+    }
+  }
+  if (type === 'mcp_degraded') {
+    const toolCount = mcpToolCount(event)
+    return {
+      id: 'mcp-connection',
+      kind: 'event',
+      icon: 'generic',
+      title: '部分 MCP 服务不可用',
+      detail: toolCount ? `仍可使用 ${toolCount} 个工具` : '本轮将继续使用其他工具',
+      status: 'failed',
+    }
+  }
   if (type === 'model_step_started') {
     return {
       id: thoughtItemId(event, itemIndex),
@@ -322,7 +373,7 @@ export function updateThoughtTimeline(
   now = Date.now(),
 ): ThoughtTimelineState {
   const type = firstString(event.type, event.event_type).toLowerCase()
-  const start = state.startedAt ?? (type === 'model_step_started' || toolStartTypes.has(type) ? now : null)
+  const start = state.startedAt ?? (type === 'model_step_started' || type === 'mcp_connecting' || toolStartTypes.has(type) ? now : null)
   if (type === 'thought_delta' || type === 'thought_summary') {
     const rawText = type === 'thought_delta'
       ? firstString(event.delta)

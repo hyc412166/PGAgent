@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "local-example": {
+      "command": "python",
+      "args": ["-m", "your_mcp_server"],
+      "required": false,
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 120
+    },
+    "remote-example": {
+      "url": "https://example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${EXAMPLE_MCP_TOKEN}"
+      },
+      "enabled": false
+    }
+  }
+}

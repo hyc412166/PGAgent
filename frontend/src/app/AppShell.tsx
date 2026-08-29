@@ -1,4 +1,4 @@
-import { Bot, BookOpen, ChartNoAxesCombined, Database, History, LayoutDashboard, Menu, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Settings2, Sparkles, Sun, Type } from 'lucide-react'
+import { Bot, BookOpen, Cable, ChartNoAxesCombined, Database, History, LayoutDashboard, Menu, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Settings2, Sparkles, Sun, Type } from 'lucide-react'
 import { useEffect, useLayoutEffect, useState } from 'react'
 import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { api } from '../api'
@@ -6,6 +6,7 @@ import { PenguinMark } from '../components/penguin'
 import { AgentsPage } from '../features/agents/AgentsPage'
 import { DashboardPage } from '../features/dashboard/DashboardPage'
 import { MemoriesPage } from '../features/memories/MemoriesPage'
+import { McpPage } from '../features/mcp/McpPage'
 import { ModelsPage } from '../features/models/ModelsPage'
 import { RunsPage } from '../features/runs/RunsPage'
 import { AppearanceSettingsPage } from '../features/settings/AppearanceSettingsPage'
@@ -20,6 +21,7 @@ const navigation = [
   { path: '/dashboard', label: '总览', icon: LayoutDashboard },
   { path: '/agents', label: 'Agent 小队', icon: Bot },
   { path: '/skills', label: '技能库', icon: BookOpen },
+  { path: '/mcp', label: 'MCP', icon: Cable },
   { path: '/sessions', label: '会话', icon: MessageSquare },
   { path: '/runs', label: '运行记录', icon: History },
   { path: '/usage', label: '用量统计', icon: ChartNoAxesCombined },
@@ -91,13 +93,13 @@ function AppShell() {
           </div>
         <nav aria-label="主导航">
           <p className="nav-label">企鹅工作台</p>
-          {navigation.slice(0, 6).map(({ path, label, icon: Icon }) => (
+          {navigation.slice(0, 7).map(({ path, label, icon: Icon }) => (
             <NavLink key={path} to={path} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={collapsed ? label : undefined}>
               <Icon size={18} /><span>{label}</span>
             </NavLink>
           ))}
           <p className="nav-label nav-label-spaced">系统舱</p>
-          {navigation.slice(6).map(({ path, label, icon: Icon }) => (
+          {navigation.slice(7).map(({ path, label, icon: Icon }) => (
             <NavLink key={path} to={path} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={collapsed ? label : undefined}>
               <Icon size={18} /><span>{label}</span>
             </NavLink>
@@ -116,6 +118,7 @@ function AppShell() {
           <Route path="/workspaces" element={<Navigate to="/sessions" replace />} />
           <Route path="/agents" element={<AgentsPage />} />
           <Route path="/skills" element={<SkillsPage />} />
+          <Route path="/mcp" element={<McpPage />} />
           <Route path="/sessions" element={<SessionsPage />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/usage" element={<UsagePage />} />

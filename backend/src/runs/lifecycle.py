@@ -58,6 +58,7 @@ from src.context.assembly import COMPACTION_SCHEMA, CONTINUATION_PREFIX
 from src.tools import create_default_registry
 from src.tools.registry import TOOL_SCHEMAS
 from src.tools.types import ToolResult
+from src.mcp import attach_mcp_tools, mcp_runtime_pool
 
 from src.tasks import background as background_job_service
 from src.model.gateway import ModelConfigurationError, ProviderConfig
@@ -214,6 +215,15 @@ class RunCoordinator:
 
     def unregister_tool_canceller(self, run_id: str) -> None:
         self._tool_cancellers.pop(run_id, None)
+
+    def close_mcp_session(self, session_id: str) -> None:
+        """Schedule teardown after a durable conversation is deleted."""
+
+        loop = self._event_loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(mcp_runtime_pool.close_session(session_id))
+            )
 
     @classmethod
     def _remember_stream_delta(cls, run_id: str, event: Mapping[str, Any]) -> None:
@@ -876,6 +886,7 @@ class RunCoordinator:
                 db.commit()
         self._tasks.clear()
         self._memory_tasks.clear()
+        await mcp_runtime_pool.shutdown()
 
     @staticmethod
     def reconcile_interrupted_runs() -> list[str]:
@@ -2190,6 +2201,13 @@ class RunCoordinator:
             if self._stop_requested(run_id):
                 return
             runtime, context = self._resolve_runtime(run_id, coordinator_instance=self)
+            await attach_mcp_tools(
+                runtime.tool_registry,
+                session_key=str(context.get("session_id") or run_id),
+                workspace_root=str(context["workspace_root"]),
+                frozen_tools=context["runtime_binding"].get("mcp_tools"),
+                progress_sink=self._event_sink(run_id),
+            )
             self._install_completion_verifier(runtime, context)
             outcome = await runtime.run(
                 system_prompt=context["system_prompt"],
@@ -2236,6 +2254,13 @@ class RunCoordinator:
                 run_id,
                 runtime_binding=prior.runtime_binding,
                 coordinator_instance=self,
+            )
+            await attach_mcp_tools(
+                runtime.tool_registry,
+                session_key=str(context.get("session_id") or run_id),
+                workspace_root=str(context["workspace_root"]),
+                frozen_tools=context["runtime_binding"].get("mcp_tools"),
+                progress_sink=self._event_sink(run_id),
             )
             self._install_completion_verifier(runtime, context)
             if prior.stop_reason == "waiting_background":
@@ -2301,6 +2326,13 @@ class RunCoordinator:
                 run_id,
                 runtime_binding=prior.runtime_binding,
                 coordinator_instance=self,
+            )
+            await attach_mcp_tools(
+                runtime.tool_registry,
+                session_key=str(context.get("session_id") or run_id),
+                workspace_root=str(context["workspace_root"]),
+                frozen_tools=context["runtime_binding"].get("mcp_tools"),
+                progress_sink=self._event_sink(run_id),
             )
             self._install_completion_verifier(runtime, context)
             outcome = await runtime.resume_after_delegated_child(

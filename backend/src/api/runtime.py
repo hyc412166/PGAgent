@@ -47,7 +47,12 @@ from src.runs.service import (
 )
 from src.runs.stream import TERMINAL_EVENT_TYPES, run_stream_broker
 from src.skills.registry import replace_session_skills, validate_skill_ids
-from src.tasks.state import bind_recovery_task
+from src.tasks.state import (
+    bind_recovery_task,
+    cancel_durable_task,
+    is_task_cancellation_request,
+    latest_resumable_task,
+)
 from src.sessions.delivery import (
     find_turn_by_client_message,
     is_terminal_delivery,
@@ -391,6 +396,18 @@ async def launch_session_run(
     workspace_id = chat_session.workspace_id or agent.workspace_id or DEFAULT_WORKSPACE_ID
     if not workspace_id or db.get(Workspace, workspace_id) is None:
         raise HTTPException(status_code=409, detail="请先为会话或 Agent 选择有效工作区")
+    cancellation_request = is_task_cancellation_request(content)
+    if cancellation_request:
+        task = latest_resumable_task(db, session_id)
+        if task is not None:
+            linked_run_ids = list(db.scalars(
+                select(Run.id).where(Run.task_id == task.id).order_by(Run.started_at.desc())
+            ))
+            for linked_run_id in linked_run_ids:
+                coordinator.stop(linked_run_id, db=db, reason="user_interrupted")
+            cancel_durable_task(db, task)
+            db.commit()
+
     active = db.scalar(select(Run).where(Run.session_id == session_id, Run.status.in_(ACTIVE_STATUSES | {"awaiting_approval"})))
     if active is not None:
         raise HTTPException(status_code=409, detail="当前会话已有运行或待审批工具，请先处理后再发送")
@@ -407,7 +424,8 @@ async def launch_session_run(
         fingerprint=fingerprint,
         message_extra={"mode": mode},
     )
-    bind_recovery_task(db, run, content)
+    if not cancellation_request:
+        bind_recovery_task(db, run, content)
     chat_session.updated_at = datetime.now(timezone.utc)
     try:
         db.commit()

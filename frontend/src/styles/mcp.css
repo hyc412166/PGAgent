@@ -1,0 +1,134 @@
+.mcp-page { display: grid; gap: 16px; }
+.mcp-page .page-header { margin-bottom: 2px; }
+
+.mcp-overview {
+  min-height: 64px;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) minmax(230px, 320px);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 17px 17px 17px 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.mcp-overview-mark,
+.mcp-server-icon {
+  display: grid;
+  place-items: center;
+  color: var(--ocean-800);
+  border: 1px solid rgb(98 186 218 / 22%);
+  background: var(--ice);
+}
+
+.mcp-overview-mark { width: 42px; height: 42px; border-radius: 13px 13px 13px 6px; }
+.mcp-overview > div:nth-child(2) { min-width: 0; display: grid; gap: 3px; }
+.mcp-overview strong { color: var(--ink); font-size: .8125rem; }
+.mcp-overview span { color: var(--muted); font-size: .625rem; }
+
+.mcp-search {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px 12px 12px 6px;
+  color: var(--muted-2);
+  background: var(--surface-soft);
+}
+
+.mcp-search:focus-within { border-color: #e9a4ad; box-shadow: 0 0 0 3px var(--scarf-soft); }
+.mcp-search input { min-width: 0; width: 100%; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: .6875rem; }
+
+.mcp-server-list { display: grid; gap: 10px; }
+.mcp-server-card { position: relative; display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: stretch; }
+.mcp-connector { position: relative; display: flex; justify-content: center; }
+.mcp-connector::before { position: absolute; top: 0; bottom: -10px; left: 50%; width: 1px; content: ''; background: var(--line-strong); }
+.mcp-server-card:last-child .mcp-connector::before { bottom: 50%; }
+.mcp-connector span { z-index: 1; width: 13px; height: 13px; margin-top: 25px; border: 3px solid var(--page); border-radius: 50%; background: var(--muted-2); box-shadow: 0 0 0 1px var(--line-strong); }
+.mcp-server-card.is-enabled .mcp-connector span { background: var(--action-fill); }
+.mcp-connector i { position: absolute; top: 31px; right: 0; width: 13px; height: 1px; background: var(--line-strong); }
+
+.mcp-server-main {
+  min-width: 0;
+  padding: 13px 15px 11px;
+  border: 1px solid var(--line);
+  border-radius: 16px 16px 16px 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+}
+
+.mcp-server-main:hover { border-color: var(--line-strong); box-shadow: var(--shadow-md); transform: translateY(-1px); }
+.mcp-server-main > header { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+.mcp-server-icon { width: 38px; height: 38px; border-radius: 12px 12px 12px 5px; }
+.mcp-server-title { min-width: 0; }
+.mcp-server-title > div { display: flex; align-items: center; gap: 8px; }
+.mcp-server-title h2 { max-width: min(420px, 46vw); margin: 0; overflow: hidden; color: var(--ink); font-size: .8125rem; text-overflow: ellipsis; white-space: nowrap; }
+.mcp-server-title p { margin: 4px 0 0; color: var(--muted); font-size: .5625rem; }
+.mcp-runtime-status { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: .5625rem; font-weight: 760; }
+.mcp-runtime-status::before { width: 6px; height: 6px; border-radius: 50%; content: ''; background: var(--muted-2); }
+.mcp-runtime-status.status-ready { color: var(--success); }
+.mcp-runtime-status.status-ready::before { background: var(--success); box-shadow: 0 0 0 3px rgb(49 164 119 / 12%); }
+.mcp-runtime-status.status-degraded,
+.mcp-runtime-status.status-failed { color: var(--red); }
+.mcp-runtime-status.status-degraded::before,
+.mcp-runtime-status.status-failed::before { background: var(--red); }
+.mcp-server-controls { display: flex; align-items: center; gap: 3px; }
+.mcp-server-controls .icon-button { width: 40px; height: 40px; }
+.mcp-server-controls .danger-icon:hover:not(:disabled) { color: var(--red); background: var(--red-soft); }
+
+.mcp-command-line { min-width: 0; display: flex; align-items: center; gap: 8px; margin-top: 11px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px 10px 10px 5px; color: var(--muted); background: var(--surface-soft); }
+.mcp-command-line svg { flex: 0 0 auto; }
+.mcp-command-line code { min-width: 0; overflow: hidden; color: var(--ink); font-size: .625rem; text-overflow: ellipsis; white-space: nowrap; }
+.mcp-server-main > footer { display: flex; align-items: center; gap: 12px; padding-top: 9px; color: var(--muted-2); font-size: .5625rem; font-variant-numeric: tabular-nums; }
+.mcp-server-main > footer span + span::before { margin-right: 12px; content: '·'; }
+
+.mcp-delete-confirm { display: flex; align-items: center; gap: 8px; margin-top: 10px; padding: 8px 9px; border: 1px solid rgb(224 83 97 / 24%); border-radius: 11px 11px 11px 5px; color: var(--red); background: var(--red-soft); }
+.mcp-delete-confirm > span { min-width: 0; flex: 1; font-size: .625rem; }
+.mcp-delete-confirm .button { min-height: 34px; }
+.mcp-server-main .inline-error { margin-top: 9px; }
+
+.mcp-server-form { padding-bottom: 4px; }
+.mcp-arguments-field { display: grid; gap: 9px; }
+.mcp-field-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; }
+.mcp-field-heading > div { display: grid; gap: 4px; }
+.mcp-field-heading strong,
+.mcp-form-enabled strong { color: var(--ink); font-size: .625rem; }
+.mcp-field-heading small,
+.mcp-form-enabled small { color: var(--muted-2); font-size: .5625rem; line-height: 1.45; }
+.mcp-field-heading .button { min-height: 34px; }
+.mcp-argument-list { display: grid; gap: 7px; }
+.mcp-argument-row { display: grid; grid-template-columns: 27px minmax(0, 1fr) 40px; align-items: center; gap: 6px; }
+.mcp-argument-row > span { color: var(--muted-2); font-size: .5625rem; font-variant-numeric: tabular-nums; text-align: center; }
+.mcp-argument-row input { width: 100%; height: 40px; padding: 0 11px; border: 1px solid var(--line-strong); border-radius: 11px 11px 11px 5px; outline: 0; color: var(--ink); background: rgb(255 255 255 / 72%); font: .6875rem ui-monospace, Consolas, monospace; }
+.mcp-argument-row input:focus { border-color: #e9a4ad; box-shadow: 0 0 0 3px var(--scarf-soft); }
+.mcp-argument-row .icon-button { width: 40px; height: 40px; }
+.mcp-arguments-empty { min-height: 44px; display: flex; align-items: center; justify-content: center; gap: 7px; padding: 0 12px; border: 1px dashed var(--line-strong); border-radius: 11px 11px 11px 5px; color: var(--muted); background: var(--surface-soft); font-size: .625rem; }
+.mcp-arguments-empty:hover { color: var(--scarf-dark); border-color: #efb4bc; background: var(--scarf-soft); }
+.mcp-form-enabled { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 9px 7px 12px; border: 1px solid var(--line); border-radius: 12px 12px 12px 5px; background: var(--surface-soft); }
+.mcp-form-enabled > div { display: grid; gap: 4px; }
+
+.theme-dark .mcp-overview,
+.theme-dark .mcp-server-main { background: var(--surface); }
+.theme-dark .mcp-argument-row input { background: var(--surface); }
+.theme-dark .mcp-page .button-quiet,
+.theme-dark .mcp-page .button-secondary { color: var(--ink); border-color: var(--line-strong); background: var(--surface-soft); }
+.theme-dark .mcp-page .button-quiet:hover:not(:disabled),
+.theme-dark .mcp-page .button-secondary:hover:not(:disabled) { color: #fff; border-color: var(--action); background: var(--ocean-700); }
+
+@media (max-width: 700px) {
+  .mcp-overview { grid-template-columns: 42px minmax(0, 1fr); }
+  .mcp-search { grid-column: 1 / -1; }
+  .mcp-server-card { grid-template-columns: 18px minmax(0, 1fr); }
+  .mcp-connector i { width: 7px; }
+  .mcp-server-main > header { grid-template-columns: 36px minmax(0, 1fr); }
+  .mcp-server-controls { grid-column: 1 / -1; justify-content: flex-end; padding-top: 5px; border-top: 1px solid var(--line); }
+  .mcp-server-title h2 { max-width: 55vw; }
+  .mcp-delete-confirm { align-items: flex-start; flex-wrap: wrap; }
+  .mcp-delete-confirm > span { min-width: calc(100% - 26px); }
+  .mcp-delete-confirm .button:first-of-type { margin-left: auto; }
+}

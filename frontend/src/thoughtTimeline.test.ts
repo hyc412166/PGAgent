@@ -87,6 +87,37 @@ describe('实时 Thought 时间线', () => {
     expect(verifying.activeItemId).toBe('verify-1')
   })
 
+  it('从 MCP 启动开始就显示可见进度，并在连接完成后收口', () => {
+    const connecting = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'mcp_connecting',
+      servers: ['playwright'],
+    }, 1_000)
+    const ready = updateThoughtTimeline(connecting, {
+      type: 'mcp_ready',
+      tool_count: 24,
+      failed_servers: [],
+    }, 15_000)
+
+    expect(connecting.items).toEqual([
+      expect.objectContaining({
+        id: 'mcp-connection',
+        title: '正在连接 MCP 服务',
+        detail: 'playwright',
+        status: 'running',
+      }),
+    ])
+    expect(connecting.activeItemId).toBe('mcp-connection')
+    expect(ready.items).toEqual([
+      expect.objectContaining({
+        id: 'mcp-connection',
+        title: 'MCP 已就绪',
+        detail: '已发现 24 个工具',
+        status: 'completed',
+      }),
+    ])
+    expect(ready.activeItemId).toBeUndefined()
+  })
+
   it('中断后用服务端快照补齐可能漏掉的最后一段思考', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 2 }, 1_000)
     const partial = updateThoughtTimeline(started, { type: 'thought_delta', step: 2, delta: '正在分析' }, 1_100)

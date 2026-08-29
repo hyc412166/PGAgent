@@ -19,6 +19,8 @@ from src.persistence.database import (
 from src.runs.service import RunCoordinator
 from src.tasks.state import (
     bind_recovery_task,
+    cancel_durable_task,
+    is_task_cancellation_request,
     is_continuation_request,
     recovery_prompt,
     sync_todos_for_run,
@@ -133,6 +135,34 @@ def test_continuation_request_accepts_common_resume_wording() -> None:
     assert is_continuation_request("继续刚刚没完成的工作？")
     assert is_continuation_request("接着之前的步骤做")
     assert is_continuation_request("continue where we left off")
+
+
+def test_task_cancellation_request_accepts_explicit_short_commands() -> None:
+    assert is_task_cancellation_request("取消这个任务")
+    assert is_task_cancellation_request("cancel this task")
+    assert not is_task_cancellation_request("取消这个任务后，帮我创建另一个发布任务")
+
+
+def test_cancel_durable_task_is_terminal_and_preserves_completed_steps(task_db) -> None:
+    _session_id, run_id = _stage("Cancel a durable task")
+    sync_todos_for_run(run_id, [
+        {"id": "done", "content": "Completed work", "status": "completed"},
+        {"id": "active", "content": "Active work", "status": "in_progress"},
+        {"id": "next", "content": "Pending work", "status": "pending"},
+    ])
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        task = db.get(DurableTask, run.task_id)
+        cancel_durable_task(db, task)
+        db.commit()
+
+        assert task.status == "cancelled"
+        assert task.active_step_id is None
+        assert task.completed_at is not None
+        steps = list(db.query(PlanStep).filter_by(task_id=task.id).order_by(PlanStep.position))
+        assert [step.status for step in steps] == ["completed", "cancelled", "cancelled"]
+        assert all(step.completed_at is not None for step in steps)
 
 
 def test_late_todowrite_cannot_reopen_a_stopped_task(task_db) -> None:

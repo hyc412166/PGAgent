@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
 from . import advanced, builtins
@@ -433,6 +433,11 @@ class ToolRegistry:
         self.sandbox = sandbox
         self.permission_mode = normalize_permission_mode(permission_mode)
         self._tools: dict[str, Callable[..., ToolResult]] = {}
+        self._async_tools: dict[str, Callable[[dict[str, Any]], Awaitable[ToolResult]]] = {}
+        self._schemas: dict[str, dict[str, Any]] = dict(TOOL_SCHEMAS)
+        self._external_read_only: dict[str, bool] = {}
+        self._parallel_external_tools: set[str] = set()
+        self._external_state: dict[str, Any] = {}
         self._known_tools = set(TOOL_SCHEMAS)
         self._task_delegate = task_delegate
         self._todo_change_sink = todo_change_sink
@@ -650,26 +655,51 @@ class ToolRegistry:
             self.register(name, function)
 
     def register(self, name: str, function: Callable[..., ToolResult]) -> None:
-        if name not in TOOL_SCHEMAS:
+        if name not in self._schemas:
             raise ValueError(f"工具没有 provider schema: {name}")
         self._tools[name] = function
 
+    def register_external(
+        self,
+        name: str,
+        schema: Mapping[str, Any],
+        function: Callable[[dict[str, Any]], Awaitable[ToolResult]],
+        *,
+        read_only: bool,
+        parallel: bool,
+    ) -> None:
+        """Register one discovered asynchronous integration tool."""
+
+        self._schemas[name] = dict(schema)
+        self._known_tools.add(name)
+        self._async_tools[name] = function
+        self._external_read_only[name] = bool(read_only)
+        if parallel:
+            self._parallel_external_tools.add(name)
+
+    def schema_for(self, name: str) -> dict[str, Any]:
+        return dict(self._schemas[name])
+
+    def set_external_state(self, key: str, value: Any) -> None:
+        self._external_state[key] = value
+
     @property
     def enabled_tool_names(self) -> tuple[str, ...]:
-        return tuple(self._tools)
+        return (*self._tools, *(name for name in self._async_tools if name not in self._tools))
 
     def can_execute_batch_in_parallel(self, names: Iterable[str]) -> bool:
         normalized = tuple(str(name) for name in names)
         return len(normalized) > 1 and all(
-            name in self._tools and name in PARALLEL_READ_ONLY_TOOL_NAMES
+            (name in self._tools or name in self._async_tools)
+            and (name in PARALLEL_READ_ONLY_TOOL_NAMES or name in self._parallel_external_tools)
             for name in normalized
         )
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
         return [
-            {"type": "function", "function": {"name": name, **TOOL_SCHEMAS[name]}}
-            for name in self._tools
+            {"type": "function", "function": {"name": name, **self._schemas[name]}}
+            for name in self.enabled_tool_names
         ]
 
     @property
@@ -693,6 +723,7 @@ class ToolRegistry:
             "permission_mode": self.permission_mode,
             "skill_instructions": [dict(item) for item in self._skill_instructions.values()],
             "todo_state": [dict(item) for item in self._todo_state],
+            **self._external_state,
         }
 
     def cancel_active(self) -> None:
@@ -801,6 +832,48 @@ class ToolRegistry:
         boundary here avoids nesting an event loop or faking a background
         result while preserving the same approval checks.
         """
+
+        external = self._async_tools.get(name)
+        if external is not None:
+            kwargs = dict(arguments or {})
+            if "_raw" in kwargs or "_invalid_json" in kwargs:
+                return ToolResult(
+                    name,
+                    False,
+                    "MCP 工具参数不是有效的 JSON 对象",
+                    error_code="invalid_tool_arguments",
+                )
+            read_only = self._external_read_only.get(name, False)
+            if not read_only and advanced.plan_mode_enabled(self.sandbox):
+                return ToolResult(
+                    name,
+                    False,
+                    "Plan mode is active; mutating MCP tools are disabled until ExitPlanMode.",
+                    error_code="plan_mode_read_only",
+                )
+            if not approved and (
+                self.permission_mode == "ask"
+                or (self.permission_mode == "smart" and not read_only)
+            ):
+                reason = (
+                    "请求批准模式：MCP 调用会越过本地 Agent 边界，执行前需要你确认。"
+                    if self.permission_mode == "ask"
+                    else "该 MCP 工具未声明为只读，可能修改外部或本地状态，需要你确认。"
+                )
+                return _approval(name, kwargs, reason)
+            try:
+                return self._rename_result(await external(kwargs), name)
+            except TypeError as exc:
+                return ToolResult(name, False, f"MCP 工具参数无效: {exc}", error_code="invalid_arguments")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return ToolResult(
+                    name,
+                    False,
+                    f"MCP 工具执行失败: {type(exc).__name__}: {exc}",
+                    error_code="mcp_tool_error",
+                )
 
         if name not in {"task", "Agent"}:
             # Built-in tools are synchronous (filesystem, subprocess and

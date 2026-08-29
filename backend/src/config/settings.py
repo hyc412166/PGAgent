@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     context_limit_tokens: int = 100_000
     compact_threshold_tokens: int = 90_000
     completion_verification_max_attempts: int = 3
+    mcp_config_path: str | None = None
 
     @property
     def data_dir(self) -> Path:
@@ -35,5 +36,11 @@ class Settings(BaseSettings):
     @property
     def workspaces_dir(self) -> Path:
         return self.data_dir / "workspaces"
+
+    @property
+    def mcp_config_file(self) -> Path:
+        if self.mcp_config_path:
+            return Path(self.mcp_config_path).expanduser().resolve()
+        return self.data_dir / "mcp.json"
 
 settings = Settings()
