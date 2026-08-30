@@ -105,6 +105,7 @@ def configure_database(url: str) -> None:
 _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
     "agents": {
         "is_default": "BOOLEAN NOT NULL DEFAULT 0",
+        "workflow_profile_id": "VARCHAR(16) NOT NULL DEFAULT 'auto'",
     },
     "sessions": {
         "model_connection_id": "VARCHAR(36)",
@@ -463,6 +464,7 @@ def _seed_defaults() -> None:
                 system_prompt=DEFAULT_AGENT_SYSTEM_PROMPT,
                 workspace_id=DEFAULT_WORKSPACE_ID,
                 mode="auto",
+                workflow_profile_id="auto",
                 enabled=True,
                 is_default=True,
             ))
@@ -484,6 +486,7 @@ def _seed_defaults() -> None:
         agent.model_id = None
         agent.thinking_level = "auto"
         agent.mode = "auto"
+        agent.workflow_profile_id = "auto"
         agent.enabled = True
         agent.is_default = True
 

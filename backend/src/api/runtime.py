@@ -6,10 +6,11 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+from starlette.datastructures import UploadFile
 from sse_starlette.sse import EventSourceResponse
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -58,10 +59,15 @@ from src.sessions.delivery import (
     find_turn_by_client_message,
     is_terminal_delivery,
     persist_terminal_response,
-    request_fingerprint,
     run_for_turn,
     stage_user_turn,
 )
+from src.attachments.storage import (
+    UploadedAttachment,
+    persist_uploaded_attachments,
+    read_uploaded_attachments,
+)
+from src.context.assembly import FilesystemArtifactStore
 
 
 router = APIRouter(prefix="/api", tags=["runtime"])
@@ -80,7 +86,7 @@ def _stream_event_is_terminal(event: dict) -> bool:
 
 
 class SessionRunRequest(BaseModel):
-    content: str = Field(min_length=1, max_length=100_000)
+    content: str = Field(default="", max_length=100_000)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=255)
 
 
@@ -137,7 +143,11 @@ def _begin_draft_transaction(db: OrmSession) -> None:
         ) from exc
 
 
-def _draft_request_fingerprint(payload: DraftLaunchRequest, normalized_root: str | None) -> str:
+def _draft_request_fingerprint(
+    payload: DraftLaunchRequest,
+    normalized_root: str | None,
+    uploads: Sequence[UploadedAttachment] = (),
+) -> str:
     """Bind an idempotency key to its exact materialisation request."""
 
     canonical = {
@@ -153,7 +163,44 @@ def _draft_request_fingerprint(payload: DraftLaunchRequest, normalized_root: str
         "mcp_server_names": sorted({name.strip() for name in payload.mcp_server_names}),
     }
     encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(encoded.encode("utf-8"))
+    for upload in uploads:
+        digest.update(b"\0attachment\0")
+        digest.update(upload.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(upload.mime_type.encode("ascii", errors="replace"))
+        digest.update(b"\0")
+        digest.update(upload.data)
+    return digest.hexdigest()
+
+
+def _turn_request_fingerprint(content: str, uploads: Sequence[UploadedAttachment]) -> str:
+    digest = hashlib.sha256(content.strip().encode("utf-8"))
+    for upload in uploads:
+        digest.update(b"\0attachment\0")
+        digest.update(upload.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(upload.mime_type.encode("ascii", errors="replace"))
+        digest.update(b"\0")
+        digest.update(upload.data)
+    return digest.hexdigest()
+
+
+async def _multipart_payload(
+    request: Request,
+    model_type: type[DraftLaunchRequest] | type[SessionRunRequest],
+) -> tuple[DraftLaunchRequest | SessionRunRequest, list[UploadedAttachment]]:
+    form = await request.form(max_files=10, max_fields=10, max_part_size=25 * 1024 * 1024)
+    raw_payload = form.get("payload")
+    try:
+        payload = model_type.model_validate_json(str(raw_payload or ""))
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    files = [item for item in form.getlist("files") if isinstance(item, UploadFile)]
+    uploads = await read_uploaded_attachments(files)
+    if not payload.content and not uploads:
+        raise HTTPException(status_code=422, detail="消息内容和附件不能同时为空")
+    return payload, uploads
 
 
 def _workspace_for_root(db: OrmSession, normalized_root: str) -> Workspace | None:
@@ -228,11 +275,11 @@ def _mark_unscheduled_run(
     db.commit()
 
 
-@router.post("/drafts/launch", response_model=DraftLaunchRead, status_code=status.HTTP_202_ACCEPTED)
-async def launch_draft(
+async def _launch_draft_core(
     payload: DraftLaunchRequest,
     response: Response,
     db: OrmSession = Depends(get_db),
+    uploads: Sequence[UploadedAttachment] = (),
 ) -> DraftLaunchRead:
     """Atomically turn a client-only draft into its first persisted run.
 
@@ -243,7 +290,9 @@ async def launch_draft(
     """
 
     normalized_root = _normalized_workspace_root(payload.root_path) if payload.root_path else None
-    fingerprint = _draft_request_fingerprint(payload, normalized_root)
+    if not payload.content and not uploads:
+        raise HTTPException(status_code=422, detail="消息内容和附件不能同时为空")
+    fingerprint = _draft_request_fingerprint(payload, normalized_root, uploads)
     try:
         _begin_draft_transaction(db)
         existing = db.scalar(
@@ -311,6 +360,14 @@ async def launch_draft(
         db.add(chat_session)
         db.flush()
         replace_session_skills(db, chat_session, skill_ids)
+        attachments = persist_uploaded_attachments(
+            db,
+            session_id=chat_session.id,
+            artifact_store=FilesystemArtifactStore(
+                settings.data_dir / "artifacts" / chat_session.id
+            ),
+            uploads=uploads,
+        )
         _turn, message, run = stage_user_turn(
             db,
             session_id=chat_session.id,
@@ -320,8 +377,13 @@ async def launch_draft(
             mode="auto",
             client_message_id=payload.idempotency_key,
             fingerprint=fingerprint,
-            message_extra={"mode": "auto", "source": "draft_launch"},
+            message_extra={
+                "mode": "auto",
+                "source": "draft_launch",
+                "attachments": attachments,
+            },
         )
+        message.provider_payload = {"attachment_refs": attachments} if attachments else {}
         record = DraftLaunch(
             idempotency_key=payload.idempotency_key,
             request_fingerprint=fingerprint,
@@ -369,21 +431,40 @@ async def launch_draft(
     return result
 
 
-@router.post("/sessions/{session_id}/run", response_model=RunRead, status_code=status.HTTP_202_ACCEPTED)
-async def launch_session_run(
+@router.post("/drafts/launch", response_model=DraftLaunchRead, status_code=status.HTTP_202_ACCEPTED)
+async def launch_draft(
+    payload: DraftLaunchRequest,
+    response: Response,
+    db: OrmSession = Depends(get_db),
+) -> DraftLaunchRead:
+    return await _launch_draft_core(payload, response, db)
+
+
+@router.post("/drafts/launch-input", response_model=DraftLaunchRead, status_code=status.HTTP_202_ACCEPTED)
+async def launch_draft_input(
+    request: Request,
+    response: Response,
+    db: OrmSession = Depends(get_db),
+) -> DraftLaunchRead:
+    payload, uploads = await _multipart_payload(request, DraftLaunchRequest)
+    return await _launch_draft_core(payload, response, db, uploads)
+
+
+async def _launch_session_run_core(
     session_id: str,
     payload: SessionRunRequest,
     response: Response,
     db: OrmSession = Depends(get_db),
+    uploads: Sequence[UploadedAttachment] = (),
 ) -> Run:
     chat_session = db.get(Session, session_id)
     if chat_session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     content = payload.content.strip()
-    if not content:
-        raise HTTPException(status_code=422, detail="消息内容不能为空")
+    if not content and not uploads:
+        raise HTTPException(status_code=422, detail="消息内容和附件不能同时为空")
     client_message_id = payload.idempotency_key.strip() if payload.idempotency_key else None
-    fingerprint = request_fingerprint(content)
+    fingerprint = _turn_request_fingerprint(content, uploads)
     existing_turn = find_turn_by_client_message(
         db,
         session_id=session_id,
@@ -423,7 +504,15 @@ async def launch_session_run(
         raise HTTPException(status_code=409, detail="当前会话已有运行或待审批工具，请先处理后再发送")
 
     mode = "auto"
-    _turn, _message, run = stage_user_turn(
+    attachments = persist_uploaded_attachments(
+        db,
+        session_id=session_id,
+        artifact_store=FilesystemArtifactStore(
+            settings.data_dir / "artifacts" / session_id
+        ),
+        uploads=uploads,
+    )
+    _turn, message, run = stage_user_turn(
         db,
         session_id=session_id,
         workspace_id=workspace_id,
@@ -432,10 +521,12 @@ async def launch_session_run(
         mode=mode,
         client_message_id=client_message_id,
         fingerprint=fingerprint,
-        message_extra={"mode": mode},
+        message_extra={"mode": mode, "attachments": attachments},
     )
+    message.provider_payload = {"attachment_refs": attachments} if attachments else {}
     if not cancellation_request:
-        bind_recovery_task(db, run, content)
+        task_prompt = content or f"分析附件：{', '.join(item['name'] for item in attachments)}"
+        bind_recovery_task(db, run, task_prompt)
     chat_session.updated_at = datetime.now(timezone.utc)
     try:
         db.commit()
@@ -464,6 +555,27 @@ async def launch_session_run(
         _mark_unscheduled_run(db, run)
         db.refresh(run)
     return run
+
+
+@router.post("/sessions/{session_id}/run", response_model=RunRead, status_code=status.HTTP_202_ACCEPTED)
+async def launch_session_run(
+    session_id: str,
+    payload: SessionRunRequest,
+    response: Response,
+    db: OrmSession = Depends(get_db),
+) -> Run:
+    return await _launch_session_run_core(session_id, payload, response, db)
+
+
+@router.post("/sessions/{session_id}/turns", response_model=RunRead, status_code=status.HTTP_202_ACCEPTED)
+async def launch_session_turn(
+    session_id: str,
+    request: Request,
+    response: Response,
+    db: OrmSession = Depends(get_db),
+) -> Run:
+    payload, uploads = await _multipart_payload(request, SessionRunRequest)
+    return await _launch_session_run_core(session_id, payload, response, db, uploads)
 
 
 @router.get("/runs/{run_id}/stream")

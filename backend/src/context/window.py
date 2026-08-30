@@ -29,7 +29,14 @@ def estimate_tokens(value: str | Mapping[str, Any] | Sequence[Any]) -> int:
 
 
 def message_tokens(message: Mapping[str, Any]) -> int:
-    return 4 + estimate_tokens(dict(message))
+    content = message.get("content")
+    image_tokens = 0
+    if isinstance(content, list):
+        image_tokens = 1_200 * sum(
+            1 for item in content
+            if isinstance(item, Mapping) and item.get("type") == "pgagent_image_ref"
+        )
+    return 4 + estimate_tokens(dict(message)) + image_tokens
 
 
 class ContextManager:

@@ -94,6 +94,10 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
         "git_status",
         "git_diff",
         "file_info",
+        "apply_patch",
+        "validate",
+        "review_finding",
+        "debug_evidence",
     }.issubset(by_id)
     assert by_id["bash"]["runtime_tool_id"] == "bash"
     assert by_id["read"]["risk_level"] == "low"
@@ -103,6 +107,8 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
     assert by_id["delete"]["requires_approval"] is True
     assert by_id["git_diff"]["risk_level"] == "low"
     assert by_id["file_info"]["availability"] == "available"
+    assert by_id["review_finding"]["risk_level"] == "low"
+    assert by_id["debug_evidence"]["runtime_tool_id"] == "debug_evidence"
     assert {"availability", "enabled", "is_builtin"}.issubset(by_id["skill"])
 
     default_agent = test_client.get(f"/api/agents/{DEFAULT_AGENT_ID}")
@@ -193,6 +199,7 @@ def test_agent_and_session_capability_relations_persist_through_api(
         "/api/agents",
         json={
             "name": "Research helper",
+            "workflow_profile_id": "review",
             "tool_ids": ["read", "bash", "read"],
             "skill_ids": [skill["id"]],
         },
@@ -201,13 +208,16 @@ def test_agent_and_session_capability_relations_persist_through_api(
     agent = agent_response.json()
     assert agent["tool_ids"] == ["bash", "read"]
     assert agent["skill_ids"] == [skill["id"]]
+    assert agent["workflow_profile_id"] == "review"
 
     updated_agent = test_client.patch(
-        f"/api/agents/{agent['id']}", json={"tool_ids": ["write"], "skill_ids": []}
+        f"/api/agents/{agent['id']}",
+        json={"workflow_profile_id": "debug", "tool_ids": ["write"], "skill_ids": []},
     )
     assert updated_agent.status_code == 200
     assert updated_agent.json()["tool_ids"] == ["write"]
     assert updated_agent.json()["skill_ids"] == []
+    assert updated_agent.json()["workflow_profile_id"] == "debug"
 
     session_response = test_client.post(
         "/api/sessions",

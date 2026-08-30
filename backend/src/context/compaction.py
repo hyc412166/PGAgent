@@ -54,6 +54,7 @@ from src.agent import (
 )
 from src.context import ContextManager, FilesystemArtifactStore
 from src.context.window import message_tokens
+from src.attachments.storage import attachment_message_content
 from src.context.assembly import COMPACTION_SCHEMA, CONTINUATION_PREFIX
 from src.tools import create_default_registry
 from src.tools.registry import TOOL_SCHEMAS
@@ -139,9 +140,20 @@ def approval_matches_pending(approval: Approval, pending: dict[str, Any] | None)
 def _message_payload(message: ChatMessage) -> dict[str, Any]:
     provider_payload = message.provider_payload if isinstance(message.provider_payload, dict) else {}
     rendered_content = provider_payload.get("rendered_content")
+    attachment_refs = provider_payload.get("attachment_refs")
+    user_content: Any = (
+        rendered_content
+        if message.role == "user" and isinstance(rendered_content, str)
+        else message.content
+    )
+    if message.role == "user" and isinstance(attachment_refs, list) and attachment_refs:
+        user_content = attachment_message_content(
+            str(user_content),
+            [item for item in attachment_refs if isinstance(item, Mapping)],
+        )
     payload: dict[str, Any] = {
         "role": message.role,
-        "content": rendered_content if message.role == "user" and isinstance(rendered_content, str) else message.content,
+        "content": user_content,
     }
     if message.tool_name:
         payload["name"] = message.tool_name

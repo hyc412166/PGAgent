@@ -70,7 +70,7 @@ API Key 不写入 SQLite，保存到 Windows Credential Manager；数据库只�
 - `GET /api/usage/runs/{run_id}`：读取单次运行的精确 Token/缓存/成本明细；无 provider 用量回报时返回 `null`。
 - `GET /api/skills`、`POST /api/skills/import`：列出或安全导入本地 `SKILL.md` 文件夹。
 - `GET /api/skills/market/status`、`POST /api/skills/market/search`：skills.sh 市场状态与搜索。市场 API 需要环境变量 `SKILLS_SH_API_TOKEN`（或 Vercel OIDC token）；未配置时会明确返回 `available=false`，不会伪造搜索结果。
-- 本地启动会通过已登录且已关联项目的 Vercel CLI 刷新短期 OIDC token；运行中若 skills.sh 返回 401，后端会刷新一次并重试。刷新失败不会阻止 PGAgent 的其他本地功能启动。
+- 本地启动只读取 `.env.local` 中已有的短期 OIDC token，不再连带运行刷新脚本；运行中若 skills.sh 返回 401，后端会按需刷新一次并重试。刷新失败不会阻止 PGAgent 的其他本地功能。
 - `POST /api/skills/market/install`：传入 `market_id` 或受限的公开 GitHub 仓库/ZIP `source_url`。默认只返回候选 Skill 与文件预览；再次携带 `confirm=true` 才会复制，不执行任何 Skill 脚本。
 - `AgentCreate/AgentUpdate` 支持 `tool_ids`、`skill_ids`；`SessionCreate/SessionUpdate` 支持 `permission_mode`、`skill_ids`。相应 Read 响应始终返回这些字段。固定 PGAgent 主控展示全套内置工具，不能修改或删除。
 - `GET /api/mcp`：只读查看已配置 server 和当前会话连接状态，不返回 command 参数、HTTP Header 或环境变量值。

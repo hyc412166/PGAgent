@@ -8,6 +8,7 @@ mcp==2.1.1
 litellm==1.96.0
 keyring==25.6.0
 python-multipart==0.0.20
+pymupdf==1.26.4
 sse-starlette==3.0.2
 pytest==8.4.1
 pytest-asyncio==1.1.0

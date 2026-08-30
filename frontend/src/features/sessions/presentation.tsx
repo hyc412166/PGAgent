@@ -20,6 +20,8 @@ import {
 import { useEffect, useState } from 'react'
 import { memo } from 'react'
 import { formatLiveThinkingDuration, formatThoughtDuration, type ThoughtActivityIcon, type ThoughtActivityItem, type ThoughtTimelineState } from '../../thoughtTimeline'
+import { apiUrl } from '../../api'
+import { formatAttachmentSize, messageAttachments } from '../../attachments'
 import type { Approval, DelegatedTask, Message, Run, RunEvent, Teammate } from '../../types'
 import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../components/ui'
 import { statusText } from '../../components/status'
@@ -124,6 +126,13 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
 
 export const MessageBubble = memo(function MessageBubble({ message }: { message: Message }) {
   const [copied, setCopied] = useState(false)
+  const attachments = messageAttachments(message.metadata?.attachments)
+  const imageAttachments = message.session_id
+    ? attachments.filter((attachment) => attachment.mime_type.startsWith('image/'))
+    : []
+  const fileAttachments = attachments.filter((attachment) => (
+    !attachment.mime_type.startsWith('image/') || !message.session_id
+  ))
   const isTool = message.role === 'tool' || !!message.tool_name
   const isDelegatedChild = message.metadata?.delegated_child === true
   const childAgentName = typeof message.metadata?.child_agent_name === 'string'
@@ -146,11 +155,33 @@ export const MessageBubble = memo(function MessageBubble({ message }: { message:
     }
   }
   return (
-    <article className={`message ${message.role} ${isTool ? 'tool-message' : ''}`}>
+    <article className={`message ${message.role} ${isTool ? 'tool-message' : ''} ${attachments.length ? 'has-attachments' : ''}`}>
       <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <PenguinMark size={21} />}</div>
       <div className="message-body">
         <div className="message-meta"><strong>{speaker}</strong><time>{formatUiDate(message.created_at)}</time></div>
-        <div className="message-content">{message.content}</div>
+        {!!imageAttachments.length && <div className="message-image-gallery" aria-label="消息图片">
+          {imageAttachments.map((attachment) => {
+            const href = apiUrl(`/api/sessions/${message.session_id}/attachments/${attachment.id}/content`)
+            return <a key={attachment.id} className="message-image-link" href={href} target="_blank" rel="noreferrer" title={`打开 ${attachment.name}`}>
+              <img src={href} alt={attachment.name} loading="lazy" />
+            </a>
+          })}
+        </div>}
+        {!!message.content && <div className="message-content">{message.content}</div>}
+        {!!fileAttachments.length && <div className="message-attachments" aria-label="消息附件">
+          {fileAttachments.map((attachment) => {
+            const href = message.session_id
+              ? apiUrl(`/api/sessions/${message.session_id}/attachments/${attachment.id}/content`)
+              : ''
+            return href ? <a key={attachment.id} className="message-attachment" href={href} target="_blank" rel="noreferrer" title={`打开 ${attachment.name}`}>
+              <span className="message-attachment-preview"><FileText size={18} /></span>
+              <span><strong>{attachment.name}</strong><small>{attachment.mime_type === 'application/pdf' ? 'PDF' : attachment.mime_type} · {formatAttachmentSize(attachment.size_bytes)}</small></span>
+            </a> : <span key={attachment.id} className="message-attachment">
+              <span className="message-attachment-preview"><FileText size={18} /></span>
+              <span><strong>{attachment.name}</strong><small>{formatAttachmentSize(attachment.size_bytes)}</small></span>
+            </span>
+          })}
+        </div>}
         {message.status && <StatusBadge status={message.status} />}
         <div className="message-actions">
           <button type="button" className="message-copy-button" aria-label={copied ? '已复制' : '复制消息'} title={copied ? '已复制' : '复制消息'} onClick={() => void copyMessage()}>{copied ? <CheckCheck size={11} /> : <Copy size={11} />}</button>

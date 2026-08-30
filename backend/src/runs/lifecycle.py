@@ -53,6 +53,7 @@ from src.agent import (
 )
 from src.context.window import message_tokens
 from src.context.assembly import COMPACTION_SCHEMA, CONTINUATION_PREFIX
+from src.attachments.contracts import ATTACHMENT_TOOL_NAMES
 from src.tools.registry import TOOL_SCHEMAS
 from src.tools.types import ToolResult
 from src.mcp import mcp_runtime_pool
@@ -1158,6 +1159,9 @@ class RunCoordinator:
             else:
                 transcript_sequence = 0
             agent_tool_ids = list(getattr(agent, "tool_ids", []) or [])
+            workflow_profile_id = str(
+                getattr(agent, "workflow_profile_id", "auto") or "auto"
+            )
             agent_skill_ids = list(getattr(agent, "skill_ids", []) or [])
             session_skill_ids = list(getattr(session, "skill_ids", []) or []) if session else []
             configured_skill_ids = session_skill_ids or agent_skill_ids
@@ -1238,6 +1242,9 @@ class RunCoordinator:
                 )
                 if isinstance(frozen_binding.get("tool_ids"), list):
                     agent_tool_ids = [str(item) for item in frozen_binding["tool_ids"]]
+                workflow_profile_id = str(
+                    frozen_binding.get("workflow_profile_id") or "auto"
+                )
                 if isinstance(frozen_binding.get("skill_ids"), list):
                     configured_skill_ids = [str(item) for item in frozen_binding["skill_ids"]]
                 if isinstance(frozen_binding.get("mcp_server_names"), list):
@@ -1302,6 +1309,17 @@ class RunCoordinator:
                 agents_instructions, agents_instruction_sources = load_instruction_chain(workspace_root)
                 if "read_artifact" not in allowed_tool_names:
                     allowed_tool_names.append("read_artifact")
+                has_attachments = bool(session and db.scalar(
+                    select(Artifact.id).where(
+                        Artifact.session_id == session.id,
+                        Artifact.kind == "user_attachment",
+                        Artifact.status == "available",
+                    ).limit(1)
+                ))
+                if has_attachments:
+                    for tool_name in ATTACHMENT_TOOL_NAMES:
+                        if tool_name not in allowed_tool_names:
+                            allowed_tool_names.append(tool_name)
                 provider_config = ProviderConfig(
                     provider=connection.provider,
                     base_url=connection.base_url,
@@ -1321,6 +1339,7 @@ class RunCoordinator:
                     "secret_ref": connection.secret_ref,
                     "model_id": model_id,
                     "thinking_level": thinking_level,
+                    "workflow_profile_id": workflow_profile_id,
                     "permission_mode": permission_mode,
                     "skill_ids": configured_skill_ids,
                     "mcp_server_names": configured_mcp_server_names,
@@ -1408,6 +1427,7 @@ class RunCoordinator:
                 # implements; it must not infer executable permissions merely
                 # from a catalog selection.
                 "permission_mode": permission_mode,
+                "workflow_profile_id": workflow_profile_id,
                 "skill_ids": configured_skill_ids,
                 "mcp_server_names": configured_mcp_server_names,
                 "tool_ids": agent_tool_ids,

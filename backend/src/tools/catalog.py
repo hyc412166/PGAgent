@@ -251,6 +251,28 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
         availability="available",
         runtime_tool_id="validate",
     ),
+    BuiltinTool(
+        id="review_finding",
+        name="review_finding",
+        label="记录审查发现",
+        description="记录包含严重程度、代码位置、证据和具体失败场景的结构化代码审查发现。",
+        category="developer",
+        risk_level="low",
+        enabled=True,
+        availability="available",
+        runtime_tool_id="review_finding",
+    ),
+    BuiltinTool(
+        id="debug_evidence",
+        name="debug_evidence",
+        label="记录调试证据",
+        description="记录复现、观察、假设、根因或回归结果，并在暂停恢复后继续保留。",
+        category="developer",
+        risk_level="low",
+        enabled=True,
+        availability="available",
+        runtime_tool_id="debug_evidence",
+    ),
 )
 
 

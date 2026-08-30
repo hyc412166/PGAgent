@@ -263,6 +263,100 @@
   box-shadow: 0 4px 12px rgb(30 104 137 / 7%);
 }
 
+.message-image-gallery {
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 7px;
+  margin-bottom: 7px;
+}
+
+.message.user .message-image-gallery { justify-content: end; }
+
+.message-image-link {
+  width: min(190px, 100%);
+  display: block;
+  overflow: hidden;
+  border: 1px solid rgb(168 211 228 / 78%);
+  border-radius: 14px 14px 14px 5px;
+  background: rgb(255 255 255 / 72%);
+  box-shadow: 0 5px 14px rgb(24 94 124 / 9%);
+  transition: border-color .15s ease, transform .15s ease, box-shadow .15s ease;
+}
+
+.message.user .message-image-link { border-radius: 14px 5px 14px 14px; }
+
+.message-image-link:hover {
+  border-color: var(--ocean-500);
+  box-shadow: 0 7px 18px rgb(24 94 124 / 13%);
+  transform: translateY(-1px);
+}
+
+.message-image-link img {
+  width: 100%;
+  max-height: 220px;
+  display: block;
+  object-fit: contain;
+}
+
+.message-attachments {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 7px;
+}
+
+.message-attachment {
+  min-width: 0;
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px 6px 6px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px 12px 12px 5px;
+  color: var(--ink);
+  background: rgb(255 255 255 / 66%);
+  text-decoration: none;
+  box-shadow: 0 3px 9px rgb(27 91 118 / 6%);
+  transition: color .15s ease, border-color .15s ease, background-color .15s ease, transform .15s ease;
+}
+
+.message-attachment:hover {
+  color: var(--ocean-800);
+  border-color: var(--ocean-500);
+  background: var(--surface);
+  transform: translateY(-1px);
+}
+
+.message-attachment-preview {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 9px 9px 9px 4px;
+  color: var(--ocean-700);
+  background: var(--ice);
+}
+
+.message-attachment-preview img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+  box-shadow: inset 0 0 0 1px rgb(11 73 101 / 12%);
+}
+
+.message-attachment > span:last-child { min-width: 0; }
+.message-attachment strong,
+.message-attachment small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.message-attachment strong { font-size: .5625rem; line-height: 1.35; }
+.message-attachment small { margin-top: 2px; color: var(--muted-2); font-size: .4375rem; }
+
 .message-copy-button {
   width: 18px;
   height: 18px;
@@ -352,6 +446,61 @@
     0 8px 20px rgb(32 101 132 / 10%),
     inset 0 1px 0 rgb(255 255 255 / 88%);
 }
+
+.attachment-file-input { display: none; }
+
+.attachment-tray {
+  max-height: 132px;
+  display: flex;
+  gap: 7px;
+  padding: 1px 2px 7px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.attachment-chip {
+  min-width: 190px;
+  max-width: 250px;
+  height: 48px;
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 5px 6px 6px;
+  border: 1px solid rgb(91 180 214 / 48%);
+  border-radius: 13px 13px 13px 6px;
+  background: rgb(255 255 255 / 62%);
+  box-shadow: 0 3px 10px rgb(32 101 132 / 6%);
+}
+
+.attachment-chip-preview {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 9px 9px 9px 4px;
+  color: var(--ocean-700);
+  background: var(--ice);
+}
+
+.attachment-chip-preview img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+  box-shadow: inset 0 0 0 1px rgb(11 73 101 / 14%);
+}
+
+.attachment-chip-copy { min-width: 0; }
+.attachment-chip-copy strong,
+.attachment-chip-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-chip-copy strong { color: var(--ink); font-size: .5625rem; }
+.attachment-chip-copy small { margin-top: 3px; color: var(--muted-2); font-size: .4375rem; font-variant-numeric: tabular-nums; }
+.attachment-chip > button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 7px; color: var(--muted-2); background: transparent; }
+.attachment-chip > button:hover:not(:disabled) { color: var(--scarf-dark); background: var(--scarf-soft); }
+.attachment-trigger:has(b) { color: var(--scarf-dark); background: var(--scarf-soft); }
 
 .composer:focus-within {
   border-color: rgb(91 180 214 / 82%);

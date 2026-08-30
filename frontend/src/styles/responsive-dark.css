@@ -40,6 +40,9 @@
 .theme-dark .context-tooltip p { color: #a8cfdd; }
 .theme-dark .context-tooltip small { color: #f0a7b0; }
 .theme-dark .message.user .message-content { border-color: var(--line); }
+.theme-dark .message-image-link { border-color: var(--line); background: rgb(10 42 58 / 74%); }
+.theme-dark .attachment-chip,
+.theme-dark .message-attachment { border-color: var(--line); background: rgb(18 58 78 / 82%); }
 .theme-dark .slide-panel {
   border-left-color: var(--line);
   background:
@@ -128,6 +131,9 @@
   .session-search { display: none; }
   .messages { padding: 18px 14px 12px; }
   .message.user .message-body { max-width: 90%; }
+  .message-image-link { width: min(148px, 100%); }
+  .message-attachments { grid-template-columns: 1fr; }
+  .attachment-chip { min-width: min(220px, 72vw); }
   .composer { width: calc(100% - 16px); margin-bottom: 8px; }
   .permission-trigger span { display: none; }
   .usage-mini-totals { position: static; margin-top: 13px; }

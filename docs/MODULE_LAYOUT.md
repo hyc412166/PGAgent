@@ -29,7 +29,7 @@ backend/                              # 完整后端核心，对应 codex-rs/cor
 │   │   ├── system.py                 # 本机系统 API
 │   │   └── usage.py                  # 用量 API
 │   ├── artifacts/                    # 大型工具输出和产物存储
-│   ├── coding/                       # 代码修改 profile、补丁、验证证据与运行态记录
+│   ├── coding/                       # Coding/Review/Debug profiles、补丁、验证与证据账本
 │   ├── config/                       # 配置、环境变量和路径
 │   ├── context/                      # 上下文装配、窗口、压缩和指令
 │   ├── memory/                       # 长期记忆导入、检索和投影
@@ -51,7 +51,7 @@ backend/                              # 完整后端核心，对应 codex-rs/cor
 - `agent/` 只负责单次模型/工具执行；跨 Run 的恢复、委派和交付归 `runs/`。
 - `tasks/` 保存可恢复的任务状态；`sessions/` 负责用户可见消息的唯一交付。
 - `context/` 负责送入模型的内容；`memory/` 负责跨会话的长期信息。
-- `coding/` 是共享 `AgentRuntime` 上的工作流层，不拥有独立运行时、审批或沙箱实现。
+- `coding/` 是共享 `AgentRuntime` 上的工程工作流层；Coding、Review、Debug 只定义 profile 和证据语义，不各自拥有运行时、审批或沙箱实现。
 - `persistence/models.py` 只声明关系实体；引擎、迁移、初始化和数据库会话归 `persistence/database.py`。
 - `main.py` 只装配各模块与进程生命周期，不新增业务实现。
 - 不再保留 `app/`、`services/`、`runtime/` 等旧实现路径；新增代码必须进入拥有该行为的领域目录。

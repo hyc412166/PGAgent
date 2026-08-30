@@ -89,6 +89,9 @@ class Agent(TimestampMixin, Base):
     model_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     thinking_level: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
     mode: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
+    workflow_profile_id: Mapped[str] = mapped_column(
+        String(16), default="auto", nullable=False
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     tool_bindings: Mapped[list["AgentTool"]] = relationship(
