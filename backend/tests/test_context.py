@@ -3,8 +3,8 @@ from __future__ import annotations
 from src.context.window import ContextManager, estimate_tokens, message_tokens
 
 
-def test_default_context_limit_is_100k() -> None:
-    assert ContextManager().max_tokens == 100_000
+def test_default_context_limit_is_200k() -> None:
+    assert ContextManager().max_tokens == 200_000
 
 
 def test_token_estimate_is_conservative_for_unicode() -> None:

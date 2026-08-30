@@ -11,7 +11,7 @@ export type DraftSessionSettings = { model_connection_id: string | null; model_i
 export type DraftLaunchResponse = { session: Session; run: Run; workspace?: Workspace }
 
 export const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'medium', skill_ids: [], mcp_server_names: [], permission_mode: 'smart', use_memories: true }
-export const emptyDraftContext: SessionContext = { used_tokens: 0, limit_tokens: 100_000, compact_threshold_tokens: 90_000, percent: 0 }
+export const emptyDraftContext: SessionContext = { used_tokens: 0, limit_tokens: 200_000, compact_threshold_tokens: 180_000, percent: 0 }
 export const noDelegatedTasks: DelegatedTask[] = []
 export const noTeammates: Teammate[] = []
 

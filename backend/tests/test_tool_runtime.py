@@ -499,6 +499,70 @@ async def test_threshold_full_compaction_builds_exact_continuation(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_threshold_compaction_is_not_limited_to_two_per_run(tmp_path) -> None:
+    (tmp_path / "large-1.txt").write_text("a" * 10_000, encoding="utf-8")
+    (tmp_path / "large-2.txt").write_text("b" * 10_000, encoding="utf-8")
+    modes: list[str] = []
+    auto_calls = 0
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal auto_calls
+        mode = str(kwargs.get("mode") or "auto")
+        modes.append(mode)
+        if mode == "compaction":
+            return ModelTurn(content="\n".join(
+                f"## {index}. {title}\nFact {index}."
+                for index, title in enumerate(COMPACTION_SECTION_TITLES, start=1)
+            ))
+        auto_calls += 1
+        if auto_calls <= 2:
+            return ModelTurn(tool_calls=[ModelToolCall(
+                f"read-{auto_calls}",
+                "read",
+                {"path": f"large-{auto_calls}.txt"},
+            )])
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=["read"],
+            permission_mode="full",
+        ),
+        context_manager=ContextManager(max_tokens=4_096),
+        context_assembler=ContextAssembler(
+            max_tokens=4_096,
+            compaction_threshold_tokens=700,
+            output_reserve_tokens=0,
+            safety_buffer_tokens=0,
+        ),
+        conversation_compactor=ConversationCompactor(
+            model_call=model_call,
+            preserve_recent_messages=1,
+            retain_tokens=100,
+        ),
+    )
+
+    outcome = await runtime.run(
+        system_prompt="stable rules",
+        recent_messages=[
+            {"role": "user", "content": "old " + ("x" * 10_000)},
+            {"role": "assistant", "content": "old result"},
+            {"role": "user", "content": "continue"},
+        ],
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.output == "done"
+    assert modes.count("compaction") == 3
+    assert sum(
+        event["type"] == "context_compaction_finished" and bool(event.get("effective"))
+        for event in outcome.events
+    ) == 3
+
+
+@pytest.mark.asyncio
 async def test_aggregate_tool_results_are_budgeted_before_nine_section_compaction(tmp_path) -> None:
     calls: list[str] = []
     provider_messages: list[dict] = []

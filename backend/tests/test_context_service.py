@@ -199,6 +199,13 @@ def test_assembler_has_stable_cache_namespace_and_append_only_transcript() -> No
     assert second.truncated is False
 
 
+def test_assembler_defaults_to_200k_with_180k_compaction_threshold() -> None:
+    assembler = ContextAssembler()
+
+    assert assembler.max_tokens == 200_000
+    assert assembler.compaction_threshold == 180_000
+
+
 def test_assembler_reports_compaction_without_mutating_seen_messages() -> None:
     assembler = ContextAssembler(
         max_tokens=400,

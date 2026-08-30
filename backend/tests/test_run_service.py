@@ -885,7 +885,7 @@ def test_history_loader_never_compacts_or_drops_messages(seeded_run: tuple[str, 
         session = db.get(Session, session_id)
         assert session is not None
         old_time = datetime.now(timezone.utc)
-        old = ChatMessage(session_id=session_id, role="user", content="界" * 45_100, created_at=old_time)
+        old = ChatMessage(session_id=session_id, role="user", content="界" * 90_100, created_at=old_time)
         latest = ChatMessage(
             session_id=session_id,
             role="user",
@@ -898,10 +898,10 @@ def test_history_loader_never_compacts_or_drops_messages(seeded_run: tuple[str, 
         db.commit()
 
         assert recent == [
-            {"role": "user", "content": "界" * 45_100},
+            {"role": "user", "content": "界" * 90_100},
             {"role": "user", "content": "keep latest"},
         ]
-        assert session.context_tokens >= 90_000
+        assert session.context_tokens >= 180_000
         assert db.query(ConversationCompaction).filter_by(session_id=session_id).count() == 0
 
 

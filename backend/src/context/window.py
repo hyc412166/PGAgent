@@ -14,8 +14,8 @@ from typing import Any, Mapping, Sequence
 
 
 Message = dict[str, Any]
-DEFAULT_CONTEXT_LIMIT_TOKENS = 100_000
-DEFAULT_COMPACT_THRESHOLD_TOKENS = 90_000
+DEFAULT_CONTEXT_LIMIT_TOKENS = 200_000
+DEFAULT_COMPACT_THRESHOLD_TOKENS = 180_000
 
 
 def estimate_tokens(value: str | Mapping[str, Any] | Sequence[Any]) -> int:
