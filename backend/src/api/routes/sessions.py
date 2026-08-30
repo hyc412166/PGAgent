@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-import shutil
 from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
@@ -74,6 +73,11 @@ from src.skills.registry import replace_agent_capabilities, replace_session_skil
 from src.tasks.state import cancel_durable_task, latest_resumable_task, task_payload
 from src.agents.collaboration import cleanup_session_worktrees
 from src.runs.service import coordinator
+from src.sessions.deletion import (
+    SessionDeletionConflict,
+    finalize_session_deletions,
+    stage_session_deletions,
+)
 router = APIRouter(prefix="/api", tags=["sessions"])
 
 from src.api.routes.shared import (
@@ -387,72 +391,12 @@ async def update_session(
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_session(session_id: str, db: Session = Depends(get_db)) -> Response:
     item = _require(db, ChatSession, session_id, "Session")
-    active_background_jobs = db.scalar(
-        select(func.count(BackgroundJob.id)).where(
-            BackgroundJob.session_id == session_id,
-            BackgroundJob.status.in_({"queued", "running"}),
-        )
-    )
-    if int(active_background_jobs or 0) > 0:
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot delete a conversation while it has active background jobs",
-        )
-    active = db.scalar(
-        select(func.count(Run.id)).where(
-            Run.session_id == session_id,
-            Run.status.in_(_ACTIVE_SESSION_RUN_STATUSES),
-        )
-    )
-    if int(active or 0) > 0:
-        raise HTTPException(status_code=409, detail="Cannot delete a conversation while it has an active run")
-
-    workspace = db.get(Workspace, item.workspace_id)
-    if workspace is not None:
-        try:
-            cleanup_session_worktrees(db, session_id, workspace.root_path)
-        except RuntimeError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Cannot delete conversation worktrees: {exc}",
-            ) from exc
-
-    run_ids = set(db.scalars(select(Run.id).where(Run.session_id == session_id)))
-    run_ids.update(
-        value
-        for value in db.scalars(
-            select(DelegatedTask.child_run_id).where(DelegatedTask.parent_session_id == session_id)
-        )
-        if value
-    )
-    db.execute(
-        delete(UsageRecord).where(
-            (UsageRecord.session_id == session_id)
-            | (UsageRecord.run_id.in_(run_ids) if run_ids else False)
-        )
-    )
-    if run_ids:
-        db.execute(delete(Run).where(Run.id.in_(run_ids)))
-    db.execute(delete(DraftLaunch).where(DraftLaunch.session_id == session_id))
-    db.execute(delete(Memory).where(Memory.scope == "session", Memory.scope_id == session_id))
-    db.delete(item)
+    try:
+        effects = stage_session_deletions(db, [item])
+    except SessionDeletionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     _commit(db)
-    coordinator.close_mcp_session(session_id)
-    refresh_memory_markdown_projection()
-
-    # Runtime artifacts are stored below one server-owned directory per
-    # session.  Cascading the Artifact rows does not remove those payloads, so
-    # finish the user-visible deletion by removing the matching directory too.
-    # Requiring the resolved parent to be the configured artifact root keeps a
-    # corrupt legacy session id from turning this into an arbitrary-path delete.
-    # Resolve through the compatibility facade so existing integrations that
-    # replace src.api.routes.settings still control deletion storage.
-    from src.api import routes as resources_api
-
-    artifact_root = (resources_api.settings.data_dir / "artifacts").resolve()
-    artifact_directory = (artifact_root / session_id).resolve()
-    if artifact_directory.parent == artifact_root and artifact_directory.is_dir():
-        shutil.rmtree(artifact_directory)
+    finalize_session_deletions(effects)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
