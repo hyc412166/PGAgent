@@ -14,9 +14,9 @@ The tool subsystem is split by lifecycle responsibility:
 - `pipeline.py`: ordered hook, authorization and execution lifecycle.
 - `scheduler.py`: parallel/ordered batch decisions based on runtime metadata.
 
-Repository coding primitives live in the sibling `coding/` domain. The tool
-registry adapts `apply_patch` and `validate` into this lifecycle, while the
-coding state recorder enters through a normal post hook. Long-running command
+Repository engineering primitives live in the sibling `coding/` domain. The tool
+registry adapts `apply_patch`, `validate`, `review_finding`, and `debug_evidence`
+into this lifecycle, while evidence recorders enter through normal post hooks. Long-running command
 input is owned by `tasks/background.py` and exposed here as `write_stdin`.
 
 Built-in, MCP and future dynamic tools must enter the runtime through
@@ -28,7 +28,7 @@ select an approval path directly.
 enum. `advertise_by_default`, `discoverable` and `model_callable` separately
 describe the model surface.
 
-For coding-enabled Agents, the review/edit core stays directly visible and
+For engineering-profile Agents, each workflow's core stays directly visible and
 low-frequency built-ins use deferred presentation. `ToolSearch` with
 `select:<tool-name>` activates them without changing the run's executable
 capability boundary; activation state is restored from `runtime_binding`.

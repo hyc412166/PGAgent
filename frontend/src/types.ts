@@ -70,6 +70,7 @@ export interface AgentProfile {
   model_connection_id?: string
   thinking_level?: string
   mode?: string
+  workflow_profile_id?: 'auto' | 'general' | 'coding' | 'review' | 'debug'
   enabled?: boolean
   is_default?: boolean
   status?: string
@@ -256,6 +257,7 @@ export interface UsageWorkspace {
 
 export interface Message {
   id: string
+  session_id?: string
   role: 'user' | 'assistant' | 'system' | 'tool' | string
   content: string
   created_at?: string

@@ -3,7 +3,7 @@ import type { PermissionMode } from './types'
 export const permissionOptions: ReadonlyArray<{ value: PermissionMode; label: string }> = [
   { value: 'ask', label: '请求批准' },
   { value: 'smart', label: '智能审批' },
-  { value: 'full', label: '完全访问权限' },
+  { value: 'full', label: '完全访问' },
 ]
 
 export function normalizedIds(ids: readonly string[]): string[] {

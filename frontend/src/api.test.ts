@@ -101,6 +101,23 @@ describe('API 客户端', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/system/select-folder', expect.objectContaining({ method: 'POST' }))
   })
 
+  it('multipart 请求交给浏览器生成 Content-Type boundary', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ id: 'run-1' }),
+      { status: 202, headers: { 'Content-Type': 'application/json' } },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+    const form = new FormData()
+    form.append('payload', JSON.stringify({ content: '分析附件' }))
+    form.append('files', new File(['hello'], 'hello.txt', { type: 'text/plain' }))
+
+    await api.postForm('/api/sessions/session-1/turns', form)
+
+    const options = fetchMock.mock.calls[0][1] as RequestInit
+    expect(options.body).toBe(form)
+    expect(new Headers(options.headers).has('Content-Type')).toBe(false)
+  })
+
   it('运行中的会话配置冲突会保留后端 409 提示', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ detail: '运行或审批期间不能更改模型配置' }),

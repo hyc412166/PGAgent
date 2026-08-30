@@ -16,6 +16,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from src import __version__
 from src.api import capabilities, connections, mcp, routes, runtime, system, usage
+from src.attachments.api import router as attachments_router
 from src.config import PROJECT_ROOT, settings
 from src.persistence.database import init_db
 from src.runs.service import coordinator
@@ -125,6 +126,7 @@ app.include_router(capabilities.router)
 app.include_router(connections.router)
 app.include_router(mcp.router)
 app.include_router(runtime.router)
+app.include_router(attachments_router)
 app.include_router(system.router)
 app.include_router(usage.router)
 

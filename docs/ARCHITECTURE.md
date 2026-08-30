@@ -41,7 +41,9 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 
 ## 工具与审批
 
-主控运行时使用公开工具名 `bash/read/write/edit/apply_patch/validate/glob/grep/rg/webfetch/websearch/task/todowrite/question/skill`。`ToolRegistry` 只注册该次运行由 `Agent.tool_ids` 选择的名称，因而未选择工具不会进入 provider 的 function schema；该选择、权限模式、已选 Skill 指令、待办和 coding evidence 会写入 `runtime_binding`，审批恢复优先使用冻结值而非会话后来的修改。启用 coding profile 且同时具备 `ToolSearch` 时，审查、补丁和验证核心直接暴露，其他已授权内置工具以 deferred 形式保留，通过 `select:<tool-name>` 按需进入后续模型轮次。
+主控运行时使用公开工具名 `bash/read/write/edit/apply_patch/validate/review_finding/debug_evidence/glob/grep/rg/webfetch/websearch/task/todowrite/question/skill`。`ToolRegistry` 只注册该次运行由 `Agent.tool_ids` 选择的名称，因而未选择工具不会进入 provider 的 function schema；该选择、权限模式、工作流 profile、已选 Skill 指令、待办和工程证据会写入 `runtime_binding`，审批恢复优先使用冻结值而非会话后来的修改。`Agent.workflow_profile_id` 可显式选择 `general/coding/review/debug`；`auto` 仅保留旧版“同时具备 apply_patch 与 validate 时启用 coding”的兼容行为。工程 profile 同时具备 `ToolSearch` 时，各自核心工具直接暴露，其他已授权内置工具以 deferred 形式保留，通过 `select:<tool-name>` 按需进入后续模型轮次。
+
+Review profile 额外形成只读工作流上限：即使 Agent 配置误选了写入、命令执行或委派工具，这些工具也会在本 Run 的模型暴露层隐藏，且不能通过 `ToolSearch` 激活；需要修改代码时必须切换到 Coding 或 Debug profile。该限制不新增第二套运行时，底层仍复用相同的注册、审批、沙箱和恢复链路。
 
 - 文件工具通过 `WorkspaceSandbox` 解析真实路径并拒绝目录逃逸、Junction 和符号链接越界。`read` 支持按真实行范围读取；`edit` 只做精确文本替换，默认要求唯一匹配；`apply_patch` 在写入前验证全部文件和 hunk，在目标同目录暂存替换内容，后续提交失败时回滚已应用文件，并保留原文件换行风格；`glob`/`grep` 保留兼容行为，`rg` 提供一等的 ripgrep 代码检索，并限制路径、文件大小和结果量。
 - `bash` 从不启动 shell，只允许裸 allowlist 可执行文件，支持工作区内的显式 `cwd`、超时、进程树终止和输出上限。`validate` 复用相同边界并记录测试、lint、类型检查或构建的结构化结果。`full` 仅跳过审批，不会取消 allowlist 或工作区边界。
@@ -65,7 +67,7 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 
 ## 能力目录、Skill 与权限配置
 
-`GET /api/tools` 返回稳定的内置目录项，包括 `bash`、`read`、`write`、`edit`、`apply_patch`、`validate`、`glob`、`grep`、`rg`、`webfetch`、`websearch`、`task`、`todowrite`、`question`、`skill` 以及兼容工具。每项都含 `availability`、风险等级、审批要求和（如有）运行时工具映射；前端必须以这些字段为准，不能把目录存在误解为已允许执行。
+`GET /api/tools` 返回稳定的内置目录项，包括 `bash`、`read`、`write`、`edit`、`apply_patch`、`validate`、`review_finding`、`debug_evidence`、`glob`、`grep`、`rg`、`webfetch`、`websearch`、`task`、`todowrite`、`question`、`skill` 以及兼容工具。每项都含 `availability`、风险等级、审批要求和（如有）运行时工具映射；前端必须以这些字段为准，不能把目录存在误解为已允许执行。
 
 `skills`、`agent_tools`、`agent_skills` 和 `session_skills` 是独立 SQLite 表。用户 Agent 的 `tool_ids`/`skill_ids` 通过关系表保存；Session 的 `skill_ids` 通过关系表保存，`permission_mode` 为 `ask | smart | full`。`AgentRead`、`SessionRead` 均返回稳定的 ID 数组。固定 `DEFAULT_AGENT_ID` 每次初始化都会恢复完整内置 Tool 目录，且资源 API 拒绝对其修改或删除。
 

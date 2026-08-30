@@ -5,7 +5,9 @@ import json
 import pytest
 
 from src.coding import patch as patch_module
+from src.coding.profiles import resolve_workflow_profile
 from src.tools import create_default_registry
+from src.tools.types import ToolResult
 
 
 def test_apply_patch_updates_multiple_files_and_records_change_evidence(tmp_path) -> None:
@@ -251,3 +253,131 @@ def test_coding_profile_does_not_defer_tools_when_tool_search_is_unavailable(tmp
 
     assert registry.model_visible_tool_names == ("apply_patch", "write")
     assert registry.workflow_prompt == ""
+
+
+@pytest.mark.asyncio
+async def test_explicit_review_profile_records_and_restores_structured_findings(tmp_path) -> None:
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=[
+            "ToolSearch", "read", "rg", "git_diff", "validate", "review_finding",
+            "apply_patch", "MCP", "TeamCreate", "read_inbox",
+        ],
+        workflow_profile_id="review",
+        permission_mode="full",
+    )
+
+    result = await registry.execute_async(
+        "review_finding",
+        {
+            "severity": "important",
+            "title": "Stale cache survives update",
+            "path": "src/cache.py",
+            "line": 42,
+            "failure_scenario": "Updating an existing key returns the previous value.",
+            "evidence": "update() writes storage but does not invalidate _cached.",
+            "suggested_fix": "Invalidate the entry after the storage write.",
+        },
+        call_id="review-call-1",
+    )
+
+    assert result.ok
+    snapshot = registry.runtime_state()
+    assert snapshot["workflow_profile_id"] == "review"
+    assert snapshot["workflow_evidence_state"]["review_findings"][0]["call_id"] == "review-call-1"
+    assert "[important] Stale cache survives update (src/cache.py:42)" in registry.workflow_prompt
+    assert "Failure scenario: Updating an existing key returns the previous value." in registry.workflow_prompt
+    assert "Evidence: update() writes storage but does not invalidate _cached." in registry.workflow_prompt
+    assert "apply_patch" not in registry.model_visible_tool_names
+    assert {"MCP", "TeamCreate", "read_inbox"}.isdisjoint(registry.model_visible_tool_names)
+    search = await registry.execute_async("ToolSearch", {"query": "select:apply_patch"})
+    assert json.loads(search.content) == []
+    assert search.metadata["activated_tools"] == []
+
+    async def external(arguments: dict) -> ToolResult:
+        return ToolResult("external", True, json.dumps(arguments))
+
+    schema = {
+        "description": "test integration",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    registry.register_external(
+        "mcp__repo__mutate",
+        schema,
+        external,
+        read_only=False,
+        parallel=False,
+        exposure="deferred",
+        owner="mcp:repo",
+    )
+    registry.register_external(
+        "mcp__repo__inspect",
+        schema,
+        external,
+        read_only=True,
+        parallel=True,
+        exposure="deferred",
+        owner="mcp:repo",
+    )
+    hidden = await registry.execute_async("ToolSearch", {"query": "select:mcp__repo__mutate"})
+    assert json.loads(hidden.content) == []
+    visible = await registry.execute_async("ToolSearch", {"query": "select:mcp__repo__inspect"})
+    assert visible.metadata["activated_tools"] == ["mcp__repo__inspect"]
+    assert "mcp__repo__inspect" in registry.model_visible_tool_names
+
+    resumed = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=snapshot["allowed_tool_names"],
+        workflow_profile_id=snapshot["workflow_profile_id"],
+        workflow_evidence_state=snapshot["workflow_evidence_state"],
+        permission_mode="full",
+    )
+    assert "Recorded review findings" in resumed.workflow_prompt
+    assert resumed.runtime_state()["workflow_evidence_state"] == snapshot["workflow_evidence_state"]
+
+
+def test_explicit_debug_profile_keeps_hypotheses_distinct_from_root_cause(tmp_path) -> None:
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["read", "rg", "debug_evidence", "apply_patch", "validate"],
+        workflow_profile_id="debug",
+        permission_mode="full",
+    )
+
+    hypothesis = registry.execute(
+        "debug_evidence",
+        {
+            "stage": "hypothesis",
+            "summary": "The parser may reuse a stale token buffer.",
+            "status": "unconfirmed",
+            "path": "src/parser.py",
+        },
+    )
+    root_cause = registry.execute(
+        "debug_evidence",
+        {
+            "stage": "root_cause",
+            "summary": "reset() does not clear the token buffer.",
+            "status": "confirmed",
+            "path": "src/parser.py",
+            "line": 18,
+        },
+    )
+
+    assert hypothesis.ok and root_cause.ok
+    state = registry.runtime_state()["workflow_evidence_state"]["debug_evidence"]
+    assert [(item["stage"], item["status"]) for item in state] == [
+        ("hypothesis", "unconfirmed"),
+        ("root_cause", "confirmed"),
+    ]
+    assert "hypothesis status=unconfirmed" in registry.workflow_prompt
+    assert "root_cause status=confirmed" in registry.workflow_prompt
+    assert "Location: src/parser.py:18" in registry.workflow_prompt
+
+
+def test_workflow_profile_resolution_preserves_auto_compatibility() -> None:
+    assert resolve_workflow_profile("review", ["read"]).id == "review"
+    assert resolve_workflow_profile("debug", ["read"]).id == "debug"
+    assert resolve_workflow_profile("general", ["apply_patch", "validate"]) is None
+    assert resolve_workflow_profile("auto", ["apply_patch", "validate"]).id == "coding"
+    assert resolve_workflow_profile("auto", ["read", "rg"]) is None

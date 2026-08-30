@@ -40,6 +40,7 @@ class WorkspaceRead(ORMModel):
 
 ThinkingLevel = Literal["off", "auto", "low", "medium", "high", "xhigh"]
 AgentMode = Literal["auto", "direct", "plan"]
+WorkflowProfileId = Literal["auto", "general", "coding", "review", "debug"]
 PermissionMode = Literal["ask", "smart", "full"]
 SkillMarketBrowseView = Literal["all-time", "trending", "hot", "curated"]
 
@@ -167,6 +168,7 @@ class AgentCreate(BaseModel):
     model_id: str | None = None
     thinking_level: ThinkingLevel = "auto"
     mode: AgentMode = "auto"
+    workflow_profile_id: WorkflowProfileId = "auto"
     enabled: bool = True
     tool_ids: list[str] = Field(default_factory=list, max_length=64)
     skill_ids: list[str] = Field(default_factory=list, max_length=128)
@@ -181,6 +183,7 @@ class AgentUpdate(BaseModel):
     model_id: str | None = None
     thinking_level: ThinkingLevel | None = None
     mode: AgentMode | None = None
+    workflow_profile_id: WorkflowProfileId | None = None
     enabled: bool | None = None
     tool_ids: list[str] | None = Field(default=None, max_length=64)
     skill_ids: list[str] | None = Field(default=None, max_length=128)
@@ -196,6 +199,7 @@ class AgentRead(ORMModel):
     model_id: str | None
     thinking_level: str
     mode: str
+    workflow_profile_id: str
     enabled: bool
     is_default: bool
     tool_ids: list[str]
@@ -370,7 +374,7 @@ class DraftLaunchRequest(BaseModel):
 
     idempotency_key: str = Field(min_length=1, max_length=255)
     title: str = Field(min_length=1, max_length=200)
-    content: str = Field(min_length=1, max_length=100_000)
+    content: str = Field(default="", max_length=100_000)
     root_path: str | None = Field(default=None, max_length=4096)
     model_connection_id: str | None = Field(default=None, max_length=36)
     model_id: str | None = Field(default=None, max_length=255)
@@ -380,13 +384,18 @@ class DraftLaunchRequest(BaseModel):
     skill_ids: list[str] = Field(default_factory=list, max_length=128)
     mcp_server_names: list[str] = Field(default_factory=list, max_length=128)
 
-    @field_validator("idempotency_key", "title", "content")
+    @field_validator("idempotency_key", "title")
     @classmethod
     def _require_non_blank_text(cls, value: str) -> str:
         normalized = value.strip()
         if not normalized:
             raise ValueError("must not be blank")
         return normalized
+
+    @field_validator("content")
+    @classmethod
+    def _normalize_content(cls, value: str) -> str:
+        return value.strip()
 
     @field_validator("root_path", "model_connection_id", "model_id")
     @classmethod

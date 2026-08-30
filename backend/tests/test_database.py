@@ -387,6 +387,7 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     agent_columns = {column["name"] for column in inspector.get_columns("agents")}
     session_columns = {column["name"] for column in inspector.get_columns("sessions")}
     assert "is_default" in agent_columns
+    assert "workflow_profile_id" in agent_columns
     assert {
         "model_connection_id", "model_id", "thinking_level", "permission_mode",
         "use_memories", "mcp_server_names", "context_tokens",
@@ -440,10 +441,16 @@ def test_core_resource_crud_and_dashboard(client: TestClient, tmp_path: Path) ->
 
     agent_response = client.post(
         "/api/agents",
-        json={"name": "Builder", "workspace_id": workspace["id"], "thinking_level": "medium"},
+        json={
+            "name": "Builder",
+            "workspace_id": workspace["id"],
+            "thinking_level": "medium",
+            "workflow_profile_id": "coding",
+        },
     )
     assert agent_response.status_code == 201
     agent = agent_response.json()
+    assert agent["workflow_profile_id"] == "coding"
 
     session_response = client.post(
         "/api/sessions",
@@ -606,6 +613,7 @@ def test_defaults_are_seeded_protected_and_used_for_new_sessions(client: TestCli
     assert default_agent["description"] == DEFAULT_AGENT_DESCRIPTION
     assert default_agent["system_prompt"] == DEFAULT_AGENT_SYSTEM_PROMPT
     assert default_agent["mode"] == "auto"
+    assert default_agent["workflow_profile_id"] == "auto"
     assert client.delete(f"/api/workspaces/{DEFAULT_WORKSPACE_ID}").status_code == 409
     assert client.delete(f"/api/agents/{DEFAULT_AGENT_ID}").status_code == 409
     for payload in (

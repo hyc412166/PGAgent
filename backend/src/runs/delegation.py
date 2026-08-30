@@ -43,6 +43,7 @@ from src.persistence.database import (
     Workspace,
 )
 from src.agent import AgentRuntime, RunOutcome
+from src.attachments.contracts import ATTACHMENT_TOOL_NAMES
 from src.tools.types import ToolResult
 
 from src.model.gateway import ModelConfigurationError, ProviderConfig
@@ -363,6 +364,9 @@ class _SubagentTaskDelegate:
         ]
         if "read_artifact" in parent_allowed and "read_artifact" not in child_tools:
             child_tools.append("read_artifact")
+        for tool_name in ATTACHMENT_TOOL_NAMES:
+            if tool_name in parent_allowed and tool_name not in child_tools:
+                child_tools.append(tool_name)
         child_skill_ids = list(getattr(child, "skill_ids", []) or [])
         skill_instructions = _read_selected_skill_instructions(db, child_skill_ids)
         workspace_root = str(
@@ -386,6 +390,9 @@ class _SubagentTaskDelegate:
             "parent_run_id": self.parent_run_id,
             "agent_id": child.id,
             "agent_system_prompt": (str(child.system_prompt or "") + _DELEGATE_CHILD_SYSTEM_SUFFIX).strip(),
+            "workflow_profile_id": str(
+                getattr(child, "workflow_profile_id", "auto") or "auto"
+            ),
             "child_agent_id": child.id,
             "workspace_root": workspace_root,
             "agents_instructions": agents_instructions,
@@ -416,6 +423,7 @@ class _SubagentTaskDelegate:
             "provider": str(binding.get("provider") or ""),
             "model_id": str(binding.get("model_id") or ""),
             "thinking_level": str(binding.get("thinking_level") or "auto"),
+            "workflow_profile_id": str(binding.get("workflow_profile_id") or "auto"),
             "permission_mode": str(binding.get("permission_mode") or "smart"),
             "allowed_tool_names": list(binding.get("allowed_tool_names") or []),
             "skill_ids": list(binding.get("skill_ids") or []),

@@ -7,8 +7,11 @@ import threading
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
+from src.attachments.contracts import ATTACHMENT_TOOL_NAMES
+
 from . import advanced, builtins
 from .advanced_contract import ADVANCED_TOOL_SCHEMAS, CLAW_TOOL_NAMES, LEARN_TOOL_NAMES
+from .engineering_contract import ENGINEERING_TOOL_NAMES, ENGINEERING_TOOL_SCHEMAS
 from .policy import normalize_permission_mode
 from .invocation import ToolInvocation
 from .name import ToolName
@@ -66,6 +69,54 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 24000},
             },
             "required": ["artifact_id"],
+        },
+    },
+    "list_attachments": {
+        "description": "列出当前会话私有附件；附件不在工作区中。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    "attachment_info": {
+        "description": "读取一个当前会话附件的名称、类型和大小。",
+        "parameters": {
+            "type": "object",
+            "properties": {"attachment_id": {"type": "string"}},
+            "required": ["attachment_id"],
+        },
+    },
+    "read_attachment": {
+        "description": "按字符分页读取当前会话中的文本附件，不创建工作区文件。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 24000},
+            },
+            "required": ["attachment_id"],
+        },
+    },
+    "inspect_pdf": {
+        "description": "从当前会话 PDF 的指定页范围提取文字；扫描页没有文字时再使用 render_pdf_page。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "string"},
+                "start_page": {"type": "integer", "minimum": 1},
+                "page_count": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+            "required": ["attachment_id"],
+        },
+    },
+    "render_pdf_page": {
+        "description": "把当前会话 PDF 的一页渲染为私有派生图片，并在下一次模型观察中直接查看。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "string"},
+                "page": {"type": "integer", "minimum": 1},
+                "scale": {"type": "number", "minimum": 0.75, "maximum": 3.0},
+            },
+            "required": ["attachment_id", "page"],
         },
     },
     "write": {
@@ -321,6 +372,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 
 # Keep the compact PGAgent aliases above and add the exact public contracts
 # exposed by the two reference implementations.
+TOOL_SCHEMAS.update(ENGINEERING_TOOL_SCHEMAS)
 TOOL_SCHEMAS.update(ADVANCED_TOOL_SCHEMAS)
 
 
@@ -328,11 +380,13 @@ PUBLIC_TOOL_NAMES: tuple[str, ...] = (
     "bash",
     "read",
     "read_artifact",
+    *ATTACHMENT_TOOL_NAMES,
     "write",
     "delete",
     "edit",
     "apply_patch",
     "validate",
+    *ENGINEERING_TOOL_NAMES,
     "glob",
     "grep",
     "rg",
@@ -365,6 +419,7 @@ _CANONICAL_MEMORY_TOOL_NAMES = frozenset({"MemoryWrite", "MemoryRead", "MemoryLi
 PARALLEL_READ_ONLY_TOOL_NAMES = frozenset({
     "read",
     "read_artifact",
+    *(name for name in ATTACHMENT_TOOL_NAMES if name != "render_pdf_page"),
     "glob",
     "grep",
     "rg",
@@ -409,6 +464,10 @@ PARALLEL_READ_ONLY_TOOL_NAMES = frozenset({
     "GitShow",
     "GitBlame",
 })
+
+# Rendering does not change the workspace, but it does create one session-private
+# derivative artifact and therefore must not run concurrently with other renders.
+READ_ONLY_TOOL_NAMES = PARALLEL_READ_ONLY_TOOL_NAMES | {"render_pdf_page"}
 
 
 def _normalize_skill_instructions(value: Iterable[Mapping[str, Any] | str] | None) -> dict[str, dict[str, Any]]:
@@ -472,14 +531,18 @@ class ToolRegistry:
         todo_change_sink: Callable[[list[dict[str, Any]]], None] | None = None,
         memory_store: Any | None = None,
         artifact_store: Any | None = None,
+        attachment_store: Any | None = None,
         background_store: Any | None = None,
         team_store: Any | None = None,
         task_store: Any | None = None,
         task_delegate: Callable[..., ToolResult | Any] | None = None,
+        workflow_profile_id: str = "auto",
+        workflow_evidence_state: Mapping[str, Any] | None = None,
         coding_state: Mapping[str, Any] | None = None,
         active_builtin_tool_names: Iterable[str] | None = None,
     ) -> None:
-        from src.coding.profile import resolve_coding_profile
+        from src.coding.evidence import WorkflowEvidenceState
+        from src.coding.profiles import resolve_workflow_profile
         from src.coding.state import CodingSessionState
 
         self.sandbox = sandbox
@@ -497,10 +560,12 @@ class ToolRegistry:
         self._todo_change_sink = todo_change_sink
         self._memory_store = memory_store
         self._artifact_store = artifact_store
+        self._attachment_store = attachment_store
         self._background_store = background_store
         self._team_store = team_store
         self._task_store = task_store
         self._coding_state = CodingSessionState.restore(coding_state)
+        self._workflow_evidence = WorkflowEvidenceState.restore(workflow_evidence_state)
         self._active_cancel_lock = threading.RLock()
         self._active_cancel_events: dict[str, threading.Event] = {}
         self._skill_instructions = _normalize_skill_instructions(skill_instructions)
@@ -517,25 +582,28 @@ class ToolRegistry:
         selected = tuple(dict.fromkeys(
             str(name).strip() for name in source_names if str(name).strip()
         ))
+        self._workflow_profile = resolve_workflow_profile(
+            workflow_profile_id,
+            selected,
+        )
+        self._defer_low_frequency_tools = (
+            allowed_tool_names is not None and "ToolSearch" in selected
+        )
         for name in selected:
             if name in _CANONICAL_MEMORY_TOOL_NAMES and self._memory_store is None:
                 continue
             if name == "read_artifact" and self._artifact_store is None:
                 continue
+            if name in ATTACHMENT_TOOL_NAMES and self._attachment_store is None:
+                continue
             self._register_default(name)
-        self._coding_profile = resolve_coding_profile(self.enabled_tool_names)
-        if (
-            allowed_tool_names is not None
-            and self._coding_profile is not None
-            and "ToolSearch" in self.enabled_tool_names
-        ):
-            self._configure_coding_exposure()
+        if "ToolSearch" in self.enabled_tool_names:
             self.activate_deferred_tools(active_builtin_tool_names or ())
         self.pipeline = InvocationPipeline(
             workspace_root=str(self.sandbox.root),
             permission_mode=self.permission_mode,
             prepare_hooks=(InvocationValidationHook(),),
-            post_hooks=(self._coding_state,),
+            post_hooks=(self._coding_state, self._workflow_evidence),
         )
         self.router = ToolRouter(self, self.pipeline)
 
@@ -550,11 +618,18 @@ class ToolRegistry:
             "bash": builtins.run_command,
             "read": builtins.read_file,
             "read_artifact": lambda _sandbox, **kwargs: self._artifact_store.read(**kwargs),
+            "list_attachments": lambda _sandbox: self._attachment_store.list(),
+            "attachment_info": lambda _sandbox, **kwargs: self._attachment_store.info(**kwargs),
+            "read_attachment": lambda _sandbox, **kwargs: self._attachment_store.read(**kwargs),
+            "inspect_pdf": lambda _sandbox, **kwargs: self._attachment_store.inspect_pdf(**kwargs),
+            "render_pdf_page": lambda _sandbox, **kwargs: self._attachment_store.render_pdf_page(**kwargs),
             "write": builtins.write_file,
             "delete": builtins.delete_file,
             "edit": builtins.edit_file,
             "apply_patch": self._apply_patch,
             "validate": self._validate,
+            "review_finding": self._review_finding,
+            "debug_evidence": self._debug_evidence,
             "glob": builtins.glob_files,
             "grep": builtins.grep_files,
             "rg": builtins.ripgrep_search,
@@ -741,6 +816,18 @@ class ToolRegistry:
 
         return run_validation(sandbox, **kwargs)
 
+    @staticmethod
+    def _review_finding(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+        from src.coding.evidence import record_review_finding
+
+        return record_review_finding(sandbox, **kwargs)
+
+    @staticmethod
+    def _debug_evidence(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+        from src.coding.evidence import record_debug_evidence
+
+        return record_debug_evidence(sandbox, **kwargs)
+
     def _tool_search(
         self,
         sandbox: WorkspaceSandbox,
@@ -759,13 +846,26 @@ class ToolRegistry:
             result.metadata["activated_tools"] = list(self.activate_deferred_tools(requested))
         return result
 
-    def _configure_coding_exposure(self) -> None:
-        direct_names = self._coding_profile.direct_tool_names if self._coding_profile is not None else frozenset()
-        for runtime in self._runtimes.values():
-            name = runtime.identity.wire_name
-            if runtime.origin.source == "builtin" and name not in direct_names:
-                runtime.presentation = ToolPresentation.deferred()
-                self._builtin_deferred_tools.add(name)
+    def _apply_workflow_presentation(self, runtime: ToolRuntime) -> None:
+        profile = self._workflow_profile
+        if profile is None:
+            return
+        name = runtime.identity.wire_name
+        if (
+            profile.read_only_tool_ceiling
+            and not runtime.execution.read_only
+            and name not in profile.allowed_non_read_only_tool_names
+        ):
+            runtime.presentation = ToolPresentation.hidden()
+            return
+        if (
+            self._defer_low_frequency_tools
+            and runtime.origin.source == "builtin"
+            and name not in profile.direct_tool_names
+            and name not in ATTACHMENT_TOOL_NAMES
+        ):
+            runtime.presentation = ToolPresentation.deferred()
+            self._builtin_deferred_tools.add(name)
 
     def register(self, name: str, function: Callable[..., ToolResult]) -> None:
         if name not in self._schemas:
@@ -776,7 +876,7 @@ class ToolRegistry:
             schema=dict(TOOL_SCHEMAS[name]),
             presentation=ToolPresentation.direct(),
             execution=ToolExecutionMetadata(
-                read_only=name in PARALLEL_READ_ONLY_TOOL_NAMES,
+                read_only=name in READ_ONLY_TOOL_NAMES,
                 supports_parallel=name in PARALLEL_READ_ONLY_TOOL_NAMES,
             ),
             executor=lambda invocation, selected=name: self._invoke_builtin_runtime(selected, invocation),
@@ -871,6 +971,7 @@ class ToolRegistry:
                     f"tool registration conflict: {existing_names} and {canonical}"
                 )
 
+        self._apply_workflow_presentation(runtime)
         self._runtimes[canonical] = runtime
         for candidate in wire_names:
             self._wire_index[candidate] = canonical
@@ -1009,10 +1110,19 @@ class ToolRegistry:
 
     @property
     def workflow_prompt(self) -> str:
-        if self._coding_profile is None:
+        if self._workflow_profile is None:
             return ""
-        evidence = self._coding_state.prompt_summary()
-        return "\n".join(item for item in (self._coding_profile.instructions, evidence) if item)
+        coding_evidence = self._coding_state.prompt_summary()
+        workflow_evidence = self._workflow_evidence.prompt_summary(self._workflow_profile.id)
+        return "\n".join(
+            item
+            for item in (
+                self._workflow_profile.instructions,
+                coding_evidence,
+                workflow_evidence,
+            )
+            if item
+        )
 
     def runtime_state(self) -> dict[str, Any]:
         """Return only JSON-safe state that must survive approval/resume."""
@@ -1022,6 +1132,10 @@ class ToolRegistry:
             "permission_mode": self.permission_mode,
             "skill_instructions": [dict(item) for item in self._skill_instructions.values()],
             "todo_state": [dict(item) for item in self._todo_state],
+            "workflow_profile_id": (
+                self._workflow_profile.id if self._workflow_profile is not None else "general"
+            ),
+            "workflow_evidence_state": self._workflow_evidence.snapshot(),
             "coding_state": self._coding_state.snapshot(),
             **self._external_state,
         }
@@ -1300,10 +1414,13 @@ def create_default_registry(
     todo_change_sink: Callable[[list[dict[str, Any]]], None] | None = None,
     memory_store: Any | None = None,
     artifact_store: Any | None = None,
+    attachment_store: Any | None = None,
     background_store: Any | None = None,
     team_store: Any | None = None,
     task_store: Any | None = None,
     task_delegate: Callable[..., ToolResult | Any] | None = None,
+    workflow_profile_id: str = "auto",
+    workflow_evidence_state: Mapping[str, Any] | None = None,
     coding_state: Mapping[str, Any] | None = None,
     active_builtin_tool_names: Iterable[str] | None = None,
 ) -> ToolRegistry:
@@ -1318,10 +1435,13 @@ def create_default_registry(
         todo_change_sink=todo_change_sink,
         memory_store=memory_store,
         artifact_store=artifact_store,
+        attachment_store=attachment_store,
         background_store=background_store,
         team_store=team_store,
         task_store=task_store,
         task_delegate=task_delegate,
+        workflow_profile_id=workflow_profile_id,
+        workflow_evidence_state=workflow_evidence_state,
         coding_state=coding_state,
         active_builtin_tool_names=active_builtin_tool_names,
     )

@@ -8,9 +8,11 @@ from typing import Any, Protocol
 from src.agent import AgentRuntime, RuntimeConfig
 from src.agents.collaboration import TeamToolStore
 from src.artifacts.storage import ArtifactToolStore
+from src.attachments.storage import AttachmentToolStore
 from src.config import settings
 from src.context import ContextManager, FilesystemArtifactStore
 from src.memory.service import MemoryToolStore
+from src.model.gateway import bind_attachment_store
 from src.tasks.background import BackgroundJobToolStore
 from src.tasks.graph import TaskGraphToolStore
 from src.tasks.state import sync_todos_for_run, task_checkpoint_for_run
@@ -91,6 +93,10 @@ class RunRuntimeFactory:
         runtime_artifact_store = FilesystemArtifactStore(
             settings.data_dir / "artifacts" / str(session_id or run_id)
         )
+        attachment_store = (
+            AttachmentToolStore(str(session_id), runtime_artifact_store)
+            if session_id else None
+        )
         registry = create_default_registry(
             context["workspace_root"],
             allowed_tool_names=context["allowed_tool_names"],
@@ -119,16 +125,22 @@ class RunRuntimeFactory:
                 else None
             ),
             artifact_store=ArtifactToolStore(runtime_artifact_store),
+            attachment_store=attachment_store,
             background_store=background_store,
             team_store=team_store,
             task_store=task_store,
             task_delegate=task_delegate,
+            workflow_profile_id=str(binding.get("workflow_profile_id") or "auto"),
+            workflow_evidence_state=binding.get("workflow_evidence_state"),
             coding_state=binding.get("coding_state"),
             active_builtin_tool_names=binding.get("builtin_active_tools"),
         )
         coordinator.register_tool_canceller(run_id, registry.cancel_active)
         runtime = runtime_type(
-            model_call=build_model_call(context["provider"]),
+            model_call=bind_attachment_store(
+                build_model_call(context["provider"]),
+                attachment_store,
+            ),
             tool_registry=registry,
             context_manager=ContextManager(max_tokens=settings.context_limit_tokens),
             artifact_store=runtime_artifact_store,

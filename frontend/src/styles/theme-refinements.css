@@ -495,6 +495,12 @@ select:focus-visible {
   background: var(--action-soft);
 }
 
+.composer-tool-button.permission-trigger-full,
+.composer-tool-button.permission-trigger-full:hover,
+.composer-tool-button.permission-trigger-full[aria-expanded='true'] {
+  color: var(--scarf);
+}
+
 .send-button {
   background: linear-gradient(145deg, #1f7897, var(--action-fill));
   box-shadow: 0 7px 16px rgb(23 111 142 / 22%);

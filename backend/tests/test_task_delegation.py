@@ -29,6 +29,7 @@ from src.agent import RunOutcome
 from src.agent.engine import ModelToolCall, ModelTurn
 from src.runs import service as run_service
 from src.runs import delegation as delegation_module
+from src.runs import runtime_factory as runtime_factory_module
 from src.tasks.background import background_job_manager
 from src.runs.service import RunCoordinator
 
@@ -194,6 +195,9 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         session = db.get(Session, delegated_run["session_id"])
         assert session is not None
         session.use_memories = False
+        child = db.get(Agent, delegated_run["child_id"])
+        assert child is not None
+        child.workflow_profile_id = "review"
         db.commit()
 
     async def parent_model(**kwargs):  # type: ignore[no-untyped-def]
@@ -238,6 +242,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
                 assert frozen_binding["memories_enabled"] is True
                 assert frozen_binding["use_memories"] is False
                 assert "skill_instructions" in frozen_binding
+                assert frozen_binding["workflow_profile_id"] == "review"
         # A malicious/buggy provider response that tries to recurse is still
         # rejected by the child registry; the second turn gives a real result.
         if child_calls == 1:
@@ -251,7 +256,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         assert json.loads(nested_results[-1]["content"])["error_code"] == "tool_not_offered"
         return ModelTurn(content="子 Agent 已完成检查。")
 
-    def fake_build_model_call(config):  # type: ignore[no-untyped-def]
+    def fake_build_model_call(config, **_kwargs):  # type: ignore[no-untyped-def]
         if config.model_id == "parent-model":
             return parent_model
         if config.model_id == "child-model":
@@ -259,6 +264,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         raise AssertionError(f"unexpected model: {config.model_id}")
 
     monkeypatch.setattr(run_service, "build_model_call", fake_build_model_call)
+    monkeypatch.setattr(runtime_factory_module, "build_model_call", fake_build_model_call)
     runtime, context = RunCoordinator._resolve_runtime(delegated_run["run_id"])
     assert delegated_run["child_id"] in context["agent_instructions"]
 
@@ -280,6 +286,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         assert task is not None and task.status == "completed"
         assert task.child_agent_id == delegated_run["child_id"]
         assert task.result["binding"]["model_id"] == "child-model"
+        assert task.result["binding"]["workflow_profile_id"] == "review"
         assert task.result["binding"]["allowed_tool_names"] == ["read", "read_artifact"]
         assert task.result["binding"]["recursive_task_enabled"] is False
         assert task.result["child_run_id"]
@@ -294,6 +301,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         assert frozen["workspace_root"] == delegated_run["parent_root"]
         assert frozen["workspace_root"] != delegated_run["child_root"]
         assert frozen["model_id"] == "child-model"
+        assert frozen["workflow_profile_id"] == "review"
         assert frozen["allowed_tool_names"] == ["read", "read_artifact"]
 
 

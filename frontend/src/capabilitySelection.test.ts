@@ -11,6 +11,6 @@ describe('会话能力选择', () => {
   it('显示后端权限值对应的中文名称', () => {
     expect(permissionLabel('ask')).toBe('请求批准')
     expect(permissionLabel('smart')).toBe('智能审批')
-    expect(permissionLabel('full')).toBe('完全访问权限')
+    expect(permissionLabel('full')).toBe('完全访问')
   })
 })

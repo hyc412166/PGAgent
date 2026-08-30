@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from src.model import gateway as model_gateway
-from src.model.gateway import ModelConfigurationError, ProviderConfig, _litellm_model, build_model_call
+from src.model.gateway import ModelConfigurationError, ProviderConfig, _litellm_model, bind_attachment_store, build_model_call
 
 
 def test_gateway_keeps_namespaced_openrouter_models_on_openrouter() -> None:
     assert _litellm_model("openrouter", "anthropic/claude-sonnet") == "openrouter/anthropic/claude-sonnet"
     assert _litellm_model("openai_compatible", "vendor/model") == "openai/vendor/model"
+
+
+def test_gateway_routes_deepseek_vision_through_openai_compatible_transport() -> None:
+    assert _litellm_model(
+        "deepseek",
+        "deepseek-v4-flash-vision-exp",
+    ) == "openai/deepseek-v4-flash-vision-exp"
+    assert _litellm_model("deepseek", "deepseek-v4-flash") == "deepseek/deepseek-v4-flash"
 
 
 @pytest.mark.asyncio
@@ -60,6 +69,97 @@ async def test_gateway_maps_openai_compatible_connection_and_thinking(monkeypatc
         "model_connection_id": "connection-1",
         "model_id": "custom-model",
         "provider": "openai_compatible",
+    }
+
+
+@pytest.mark.asyncio
+async def test_gateway_hydrates_private_image_refs_only_for_the_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    class AttachmentStore:
+        @staticmethod
+        def data_url(attachment_id: str) -> str | None:
+            return "data:image/png;base64,cHJpdmF0ZQ==" if attachment_id == "image-1" else None
+
+    async def fake_completion(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+        }
+
+    monkeypatch.setattr(model_gateway, "get_api_key", lambda _ref: "secret")
+    monkeypatch.setattr(model_gateway.litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(model_gateway.litellm, "completion_cost", lambda **_kwargs: 0.0)
+    source_messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "inspect"},
+            {"type": "pgagent_image_ref", "attachment_id": "image-1"},
+        ],
+    }]
+    call = bind_attachment_store(
+        build_model_call(ProviderConfig(
+            provider="openai_compatible",
+            base_url="https://relay.test/v1",
+            secret_ref="credential:test",
+            model_id="vision-model",
+        )),
+        AttachmentStore(),
+    )
+
+    await call(messages=source_messages, tools=[], mode="auto")
+
+    assert captured["messages"][0]["content"][1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,cHJpdmF0ZQ=="},
+    }
+    assert source_messages[0]["content"][1]["type"] == "pgagent_image_ref"
+
+
+@pytest.mark.asyncio
+async def test_gateway_injects_rendered_pdf_page_after_contiguous_tool_results() -> None:
+    captured: dict = {}
+
+    class AttachmentStore:
+        @staticmethod
+        def data_url(attachment_id: str) -> str | None:
+            return "data:image/png;base64,cGFnZQ==" if attachment_id == "page-1" else None
+
+    async def raw_model_call(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}, {"id": "call-2"}]},
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": json.dumps({
+                "ok": True,
+                "metadata": {"model_image_ref": {"id": "page-1"}},
+            }),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "content": json.dumps({"ok": True, "metadata": {}}),
+        },
+    ]
+
+    await bind_attachment_store(raw_model_call, AttachmentStore())(
+        messages=messages,
+        tools=[],
+        mode="auto",
+    )
+
+    hydrated = captured["messages"]
+    assert [message["role"] for message in hydrated] == ["assistant", "tool", "tool", "user"]
+    assert hydrated[-1]["content"][1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,cGFnZQ=="},
     }
 
 

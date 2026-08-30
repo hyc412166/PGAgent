@@ -1,12 +1,14 @@
-import { AlertCircle, ArrowUp, BookOpen, Cable, Check, ChevronRight, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Pencil, Plus, ShieldCheck, Square, Trash2, X } from 'lucide-react'
+import { AlertCircle, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
 import { Fragment, type FormEvent, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, describeError } from '../../api'
+import { attachmentForm, attachmentSignature, formatAttachmentSize, selectAttachmentFiles } from '../../attachments'
+import type { PendingAttachment } from '../../attachments'
 import { permissionLabel, permissionOptions, toggleSelectedId } from '../../capabilitySelection'
 import { modelSelectionPayload, resolveEffectiveThinking, shortModelLabel, thinkingLevelLabels } from '../../composerSettings'
 import { buildDraftLaunchPayload, createDraftIdempotencyKey, createTurnIdempotencyKey } from '../../draftLaunch'
 import { availableConnectionModels, resolveEffectiveModelSettings } from '../../modelSettings'
-import { buildSessionNavigation, folderName, isDefaultWorkspace, projectRootForSession } from '../../sessionNavigation'
+import { buildSessionNavigation, draftSessionTitle, folderName, isDefaultWorkspace, projectRootForSession } from '../../sessionNavigation'
 import { isResumableWaitingRun, isTerminalRunStatus, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from '../../sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, pickThinkingStatus, timelineFromRunEvents } from '../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../thoughtTimeline'
@@ -34,6 +36,7 @@ function SessionsPage() {
   const memorySettings = useApiData<MemorySettings | null>(null, () => api.get<MemorySettings>('/api/memories/settings'), [])
   const [activeId, setActiveId] = useState('')
   const [composerHasValue, setComposerHasValue] = useState(false)
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([])
   const [sending, setSending] = useState(false)
   const [stoppingRunId, setStoppingRunId] = useState('')
   const [cancellingTaskId, setCancellingTaskId] = useState('')
@@ -76,13 +79,15 @@ function SessionsPage() {
   const seenStreamEventsRef = useRef<{ runId: string; eventIds: Set<string> }>({ runId: '', eventIds: new Set() })
   const messagesRef = useRef<HTMLDivElement>(null)
   const composerInputRef = useRef<ComposerTextAreaHandle>(null)
+  const attachmentInputRef = useRef<HTMLInputElement>(null)
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([])
   const activeIdRef = useRef('')
   const stickToBottomRef = useRef(true)
   const historyScrollSessionRef = useRef('')
   const terminalSyncVersionRef = useRef(0)
   const pendingDraftRunRef = useRef<{ sessionId: string; runId: string } | null>(null)
   const draftIdempotencyKeyRef = useRef('')
-  const pendingSessionSendRef = useRef<{ sessionId: string; content: string; key: string } | null>(null)
+  const pendingSessionSendRef = useRef<{ sessionId: string; content: string; attachmentSignature: string; key: string } | null>(null)
   const draftVersionRef = useRef(0)
   const sendingRef = useRef(false)
   const lastSubmittedContentRef = useRef('')
@@ -92,6 +97,13 @@ function SessionsPage() {
   activeIdRef.current = activeId
   const liveRunRef = useRef(liveRun)
   liveRunRef.current = liveRun
+  pendingAttachmentsRef.current = pendingAttachments
+
+  useEffect(() => () => {
+    pendingAttachmentsRef.current.forEach((item) => {
+      if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
+    })
+  }, [])
 
   useEffect(() => {
     if (!activeId && !draftActive && sessions.data[0]) setActiveId(stringId(sessions.data[0].id))
@@ -378,8 +390,48 @@ function SessionsPage() {
     setExpandedWorkspaceIds(isProject ? new Set([workspaceId]) : new Set())
   }, [activeSession?.workspace_id, draftActive, workspaces.data])
 
+  function clearPendingAttachments() {
+    pendingAttachmentsRef.current.forEach((item) => {
+      if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
+    })
+    pendingAttachmentsRef.current = []
+    setPendingAttachments([])
+    if (attachmentInputRef.current) attachmentInputRef.current.value = ''
+  }
+
+  function queueAttachments(files: FileList | null) {
+    const selected = Array.from(files || [])
+    if (!selected.length) return
+    const current = pendingAttachmentsRef.current
+    const result = selectAttachmentFiles(selected, current.map((item) => item.file))
+    if (result.error) {
+      setActionError(result.error)
+      if (attachmentInputRef.current) attachmentInputRef.current.value = ''
+      return
+    }
+    const added = result.files.map((file, index) => ({
+      id: `attachment-${file.lastModified}-${file.size}-${index}-${Math.random().toString(36).slice(2)}`,
+      file,
+      previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : '',
+    }))
+    const next = [...current, ...added]
+    pendingAttachmentsRef.current = next
+    setPendingAttachments(next)
+    setActionError('')
+    if (attachmentInputRef.current) attachmentInputRef.current.value = ''
+  }
+
+  function removePendingAttachment(id: string) {
+    const target = pendingAttachmentsRef.current.find((item) => item.id === id)
+    if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl)
+    const next = pendingAttachmentsRef.current.filter((item) => item.id !== id)
+    pendingAttachmentsRef.current = next
+    setPendingAttachments(next)
+  }
+
   function clearDraftState() {
     draftVersionRef.current += 1
+    clearPendingAttachments()
     setDraftActive(false)
     setDraftRootPath('')
     setDraftSettings(emptyDraftSettings)
@@ -389,6 +441,7 @@ function SessionsPage() {
 
   function beginDraft() {
     if (sendingRef.current) return
+    clearPendingAttachments()
     const selectedProjectRoot = projectRootForSession(workspaces.data, activeSession)
     const selectedProjectId = selectedProjectRoot ? activeSession?.workspace_id : ''
     draftVersionRef.current += 1
@@ -408,6 +461,7 @@ function SessionsPage() {
       clearDraftState()
     }
     setActionError('')
+    clearPendingAttachments()
     stickToBottomRef.current = true
     historyScrollSessionRef.current = sessionId
     setHistoryOpenVersion((version) => version + 1)
@@ -583,7 +637,8 @@ function SessionsPage() {
   async function sendMessage(event: FormEvent) {
     event.preventDefault()
     const content = composerInputRef.current?.getValue().trim() || ''
-    if (sendingRef.current || (!activeId && !draftActive) || !content || settingsSaving || capabilitySaving || settingsLocked) return
+    const files = pendingAttachmentsRef.current.map((item) => item.file)
+    if (sendingRef.current || (!activeId && !draftActive) || (!content && !files.length) || settingsSaving || capabilitySaving || settingsLocked) return
     sendingRef.current = true
     setSending(true); setActionError('')
     lastSubmittedContentRef.current = content
@@ -594,12 +649,16 @@ function SessionsPage() {
         const draftVersion = draftVersionRef.current
         const idempotencyKey = draftIdempotencyKeyRef.current || createDraftIdempotencyKey()
         draftIdempotencyKeyRef.current = idempotencyKey
-        const launched = await api.post<DraftLaunchResponse>('/api/drafts/launch', buildDraftLaunchPayload(
+        const draftPayload = buildDraftLaunchPayload(
           idempotencyKey,
           content,
           draftRootPath,
           draftSettings,
-        ))
+        )
+        if (!content && files[0]) draftPayload.title = draftSessionTitle(files[0].name)
+        const launched = files.length
+          ? await api.postForm<DraftLaunchResponse>('/api/drafts/launch-input', attachmentForm(draftPayload, files))
+          : await api.post<DraftLaunchResponse>('/api/drafts/launch', draftPayload)
         if (draftVersionRef.current !== draftVersion) return
         const sessionId = stringId(launched.session?.id)
         const runId = stringId(launched.run?.id)
@@ -616,17 +675,22 @@ function SessionsPage() {
 
       const targetSessionId = activeId
       const pendingSend = pendingSessionSendRef.current
-      const idempotencyKey = pendingSend?.sessionId === targetSessionId && pendingSend.content === content
+      const fileSignature = attachmentSignature(files)
+      const idempotencyKey = pendingSend?.sessionId === targetSessionId && pendingSend.content === content && pendingSend.attachmentSignature === fileSignature
         ? pendingSend.key
         : createTurnIdempotencyKey()
-      pendingSessionSendRef.current = { sessionId: targetSessionId, content, key: idempotencyKey }
-      const launched = await api.post<Run>(`/api/sessions/${targetSessionId}/run`, {
+      pendingSessionSendRef.current = { sessionId: targetSessionId, content, attachmentSignature: fileSignature, key: idempotencyKey }
+      const runPayload = {
         content,
         idempotency_key: idempotencyKey,
-      })
+      }
+      const launched = files.length
+        ? await api.postForm<Run>(`/api/sessions/${targetSessionId}/turns`, attachmentForm(runPayload, files))
+        : await api.post<Run>(`/api/sessions/${targetSessionId}/run`, runPayload)
       pendingSessionSendRef.current = null
       setInterruptedRunId('')
       composerInputRef.current?.clear()
+      clearPendingAttachments()
       void messages.refresh()
       void runs.refresh()
       void context.refresh()
@@ -969,9 +1033,21 @@ function SessionsPage() {
                   <button type="button" className="draft-project-button" disabled={pickingDraftProject || sending} onClick={() => void selectDraftProject()}>{pickingDraftProject ? <LoaderCircle className="spin" size={13} /> : <FolderOpen size={13} />}选择项目</button>
                   {draftRootPath && <span className="draft-folder-pill" title={draftRootPath}><Folder size={12} /><span>{folderName(draftRootPath)}</span><button type="button" aria-label="清除所选项目" disabled={sending} onClick={clearDraftProject}><X size={11} /></button></span>}
                 </div>}
+                {!!pendingAttachments.length && <div className="attachment-tray" role="list" aria-label="待发送附件">
+                  {pendingAttachments.map((item) => <div className="attachment-chip" role="listitem" key={item.id}>
+                    <span className="attachment-chip-preview">{item.previewUrl ? <img src={item.previewUrl} alt="" /> : <FileText size={16} />}</span>
+                    <span className="attachment-chip-copy"><strong title={item.file.name}>{item.file.name}</strong><small>仅本会话 · {formatAttachmentSize(item.file.size)}</small></span>
+                    <button type="button" aria-label={`移除附件 ${item.file.name}`} title="移除附件" disabled={sending} onClick={() => removePendingAttachment(item.id)}><X size={12} /></button>
+                  </div>)}
+                </div>}
+                <input ref={attachmentInputRef} className="attachment-file-input" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => queueAttachments(event.currentTarget.files)} />
                 <ComposerTextArea ref={composerInputRef} disabled={draftActive && sending} resetKey={`${activeId}:${draftActive}`} placeholder={draftActive ? '描述你想完成的任务……' : '告诉 PGAgent 你想完成什么……'} onHasValueChange={setComposerHasValue} />
                 <div className="composer-toolbar">
                   <div className="composer-left-actions">
+                    <button type="button" className="composer-tool-button composer-plus-button attachment-trigger" aria-label="添加本机附件" title="添加本机附件（仅当前会话可见）" disabled={settingsLocked || sending} onClick={() => attachmentInputRef.current?.click()}>
+                      <Paperclip size={14} />
+                      {!!pendingAttachments.length && <b>{pendingAttachments.length}</b>}
+                    </button>
                     <div className="session-capability-picker" ref={addMenuRef}>
                       <button type="button" className="composer-tool-button composer-plus-button" aria-label="添加能力" aria-haspopup="menu" aria-expanded={addMenuOpen} aria-busy={capabilitySaving} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setAddMenuOpen((open) => !open); setSkillSubmenuOpen(false); setMcpSubmenuOpen(false); setPermissionMenuOpen(false) }}>
                         <Plus size={15} />
@@ -988,10 +1064,9 @@ function SessionsPage() {
                                 return <button key={skill.id} type="button" role="menuitemcheckbox" aria-checked={selected} className={selected ? 'selected' : ''} disabled={skill.enabled === false || capabilitySaving} onClick={() => toggleSessionSkill(skill.id)}><span><strong>{skill.name}</strong><small>{skill.description || skill.slug || 'Skill'}</small></span><Check className="selection-check" size={14} aria-hidden="true" /></button>
                               }) : <div className="capability-menu-state">技能库中暂无 Skill。</div>}
                         </div>}
-                        <button type="button" className={mcpSubmenuOpen ? 'active' : ''} role="menuitem" aria-haspopup="menu" aria-expanded={mcpSubmenuOpen} onMouseEnter={() => { setMcpSubmenuOpen(true); setSkillSubmenuOpen(false) }} onClick={() => { setMcpSubmenuOpen((open) => !open); setSkillSubmenuOpen(false) }}><Cable size={14} /><span>MCP</span><small>{selectedSessionMcpNames.length ? `已选 ${selectedSessionMcpNames.length}` : '不使用'}</small><ChevronRight size={13} /></button>
+                        <button type="button" className={mcpSubmenuOpen ? 'active' : ''} role="menuitem" aria-haspopup="menu" aria-expanded={mcpSubmenuOpen} onMouseEnter={() => { setMcpSubmenuOpen(true); setSkillSubmenuOpen(false) }} onClick={() => { setMcpSubmenuOpen((open) => !open); setSkillSubmenuOpen(false) }}><Cable size={14} /><span>MCP</span><small>{selectedSessionMcpNames.length ? `已选 ${selectedSessionMcpNames.length}` : '未选择'}</small><ChevronRight size={13} /></button>
                         {mcpSubmenuOpen && <div className="capability-popover capability-level-three" role="menu" aria-label="选择 MCP">
                           <p>当前会话使用的 MCP</p>
-                          <button type="button" role="menuitem" className={!selectedSessionMcpNames.length ? 'selected' : ''} disabled={capabilitySaving} onClick={() => void updateSessionCapabilities({ mcp_server_names: [] })}><span><strong>不使用 MCP</strong><small>本会话不连接任何 MCP 服务器</small></span><Check className="selection-check" size={14} aria-hidden="true" /></button>
                           {mcpServers.error ? <div className="capability-menu-state error"><AlertCircle size={13} /><span>{mcpServers.error}</span><button type="button" onClick={() => void mcpServers.reload()}>重试</button></div>
                             : mcpServers.loading ? <div className="capability-menu-state"><LoaderCircle className="spin" size={13} />正在读取…</div>
                               : availableMcpServers.length ? availableMcpServers.map((server) => {
@@ -1002,7 +1077,7 @@ function SessionsPage() {
                       </div>}
                     </div>
                     <div className="session-capability-picker permission-picker" ref={permissionMenuRef}>
-                      <button type="button" className="composer-tool-button permission-trigger" aria-label={`权限模式：${permissionLabel(selectedPermissionMode)}`} aria-haspopup="menu" aria-expanded={permissionMenuOpen} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setPermissionMenuOpen((open) => !open); setAddMenuOpen(false); setSkillSubmenuOpen(false); setMcpSubmenuOpen(false) }}><ShieldCheck size={14} /><span>{permissionLabel(selectedPermissionMode)}</span><ChevronRight size={12} /></button>
+                      <button type="button" className={`composer-tool-button permission-trigger${selectedPermissionMode === 'full' ? ' permission-trigger-full' : ''}`} aria-label={`权限模式：${permissionLabel(selectedPermissionMode)}`} aria-haspopup="menu" aria-expanded={permissionMenuOpen} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setPermissionMenuOpen((open) => !open); setAddMenuOpen(false); setSkillSubmenuOpen(false); setMcpSubmenuOpen(false) }}>{selectedPermissionMode === 'full' ? <ShieldAlert size={14} /> : <ShieldCheck size={14} />}<span>{permissionLabel(selectedPermissionMode)}</span><ChevronRight size={12} /></button>
                       {permissionMenuOpen && <div className="capability-popover permission-popover" role="menu" aria-label="权限模式">
                         <p>权限</p>
                         {permissionOptions.map((option) => <button key={option.value} type="button" role="menuitemradio" aria-checked={selectedPermissionMode === option.value} className={selectedPermissionMode === option.value ? 'selected' : ''} onClick={() => selectPermissionMode(option.value)}><span>{option.label}</span><Check className="selection-check" size={14} aria-hidden="true" /></button>)}
@@ -1058,7 +1133,7 @@ function SessionsPage() {
                       aria-busy={Boolean(stoppingRunId)}
                       disabled={canInterrupt
                         ? Boolean(stoppingRunId)
-                        : sending || settingsSaving || capabilitySaving || settingsLocked || !composerHasValue}
+                        : sending || settingsSaving || capabilitySaving || settingsLocked || (!composerHasValue && !pendingAttachments.length)}
                       onClick={canInterrupt ? () => void stopActiveRun() : undefined}
                     >
                       {canInterrupt

@@ -53,6 +53,7 @@ function AgentsPage() {
     try {
       const payload = {
         name: form.get('name'), description: form.get('description'), system_prompt: form.get('system_prompt'),
+        workflow_profile_id: form.get('workflow_profile_id'),
         model_connection_id: null,
         model_id: null,
         thinking_level: 'auto',
@@ -90,7 +91,7 @@ function AgentsPage() {
             <article className="entity-card agent-card" key={agent.id}>
               <div className="agent-head"><div className="agent-avatar"><Bot size={22} /></div><div className="agent-card-actions"><StatusBadge status={agent.status || 'idle'} /><button className="icon-button" aria-label={`编辑 ${agent.name}`} title="编辑子 Agent" onClick={() => openAgentPanel(agent)}><Pencil size={15} /></button><button className="icon-button danger-icon" aria-label={`删除 ${agent.name}`} disabled={deletingId === agent.id} title="删除子 Agent" onClick={() => void deleteAgent(agent)}>{deletingId === agent.id ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}</button></div></div>
               <h2>{agent.name}</h2><p className="agent-role">{agent.role || '通用执行子 Agent'}</p><p>{agent.description || '暂无角色说明'}</p>
-              <div className="agent-meta"><span><Wrench size={14} />{agent.tool_ids?.length ?? 0} 工具 · {agent.skill_ids?.length ?? 0} Skill</span></div>
+              <div className="agent-meta"><span><Wrench size={14} />{agent.tool_ids?.length ?? 0} 工具 · {agent.skill_ids?.length ?? 0} Skill · {agent.workflow_profile_id || 'auto'}</span></div>
               <footer><span>{formatDate(agent.created_at)}</span></footer>
             </article>
           ))}
@@ -100,6 +101,15 @@ function AgentsPage() {
         <form className="panel-form" onSubmit={saveAgent} key={editing?.id || 'new-agent'}>
           <Field label="名称"><input name="name" required placeholder="例如：代码协作者" autoFocus defaultValue={editing?.name || template?.name || ''} /></Field>
           <Field label="简介"><input name="description" placeholder="简要描述擅长处理的任务" defaultValue={editing?.description || template?.description || ''} /></Field>
+          <Field label="工程工作流">
+            <select name="workflow_profile_id" defaultValue={editing?.workflow_profile_id || template?.workflowProfileId || 'general'}>
+              <option value="general">通用</option>
+              <option value="coding">Coding：实现与验证</option>
+              <option value="review">Review：只读审查</option>
+              <option value="debug">Debug：证据驱动调试</option>
+              <option value="auto">自动兼容模式</option>
+            </select>
+          </Field>
           <Field label="系统指令"><textarea name="system_prompt" rows={6} placeholder="说明工作原则、输出风格和边界……" defaultValue={editing?.system_prompt || template?.systemPrompt || ''} /></Field>
           <CapabilityMultiSelect label="工具" items={tools.data.map((item) => ({ ...item, name: item.label || item.name }))} selectedIds={selectedToolIds} loading={tools.loading} error={tools.error} onRetry={() => void tools.reload()} onToggle={(id) => setSelectedToolIds((current) => toggleSelectedId(current, id))} />
           <CapabilityMultiSelect label="Skill" items={skills.data} selectedIds={selectedSkillIds} loading={skills.loading} error={skills.error} onRetry={() => void skills.reload()} onToggle={(id) => setSelectedSkillIds((current) => toggleSelectedId(current, id))} />
