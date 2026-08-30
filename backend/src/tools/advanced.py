@@ -87,15 +87,13 @@ def read_file_slice(
     limit: int | None = None,
     max_chars: int = 100_000,
 ) -> ToolResult:
-    result = builtins.read_file(sandbox, path, max_chars=max_chars)
-    if not result.ok or (offset <= 0 and limit is None):
-        return result
-    lines = result.content.splitlines(keepends=True)
-    start = max(0, int(offset))
-    end = len(lines) if limit is None else start + max(1, int(limit))
-    result.content = "".join(lines[start:end])
-    result.metadata.update({"offset": start, "line_limit": limit, "total_lines": len(lines)})
-    return result
+    return builtins.read_file(
+        sandbox,
+        path,
+        offset=offset,
+        limit=limit,
+        max_chars=max_chars,
+    )
 
 
 def notebook_edit(

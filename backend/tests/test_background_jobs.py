@@ -102,6 +102,25 @@ def test_background_job_is_persisted_and_wait_returns_terminal_output(background
         assert not (Path(store.workspace_root) / ".pgagent").exists()
 
 
+def test_write_stdin_sends_input_to_running_background_job(background_store) -> None:
+    store, _manager = background_store
+    started = store.start(
+        command='$line = [Console]::In.ReadLine(); Write-Output "stdin:$line"',
+        shell="powershell",
+        timeout=30,
+    )
+    job_id = started.metadata["background_job_id"]
+    _wait_for_job_status(job_id, {"running"}, require_pid=True)
+
+    sent = store.write_stdin(task_id=job_id, input="hello\n")
+    result = store.check(task_id=job_id, wait=True, wait_timeout=10)
+
+    assert sent.ok
+    assert '"chars_sent": 6' in sent.content
+    assert result.ok
+    assert "stdin:hello" in result.content
+
+
 def test_recover_relaunches_queued_job_and_settles_stale_running_job(background_store) -> None:
     store, manager = background_store
     with database.SessionLocal() as db:

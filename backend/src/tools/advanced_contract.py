@@ -88,6 +88,7 @@ ADVANCED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "compress": _schema("Request a full conversation compaction at the next safe boundary.", {"reason": _STRING}),
     "background_run": _schema("Start a durable bounded background command and return immediately.", {"command": _STRING, "timeout": _INTEGER, "shell": {"type": "string", "enum": ["command", "powershell"]}, "plan_step_id": _STRING}, ("command",)),
     "check_background": _schema("Check one or all background commands. Set wait=true after finishing independent work so the Agent waits for terminal results before replying.", {"task_id": _STRING, "wait": _BOOL, "wait_timeout": _INTEGER}),
+    "write_stdin": _schema("Send input to a running background command, optionally closing its stdin.", {"task_id": _STRING, "input": _STRING, "close": _BOOL}, ("task_id", "input")),
     "task_create": _schema("Create a durable shared task.", {"subject": _STRING, "description": _STRING}, ("subject",)),
     "task_get": _schema("Get one durable shared task.", {"task_id": {"oneOf": [_STRING, _INTEGER]}}, ("task_id",)),
     "task_update": _schema("Update one durable shared task.", {"task_id": {"oneOf": [_STRING, _INTEGER]}, "status": _STRING, "message": _STRING, "add_blocked_by": _STRINGS, "remove_blocked_by": _STRINGS, "output": _STRING}, ("task_id",)),
@@ -117,7 +118,7 @@ CLAW_TOOL_NAMES: tuple[str, ...] = (
 )
 
 LEARN_TOOL_NAMES: tuple[str, ...] = (
-    "load_skill", "compress", "background_run", "check_background", "task_create", "task_get", "task_update",
+    "load_skill", "compress", "background_run", "check_background", "write_stdin", "task_create", "task_get", "task_update",
     "task_list", "spawn_teammate", "list_teammates", "send_message", "read_inbox", "broadcast",
     "shutdown_request", "integrate_teammate", "plan_approval", "idle", "claim_task",
 )

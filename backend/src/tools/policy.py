@@ -49,9 +49,11 @@ SIDE_EFFECT_OR_NETWORK_TOOLS: Final[frozenset[str]] = frozenset(
         "write",
         "write_file",
         "edit",
+        "apply_patch",
         "delete",
         "bash",
         "run_command",
+        "validate",
         "task",
         "Agent",
         "webfetch",
@@ -78,6 +80,7 @@ SIDE_EFFECT_OR_NETWORK_TOOLS: Final[frozenset[str]] = frozenset(
         "task_update",
         "claim_task",
         "background_run",
+        "write_stdin",
         "spawn_teammate",
         "send_message",
         "read_inbox",
@@ -104,7 +107,7 @@ HIGH_IMPACT_TOOLS: Final[frozenset[str]] = SIDE_EFFECT_OR_NETWORK_TOOLS
 NETWORK_TOOLS: Final[frozenset[str]] = frozenset({"webfetch", "websearch", "WebFetch", "WebSearch", "RemoteTrigger", "MCP"})
 FILE_WRITE_TOOLS: Final[frozenset[str]] = frozenset({"write", "write_file", "edit", "edit_file"})
 FILE_DELETE_TOOLS: Final[frozenset[str]] = frozenset({"delete"})
-COMMAND_TOOLS: Final[frozenset[str]] = frozenset({"bash", "run_command", "PowerShell", "REPL", "background_run"})
+COMMAND_TOOLS: Final[frozenset[str]] = frozenset({"bash", "run_command", "validate", "PowerShell", "REPL", "background_run"})
 
 _SENSITIVE_FILE_NAMES: Final[frozenset[str]] = frozenset(
     {
@@ -225,7 +228,15 @@ def _normalized_relative_path(value: object) -> str:
     """Normalize only for classification; real access stays in WorkspaceSandbox."""
 
     raw = str(value or "").strip().replace("\\", "/")
-    return "/".join(part for part in raw.split("/") if part and part != ".").casefold()
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if not part or part == ".":
+            continue
+        if part == ".." and parts and parts[-1] != "..":
+            parts.pop()
+            continue
+        parts.append(part)
+    return "/".join(parts).casefold()
 
 
 def _file_path_risk(path: object) -> str | None:
@@ -249,6 +260,24 @@ def _file_path_risk(path: object) -> str | None:
     if filename.endswith(_SCRIPT_SUFFIXES):
         return "目标是可执行脚本"
     return None
+
+
+def _workspace_path_for_risk(
+    workspace_root: str | Path | None,
+    path: object,
+) -> object:
+    if workspace_root is None:
+        return path
+    raw_path = str(path or "").strip()
+    candidate_input = Path(raw_path)
+    if not raw_path or candidate_input.is_absolute():
+        return path
+    try:
+        root = Path(workspace_root).expanduser().resolve()
+        candidate = (root / candidate_input).resolve(strict=False)
+        return candidate.relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return path
 
 
 def _existing_file_size(workspace_root: str | Path | None, path: object) -> int | None:
@@ -283,6 +312,7 @@ def _write_decision(
     workspace_root: str | Path | None,
 ) -> ToolRiskDecision:
     path = arguments.get("path")
+    path = _workspace_path_for_risk(workspace_root, path)
     path_risk = _file_path_risk(path)
     if path_risk:
         return _approval(f"{path_risk}，智能审批需要你确认这次文件修改。")
@@ -318,6 +348,29 @@ def _write_decision(
             return _approval("这次写入会覆盖超大已有文件，智能审批需要你确认。")
         if existing_size >= _BROAD_REWRITE_MIN_BYTES and len(content.encode("utf-8")) * 5 < existing_size:
             return _approval("这次写入会显著缩小已有文件，智能审批需要你确认。")
+    return _allow()
+
+
+def _patch_decision(
+    arguments: Mapping[str, object],
+    workspace_root: str | Path | None,
+) -> ToolRiskDecision:
+    patch = arguments.get("patch")
+    if not isinstance(patch, str):
+        return _allow()
+    if _content_contains_secret(patch):
+        return _approval("补丁内容看起来包含访问密钥或私钥，智能审批需要你确认。")
+    if len(patch) > _LARGE_WRITE_CHARS:
+        return _approval("单次补丁内容过大，智能审批需要你确认影响范围。")
+    for line in patch.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if line.startswith("*** Delete File: "):
+            return _approval("补丁会删除文件，智能审批需要你确认这项不可逆操作。")
+        if line.startswith(("*** Add File: ", "*** Update File: ")):
+            path = line.split(": ", 1)[1]
+            path = _workspace_path_for_risk(workspace_root, path)
+            path_risk = _file_path_risk(path)
+            if path_risk:
+                return _approval(f"{path_risk}，智能审批需要你确认这次补丁。")
     return _allow()
 
 
@@ -390,6 +443,8 @@ def _smart_decision(
 ) -> ToolRiskDecision:
     if tool_name in FILE_DELETE_TOOLS:
         return _approval("删除文件是不可逆操作，智能审批需要你确认。")
+    if tool_name == "apply_patch":
+        return _patch_decision(arguments, workspace_root)
     if tool_name in FILE_WRITE_TOOLS:
         return _write_decision(tool_name, arguments, workspace_root)
     if tool_name in COMMAND_TOOLS:

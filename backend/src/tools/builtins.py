@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -162,6 +163,8 @@ def read_file(
     sandbox: WorkspaceSandbox,
     path: str,
     *,
+    offset: int = 0,
+    limit: int | None = None,
     max_chars: int = 100_000,
 ) -> ToolResult:
     try:
@@ -173,17 +176,43 @@ def read_file(
             prefix = binary_stream.read(8192)
         if b"\x00" in prefix:
             return ToolResult("read_file", False, "暂不支持读取二进制文件", error_code="binary_file")
+        line_offset = max(0, int(offset))
+        line_limit = None if limit is None else max(1, int(limit))
         max_chars = min(max(int(max_chars), 1), 1_000_000)
+        chunks: list[str] = []
+        captured_chars = 0
+        returned_lines = 0
+        truncated = False
         with target.open("r", encoding="utf-8", errors="replace") as text_stream:
-            text = text_stream.read(max_chars + 1)
-        # Text mode may normalize CRLF, so byte/encoded-length comparison would
-        # falsely report truncation. Reading one extra character is authoritative.
-        truncated = len(text) > max_chars
+            for line_index, line in enumerate(text_stream):
+                if line_index < line_offset:
+                    continue
+                if line_limit is not None and returned_lines >= line_limit:
+                    truncated = True
+                    break
+                remaining = max_chars - captured_chars
+                if len(line) > remaining:
+                    chunks.append(line[:remaining])
+                    captured_chars += remaining
+                    if remaining:
+                        returned_lines += 1
+                    truncated = True
+                    break
+                chunks.append(line)
+                captured_chars += len(line)
+                returned_lines += 1
+        text = "".join(chunks)
         return ToolResult(
             "read_file",
             True,
-            text[:max_chars],
-            metadata={"truncated": truncated, "size_bytes": size_bytes},
+            text,
+            metadata={
+                "truncated": truncated,
+                "size_bytes": size_bytes,
+                "offset": line_offset,
+                "line_limit": line_limit,
+                "lines_returned": returned_lines,
+            },
         )
     except (SandboxViolation, FileNotFoundError, OSError) as exc:
         return ToolResult("read_file", False, str(exc), error_code="path_error")
@@ -389,6 +418,91 @@ def grep_files(
         )
     except (SandboxViolation, FileNotFoundError, OSError, re.error, ValueError) as exc:
         return ToolResult("grep", False, str(exc), error_code="grep_error")
+
+
+def ripgrep_search(
+    sandbox: WorkspaceSandbox,
+    pattern: str,
+    *,
+    path: str = ".",
+    glob: str | None = None,
+    case_sensitive: bool = False,
+    fixed_strings: bool = False,
+    context: int = 0,
+    limit: int = 200,
+) -> ToolResult:
+    """Run ripgrep without a shell and keep traversal inside the workspace."""
+
+    executable = shutil.which("rg")
+    if executable is None:
+        return ToolResult("rg", False, "ripgrep executable is unavailable", error_code="tool_unavailable")
+    try:
+        target = sandbox.resolve(path, must_exist=True)
+        relative_target = sandbox.relative(target)
+        result_limit = min(max(int(limit), 1), 2_000)
+        args = [
+            executable,
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--color",
+            "never",
+            "--no-follow",
+            "--max-columns",
+            "1000",
+            "--max-filesize",
+            "2M",
+        ]
+        if not case_sensitive:
+            args.append("--ignore-case")
+        if fixed_strings:
+            args.append("--fixed-strings")
+        context_lines = min(max(int(context), 0), 20)
+        if context_lines:
+            args.extend(["--context", str(context_lines)])
+        if glob:
+            args.extend(["--glob", str(glob)])
+        args.extend(["--", str(pattern), relative_target])
+        process = subprocess.Popen(
+            args,
+            cwd=sandbox.root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+        )
+        lines: list[str] = []
+        truncated = False
+        assert process.stdout is not None
+        for line in process.stdout:
+            if len(lines) >= result_limit:
+                truncated = True
+                process.terminate()
+                break
+            lines.append(line[:2_000])
+        process.stdout.close()
+        try:
+            exit_code = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            exit_code = process.wait(timeout=5)
+        if not truncated and exit_code not in {0, 1}:
+            return ToolResult("rg", False, "".join(lines), error_code="rg_error", metadata={"exit_code": exit_code})
+        return ToolResult(
+            "rg",
+            True,
+            "".join(lines) if lines else "No matches found",
+            metadata={
+                "count": len(lines),
+                "truncated": truncated,
+                "path": relative_target,
+                "exit_code": exit_code,
+            },
+        )
+    except (SandboxViolation, FileNotFoundError, OSError, ValueError) as exc:
+        return ToolResult("rg", False, str(exc), error_code="rg_error")
 
 
 def edit_file(
@@ -1687,12 +1801,13 @@ def run_command(
     command: str | list[str],
     *,
     approved: bool = False,
+    cwd: str = ".",
     timeout_seconds: float = 30,
     output_limit: int = 20_000,
     allowlist: frozenset[str] = DEFAULT_COMMAND_ALLOWLIST,
     _cancel_event: threading.Event | None = None,
 ) -> ToolResult:
-    arguments = {"command": command, "timeout_seconds": timeout_seconds}
+    arguments = {"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds}
     if not approved:
         return _approval(
             "run_command",
@@ -1700,6 +1815,10 @@ def run_command(
             "命令将以当前用户权限在本机运行，可能访问工作区外资源；执行前必须批准",
         )
     try:
+        working_directory = sandbox.resolve(cwd, must_exist=True)
+        if not working_directory.is_dir():
+            return ToolResult("run_command", False, "cwd is not a directory", error_code="not_directory")
+        relative_cwd = sandbox.relative(working_directory)
         parts = _split_command(command)
         # Accept a bare allowlisted executable only.  Supplying an arbitrary
         # path to a program called ``python.exe`` would otherwise defeat the
@@ -1729,7 +1848,7 @@ def run_command(
             popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(
             parts,
-            cwd=sandbox.root,
+            cwd=working_directory,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1820,6 +1939,7 @@ def run_command(
                     (partial + "\nCommand execution interrupted by the user.")[:output_limit],
                     error_code="cancelled",
                     metadata={
+                        "cwd": relative_cwd,
                         "process_tree_terminated": tree_terminated,
                         "truncated": output_truncated,
                         "security_scope": "current_user_host_permissions",
@@ -1832,6 +1952,7 @@ def run_command(
                 (partial + f"\n命令执行超时（{timeout_seconds}s），{termination_text}")[:output_limit],
                 error_code="timeout",
                 metadata={
+                    "cwd": relative_cwd,
                     "timeout_seconds": timeout_seconds,
                     "process_tree_terminated": tree_terminated,
                     "truncated": output_truncated,
@@ -1849,6 +1970,7 @@ def run_command(
             changed=False,
             error_code=None if process.returncode == 0 else "nonzero_exit",
             metadata={
+                "cwd": relative_cwd,
                 "exit_code": process.returncode,
                 "truncated": output_truncated,
                 "security_scope": "current_user_host_permissions",

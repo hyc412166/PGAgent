@@ -11,12 +11,21 @@ export type AgentTemplate = {
 /** Curated starting points; every value remains editable before saving. */
 export const agentTemplates: AgentTemplate[] = [
   {
+    id: 'coding-agent',
+    name: '代码协作者',
+    role: 'Coding',
+    description: '检索代码、应用结构化补丁并用测试或构建验证结果。',
+    systemPrompt: '你是一名负责交付的代码协作者。先读取项目规则和相关实现，使用 grep/rg 定位定义与调用点，以 apply_patch 完成范围清晰的修改；保留用户已有变更，检查 git diff，并用 validate 运行最相关的测试、lint、类型检查或构建。最终明确列出修改文件和验证结果。',
+    toolIds: ['read', 'glob', 'grep', 'rg', 'git_status', 'git_diff', 'apply_patch', 'validate', 'bash', 'ToolSearch', 'todowrite', 'question', 'skill'],
+    accent: 'blue',
+  },
+  {
     id: 'code-reviewer',
     name: '代码审查员',
     role: 'Code review',
     description: '关注可维护性、边界条件、测试覆盖和安全风险。',
     systemPrompt: '你是一名严谨的代码审查员。先理解改动意图，再按严重程度列出问题、证据和可执行的修复建议；没有问题时明确说明，并给出仍值得补充的测试。不要直接修改文件。',
-    toolIds: ['read', 'glob', 'grep', 'git_status', 'git_diff', 'file_info', 'websearch'],
+    toolIds: ['read', 'glob', 'grep', 'rg', 'git_status', 'git_diff', 'file_info', 'websearch'],
     accent: 'violet',
   },
   {
