@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     no_progress_limit: int = 4
     model_timeout_seconds: float = 90.0
     max_run_seconds: float | None = 1_800.0
-    context_limit_tokens: int = 100_000
-    compact_threshold_tokens: int = 90_000
+    context_limit_tokens: int = 200_000
+    compact_threshold_tokens: int = 180_000
     completion_verification_max_attempts: int = 3
     mcp_config_path: str | None = None
 

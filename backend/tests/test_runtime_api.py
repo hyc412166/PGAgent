@@ -1060,8 +1060,8 @@ def test_session_context_recalculates_messages_when_cached_count_is_zero(
     assert response.status_code == 200
     body = response.json()
     assert body["used_tokens"] > 0
-    assert body["limit_tokens"] == 100_000
-    assert body["compact_threshold_tokens"] == 90_000
+    assert body["limit_tokens"] == 200_000
+    assert body["compact_threshold_tokens"] == 180_000
     assert body["percent"] > 0
     assert body["last_compaction_at"] is None
     with database.SessionLocal() as db:
@@ -1080,7 +1080,7 @@ def test_session_context_get_reports_threshold_without_mutating_history(
             ChatMessage(
                 session_id=session_id,
                 role="user",
-                content="界" * 45_100,
+                content="界" * 90_100,
                 created_at=old_time,
             ),
             ChatMessage(

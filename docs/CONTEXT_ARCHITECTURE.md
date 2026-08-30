@@ -109,6 +109,8 @@ clamped to the available input budget. Production compaction retains a suffix
 of complete message groups within the configured 8,000-token budget. The newest
 group is always retained even when that one group exceeds the budget; an
 assistant tool-call batch is never split from any of its tool results.
+There is no per-run compaction-count limit: every model turn independently
+applies the configured threshold and explicit compaction requests.
 
 ## Artifact retrieval
 
@@ -152,7 +154,7 @@ assistant tool-call batch is never split from any of its tool results.
    aggregate remains above 150,000 characters, the runtime passes that provider
    view through unchanged. The append-only `ChatMessage` transcript remains the
    durable raw source used to rebuild later provider views, and the independent
-   90,000-token context threshold will trigger nine-section compaction when
+   180,000-token context threshold will trigger nine-section compaction when
    reached.
 6. The two most recent tool results always remain verbatim so the next model
    turn retains its freshest observations. They still count toward both the

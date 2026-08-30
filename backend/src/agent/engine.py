@@ -359,12 +359,11 @@ class RuntimeConfig:
     observation_history_limit: int = 100_000
     event_sink_timeout_seconds: float = 5.0
     # Context budgeting reserves room for the model response and provider
-    # overhead.  Semantic compaction is bounded per run to prevent retry loops.
+    # overhead.
     context_output_reserve_tokens: int = 8_000
     context_safety_buffer_tokens: int = 2_000
     context_compaction_threshold_tokens: int | None = None
     context_compaction_retain_tokens: int = 8_000
-    max_compactions_per_run: int = 2
     max_completion_verification_attempts: int = 3
 
 
@@ -881,7 +880,6 @@ class AgentRuntime:
             estimated_tokens = sum(message_tokens(item) for item in state.get("messages", []))
             if (
                 estimated_tokens >= self.context_assembler.compaction_threshold
-                and int(state.get("compaction_count", 0) or 0) < self.config.max_compactions_per_run
                 and len(transcript) > 2
             ):
                 state = await compact_state(state, reason="threshold", phase="before_model")
@@ -948,13 +946,9 @@ class AgentRuntime:
             forced_reason = str(state.get("force_compaction_reason") or "").strip()
             if forced_reason:
                 state = {**state, "force_compaction_reason": ""}
-                if int(state.get("compaction_count", 0) or 0) < self.config.max_compactions_per_run:
-                    state = await compact_state(state, reason=forced_reason, phase="before_model")
+                state = await compact_state(state, reason=forced_reason, phase="before_model")
                 current_tokens = sum(message_tokens(item) for item in state.get("messages", []))
-            if (
-                current_tokens >= self.context_assembler.compaction_threshold
-                and int(state.get("compaction_count", 0) or 0) < self.config.max_compactions_per_run
-            ):
+            if current_tokens >= self.context_assembler.compaction_threshold:
                 state = await compact_state(state, reason="threshold", phase="before_model")
 
             async def retry_event(attempt: int, delay: float, kind: APIErrorKind, error: BaseException) -> None:

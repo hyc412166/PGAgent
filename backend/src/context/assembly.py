@@ -490,7 +490,7 @@ class ContextAssembler:
     def __init__(
         self,
         *,
-        max_tokens: int = 100_000,
+        max_tokens: int = 200_000,
         output_reserve_tokens: int = 8_000,
         safety_buffer_tokens: int = 2_000,
         compaction_threshold_tokens: int | None = None,
