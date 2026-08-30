@@ -58,6 +58,8 @@ _SECRET_ARGUMENT_MARKERS = (
     "content",
     "old_string",
     "new_string",
+    "patch",
+    "input",
 )
 
 
@@ -627,7 +629,13 @@ class AgentRuntime:
             auto_rule = "根据任务复杂度自行决定是否先在内部规则中规划；简单任务可直接执行。"
             rendered = f"{instructions}\n{auto_rule}" if instructions else auto_rule
             skill_catalog = self.tool_registry.skill_catalog_prompt
-            return f"{rendered}\n{skill_catalog}" if skill_catalog else rendered
+            if skill_catalog:
+                rendered = f"{rendered}\n{skill_catalog}"
+            deferred_tool_catalog = self.tool_registry.deferred_tool_catalog_prompt
+            if deferred_tool_catalog:
+                rendered = f"{rendered}\n{deferred_tool_catalog}"
+            workflow_prompt = self.tool_registry.workflow_prompt
+            return f"{rendered}\n{workflow_prompt}" if workflow_prompt else rendered
 
         def render_stable_prefix(context: Mapping[str, Any]) -> list[dict[str, Any]]:
             extra_messages = [{"role": "system", "content": render_instructions(context)}]
@@ -845,6 +853,9 @@ class AgentRuntime:
             deferred_tool_catalog = self.tool_registry.deferred_tool_catalog_prompt
             if deferred_tool_catalog:
                 instructions = f"{instructions}\n{deferred_tool_catalog}"
+            workflow_prompt = self.tool_registry.workflow_prompt
+            if workflow_prompt:
+                instructions = f"{instructions}\n{workflow_prompt}"
             extra_messages = [{"role": "system", "content": instructions}]
             if str(context.get("memory_index") or "").strip():
                 extra_messages.append(memory_system_message(str(context["memory_index"])))

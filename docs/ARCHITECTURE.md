@@ -41,10 +41,10 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 
 ## 工具与审批
 
-主控运行时使用公开工具名 `bash/read/write/edit/glob/grep/webfetch/websearch/task/todowrite/question/skill`。`ToolRegistry` 只注册该次运行由 `Agent.tool_ids` 选择的名称，因而未选择工具不会进入 provider 的 function schema；该选择、权限模式、已选 Skill 指令和待办状态会写入 `runtime_binding`，审批恢复优先使用冻结值而非会话后来的修改。
+主控运行时使用公开工具名 `bash/read/write/edit/apply_patch/validate/glob/grep/rg/webfetch/websearch/task/todowrite/question/skill`。`ToolRegistry` 只注册该次运行由 `Agent.tool_ids` 选择的名称，因而未选择工具不会进入 provider 的 function schema；该选择、权限模式、已选 Skill 指令、待办和 coding evidence 会写入 `runtime_binding`，审批恢复优先使用冻结值而非会话后来的修改。启用 coding profile 且同时具备 `ToolSearch` 时，审查、补丁和验证核心直接暴露，其他已授权内置工具以 deferred 形式保留，通过 `select:<tool-name>` 按需进入后续模型轮次。
 
-- 文件工具通过 `WorkspaceSandbox` 解析真实路径并拒绝目录逃逸、Junction 和符号链接越界。`edit` 只做精确文本替换，默认要求唯一匹配；`glob`/`grep` 有扫描、文件大小和结果上限。
-- `bash` 从不启动 shell，只允许裸 allowlist 可执行文件，使用工作区 cwd、超时、进程树终止和输出上限。`full` 仅跳过审批，不会取消 allowlist 或工作区边界。
+- 文件工具通过 `WorkspaceSandbox` 解析真实路径并拒绝目录逃逸、Junction 和符号链接越界。`read` 支持按真实行范围读取；`edit` 只做精确文本替换，默认要求唯一匹配；`apply_patch` 在写入前验证全部文件和 hunk，在目标同目录暂存替换内容，后续提交失败时回滚已应用文件，并保留原文件换行风格；`glob`/`grep` 保留兼容行为，`rg` 提供一等的 ripgrep 代码检索，并限制路径、文件大小和结果量。
+- `bash` 从不启动 shell，只允许裸 allowlist 可执行文件，支持工作区内的显式 `cwd`、超时、进程树终止和输出上限。`validate` 复用相同边界并记录测试、lint、类型检查或构建的结构化结果。`full` 仅跳过审批，不会取消 allowlist 或工作区边界。
 - `webfetch` 使用无环境代理的 HTTP 客户端，只允许公开 HTTP(S) DNS 地址，拒绝私网/回环/保留地址与自动重定向，并限制响应大小和超时；`websearch` 通过 DuckDuckGo HTML 返回真实解析结果，失败时显式返回 provider 不可用。
 - `todowrite` 是 JSON 可序列化的运行/会话待办状态；`skill` 只按 ID 返回会话已选的受管理 `SKILL.md` 文本，不执行脚本；`question` 结束本轮并将澄清问题作为正常助手消息。`task` 会先持久化完整 DAG，再按 ready wave 并发创建幂等委派记录和独立子 `Run`；失败前置节点的后继任务不会被错误启动。
 - 子 Agent 继承父运行已经冻结的权限模式；它的工具为“父运行允许工具”与“子 Agent 自己勾选工具”的交集，并强制移除递归委派、团队管理和共享任务板写入工具。子 Run 若需要二次审批会真实进入 `awaiting_approval`，若其后台 Job 未完成则进入事件等待，绝不把未批准或仅入队的操作说成已完成。
@@ -65,7 +65,7 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 
 ## 能力目录、Skill 与权限配置
 
-`GET /api/tools` 返回稳定的内置目录项：`bash`、`read`、`write`、`edit`、`glob`、`grep`、`webfetch`、`websearch`、`task`、`todowrite`、`question`、`skill`。每项都含 `availability`、风险等级、审批要求和（如有）运行时工具映射；前端必须以这些字段为准，不能把目录存在误解为已允许执行。
+`GET /api/tools` 返回稳定的内置目录项，包括 `bash`、`read`、`write`、`edit`、`apply_patch`、`validate`、`glob`、`grep`、`rg`、`webfetch`、`websearch`、`task`、`todowrite`、`question`、`skill` 以及兼容工具。每项都含 `availability`、风险等级、审批要求和（如有）运行时工具映射；前端必须以这些字段为准，不能把目录存在误解为已允许执行。
 
 `skills`、`agent_tools`、`agent_skills` 和 `session_skills` 是独立 SQLite 表。用户 Agent 的 `tool_ids`/`skill_ids` 通过关系表保存；Session 的 `skill_ids` 通过关系表保存，`permission_mode` 为 `ask | smart | full`。`AgentRead`、`SessionRead` 均返回稳定的 ID 数组。固定 `DEFAULT_AGENT_ID` 每次初始化都会恢复完整内置 Tool 目录，且资源 API 拒绝对其修改或删除。
 
@@ -94,7 +94,7 @@ SQLite `delegated_tasks` 保存父会话、父 Run、子 Run、任务图步骤�
 
 队友默认共享父工作区。`workspace_mode=worktree` 会为该队友创建独立 Git branch/worktree，子 Run 的沙箱根切换到该 worktree，避免多个写入型 Agent 同时修改同一目录。创建流程先短事务写入 `provisioning`，再在事务外执行 Git，成功后用第二个短事务转为 `idle`，所以大型仓库或 Git hook 不会长期占用 SQLite 写锁。主控通过需要审批的 `integrate_teammate` 显式提交并合并队友分支；队友仍在工作时拒绝合并，冲突或超时时执行 `merge --abort` 并返回明确错误。
 
-长时间下载、安装和构建使用持久化 `background_jobs`。`background_run` 只负责入队并立即返回 Job ID，命令由独立后台线程执行，状态、PID、超时、日志路径和终态结果写入 SQLite；传入 `plan_step_id` 时 Job 会原子认领并在终态结算对应 DAG 步骤。Agent 可在入队后继续处理不依赖该结果的 ready step。若准备结束时仍有活动 Job，完成验收把 Run 持久化为 `stopped/waiting_background` 并登记 `waiting_run_id`，不再让 LLM 循环调用“完成了吗”。后台线程只在终态写一次事件并通知协调器；协调器确认该 Run 的全部等待 Job 均终态后自动恢复模型，启动 watchdog 也会重放遗漏的通知。终态事件先作为未确认消息注入模型，只有包含处理结果的 Run outcome 成功提交时才在同一事务中写入 `observed_at/consumed_at`；provider 失败或进程退出会保留事件供下次至少一次重投。`check_background` 保留为人工查询兼容工具，不是自动续跑的必要条件。正常关闭时运行中的 Job 会终止并回到队列，下次启动自动恢复；异常退出后无法证明原进程终态的 Job 会明确标记失败，不会盲目重复安装命令。会话可通过 `/api/sessions/{id}/background-jobs` 读取持久状态。
+长时间下载、安装和构建使用持久化 `background_jobs`。`background_run` 只负责入队并立即返回 Job ID，命令由独立后台线程执行，状态、PID、超时、日志路径和终态结果写入 SQLite；需要交互的运行中命令可由 `write_stdin` 发送输入或关闭 stdin。传入 `plan_step_id` 时 Job 会原子认领并在终态结算对应 DAG 步骤。Agent 可在入队后继续处理不依赖该结果的 ready step。若准备结束时仍有活动 Job，完成验收把 Run 持久化为 `stopped/waiting_background` 并登记 `waiting_run_id`，不再让 LLM 循环调用“完成了吗”。后台线程只在终态写一次事件并通知协调器；协调器确认该 Run 的全部等待 Job 均终态后自动恢复模型，启动 watchdog 也会重放遗漏的通知。终态事件先作为未确认消息注入模型，只有包含处理结果的 Run outcome 成功提交时才在同一事务中写入 `observed_at/consumed_at`；provider 失败或进程退出会保留事件供下次至少一次重投。`check_background` 保留为人工查询兼容工具，不是自动续跑的必要条件。正常关闭时运行中的 Job 会终止并回到队列，下次启动自动恢复；异常退出后无法证明原进程终态的 Job 会明确标记失败，不会盲目重复安装命令。会话可通过 `/api/sessions/{id}/background-jobs` 读取持久状态。
 
 ## 模型网关
 

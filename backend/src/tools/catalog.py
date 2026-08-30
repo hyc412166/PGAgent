@@ -120,6 +120,17 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
         runtime_tool_id="grep",
     ),
     BuiltinTool(
+        id="rg",
+        name="rg",
+        label="Ripgrep 代码搜索",
+        description="使用 ripgrep 按模式、路径和文件 glob 快速检索代码，并返回带行号的结果。",
+        category="developer",
+        risk_level="low",
+        enabled=True,
+        availability="available",
+        runtime_tool_id="rg",
+    ),
+    BuiltinTool(
         id="webfetch",
         name="webfetch",
         label="抓取网页",
@@ -218,19 +229,41 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
         availability="available",
         runtime_tool_id="file_info",
     ),
+    BuiltinTool(
+        id="apply_patch",
+        name="apply_patch",
+        label="应用代码补丁",
+        description="应用严格的多文件文本补丁；普通源码修改可直接执行，删除或敏感边界仍需确认。",
+        category="developer",
+        risk_level="adaptive",
+        enabled=True,
+        availability="available",
+        runtime_tool_id="apply_patch",
+    ),
+    BuiltinTool(
+        id="validate",
+        name="validate",
+        label="验证代码变更",
+        description="运行测试、lint、类型检查或构建，并记录结构化验证结果。",
+        category="developer",
+        risk_level="adaptive",
+        enabled=True,
+        availability="available",
+        runtime_tool_id="validate",
+    ),
 )
 
 
 _REFERENCE_TOOL_NAMES = ("read_file", "write_file", *CLAW_TOOL_NAMES, *LEARN_TOOL_NAMES)
 _REFERENCE_NETWORK = {"WebFetch", "WebSearch", "RemoteTrigger", "MCP", "McpAuth"}
-_REFERENCE_EXECUTION = {"PowerShell", "REPL", "background_run"}
+_REFERENCE_EXECUTION = {"PowerShell", "REPL", "background_run", "write_stdin"}
 _REFERENCE_FILESYSTEM = {
     "read_file", "write_file", "edit_file", "glob_search", "grep_search",
     "NotebookEdit", "MemoryWrite", "MemoryRead", "MemoryList", "MemorySearch",
 }
 _REFERENCE_HIGH_RISK = {
     "write_file", "edit_file", "NotebookEdit", "PowerShell", "REPL", "RemoteTrigger",
-    "MCP", "MemoryWrite", "background_run", "integrate_teammate", "CronCreate", "CronDelete",
+    "MCP", "MemoryWrite", "background_run", "write_stdin", "integrate_teammate", "CronCreate", "CronDelete",
 }
 
 # The reference projects expose a broad built-in contract.  These entries are

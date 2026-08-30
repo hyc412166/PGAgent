@@ -162,6 +162,7 @@ class BackgroundJobManager:
                 process = subprocess.Popen(
                     parts,
                     cwd=workspace_root,
+                    stdin=subprocess.PIPE,
                     stdout=output,
                     stderr=subprocess.STDOUT,
                     shell=False,
@@ -212,6 +213,8 @@ class BackgroundJobManager:
         except Exception as exc:
             self._finish(job_id, "failed", process.returncode if process else None, str(exc), None)
         finally:
+            if process is not None and process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
             with self._lock:
                 self._processes.pop(job_id, None)
                 self._cancel_events.pop(job_id, None)
@@ -303,6 +306,20 @@ class BackgroundJobManager:
             None,
             expected_statuses=("queued",),
         )
+
+    def send_input(self, job_id: str, input_text: str, *, close: bool = False) -> str | None:
+        with self._lock:
+            process = self._processes.get(job_id)
+        if process is None or process.poll() is not None or process.stdin is None:
+            return "background job is not accepting input"
+        try:
+            process.stdin.write(str(input_text).encode("utf-8"))
+            process.stdin.flush()
+            if close:
+                process.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            return "background job stdin is closed"
+        return None
 
     def cancel_for_runs(self, run_ids: list[str]) -> list[str]:
         """Cancel active jobs owned or awaited by the stopped runs."""
@@ -531,6 +548,30 @@ class BackgroundJobToolStore:
                     },
                 )
             time.sleep(0.25)
+
+    def write_stdin(self, *, task_id: str, input: str, close: bool = False) -> ToolResult:
+        normalized_id = str(task_id or "").strip()
+        if not normalized_id:
+            return ToolResult("write_stdin", False, "task_id is required", error_code="invalid_arguments")
+        with database_module.SessionLocal() as db:
+            job = db.scalar(select(BackgroundJob).where(
+                self._ownership_clause(),
+                BackgroundJob.id == normalized_id,
+            ))
+            if job is None:
+                return ToolResult("write_stdin", False, "background job not found", error_code="task_not_found")
+            if job.status != "running":
+                return ToolResult(
+                    "write_stdin",
+                    False,
+                    f"background job is {job.status}",
+                    error_code="task_not_running",
+                )
+        error = background_job_manager.send_input(normalized_id, input, close=bool(close))
+        if error:
+            return ToolResult("write_stdin", False, error, error_code="stdin_unavailable")
+        payload = {"task_id": normalized_id, "chars_sent": len(str(input)), "stdin_closed": bool(close)}
+        return ToolResult("write_stdin", True, json.dumps(payload, ensure_ascii=False), changed=True)
 
     def unresolved_jobs(self) -> list[dict[str, Any]]:
         with database_module.SessionLocal() as db:

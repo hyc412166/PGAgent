@@ -412,6 +412,9 @@ def test_compactor_uses_original_system_prefix_and_merges_task_state_into_nine_s
     assert "latest progress" not in str(prompt)
     assert prompt[-1]["role"] == "user"
     assert "Do not summarize, rewrite, quote, or modify the System Prompt" in prompt[-1]["content"]
+    assert "Write as concisely as possible while preserving every fact" in prompt[-1]["content"]
+    assert "Never omit an unresolved ambiguity" in prompt[-1]["content"]
+    assert "token" not in prompt[-1]["content"].lower()
     assert '"status":"running"' in prompt[-1]["content"]
     continuation = result.messages[0]["content"]
     assert continuation.startswith("<continuation-summary")

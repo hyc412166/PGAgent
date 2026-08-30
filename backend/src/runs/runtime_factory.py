@@ -123,6 +123,8 @@ class RunRuntimeFactory:
             team_store=team_store,
             task_store=task_store,
             task_delegate=task_delegate,
+            coding_state=binding.get("coding_state"),
+            active_builtin_tool_names=binding.get("builtin_active_tools"),
         )
         coordinator.register_tool_canceller(run_id, registry.cancel_active)
         runtime = runtime_type(

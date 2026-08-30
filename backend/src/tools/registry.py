@@ -37,6 +37,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "type": "object",
             "properties": {
                 "command": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                "cwd": {"type": "string"},
                 "timeout_seconds": {"type": "number"},
             },
             "required": ["command"],
@@ -46,7 +47,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "description": "读取工作区内一个 UTF-8 文本文件。",
         "parameters": {
             "type": "object",
-            "properties": {"path": {"type": "string"}, "max_chars": {"type": "integer"}},
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1},
+                "max_chars": {"type": "integer"},
+            },
             "required": ["path"],
         },
     },
@@ -95,6 +101,27 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["path", "old_string", "new_string"],
         },
     },
+    "apply_patch": {
+        "description": "Apply one strict, workspace-scoped multi-file text patch.",
+        "parameters": {
+            "type": "object",
+            "properties": {"patch": {"type": "string"}},
+            "required": ["patch"],
+        },
+    },
+    "validate": {
+        "description": "Run a bounded project check and record structured validation evidence.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                "kind": {"type": "string", "enum": ["test", "lint", "typecheck", "build", "format_check", "other"]},
+                "cwd": {"type": "string"},
+                "timeout_seconds": {"type": "number"},
+            },
+            "required": ["command"],
+        },
+    },
     "glob": {
         "description": "按 glob pattern 查找工作区文件与目录，不会跟随越界链接。",
         "parameters": {
@@ -116,6 +143,22 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "path": {"type": "string"},
                 "file_pattern": {"type": "string"},
                 "case_sensitive": {"type": "boolean"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["pattern"],
+        },
+    },
+    "rg": {
+        "description": "Search repository text with ripgrep using bounded structured arguments.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+                "glob": {"type": "string"},
+                "case_sensitive": {"type": "boolean"},
+                "fixed_strings": {"type": "boolean"},
+                "context": {"type": "integer", "minimum": 0, "maximum": 20},
                 "limit": {"type": "integer"},
             },
             "required": ["pattern"],
@@ -270,7 +313,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "description": "在工作区中运行受控 allowlist 命令，不会启动 shell。",
         "parameters": {
             "type": "object",
-            "properties": {"command": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}, "timeout_seconds": {"type": "number"}},
+            "properties": {"command": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}, "cwd": {"type": "string"}, "timeout_seconds": {"type": "number"}},
             "required": ["command"],
         },
     },
@@ -288,8 +331,11 @@ PUBLIC_TOOL_NAMES: tuple[str, ...] = (
     "write",
     "delete",
     "edit",
+    "apply_patch",
+    "validate",
     "glob",
     "grep",
+    "rg",
     "webfetch",
     "websearch",
     "task",
@@ -321,6 +367,7 @@ PARALLEL_READ_ONLY_TOOL_NAMES = frozenset({
     "read_artifact",
     "glob",
     "grep",
+    "rg",
     "webfetch",
     "websearch",
     "skill",
@@ -395,14 +442,14 @@ def _normalize_claw_todos(todos: Iterable[Mapping[str, Any]]) -> list[dict[str, 
 
 
 PLAN_MODE_MUTATING_TOOLS = frozenset({
-    "write", "write_file", "edit", "edit_file", "delete", "bash", "run_command",
+    "write", "write_file", "edit", "edit_file", "apply_patch", "delete", "bash", "run_command", "validate",
     "PowerShell", "REPL", "NotebookEdit", "RemoteTrigger", "MCP", "MemoryWrite",
     "TodoWrite", "todowrite", "read_inbox",
     "task", "Agent", "TaskCreate", "RunTaskPacket", "TaskStop", "TaskUpdate", "task_create", "task_update",
     "claim_task", "spawn_teammate", "send_message", "broadcast", "shutdown_request",
     "plan_approval", "TeamCreate", "TeamDelete", "WorkerCreate", "WorkerObserve",
     "WorkerResolveTrust", "WorkerSendPrompt", "WorkerRestart", "WorkerTerminate",
-    "WorkerObserveCompletion", "CronCreate", "CronDelete", "Config", "background_run",
+    "WorkerObserveCompletion", "CronCreate", "CronDelete", "Config", "background_run", "write_stdin",
 })
 
 
@@ -429,12 +476,18 @@ class ToolRegistry:
         team_store: Any | None = None,
         task_store: Any | None = None,
         task_delegate: Callable[..., ToolResult | Any] | None = None,
+        coding_state: Mapping[str, Any] | None = None,
+        active_builtin_tool_names: Iterable[str] | None = None,
     ) -> None:
+        from src.coding.profile import resolve_coding_profile
+        from src.coding.state import CodingSessionState
+
         self.sandbox = sandbox
         self.permission_mode = normalize_permission_mode(permission_mode)
         self._tools: dict[str, Callable[..., ToolResult]] = {}
         self._schemas: dict[str, dict[str, Any]] = dict(TOOL_SCHEMAS)
         self._activated_deferred_tools: set[str] = set()
+        self._builtin_deferred_tools: set[str] = set()
         self._external_state: dict[str, Any] = {}
         self._known_tools = set(TOOL_SCHEMAS)
         self._runtimes: dict[ToolName, ToolRuntime] = {}
@@ -447,6 +500,7 @@ class ToolRegistry:
         self._background_store = background_store
         self._team_store = team_store
         self._task_store = task_store
+        self._coding_state = CodingSessionState.restore(coding_state)
         self._active_cancel_lock = threading.RLock()
         self._active_cancel_events: dict[str, threading.Event] = {}
         self._skill_instructions = _normalize_skill_instructions(skill_instructions)
@@ -469,10 +523,19 @@ class ToolRegistry:
             if name == "read_artifact" and self._artifact_store is None:
                 continue
             self._register_default(name)
+        self._coding_profile = resolve_coding_profile(self.enabled_tool_names)
+        if (
+            allowed_tool_names is not None
+            and self._coding_profile is not None
+            and "ToolSearch" in self.enabled_tool_names
+        ):
+            self._configure_coding_exposure()
+            self.activate_deferred_tools(active_builtin_tool_names or ())
         self.pipeline = InvocationPipeline(
             workspace_root=str(self.sandbox.root),
             permission_mode=self.permission_mode,
             prepare_hooks=(InvocationValidationHook(),),
+            post_hooks=(self._coding_state,),
         )
         self.router = ToolRouter(self, self.pipeline)
 
@@ -490,8 +553,11 @@ class ToolRegistry:
             "write": builtins.write_file,
             "delete": builtins.delete_file,
             "edit": builtins.edit_file,
+            "apply_patch": self._apply_patch,
+            "validate": self._validate,
             "glob": builtins.glob_files,
             "grep": builtins.grep_files,
+            "rg": builtins.ripgrep_search,
             "webfetch": builtins.web_fetch,
             "websearch": builtins.web_search,
             "task": lambda sandbox, **kwargs: builtins.delegate_task(sandbox, delegate=self._task_delegate, **kwargs),
@@ -532,12 +598,7 @@ class ToolRegistry:
                 agent_id=subagent_type or name,
                 delegate=self._task_delegate,
             ),
-            "ToolSearch": lambda sandbox, query, max_results=20: advanced.tool_search(
-                sandbox,
-                query,
-                TOOL_SCHEMAS,
-                max_results=max_results,
-            ),
+            "ToolSearch": self._tool_search,
             "NotebookEdit": advanced.notebook_edit,
             "Sleep": advanced.sleep_tool,
             "SendUserMessage": advanced.send_user_message,
@@ -620,6 +681,11 @@ class ToolRegistry:
             "check_background": (
                 lambda _sandbox, **kwargs: self._background_store.check(**kwargs)
             ) if self._background_store is not None else advanced.check_background,
+            "write_stdin": (
+                lambda _sandbox, **kwargs: self._background_store.write_stdin(**kwargs)
+            ) if self._background_store is not None else lambda _sandbox, **_kwargs: ToolResult(
+                "write_stdin", False, "background runtime is unavailable", error_code="tool_unavailable"
+            ),
             "task_create": (
                 lambda _sandbox, **kwargs: self._task_store.create(**kwargs)
             ) if self._task_store is not None else advanced.task_create,
@@ -662,6 +728,44 @@ class ToolRegistry:
         function = mapping.get(name)
         if function is not None:
             self.register(name, function)
+
+    @staticmethod
+    def _apply_patch(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+        from src.coding.patch import apply_patch
+
+        return apply_patch(sandbox, **kwargs)
+
+    @staticmethod
+    def _validate(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+        from src.coding.validation import run_validation
+
+        return run_validation(sandbox, **kwargs)
+
+    def _tool_search(
+        self,
+        sandbox: WorkspaceSandbox,
+        query: str,
+        max_results: int = 20,
+    ) -> ToolResult:
+        catalog = {
+            runtime.identity.wire_name: runtime.schema
+            for runtime in self._runtimes.values()
+            if runtime.presentation.discoverable
+        }
+        result = advanced.tool_search(sandbox, query, catalog, max_results=max_results)
+        raw = str(query or "").strip()
+        if raw.casefold().startswith("select:"):
+            requested = [item.strip() for item in raw[len("select:"):].split(",") if item.strip()]
+            result.metadata["activated_tools"] = list(self.activate_deferred_tools(requested))
+        return result
+
+    def _configure_coding_exposure(self) -> None:
+        direct_names = self._coding_profile.direct_tool_names if self._coding_profile is not None else frozenset()
+        for runtime in self._runtimes.values():
+            name = runtime.identity.wire_name
+            if runtime.origin.source == "builtin" and name not in direct_names:
+                runtime.presentation = ToolPresentation.deferred()
+                self._builtin_deferred_tools.add(name)
 
     def register(self, name: str, function: Callable[..., ToolResult]) -> None:
         if name not in self._schemas:
@@ -821,7 +925,13 @@ class ToolRegistry:
             )
         )
         self._activated_deferred_tools.update(activated)
-        self._external_state["mcp_active_tools"] = sorted(self._activated_deferred_tools)
+        builtin_active = sorted(name for name in self._activated_deferred_tools if name in self._builtin_deferred_tools)
+        external_active = sorted(
+            name for name in self._activated_deferred_tools
+            if name not in self._builtin_deferred_tools
+        )
+        self._external_state["builtin_active_tools"] = builtin_active
+        self._external_state["mcp_active_tools"] = external_active
         return activated
 
     @property
@@ -875,13 +985,19 @@ class ToolRegistry:
 
     @property
     def deferred_tool_catalog_prompt(self) -> str:
+        lines: list[str] = []
+        if self._builtin_deferred_tools:
+            lines.append(
+                f"{len(self._builtin_deferred_tools)} low-frequency built-in tools are available on demand. "
+                "Use ToolSearch with `select:<tool-name>` to activate one."
+            )
         sources = self._external_state.get("mcp_namespaces")
         if not isinstance(sources, list) or not sources:
-            return ""
-        lines = [
+            return "\n".join(lines)
+        lines.extend([
             "MCP tools are loaded on demand. Use McpToolSearch before attempting an MCP operation.",
             "Available MCP namespaces:",
-        ]
+        ])
         for source in sources:
             if not isinstance(source, Mapping):
                 continue
@@ -891,6 +1007,13 @@ class ToolRegistry:
                 lines.append(f"- {namespace}: {count} tools")
         return "\n".join(lines)
 
+    @property
+    def workflow_prompt(self) -> str:
+        if self._coding_profile is None:
+            return ""
+        evidence = self._coding_state.prompt_summary()
+        return "\n".join(item for item in (self._coding_profile.instructions, evidence) if item)
+
     def runtime_state(self) -> dict[str, Any]:
         """Return only JSON-safe state that must survive approval/resume."""
 
@@ -899,6 +1022,7 @@ class ToolRegistry:
             "permission_mode": self.permission_mode,
             "skill_instructions": [dict(item) for item in self._skill_instructions.values()],
             "todo_state": [dict(item) for item in self._todo_state],
+            "coding_state": self._coding_state.snapshot(),
             **self._external_state,
         }
 
@@ -1015,7 +1139,10 @@ class ToolRegistry:
             return self._rename_result(function(self.sandbox, **kwargs), name)
         # Authorization has already completed in InvocationPipeline. Built-ins
         # keep their local primitive only as an execution-level safety API.
-        if name in {"write", "write_file", "edit", "edit_file", "delete", "bash", "run_command"}:
+        if name in {
+            "write", "write_file", "edit", "edit_file", "apply_patch",
+            "delete", "bash", "run_command", "validate",
+        }:
             kwargs["approved"] = True
         if _cancel_event is not None and name in {"bash", "run_command", "check_background"}:
             # This is an in-process cancellation signal, not a model/tool
@@ -1177,6 +1304,8 @@ def create_default_registry(
     team_store: Any | None = None,
     task_store: Any | None = None,
     task_delegate: Callable[..., ToolResult | Any] | None = None,
+    coding_state: Mapping[str, Any] | None = None,
+    active_builtin_tool_names: Iterable[str] | None = None,
 ) -> ToolRegistry:
     """Create a sandboxed registry with an explicit, frozen capability list."""
 
@@ -1193,4 +1322,6 @@ def create_default_registry(
         team_store=team_store,
         task_store=task_store,
         task_delegate=task_delegate,
+        coding_state=coding_state,
+        active_builtin_tool_names=active_builtin_tool_names,
     )

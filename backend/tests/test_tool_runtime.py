@@ -6,7 +6,7 @@ import pytest
 
 from src.context.window import ContextManager
 from src.context.assembly import COMPACTION_SECTION_TITLES, ContextAssembler, ConversationCompactor
-from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig
+from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, safe_tool_argument_summary
 from src.tools import create_default_registry
 from src.tools.policy import assess_tool_call
 
@@ -53,6 +53,15 @@ def test_registry_exposes_only_selected_tools_and_enforces_permission_modes(tmp_
     assert blocked_command.error_code == "command_not_allowed"
 
 
+def test_timeline_redacts_patch_and_stdin_payloads() -> None:
+    summary = safe_tool_argument_summary(
+        "apply_patch",
+        {"patch": "*** Begin Patch\n+secret\n*** End Patch", "input": "private input"},
+    )
+
+    assert summary == {"arguments": {"patch": "[redacted]", "input": "[redacted]"}}
+
+
 def test_smart_mode_allows_routine_code_edits_but_escalates_sensitive_or_broad_writes(tmp_path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "src.py").write_text("print('before')\n", encoding="utf-8")
@@ -80,6 +89,15 @@ def test_smart_mode_allows_routine_code_edits_but_escalates_sensitive_or_broad_w
     control_plane = registry.execute("write", {"path": ".github/workflows/release.yml", "content": "jobs: {}"})
     assert control_plane.approval_required
     assert "自动化" in control_plane.content
+
+    reentered_control_plane = registry.execute(
+        "write",
+        {
+            "path": f"tmp/../../{tmp_path.name}/.github/workflows/release.yml",
+            "content": "jobs: {}",
+        },
+    )
+    assert reentered_control_plane.approval_required
 
     destructive = registry.execute("write", {"path": "large.txt", "content": "short"})
     assert destructive.approval_required

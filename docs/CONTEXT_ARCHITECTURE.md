@@ -94,6 +94,16 @@ pending/recovery step records. With no current durable plan, sections 4 and 5
 explicitly say that no inherited board is active. Therefore a fluent but stale
 model summary cannot override the SQLite task checkpoint.
 
+The compaction instruction asks the model to be as concise as possible while
+preserving every semantic fact needed for correct continuation. It removes
+repetition, greetings, narrative filler, duplicated conclusions, and verbose
+raw detail already represented by a precise result, while retaining user
+corrections, constraints, work state, files, decisions and rationale, failures,
+verified fixes, unresolved ambiguity, evidence, dependencies, and next actions.
+PGAgent does not give the compaction model a target summary length. Compaction
+mode also omits the normal model-output cap, so semantic completeness rather
+than a fixed output budget determines the returned summary size.
+
 The configured compaction threshold is passed through `RuntimeConfig` and
 clamped to the available input budget. Production compaction retains a suffix
 of complete message groups within the configured 8,000-token budget. The newest
