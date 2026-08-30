@@ -544,6 +544,74 @@ def test_workspace_filesystem_root_uses_project_fallback_name(client: TestClient
     assert created.json()["name"] == "项目"
 
 
+def test_delete_workspace_keeps_local_files_and_deletes_complete_session_history(
+    client: TestClient, tmp_path: Path
+) -> None:
+    root = tmp_path / "removable-project"
+    root.mkdir()
+    marker = root / "user-code.py"
+    marker.write_text("print('keep me')", encoding="utf-8")
+    workspace = client.post("/api/workspaces", json={"root_path": str(root)}).json()
+    session = client.post(
+        "/api/sessions",
+        json={"title": "Keep history", "workspace_id": workspace["id"]},
+    ).json()
+    with database.SessionLocal() as db:
+        run = database.Run(session_id=session["id"], workspace_id=workspace["id"], status="completed")
+        message = database.ChatMessage(
+            session_id=session["id"], role="user", content="delete with project", sequence=1
+        )
+        usage = database.UsageRecord(
+            session_id=session["id"], model_id="test-model", provider="test"
+        )
+        project_memory = database.Memory(
+            scope="workspace",
+            scope_id=workspace["id"],
+            name="Project memory",
+            title="Project memory",
+            content="delete with project",
+        )
+        db.add_all((run, message, usage, project_memory))
+        db.commit()
+        run_id = run.id
+
+    deleted = client.delete(f"/api/workspaces/{workspace['id']}")
+
+    assert deleted.status_code == 204, deleted.text
+    assert marker.read_text(encoding="utf-8") == "print('keep me')"
+    assert all(item["id"] != workspace["id"] for item in client.get("/api/workspaces").json())
+    assert client.get(f"/api/sessions/{session['id']}").status_code == 404
+    with database.SessionLocal() as db:
+        assert db.get(database.Session, session["id"]) is None
+        assert db.get(database.Run, run_id) is None
+        assert db.query(database.ChatMessage).filter_by(session_id=session["id"]).count() == 0
+        assert db.query(database.UsageRecord).filter_by(session_id=session["id"]).count() == 0
+        assert db.query(database.Memory).filter_by(
+            scope="workspace", scope_id=workspace["id"]
+        ).count() == 0
+
+
+def test_delete_workspace_rejects_active_project_run(client: TestClient, tmp_path: Path) -> None:
+    root = tmp_path / "active-project"
+    root.mkdir()
+    workspace = client.post("/api/workspaces", json={"root_path": str(root)}).json()
+    session = client.post(
+        "/api/sessions",
+        json={"title": "Active history", "workspace_id": workspace["id"]},
+    ).json()
+    with database.SessionLocal() as db:
+        db.add(database.Run(
+            session_id=session["id"], workspace_id=workspace["id"], status="running"
+        ))
+        db.commit()
+
+    deleted = client.delete(f"/api/workspaces/{workspace['id']}")
+
+    assert deleted.status_code == 409
+    assert client.get(f"/api/workspaces/{workspace['id']}").status_code == 200
+    assert client.get(f"/api/sessions/{session['id']}").status_code == 200
+
+
 def test_delete_session_purges_its_complete_conversation_history(
     client: TestClient,
     tmp_path: Path,

@@ -21,6 +21,8 @@ import { stringId } from '../../shared/lib/display'
 import { ComposerTextArea } from './components/ComposerTextArea'
 import type { ComposerTextAreaHandle } from './components/ComposerTextArea'
 import { DurableTaskCard } from './components/DurableTaskCard'
+import { ProjectTreeItem } from './components/ProjectTreeItem'
+import { projectDeleteConfirmation } from './projectDeletion'
 import { useRunTransport } from './hooks/useRunTransport'
 import { activeRunStatuses, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
@@ -41,6 +43,7 @@ function SessionsPage() {
   const [stoppingRunId, setStoppingRunId] = useState('')
   const [cancellingTaskId, setCancellingTaskId] = useState('')
   const [deletingSessionId, setDeletingSessionId] = useState('')
+  const [deletingWorkspaceId, setDeletingWorkspaceId] = useState('')
   const [interruptedRunId, setInterruptedRunId] = useState('')
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false)
@@ -510,6 +513,38 @@ function SessionsPage() {
     } finally { setAddingProject(false) }
   }
 
+  async function deleteProject(workspace: Workspace, projectSessions: Session[]) {
+    const workspaceId = stringId(workspace.id)
+    const deletedSessionIds = new Set(projectSessions.map((session) => stringId(session.id)))
+    const activeProjectRun = (sendingRef.current || canInterrupt)
+      && projectSessions.some((session) => stringId(session.id) === activeIdRef.current)
+    if (!workspaceId || deletingWorkspaceId || activeProjectRun) return
+    if (!window.confirm(projectDeleteConfirmation(workspace.name, projectSessions.length))) return
+    setDeletingWorkspaceId(workspaceId)
+    setProjectError('')
+    setProjectHoverCard(null)
+    try {
+      await api.delete<void>(`/api/workspaces/${encodeURIComponent(workspaceId)}`)
+      const [, latestSessions] = await Promise.all([workspaces.refresh(), sessions.refresh()])
+      if (deletedSessionIds.has(activeIdRef.current)) {
+        closeRunTransport()
+        terminalSyncVersionRef.current += 1
+        setLiveRun(emptyLiveRun())
+        setCompletedThoughtsByRun({})
+        setActiveId(latestSessions?.[0] ? stringId(latestSessions[0].id) : '')
+      }
+      setExpandedWorkspaceIds((current) => {
+        const next = new Set(current)
+        next.delete(workspaceId)
+        return next
+      })
+    } catch (error) {
+      setProjectError(describeError(error))
+    } finally {
+      setDeletingWorkspaceId('')
+    }
+  }
+
   async function selectDraftProject() {
     if (pickingDraftProject) return
     setPickingDraftProject(true); setActionError('')
@@ -948,16 +983,24 @@ function SessionsPage() {
               {sessionNavigation.projects.map(({ workspace, sessions: projectSessions }) => {
                 const expanded = expandedWorkspaceIds.has(workspace.id)
                 const path = workspace.root_path || workspace.path || '未提供路径'
-                return <div className={`project-node ${expanded ? 'expanded' : ''}`} key={workspace.id}>
-                  <div className="project-row-wrap" onMouseLeave={() => setProjectHoverCard((current) => current?.id === workspace.id ? null : current)}>
-                    <button type="button" className="project-row" aria-expanded={expanded} aria-describedby={projectHoverCard?.id === workspace.id ? 'project-hover-card' : undefined} onMouseEnter={(event) => showProjectHoverCard(event, workspace, projectSessions.length, path)} onFocus={(event) => showProjectHoverCard(event, workspace, projectSessions.length, path)} onBlur={() => setProjectHoverCard((current) => current?.id === workspace.id ? null : current)} onClick={() => toggleProject(workspace.id)}>
-                      <ChevronRight className="project-chevron" size={13} /><Folder size={15} /><span>{workspace.name}</span>
-                    </button>
-                  </div>
-                  {expanded && <div className="project-children">
+                const deleting = deletingWorkspaceId === workspace.id
+                const activeProjectRun = (sending || canInterrupt) && projectSessions.some((session) => stringId(session.id) === activeId)
+                return <ProjectTreeItem
+                  key={workspace.id}
+                  workspace={workspace}
+                  expanded={expanded}
+                  deleting={deleting}
+                  deleteDisabled={deleting || !!deletingWorkspaceId || activeProjectRun}
+                  hoverCardVisible={projectHoverCard?.id === workspace.id}
+                  onToggle={() => toggleProject(workspace.id)}
+                  onDelete={() => void deleteProject(workspace, projectSessions)}
+                  onShowHoverCard={(event) => showProjectHoverCard(event, workspace, projectSessions.length, path)}
+                  onHideHoverCard={() => setProjectHoverCard((current) => current?.id === workspace.id ? null : current)}
+                >
+                  <div className="project-children">
                     {projectSessions.length ? projectSessions.map((session) => renderSessionTreeItem(session)) : <p className="tree-empty">暂无对话</p>}
-                  </div>}
-                </div>
+                  </div>
+                </ProjectTreeItem>
               })}
               {!sessionNavigation.projects.length && !workspaces.loading && <p className="tree-empty tree-empty-projects">点击右上角 + 添加项目</p>}
             </section>

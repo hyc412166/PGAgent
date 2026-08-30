@@ -71,6 +71,11 @@ from src.memory.service import recall_memories, refresh_memory_markdown_projecti
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
 from src.tasks.state import latest_resumable_task, task_payload
 from src.agents.collaboration import cleanup_session_worktrees
+from src.sessions.deletion import (
+    SessionDeletionConflict,
+    finalize_session_deletions,
+    stage_session_deletions,
+)
 router = APIRouter(prefix="/api", tags=["workspaces"])
 
 from src.api.routes.shared import (
@@ -145,9 +150,21 @@ def delete_workspace(workspace_id: str, db: Session = Depends(get_db)) -> Respon
     item = _require(db, Workspace, workspace_id, "Workspace")
     if item.id == DEFAULT_WORKSPACE_ID:
         raise HTTPException(status_code=409, detail="The default workspace cannot be deleted")
+    conversations = list(
+        db.scalars(
+            select(ChatSession)
+            .where(ChatSession.workspace_id == workspace_id)
+            .order_by(ChatSession.created_at.asc(), ChatSession.id.asc())
+        )
+    )
+    try:
+        effects = stage_session_deletions(db, conversations)
+    except SessionDeletionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.execute(delete(Memory).where(Memory.scope == "workspace", Memory.scope_id == workspace_id))
     db.delete(item)
     _commit(db)
-    refresh_memory_markdown_projection()
+    finalize_session_deletions(effects)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
