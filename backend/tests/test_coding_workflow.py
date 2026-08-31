@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import shutil
+import subprocess
 
 import pytest
 
@@ -8,6 +11,14 @@ from src.coding import patch as patch_module
 from src.coding.profiles import resolve_workflow_profile
 from src.tools import create_default_registry
 from src.tools.types import ToolResult
+
+
+def _init_git_repository(path) -> None:
+    subprocess.run(["git", "init", "--quiet"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "pgagent-test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "PGAgent Test"], cwd=path, check=True)
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "baseline"], cwd=path, check=True)
 
 
 def test_apply_patch_updates_multiple_files_and_records_change_evidence(tmp_path) -> None:
@@ -212,6 +223,309 @@ def test_change_after_validation_marks_the_evidence_stale(tmp_path) -> None:
 
     assert validated.ok and changed.ok
     assert "Validation status: stale" in registry.workflow_prompt
+
+
+def test_coding_bash_detects_real_tracked_file_changes(tmp_path) -> None:
+    source = tmp_path / "value.txt"
+    source.write_text("before\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["bash", "apply_patch", "validate"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+    )
+
+    result = registry.execute(
+        "bash",
+        {
+            "command": [
+                "python",
+                "-c",
+                "__import__('pathlib').Path('value.txt').write_text('after\\n', encoding='utf-8')",
+            ]
+        },
+    )
+
+    assert result.ok and result.changed
+    assert result.metadata["change_set"]["source"] == "shell"
+    assert result.metadata["change_set"]["files"] == [
+        {"path": "value.txt", "operation": "update"}
+    ]
+    state = registry.runtime_state()["coding_state"]
+    assert state["changes"][-1]["tool"] == "bash"
+    assert "Changed paths: value.txt" in registry.workflow_prompt
+
+
+def test_coding_bash_detects_existing_untracked_file_content_changes(tmp_path) -> None:
+    (tmp_path / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    scratch = tmp_path / "scratch.txt"
+    scratch.write_text("v1\n", encoding="utf-8")
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["bash", "apply_patch", "validate"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+    )
+    validated = registry.execute(
+        "validate",
+        {"command": ["python", "--version"], "kind": "other"},
+    )
+
+    result = registry.execute(
+        "bash",
+        {
+            "command": [
+                "python",
+                "-c",
+                "__import__('pathlib').Path('scratch.txt').write_text('version-two\\n', encoding='utf-8')",
+            ]
+        },
+    )
+
+    assert validated.ok
+    assert result.ok and result.changed
+    assert result.metadata["change_set"]["files"] == [
+        {"path": "scratch.txt", "operation": "add"}
+    ]
+    assert "Validation status: stale" in registry.workflow_prompt
+
+
+def test_coding_bash_reports_only_files_changed_by_this_command(tmp_path) -> None:
+    user_file = tmp_path / "user.txt"
+    agent_file = tmp_path / "agent.txt"
+    user_file.write_text("baseline\n", encoding="utf-8")
+    agent_file.write_text("baseline\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    user_file.write_text("preexisting user change\n", encoding="utf-8")
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["bash", "apply_patch", "validate"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+    )
+
+    result = registry.execute(
+        "bash",
+        {
+            "command": [
+                "python",
+                "-c",
+                "__import__('pathlib').Path('agent.txt').write_text('agent change\\n', encoding='utf-8')",
+            ]
+        },
+    )
+
+    assert result.ok and result.changed
+    assert result.metadata["change_set"]["files"] == [
+        {"path": "agent.txt", "operation": "update"}
+    ]
+
+
+def test_coding_bash_detects_same_size_untracked_change_with_restored_mtime(tmp_path) -> None:
+    (tmp_path / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    scratch = tmp_path / "scratch.txt"
+    scratch.write_text("one\n", encoding="utf-8")
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["bash", "apply_patch", "validate"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+    )
+
+    result = registry.execute(
+        "bash",
+        {
+            "command": [
+                "python",
+                "-c",
+                "exec(\"from pathlib import Path\\nimport os\\np = Path('scratch.txt')\\ns = p.stat()\\np.write_text('two\\\\n', encoding='utf-8')\\nos.utime(p, ns=(s.st_atime_ns, s.st_mtime_ns))\")",
+            ]
+        },
+    )
+
+    assert result.ok and result.changed
+    assert result.metadata["change_set"]["files"] == [
+        {"path": "scratch.txt", "operation": "add"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("file_name", "tracked", "operation"),
+    [("代码.py", True, "update"), ("草稿.txt", False, "add")],
+)
+def test_coding_bash_reports_unicode_paths(
+    tmp_path,
+    file_name: str,
+    tracked: bool,
+    operation: str,
+) -> None:
+    (tmp_path / "baseline.txt").write_text("baseline\n", encoding="utf-8")
+    target = tmp_path / file_name
+    if tracked:
+        target.write_text("before\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    if not tracked:
+        target.write_text("before\n", encoding="utf-8")
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["bash", "apply_patch", "validate"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+    )
+
+    result = registry.execute(
+        "bash",
+        {
+            "command": [
+                "python",
+                "-c",
+                f"__import__('pathlib').Path({file_name!r}).write_text('after\\n', encoding='utf-8')",
+            ]
+        },
+    )
+
+    assert result.ok and result.changed
+    assert result.metadata["change_set"]["files"] == [
+        {"path": file_name, "operation": operation}
+    ]
+
+
+def test_validate_baseline_runs_in_isolated_head_worktree(tmp_path) -> None:
+    source = tmp_path / "value.txt"
+    source.write_text("baseline\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    source.write_text("candidate\n", encoding="utf-8")
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["validate_baseline", "apply_patch", "validate"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+    )
+
+    result = registry.execute(
+        "validate_baseline",
+        {
+            "command": [
+                "python",
+                "-c",
+                "assert __import__('pathlib').Path('value.txt').read_text(encoding='utf-8') == 'baseline\\n'",
+            ],
+            "kind": "test",
+        },
+    )
+
+    assert result.ok
+    assert result.metadata["baseline_validation"]["ref"] == "HEAD"
+    assert result.metadata["baseline_validation"]["isolated"] is True
+    assert source.read_text(encoding="utf-8") == "candidate\n"
+    worktrees = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert worktrees.count("worktree ") == 1
+    assert registry.runtime_state()["coding_state"]["validations"] == []
+
+
+def test_validate_baseline_unlocks_and_removes_worktree_after_command(tmp_path) -> None:
+    (tmp_path / "value.txt").write_text("baseline\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["validate_baseline", "apply_patch", "validate"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+    )
+
+    result = registry.execute(
+        "validate_baseline",
+        {"command": ["git", "worktree", "lock", "--reason", "test-lock", "."]},
+    )
+
+    assert result.ok
+    worktrees = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert worktrees.count("worktree ") == 1
+
+
+@pytest.mark.asyncio
+async def test_validate_baseline_cancellation_stops_command_and_removes_worktree(tmp_path) -> None:
+    (tmp_path / "value.txt").write_text("baseline\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["validate_baseline", "apply_patch", "validate"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+    )
+
+    pending = asyncio.create_task(registry.execute_async(
+        "validate_baseline",
+        {"command": ["python", "-c", "__import__('time').sleep(30)"]},
+    ))
+    await asyncio.sleep(0.5)
+    registry.cancel_active()
+    result = await asyncio.wait_for(pending, timeout=10)
+
+    assert not result.ok
+    assert result.error_code == "cancelled"
+    worktrees = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert worktrees.count("worktree ") == 1
+
+
+def test_validate_baseline_does_not_prune_unrelated_missing_worktree(tmp_path) -> None:
+    (tmp_path / "value.txt").write_text("baseline\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    offline_worktree = tmp_path.parent / f"{tmp_path.name}-offline"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(offline_worktree), "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    shutil.rmtree(offline_worktree)
+    subprocess.run(
+        ["git", "config", "gc.worktreePruneExpire", "now"],
+        cwd=tmp_path,
+        check=True,
+    )
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["validate_baseline", "apply_patch", "validate"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+    )
+
+    result = registry.execute(
+        "validate_baseline",
+        {"command": ["python", "--version"]},
+    )
+
+    assert result.ok
+    worktrees = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert worktrees.count("worktree ") == 2
 
 
 @pytest.mark.asyncio

@@ -633,6 +633,55 @@ async def test_runtime_stops_after_four_failed_no_progress_steps(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+async def test_coding_runtime_gets_one_recovery_turn_before_no_progress_stop(tmp_path) -> None:
+    model_messages: list[list[dict]] = []
+    turn = 0
+
+    async def model_call(**kwargs) -> ModelTurn:
+        nonlocal turn
+        turn += 1
+        model_messages.append([dict(item) for item in kwargs["messages"]])
+        if turn == 1:
+            return ModelTurn(
+                tool_calls=[
+                    ModelToolCall(
+                        "edit-1",
+                        "write",
+                        {"path": "candidate.txt", "content": "working candidate\n"},
+                    )
+                ]
+            )
+        if turn <= 5:
+            return ModelTurn(tool_calls=[ModelToolCall(f"missing-{turn}", f"missing-{turn}", {})])
+        return ModelTurn(content="Recovered the intended candidate and stopped experimenting.")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=["write", "apply_patch", "validate"],
+            workflow_profile_id="coding",
+            permission_mode="full",
+        ),
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert outcome.tool_calls == 5
+    recovery_context = "\n".join(
+        str(item.get("content") or "") for item in model_messages[-1]
+    )
+    assert "恢复轮" in recovery_context
+    assert "git status" in recovery_context
+    recovery_events = [
+        item for item in outcome.events if item.get("type") == "stagnation_recovery_started"
+    ]
+    assert len(recovery_events) == 1
+    assert outcome.guard_snapshot["stagnation_recovery_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> None:
     turns = 0
 
@@ -976,7 +1025,8 @@ async def test_approval_resume_preserves_seen_observations_for_no_progress_guard
     resumed = await runtime.resume_after_approval(waiting)
     assert resumed.status == "stopped"
     assert resumed.stop_reason == "no_progress"
-    assert turns == 5
+    assert turns == 6
+    assert resumed.guard_snapshot["stagnation_recovery_count"] == 1
 
 
 @pytest.mark.asyncio

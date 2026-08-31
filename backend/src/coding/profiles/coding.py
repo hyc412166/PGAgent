@@ -28,6 +28,7 @@ CODING_PROFILE = WorkflowProfile(
         "task",
         "todowrite",
         "validate",
+        "validate_baseline",
         "webfetch",
         "websearch",
         "write",
@@ -40,6 +41,8 @@ CODING_PROFILE = WorkflowProfile(
         "navigation and use ToolSearch for lower-frequency capabilities. Keep the plan proportional to "
         "the task, preserve unrelated user changes, and prefer apply_patch for existing source files. "
         "After editing, inspect git status/diff and run the narrowest relevant checks with validate. "
+        "When proving that a failure is pre-existing on pristine HEAD, use validate_baseline instead of "
+        "temporarily reverting candidate files in the main worktree. "
         "Do not claim success from code inspection alone when a runnable check is available. Report the "
         "changed files, observed behavior, and whether validation passed, failed, or was not run."
     ),
