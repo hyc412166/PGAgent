@@ -39,6 +39,16 @@ describe('durable task card', () => {
     expect(markup).toContain('正在取消…')
   })
 
+  it('shows direct resume progress while the recovery request is being sent', () => {
+    const markup = renderToStaticMarkup(
+      <DurableTaskCard task={pausedTask} onResume={() => undefined} onCancel={() => undefined} resuming />,
+    )
+
+    expect(markup).toContain('正在继续…')
+    expect(markup).toContain('aria-busy="true"')
+    expect(markup.match(/disabled=""/g)).toHaveLength(1)
+  })
+
   it('can cancel a running task without offering a duplicate resume action', () => {
     const markup = renderToStaticMarkup(
       <DurableTaskCard task={{ ...pausedTask, status: 'running' }} onResume={() => undefined} onCancel={() => undefined} />,

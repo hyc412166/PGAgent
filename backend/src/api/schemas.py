@@ -522,6 +522,7 @@ class ModelConnectionCreate(BaseModel):
     base_url: str = Field(min_length=1)
     api_key: str = Field(min_length=1)
     provider: str = "openai_compatible"
+    api_protocol: Literal["responses", "chat_completions"] = "responses"
     manual_models: list[str] = Field(default_factory=list)
     default_model: str | None = None
     thinking_level: ThinkingLevel = "auto"
@@ -547,6 +548,7 @@ class ModelConnectionUpdate(BaseModel):
     base_url: str | None = Field(default=None, min_length=1)
     api_key: str | None = Field(default=None, min_length=1)
     provider: str | None = None
+    api_protocol: Literal["responses", "chat_completions"] | None = None
     manual_models: list[str] | None = None
     default_model: str | None = None
     thinking_level: ThinkingLevel | None = None
@@ -575,6 +577,7 @@ class ModelConnectionRead(ORMModel):
     id: str
     name: str
     provider: str
+    api_protocol: str
     base_url: str
     discovered_models: list[str]
     manual_models: list[str]

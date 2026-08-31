@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -112,13 +113,117 @@ def test_write_stdin_sends_input_to_running_background_job(background_store) -> 
     job_id = started.metadata["background_job_id"]
     _wait_for_job_status(job_id, {"running"}, require_pid=True)
 
-    sent = store.write_stdin(task_id=job_id, input="hello\n")
-    result = store.check(task_id=job_id, wait=True, wait_timeout=10)
+    sent = store.write_stdin(task_id=job_id, input="hello\n", wait_ms=10_000)
 
     assert sent.ok
     assert '"chars_sent": 6' in sent.content
-    assert result.ok
-    assert "stdin:hello" in result.content
+    assert "stdin:hello" in sent.content
+
+
+def test_background_wait_timeout_yields_without_stopping_process(background_store) -> None:
+    store, _manager = background_store
+    started = store.start(
+        command="Start-Sleep -Seconds 2; Write-Output late",
+        shell="powershell",
+        timeout=30,
+    )
+    job_id = started.metadata["background_job_id"]
+    running = _wait_for_job_status(job_id, {"running"}, require_pid=True)
+
+    yielded = store.check(task_id=job_id, wait=True, wait_timeout=0.05)
+
+    assert yielded.ok is True
+    assert yielded.metadata["background_job_active"] is True
+    assert yielded.metadata["background_wait_timed_out"] is True
+    with database.SessionLocal() as db:
+        current = db.get(BackgroundJob, job_id)
+        assert current.status == "running"
+        assert current.pid == running.pid
+    assert _manager.cancel(job_id) is True
+
+
+def test_background_output_offsets_return_only_new_bytes(background_store) -> None:
+    store, _manager = background_store
+    started = store.start(
+        command="Write-Output first; Start-Sleep -Seconds 1; Write-Output second",
+        shell="powershell",
+        timeout=30,
+    )
+    job_id = started.metadata["background_job_id"]
+    _wait_for_job_status(job_id, {"running"}, require_pid=True)
+    deadline = time.monotonic() + 5
+    first_payload = None
+    while time.monotonic() < deadline:
+        first_result = store.check(task_id=job_id, output_offset=0)
+        candidate = json.loads(first_result.content)
+        if "first" in candidate["output"]:
+            first_payload = candidate
+            break
+        time.sleep(0.05)
+    assert first_payload is not None
+
+    terminal = store.check(
+        task_id=job_id,
+        wait=True,
+        wait_timeout=10,
+        output_offset=first_payload["next_output_offset"],
+    )
+    terminal_payload = json.loads(terminal.content)
+
+    assert terminal.ok is True
+    assert "second" in terminal_payload["output"]
+    assert "first" not in terminal_payload["output"]
+
+
+def test_bash_yields_a_durable_session_without_starting_a_second_process(background_store) -> None:
+    store, _manager = background_store
+    registry = create_default_registry(
+        store.workspace_root,
+        allowed_tool_names=["bash", "check_background"],
+        permission_mode="full",
+        background_store=store,
+    )
+
+    yielded = registry.execute(
+        "bash",
+        {
+            "command": ["python", "-c", "__import__('time').sleep(1)"],
+            "yield-time_ms": 10,
+            "timeout_seconds": 30,
+        },
+        approved=True,
+    )
+    job_id = yielded.metadata["session_id"]
+    running = _wait_for_job_status(job_id, {"running"}, require_pid=True)
+    terminal = store.check(task_id=job_id, wait=True, wait_timeout=10)
+
+    assert yielded.ok is True
+    assert yielded.metadata["background_job_active"] is True
+    assert yielded.metadata["background_wait_timed_out"] is True
+    assert terminal.ok is True
+    with database.SessionLocal() as db:
+        assert db.query(BackgroundJob).filter_by(id=job_id).count() == 1
+        assert running.pid is not None
+
+
+def test_bash_returns_terminal_output_when_command_finishes_inside_yield_window(background_store) -> None:
+    store, _manager = background_store
+    registry = create_default_registry(
+        store.workspace_root,
+        allowed_tool_names=["bash"],
+        permission_mode="full",
+        background_store=store,
+    )
+
+    result = registry.execute(
+        "bash",
+        {"command": ["python", "-c", "print('fast')"], "yield-time_ms": 10_000},
+        approved=True,
+    )
+
+    assert result.ok is True
+    assert result.metadata["background_job_active"] is False
+    assert "fast" in result.content
 
 
 def test_recover_relaunches_queued_job_and_settles_stale_running_job(background_store) -> None:

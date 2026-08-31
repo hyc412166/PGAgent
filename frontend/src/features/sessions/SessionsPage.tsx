@@ -669,10 +669,7 @@ function SessionsPage() {
     }
   }, [activeId, childPanelOpen, completedThoughtLayoutVersion, historyHydration.complete, historyHydration.sessionId, historyOpenVersion, messages.data.ownerSessionId, messages.loading, liveRun.draft, liveRun.phase, runs.data.ownerSessionId, runs.loading, visibleApprovals.length, visibleMessages.length])
 
-  async function sendMessage(event: FormEvent) {
-    event.preventDefault()
-    const content = composerInputRef.current?.getValue().trim() || ''
-    const files = pendingAttachmentsRef.current.map((item) => item.file)
+  async function submitMessage(content: string, files: File[], consumeComposer: boolean) {
     if (sendingRef.current || (!activeId && !draftActive) || (!content && !files.length) || settingsSaving || capabilitySaving || settingsLocked) return
     sendingRef.current = true
     setSending(true); setActionError('')
@@ -700,7 +697,7 @@ function SessionsPage() {
         if (!sessionId || !runId) throw new Error('草稿启动响应缺少会话或运行标识。')
         setInterruptedRunId('')
         pendingDraftRunRef.current = { sessionId, runId }
-        composerInputRef.current?.clear()
+        if (consumeComposer) composerInputRef.current?.clear()
         clearDraftState()
         setActiveId(sessionId)
         void sessions.refresh()
@@ -724,8 +721,10 @@ function SessionsPage() {
         : await api.post<Run>(`/api/sessions/${targetSessionId}/run`, runPayload)
       pendingSessionSendRef.current = null
       setInterruptedRunId('')
-      composerInputRef.current?.clear()
-      clearPendingAttachments()
+      if (consumeComposer) {
+        composerInputRef.current?.clear()
+        clearPendingAttachments()
+      }
       void messages.refresh()
       void runs.refresh()
       void context.refresh()
@@ -743,6 +742,15 @@ function SessionsPage() {
       sendingRef.current = false
       setSending(false)
     }
+  }
+
+  function sendMessage(event: FormEvent) {
+    event.preventDefault()
+    void submitMessage(
+      composerInputRef.current?.getValue().trim() || '',
+      pendingAttachmentsRef.current.map((item) => item.file),
+      true,
+    )
   }
 
   async function stopActiveRun() {
@@ -1050,10 +1058,8 @@ function SessionsPage() {
                 {!draftActive && durableTask.data && <DurableTaskCard
                   task={durableTask.data}
                   cancelling={cancellingTaskId === durableTask.data.id}
-                  onResume={() => {
-                    composerInputRef.current?.setValue('继续刚刚的工作')
-                    composerInputRef.current?.focus()
-                  }}
+                  resuming={sending}
+                  onResume={() => void submitMessage('继续刚刚的工作', [], false)}
                   onCancel={() => void cancelDurableTask(durableTask.data!.id)}
                 />}
                 {!draftActive && stoppedRunNotices.map((run) => <div key={`run-notice:${run.id}`} className="stopped-run-notice" role="status"><AlertCircle size={16} /><div><strong>{run.status === 'failed' ? '本次运行失败，未生成最终回复' : '本次运行已停止，未生成最终回复'}</strong><p>{run.error_message || run.stop_reason || 'Agent 未能继续执行，请调整指令后重试。'}</p></div></div>)}

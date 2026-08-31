@@ -57,6 +57,7 @@ def _provider_config(job: MemoryJob, connection: ModelConnection) -> ProviderCon
         model_connection_id=connection.id,
         thinking_level="off",
         custom_headers=dict(connection.custom_headers or {}),
+        api_protocol=str(binding.get("api_protocol") or connection.api_protocol or "chat_completions"),
     )
 
 

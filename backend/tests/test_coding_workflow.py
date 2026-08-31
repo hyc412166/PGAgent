@@ -489,6 +489,30 @@ async def test_validate_baseline_cancellation_stops_command_and_removes_worktree
     assert worktrees.count("worktree ") == 1
 
 
+@pytest.mark.asyncio
+async def test_validate_cancellation_stops_command(tmp_path) -> None:
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["validate"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+    )
+
+    pending = asyncio.create_task(registry.execute_async(
+        "validate",
+        {
+            "kind": "test",
+            "command": ["python", "-c", "__import__('time').sleep(30)"],
+        },
+    ))
+    await asyncio.sleep(0.5)
+    registry.cancel_active()
+    result = await asyncio.wait_for(pending, timeout=10)
+
+    assert not result.ok
+    assert result.error_code == "cancelled"
+
+
 def test_validate_baseline_does_not_prune_unrelated_missing_worktree(tmp_path) -> None:
     (tmp_path / "value.txt").write_text("baseline\n", encoding="utf-8")
     _init_git_repository(tmp_path)

@@ -136,11 +136,49 @@ def upsert_delegated_graph(
         by_external_id = {step.external_id: step for step in existing_steps}
         next_position = max((step.position for step in existing_steps), default=0) + 1
         selected: dict[str, PlanStep] = {}
+        linked_existing_step_ids: set[str] = set()
         graph_prefix = f"delegate:{graph_call_id}:" if graph_call_id else ""
         for spec in rows:
             local_external_id = str(spec["id"])
             persisted_external_id = f"{graph_prefix}{local_external_id}"
             step = by_external_id.get(persisted_external_id)
+            explicit_step = by_external_id.get(local_external_id)
+            if (
+                step is None
+                and explicit_step is not None
+                and explicit_step.executor_kind == "subagent"
+                and (
+                    not str(spec.get("agent_id") or "").strip()
+                    or explicit_step.assigned_agent_id == str(spec.get("agent_id") or "").strip()
+                )
+            ):
+                step = explicit_step
+                linked_existing_step_ids.add(step.id)
+            if step is None and bool(spec.get("link_existing")):
+                candidates = [
+                    candidate
+                    for candidate in ready_steps(db, task.id, executor_kind="subagent")
+                    if candidate.assigned_run_id is None
+                    and candidate.id not in linked_existing_step_ids
+                    and (
+                        not str(spec.get("agent_id") or "").strip()
+                        or candidate.assigned_agent_id == str(spec.get("agent_id") or "").strip()
+                    )
+                ]
+                if len(candidates) > 1:
+                    delegated_title = str(spec.get("task") or "").strip()
+                    exact_matches = [
+                        candidate
+                        for candidate in candidates
+                        if delegated_title in {
+                            str(candidate.title or "").strip(),
+                            str(candidate.description or "").strip(),
+                        }
+                    ]
+                    candidates = exact_matches
+                if len(candidates) == 1:
+                    step = candidates[0]
+                    linked_existing_step_ids.add(step.id)
             if step is None:
                 step = PlanStep(
                     task_id=task.id,
@@ -153,7 +191,8 @@ def upsert_delegated_graph(
                 db.add(step)
                 db.flush()
                 by_external_id[persisted_external_id] = step
-            step.title = str(spec.get("task") or step.title)
+            if step.id not in linked_existing_step_ids:
+                step.title = str(spec.get("task") or step.title)
             step.description = str(spec.get("task") or step.description)
             step.executor_kind = "subagent"
             step.assigned_agent_id = str(spec.get("agent_id") or "") or None
@@ -161,13 +200,17 @@ def upsert_delegated_graph(
             step.remaining_work = [] if step.status == "completed" else [step.title]
             selected[local_external_id] = step
 
-        selected_step_ids = [step.id for step in selected.values()]
+        selected_step_ids = [
+            step.id for step in selected.values() if step.id not in linked_existing_step_ids
+        ]
         if selected_step_ids:
             db.execute(delete(PlanStepDependency).where(
                 PlanStepDependency.step_id.in_(selected_step_ids)
             ))
         for spec in rows:
             step = selected[str(spec["id"])]
+            if step.id in linked_existing_step_ids:
+                continue
             for dependency_external_id in spec.get("depends_on") or ():
                 dependency = selected[str(dependency_external_id)]
                 db.add(PlanStepDependency(step_id=step.id, depends_on_step_id=dependency.id))

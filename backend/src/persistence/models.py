@@ -38,6 +38,9 @@ class ModelConnection(TimestampMixin, Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
     provider: Mapped[str] = mapped_column(String(50), default="openai_compatible", nullable=False)
+    # Existing rows are migrated to Chat Completions; newly created rows set
+    # their explicit protocol from the API request (Responses by default).
+    api_protocol: Mapped[str] = mapped_column(String(32), default="chat_completions", nullable=False)
     base_url: Mapped[str] = mapped_column(Text, nullable=False)
     secret_ref: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     discovered_models: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)

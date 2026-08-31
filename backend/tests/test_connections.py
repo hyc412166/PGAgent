@@ -15,8 +15,9 @@ from src.persistence.database import Base, configure_database, init_db
 
 
 class FakeHttpClient:
-    def __init__(self, response: httpx.Response):
+    def __init__(self, response: httpx.Response, protocol_response: httpx.Response):
         self.response = response
+        self.protocol_response = protocol_response
 
     def __enter__(self):  # type: ignore[no-untyped-def]
         return self
@@ -28,6 +29,29 @@ class FakeHttpClient:
         assert url.endswith("/models")
         assert headers["Authorization"].startswith("Bearer ")
         return self.response
+
+    def post(self, url: str, headers: dict[str, str], json: dict) -> httpx.Response:  # type: ignore[no-untyped-def]
+        assert url.endswith(("/responses", "/chat/completions"))
+        assert headers["Authorization"].startswith("Bearer ")
+        if url.endswith("/responses"):
+            assert json["store"] is False
+            assert json["max_output_tokens"] == 16
+        return self.protocol_response
+
+    class _Stream:
+        def __init__(self, response: httpx.Response):
+            self.response = response
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self.response
+
+        def __exit__(self, *_args):  # type: ignore[no-untyped-def]
+            return None
+
+    def stream(self, method: str, url: str, headers: dict[str, str], json: dict) -> "FakeHttpClient._Stream":  # type: ignore[no-untyped-def]
+        assert method == "POST"
+        assert json["stream"] is True
+        return self._Stream(self.post(url, headers=headers, json=json))
 
 
 @pytest.fixture()
@@ -52,10 +76,25 @@ def client(tmp_path: Path, secret_backend: dict[tuple[str, str], str]) -> TestCl
     Base.metadata.drop_all(bind=database.engine)
 
 
-def mock_response(monkeypatch: pytest.MonkeyPatch, status: int, payload=None) -> None:  # type: ignore[no-untyped-def]
+def mock_response(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    payload=None,  # type: ignore[no-untyped-def]
+    *,
+    protocol_status: int = 200,
+) -> None:
     request = httpx.Request("GET", "https://provider.test/v1/models")
     response = httpx.Response(status, json=payload, request=request)
-    monkeypatch.setattr(connections.httpx, "Client", lambda **_kwargs: FakeHttpClient(response))
+    protocol_response = httpx.Response(
+        protocol_status,
+        json={"id": "response-test"},
+        request=httpx.Request("POST", "https://provider.test/v1/responses"),
+    )
+    monkeypatch.setattr(
+        connections.httpx,
+        "Client",
+        lambda **_kwargs: FakeHttpClient(response, protocol_response),
+    )
 
 
 def test_create_discovers_models_and_keeps_key_out_of_database_and_response(
@@ -72,6 +111,7 @@ def test_create_discovers_models_and_keeps_key_out_of_database_and_response(
     body = response.json()
     assert body["discovered_models"] == ["model-a", "model-b"]
     assert body["default_model"] == "model-a"
+    assert body["api_protocol"] == "responses"
     assert body["thinking_level"] == "auto"
     assert "api_key" not in body
     assert "secret_ref" not in body

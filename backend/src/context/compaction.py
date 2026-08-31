@@ -166,6 +166,9 @@ def _message_payload(message: ChatMessage) -> dict[str, Any]:
     reasoning_content = provider_payload.get("reasoning_content")
     if message.role == "assistant" and isinstance(reasoning_content, str) and reasoning_content:
         payload["reasoning_content"] = reasoning_content
+    native_provider = provider_payload.get("native")
+    if message.role == "assistant" and isinstance(native_provider, dict):
+        payload["_pgagent_provider"] = _json_safe(native_provider)
     return payload
 
 
@@ -216,6 +219,7 @@ def _chat_message_key(message: Mapping[str, Any]) -> str:
         "tool_call_id": message.get("tool_call_id"),
         "tool_calls": message.get("tool_calls") or [],
         "reasoning_content": message.get("reasoning_content") or "",
+        "provider_payload": message.get("_pgagent_provider") or {},
     }
     return json.dumps(_json_safe(selected), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -296,6 +300,9 @@ def _append_runtime_transcript(
             payload["tool_calls"] = _json_safe(raw["tool_calls"])
         if role == "assistant" and isinstance(raw.get("reasoning_content"), str):
             payload["reasoning_content"] = str(raw["reasoning_content"])
+        native_provider = raw.get("_pgagent_provider")
+        if role == "assistant" and isinstance(native_provider, dict):
+            payload["_pgagent_provider"] = _json_safe(native_provider)
         if role == "tool" and payload.get("name") == "task" and payload.get("tool_call_id"):
             existing_task_result = db.scalar(
                 select(ChatMessage)
@@ -360,8 +367,10 @@ def _append_runtime_transcript(
                 sequence=next_sequence,
                 extra=metadata,
                 provider_payload=(
-                    {"reasoning_content": payload["reasoning_content"]}
-                    if payload.get("reasoning_content") else {}
+                    {
+                        **({"reasoning_content": payload["reasoning_content"]} if payload.get("reasoning_content") else {}),
+                        **({"native": payload["_pgagent_provider"]} if payload.get("_pgagent_provider") else {}),
+                    }
                 ),
             )
         )

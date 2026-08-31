@@ -329,6 +329,23 @@ class RunCoordinator:
         task.add_done_callback(lambda completed, key=run_id: self._clear_task(completed, key))
         return True
 
+    async def wait_for_run(self, run_id: str, *, timeout_seconds: float) -> bool:
+        """Wait for a coordinator-owned Run without transferring cancellation."""
+
+        task = self._tasks.get(run_id)
+        if task is None:
+            with database_module.SessionLocal() as db:
+                status = db.scalar(select(Run.status).where(Run.id == run_id))
+            return status in {"completed", "failed", "stopped", "awaiting_approval"}
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=max(0.0, float(timeout_seconds)),
+            )
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     def _schedule_background_continuation(self, run_id: str, job_id: str) -> None:
         def launch() -> None:
             run_stream_broker.publish(run_id, {
@@ -1218,6 +1235,7 @@ class RunCoordinator:
                     raise RuntimeError("冻结的模型连接已不存在或被禁用，已拒绝续跑")
                 connection_changed = (
                     connection.provider != str(frozen_binding["provider"])
+                    or connection.api_protocol != str(frozen_binding.get("api_protocol") or "chat_completions")
                     or connection.base_url != str(frozen_binding["base_url"])
                     or connection.secret_ref != str(frozen_binding["secret_ref"])
                     or _configuration_digest(connection.custom_headers or {})
@@ -1239,6 +1257,7 @@ class RunCoordinator:
                     model_connection_id=str(frozen_binding["model_connection_id"]),
                     thinking_level=str(frozen_binding.get("thinking_level") or "auto"),
                     custom_headers=dict(connection.custom_headers or {}),
+                    api_protocol=str(frozen_binding.get("api_protocol") or "chat_completions"),
                 )
                 if isinstance(frozen_binding.get("tool_ids"), list):
                     agent_tool_ids = [str(item) for item in frozen_binding["tool_ids"]]
@@ -1275,6 +1294,12 @@ class RunCoordinator:
                 # from a hand-edited/legacy binding during approval resume.
                 if frozen_binding.get("delegation_version"):
                     allowed_tool_names = [name for name in allowed_tool_names if name != "task"]
+                    messages = [{
+                        "role": "user",
+                        "content": str(frozen_binding.get("rendered_task") or ""),
+                    }]
+                    compaction_state = {}
+                    transcript_sequence = 0
                     if "max_run_seconds" in frozen_binding:
                         frozen_limit = frozen_binding.get("max_run_seconds")
                         runtime_max_run_seconds = (
@@ -1328,6 +1353,7 @@ class RunCoordinator:
                     model_connection_id=connection.id,
                     thinking_level=thinking_level,
                     custom_headers=dict(connection.custom_headers or {}),
+                    api_protocol=connection.api_protocol,
                 )
                 frozen_binding = {
                     "workspace_root": workspace_root,
@@ -1335,6 +1361,7 @@ class RunCoordinator:
                     "agents_instruction_sources": agents_instruction_sources,
                     "model_connection_id": connection.id,
                     "provider": connection.provider,
+                    "api_protocol": connection.api_protocol,
                     "base_url": connection.base_url,
                     "secret_ref": connection.secret_ref,
                     "model_id": model_id,
@@ -1723,6 +1750,7 @@ class RunCoordinator:
         stop_reason: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        runtime_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Expose a transaction-local terminal sync for approval rejection."""
 
@@ -1733,6 +1761,7 @@ class RunCoordinator:
             stop_reason=stop_reason,
             error=error,
             error_code=error_code,
+            runtime_binding=runtime_binding,
         )
 
     @staticmethod
@@ -1955,17 +1984,19 @@ class RunCoordinator:
                         arguments=dict(pending.get("arguments") or {}),
                         reason=str(pending.get("reason") or "该工具会修改本机状态，需要你的确认"),
                     ))
-            terminal_reasoning = next(
+            terminal_provider_message = next(
                 (
-                    str(message.get("reasoning_content") or "")
+                    message
                     for message in reversed(list(outcome.transcript_delta or outcome.messages))
                     if isinstance(message, dict)
                     and message.get("role") == "assistant"
                     and not message.get("tool_calls")
                     and str(message.get("content") or "").strip() == str(outcome.output or "").strip()
                 ),
-                "",
+                {},
             )
+            terminal_reasoning = str(terminal_provider_message.get("reasoning_content") or "")
+            terminal_native = terminal_provider_message.get("_pgagent_provider")
             persist_terminal_response(
                 db,
                 run,
@@ -1973,8 +2004,10 @@ class RunCoordinator:
                 error_code=normalized_error_code,
                 error_message=safe_error_message,
                 provider_payload=(
-                    {"reasoning_content": terminal_reasoning}
-                    if terminal_reasoning else None
+                    {
+                        **({"reasoning_content": terminal_reasoning} if terminal_reasoning else {}),
+                        **({"native": terminal_native} if isinstance(terminal_native, dict) else {}),
+                    } or None
                 ),
             )
             cited = (
@@ -2099,7 +2132,21 @@ class RunCoordinator:
         try:
             if self._stop_requested(run_id):
                 return
-            runtime, context = self._resolve_runtime(run_id, coordinator_instance=self)
+            delegated_binding: dict[str, Any] | None = None
+            with database_module.SessionLocal() as db:
+                snapshot = db.scalar(
+                    select(RunEvent)
+                    .where(RunEvent.run_id == run_id, RunEvent.event_type == "runtime_snapshot")
+                    .order_by(RunEvent.created_at.desc(), RunEvent.id.desc())
+                )
+                candidate = dict(snapshot.payload or {}).get("runtime_binding") if snapshot is not None else None
+                if isinstance(candidate, dict) and candidate.get("delegation_version"):
+                    delegated_binding = dict(candidate)
+            runtime, context = self._resolve_runtime(
+                run_id,
+                runtime_binding=delegated_binding,
+                coordinator_instance=self,
+            )
             await RunRuntimePreparer().prepare(
                 run_id=run_id,
                 runtime=runtime,

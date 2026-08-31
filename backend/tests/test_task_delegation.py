@@ -34,6 +34,29 @@ from src.tasks.background import background_job_manager
 from src.runs.service import RunCoordinator
 
 
+@pytest.mark.asyncio
+async def test_parent_wait_timeout_does_not_cancel_delegated_child() -> None:
+    coordinator = RunCoordinator()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+
+    async def child() -> None:
+        await release.wait()
+        completed.set()
+
+    child_task = asyncio.create_task(child())
+    coordinator._tasks["child-run"] = child_task
+
+    finished = await coordinator.wait_for_run("child-run", timeout_seconds=0.01)
+
+    assert finished is False
+    assert child_task.done() is False
+    assert child_task.cancelled() is False
+    release.set()
+    await child_task
+    assert completed.is_set()
+
+
 def test_session_delegations_include_legacy_child_run_history(
     delegated_run: dict[str, str],
 ) -> None:
@@ -575,8 +598,6 @@ async def test_child_failure_blocks_once_and_repeated_delegate_call_is_idempoten
 async def test_child_timeout_is_limited_to_the_parent_remaining_budget(
     delegated_run: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured_limits: list[float | None] = []
-
     monkeypatch.setattr(run_service, "build_model_call", lambda _config: (lambda **_kwargs: None))
     parent_runtime, _context = RunCoordinator._resolve_runtime(delegated_run["run_id"])
     delegate = parent_runtime.tool_registry._task_delegate  # type: ignore[attr-defined]
@@ -586,31 +607,19 @@ async def test_child_timeout_is_limited_to_the_parent_remaining_budget(
         parent.started_at = datetime.now(timezone.utc) - timedelta(seconds=7)
         db.commit()
 
-    class FakeChildRuntime:
-        def __init__(self, *, config, **_kwargs):  # type: ignore[no-untyped-def]
-            captured_limits.append(config.max_run_seconds)
-            self.config = config
-            self.completion_verifier = None
-
-        async def run(self, **_kwargs):  # type: ignore[no-untyped-def]
-            return RunOutcome(
-                status="completed",
-                output="budget constrained",
-                messages=[],
-                events=[{"type": "run_completed"}],
-                steps=1,
-                tool_calls=0,
-            )
-
     monkeypatch.setattr(run_service.settings, "max_run_seconds", 10.0)
-    monkeypatch.setattr(delegation_module, "AgentRuntime", FakeChildRuntime)
-    result = await delegate("bounded", agent_id=delegated_run["child_id"], call_id="budget-child")
-    assert result.ok
-    assert len(captured_limits) == 1
-    assert captured_limits[0] is not None
-    assert 0 < captured_limits[0] < 5
+    await delegate("bounded", agent_id=delegated_run["child_id"], call_id="budget-child")
     with database.SessionLocal() as db:
-        assert db.scalar(select(DelegatedTask)) is not None
+        task = db.scalar(select(DelegatedTask))
+        assert task is not None and task.child_run_id
+        snapshot = db.scalar(select(RunEvent).where(
+            RunEvent.run_id == task.child_run_id,
+            RunEvent.event_type == "runtime_snapshot",
+        ).order_by(RunEvent.created_at.asc()))
+        assert snapshot is not None
+        child_limit = snapshot.payload["runtime_binding"]["max_run_seconds"]
+        assert child_limit is not None
+        assert 0 < child_limit < 5
 
 
 @pytest.mark.asyncio

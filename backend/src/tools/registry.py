@@ -35,13 +35,14 @@ from .validation import InvocationValidationHook
 # appear in the provider schema.
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "bash": {
-        "description": "在工作区中运行受控 allowlist 命令；不会启动 shell，仍受命令安全限制。",
+        "description": "在工作区中运行受控 allowlist 命令；短命令直接返回，超过 yield 窗口会返回可继续读取的持久 session_id。",
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                 "cwd": {"type": "string"},
                 "timeout_seconds": {"type": "number"},
+                "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 300000},
             },
             "required": ["command"],
         },
@@ -245,13 +246,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "task": {
-        "description": "把一个或多个相互独立的子任务并行委派给已启用的子 Agent。单任务使用 task+agent_id；多个任务使用 tasks 数组，系统会并行启动并在全部结束后返回结构化结果。子 Agent 只能使用它自身被勾选且不超过当前会话权限的工具，且不能再次委派。",
+        "description": "把一个或多个相互独立的子任务并行委派给已启用的子 Agent。单任务使用 task+agent_id；如果该任务已由 todowrite 规划为 subagent，必须把其稳定 id 作为 step_id。多个任务使用 tasks 数组并为已规划项沿用 id。系统会并行启动并在全部结束后返回结构化结果。子 Agent 只能使用它自身被勾选且不超过当前会话权限的工具，且不能再次委派。",
         "parameters": {
             "type": "object",
             "properties": {
                 "task": {"type": "string"},
                 "agent_id": {"type": "string"},
-                "step_id": {"type": "string"},
+                "step_id": {"type": "string", "description": "对应 todowrite 中已规划子 Agent 步骤的稳定 id。"},
                 "depends_on": {"type": "array", "items": {"type": "string"}},
                 "tasks": {
                     "type": "array",
@@ -276,7 +277,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "todowrite": {
-        "description": "更新本次运行的结构化任务清单；每一步必须提供跨更新保持不变的 id。",
+        "description": "更新本次运行的结构化任务清单；每一步必须提供跨更新保持不变的 id。executor_kind=subagent 只表示规划，随后仍须调用 task，并把同一 id 作为 step_id。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -697,7 +698,7 @@ class ToolRegistry:
             "ExitPlanMode": advanced.exit_plan_mode,
             "StructuredOutput": advanced.structured_output,
             "REPL": advanced.repl,
-            "PowerShell": advanced.powershell,
+            "PowerShell": self._powershell,
             "AskUserQuestion": builtins.ask_question,
             "TaskCreate": (
                 lambda _sandbox, **kwargs: self._task_store.create(tool_name="TaskCreate", **kwargs)
@@ -828,11 +829,44 @@ class ToolRegistry:
     def _bash(self, sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
         from src.coding.worktree import annotate_command_changes, capture_worktree_state
 
+        yield_time_ms = kwargs.pop("yield_time_ms", kwargs.pop("yield-time_ms", 10_000))
+        cancel_event = kwargs.pop("_cancel_event", None)
+        kwargs.pop("approved", None)
+        if self._background_store is not None and yield_time_ms is not None:
+            before = capture_worktree_state(sandbox.root) if self.workflow_profile_id in {"coding", "debug"} else None
+            started = self._background_store.start(
+                command=kwargs.pop("command"),
+                cwd=str(kwargs.pop("cwd", ".")),
+                timeout=max(1, int(kwargs.pop("timeout_seconds", 3600))),
+            )
+            if not started.ok:
+                return started
+            job_id = str(started.metadata["background_job_id"])
+            result = self._background_store.check(
+                task_id=job_id,
+                wait=True,
+                wait_timeout=min(300_000, max(0, int(yield_time_ms))) / 1000,
+                output_offset=0,
+                _cancel_event=cancel_event,
+            )
+            result.metadata = {**started.metadata, **result.metadata}
+            if before is not None and not result.metadata.get("background_job_active"):
+                return annotate_command_changes(result, sandbox.root, before, source="shell")
+            return result
         if self.workflow_profile_id not in {"coding", "debug"}:
-            return builtins.run_command(sandbox, **kwargs)
+            return builtins.run_command(sandbox, approved=True, _cancel_event=cancel_event, **kwargs)
         before = capture_worktree_state(sandbox.root)
-        result = builtins.run_command(sandbox, **kwargs)
+        result = builtins.run_command(sandbox, approved=True, _cancel_event=cancel_event, **kwargs)
         return annotate_command_changes(result, sandbox.root, before, source="shell")
+
+    def _powershell(self, sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+        if self._background_store is not None and bool(kwargs.get("run_in_background")):
+            return self._background_store.start(
+                command=str(kwargs.get("command") or ""),
+                timeout=max(1, int(kwargs.get("timeout", 3600))),
+                shell="powershell",
+            )
+        return advanced.powershell(sandbox, **kwargs)
 
     def _validate(self, sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
         from src.coding.validation import run_validation
@@ -1300,7 +1334,7 @@ class ToolRegistry:
         }:
             kwargs["approved"] = True
         if _cancel_event is not None and name in {
-            "bash", "run_command", "validate_baseline", "check_background",
+            "bash", "run_command", "validate", "validate_baseline", "check_background",
         }:
             # This is an in-process cancellation signal, not a model/tool
             # argument.  Inject it only after policy approval so it can never
