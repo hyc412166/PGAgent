@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -27,6 +28,7 @@ from src.tools.types import ToolResult
 TERMINAL_BACKGROUND_STATUSES = frozenset({"completed", "failed", "cancelled"})
 MAX_BACKGROUND_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 MAX_BACKGROUND_OUTPUT_CHARS = 100_000
+MAX_BACKGROUND_OUTPUT_BYTES = MAX_BACKGROUND_OUTPUT_CHARS * 4
 logger = logging.getLogger(__name__)
 
 
@@ -42,15 +44,15 @@ def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:
             ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
             capture_output=True,
             check=False,
-            timeout=10,
+            timeout=3,
         )
     else:
         os.killpg(os.getpgid(process.pid), signal.SIGKILL)
     try:
-        process.wait(timeout=10)
+        process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait(timeout=5)
+        process.wait(timeout=2)
 
 
 def _read_log_tail(path: Path) -> str:
@@ -62,9 +64,30 @@ def _read_log_tail(path: Path) -> str:
         return stream.read().decode("utf-8", errors="replace")[-MAX_BACKGROUND_OUTPUT_CHARS:]
 
 
-def background_job_payload(job: BackgroundJob) -> dict[str, Any]:
-    return {
+def _read_log_slice(path: Path, offset: int) -> tuple[str, int, bool]:
+    """Read output produced after a caller-owned byte offset."""
+
+    if not path.exists():
+        return "", 0, False
+    with path.open("rb") as stream:
+        size = stream.seek(0, os.SEEK_END)
+        requested = min(size, max(0, int(offset)))
+        truncated = size - requested > MAX_BACKGROUND_OUTPUT_BYTES
+        start = max(requested, size - MAX_BACKGROUND_OUTPUT_BYTES)
+        stream.seek(start)
+        output = stream.read().decode("utf-8", errors="replace")[-MAX_BACKGROUND_OUTPUT_CHARS:]
+    return output, size, truncated
+
+
+def background_job_payload(job: BackgroundJob, *, output_offset: int | None = None) -> dict[str, Any]:
+    output = job.output_preview
+    next_output_offset: int | None = None
+    output_truncated = False
+    if output_offset is not None and job.log_path:
+        output, next_output_offset, output_truncated = _read_log_slice(Path(job.log_path), output_offset)
+    payload = {
         "id": job.id,
+        "session_id": job.id,
         "run_id": job.run_id,
         "status": job.status,
         "command": job.command,
@@ -73,7 +96,7 @@ def background_job_payload(job: BackgroundJob) -> dict[str, Any]:
         "pid": job.pid,
         "exit_code": job.exit_code,
         "log_path": job.log_path,
-        "output": job.output_preview,
+        "output": output,
         "error": job.error,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "started_at": job.started_at.isoformat() if job.started_at else None,
@@ -82,6 +105,10 @@ def background_job_payload(job: BackgroundJob) -> dict[str, Any]:
         "observed_by_run_id": job.observed_by_run_id,
         "waiting_run_id": job.waiting_run_id,
     }
+    if next_output_offset is not None:
+        payload["next_output_offset"] = next_output_offset
+        payload["output_truncated"] = output_truncated
+    return payload
 
 
 class BackgroundJobManager:
@@ -343,18 +370,24 @@ class BackgroundJobManager:
         with self._lock:
             self._shutting_down = False
         with database_module.SessionLocal() as db:
-            stale_ids = list(db.scalars(select(BackgroundJob.id).where(BackgroundJob.status == "running")))
+            stale_jobs = list(
+                db.execute(
+                    select(BackgroundJob.id, BackgroundJob.log_path).where(
+                        BackgroundJob.status == "running"
+                    )
+                )
+            )
             queued = [str(item) for item in db.scalars(
                 select(BackgroundJob.id).where(BackgroundJob.status == "queued")
             )]
             db.commit()
-        for job_id in stale_ids:
+        for job_id, log_path in stale_jobs:
             self._finish(
                 str(job_id),
                 "failed",
                 None,
                 "backend restarted while the background job was running",
-                None,
+                Path(log_path) if log_path else None,
             )
         for job_id in queued:
             self.launch(job_id)
@@ -401,17 +434,39 @@ class BackgroundJobToolStore:
     def start(
         self,
         *,
-        command: str,
+        command: str | list[str],
         timeout: int = 3600,
         shell: str = "command",
         plan_step_id: str = "",
+        cwd: str = ".",
     ) -> ToolResult:
-        normalized_command = str(command or "").strip()
         normalized_shell = str(shell or "command").strip().lower()
+        if normalized_shell == "powershell":
+            if not isinstance(command, str):
+                return ToolResult("background_run", False, "PowerShell command must be a string", error_code="invalid_arguments")
+            normalized_command = command.strip()
+        else:
+            try:
+                command_parts = builtins._split_command(command)
+            except ValueError as exc:
+                return ToolResult("background_run", False, str(exc), error_code="invalid_arguments")
+            normalized_command = (
+                subprocess.list2cmdline(command_parts)
+                if os.name == "nt"
+                else shlex.join(command_parts)
+            )
         if not normalized_command:
             return ToolResult("background_run", False, "command is required", error_code="invalid_arguments")
         if normalized_shell not in {"command", "powershell"}:
             return ToolResult("background_run", False, "shell must be command or powershell", error_code="invalid_arguments")
+        workspace_root = Path(self.workspace_root)
+        working_directory = (workspace_root / str(cwd or ".")).resolve()
+        try:
+            working_directory.relative_to(workspace_root)
+        except ValueError:
+            return ToolResult("background_run", False, "cwd escapes workspace", error_code="path_outside_workspace")
+        if not working_directory.is_dir():
+            return ToolResult("background_run", False, "cwd is not a directory", error_code="not_directory")
         timeout_seconds = min(MAX_BACKGROUND_TIMEOUT_SECONDS, max(1, int(timeout)))
         with database_module.SessionLocal() as db:
             if db.get_bind().dialect.name == "sqlite":
@@ -450,7 +505,7 @@ class BackgroundJobToolStore:
                 run_id=self.run_id,
                 session_id=self.session_id,
                 workspace_id=self.workspace_id,
-                workspace_root=self.workspace_root,
+                workspace_root=str(working_directory),
                 command=normalized_command,
                 shell=normalized_shell,
                 status="queued",
@@ -471,6 +526,7 @@ class BackgroundJobToolStore:
             changed=True,
             metadata={
                 "background_job_id": job.id,
+                "session_id": job.id,
                 "background_job_active": True,
                 "plan_step_id": job.plan_step_id or "",
             },
@@ -481,11 +537,12 @@ class BackgroundJobToolStore:
         *,
         task_id: str | None = None,
         wait: bool = False,
-        wait_timeout: int = MAX_BACKGROUND_TIMEOUT_SECONDS,
+        wait_timeout: float = MAX_BACKGROUND_TIMEOUT_SECONDS,
+        output_offset: int = 0,
         _cancel_event: threading.Event | None = None,
     ) -> ToolResult:
         wait_started_at = time.monotonic()
-        deadline = time.monotonic() + min(MAX_BACKGROUND_TIMEOUT_SECONDS, max(1, int(wait_timeout)))
+        deadline = time.monotonic() + min(MAX_BACKGROUND_TIMEOUT_SECONDS, max(0.0, float(wait_timeout)))
         while True:
             with database_module.SessionLocal() as db:
                 ownership = self._ownership_clause()
@@ -504,7 +561,7 @@ class BackgroundJobToolStore:
                         job.observed_at = _utcnow()
                         job.observed_by_run_id = self.run_id
                         db.commit()
-                    payload: Any = background_job_payload(job)
+                    payload: Any = background_job_payload(job, output_offset=output_offset)
                     statuses = {job.status}
                 else:
                     jobs = list(db.scalars(query.order_by(BackgroundJob.created_at.asc())))
@@ -525,6 +582,8 @@ class BackgroundJobToolStore:
                     error_code=None if ok else "background_job_failed",
                     metadata={
                         "background_job_active": not terminal,
+                        "session_id": str(task_id or ""),
+                        "next_output_offset": payload.get("next_output_offset", 0) if isinstance(payload, dict) else 0,
                         "background_wait_seconds": max(0.0, time.monotonic() - wait_started_at) if wait else 0.0,
                     },
                 )
@@ -539,23 +598,36 @@ class BackgroundJobToolStore:
             if time.monotonic() >= deadline:
                 return ToolResult(
                     "check_background",
-                    False,
+                    True,
                     json.dumps(payload, ensure_ascii=False),
-                    error_code="background_wait_timeout",
                     metadata={
                         "background_job_active": True,
+                        "background_wait_timed_out": True,
+                        "session_id": str(task_id or ""),
+                        "next_output_offset": payload.get("next_output_offset", 0) if isinstance(payload, dict) else 0,
                         "background_wait_seconds": max(0.0, time.monotonic() - wait_started_at),
                     },
                 )
             time.sleep(0.25)
 
-    def write_stdin(self, *, task_id: str, input: str, close: bool = False) -> ToolResult:
+    def write_stdin(
+        self,
+        *,
+        task_id: str,
+        input: str,
+        close: bool = False,
+        wait_ms: int = 250,
+        output_offset: int = 0,
+    ) -> ToolResult:
         normalized_id = str(task_id or "").strip()
         if not normalized_id:
             return ToolResult("write_stdin", False, "task_id is required", error_code="invalid_arguments")
         with database_module.SessionLocal() as db:
+            ownership = self._ownership_clause()
+            if self.session_id is not None:
+                ownership = BackgroundJob.session_id == self.session_id
             job = db.scalar(select(BackgroundJob).where(
-                self._ownership_clause(),
+                ownership,
                 BackgroundJob.id == normalized_id,
             ))
             if job is None:
@@ -570,8 +642,19 @@ class BackgroundJobToolStore:
         error = background_job_manager.send_input(normalized_id, input, close=bool(close))
         if error:
             return ToolResult("write_stdin", False, error, error_code="stdin_unavailable")
-        payload = {"task_id": normalized_id, "chars_sent": len(str(input)), "stdin_closed": bool(close)}
-        return ToolResult("write_stdin", True, json.dumps(payload, ensure_ascii=False), changed=True)
+        result = self.check(
+            task_id=normalized_id,
+            wait=True,
+            wait_timeout=min(MAX_BACKGROUND_TIMEOUT_SECONDS, max(0, int(wait_ms))) / 1000,
+            output_offset=output_offset,
+        )
+        payload = json.loads(result.content)
+        payload["chars_sent"] = len(str(input))
+        payload["stdin_closed"] = bool(close)
+        result.tool_name = "write_stdin"
+        result.content = json.dumps(payload, ensure_ascii=False)
+        result.changed = True
+        return result
 
     def unresolved_jobs(self) -> list[dict[str, Any]]:
         with database_module.SessionLocal() as db:

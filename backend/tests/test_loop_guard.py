@@ -587,7 +587,7 @@ async def test_runtime_stops_repeated_model_tool_call(tmp_path) -> None:
     runtime = AgentRuntime(
         model_call=model_call,
         tool_registry=create_default_registry(str(tmp_path)),
-        config=RuntimeConfig(api_base_delay=0),
+        config=RuntimeConfig(api_base_delay=0, identical_call_limit=3),
     )
     outcome = await runtime.run(system_prompt="safe", recent_messages=[])
     assert outcome.status == "stopped"
@@ -624,7 +624,8 @@ async def test_runtime_stops_after_four_failed_no_progress_steps(tmp_path) -> No
 
     runtime = AgentRuntime(
         model_call=model_call,
-        tool_registry=create_default_registry(str(tmp_path)),
+        tool_registry=create_default_registry(str(tmp_path), workflow_profile_id="general"),
+        config=RuntimeConfig(no_progress_limit=4),
     )
     outcome = await runtime.run(system_prompt="safe", recent_messages=[])
     assert outcome.status == "stopped"
@@ -663,6 +664,7 @@ async def test_coding_runtime_gets_one_recovery_turn_before_no_progress_stop(tmp
             workflow_profile_id="coding",
             permission_mode="full",
         ),
+        config=RuntimeConfig(no_progress_limit=4),
     )
 
     outcome = await runtime.run(system_prompt="safe", recent_messages=[])
@@ -682,6 +684,95 @@ async def test_coding_runtime_gets_one_recovery_turn_before_no_progress_stop(tmp
 
 
 @pytest.mark.asyncio
+async def test_coding_runtime_recovers_once_from_tool_errors_before_any_edit(tmp_path) -> None:
+    turns = 0
+    recovery_messages: list[dict] = []
+
+    async def model_call(**kwargs) -> ModelTurn:
+        nonlocal turns, recovery_messages
+        turns += 1
+        if turns <= 4:
+            return ModelTurn(
+                tool_calls=[ModelToolCall(f"bad-{turns}", f"missing-{turns}", {})]
+            )
+        recovery_messages = [dict(item) for item in kwargs["messages"]]
+        return ModelTurn(content="Stopped repeating invalid tool calls.")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=["read", "rg"],
+            workflow_profile_id="debug",
+        ),
+        config=RuntimeConfig(no_progress_limit=4),
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert outcome.tool_calls == 4
+    recovery_context = "\n".join(
+        str(item.get("content") or "") for item in recovery_messages
+    )
+    assert "error_code" in recovery_context
+    assert "不要重复相同调用" in recovery_context
+
+
+@pytest.mark.asyncio
+async def test_stream_activity_resets_model_idle_timeout(tmp_path) -> None:
+    async def model_call(*, on_delta, **_kwargs) -> ModelTurn:
+        await asyncio.sleep(0.3)
+        await on_delta("still working")
+        await asyncio.sleep(0.3)
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+        config=RuntimeConfig(model_timeout_seconds=0.5, api_max_attempts=1),
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert outcome.output == "done"
+
+
+@pytest.mark.asyncio
+async def test_stream_idle_after_activity_is_not_retried(tmp_path) -> None:
+    calls = 0
+    cancelled = asyncio.Event()
+
+    async def model_call(*, on_delta, **_kwargs) -> ModelTurn:
+        nonlocal calls
+        calls += 1
+        await on_delta("partial")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+        config=RuntimeConfig(model_timeout_seconds=0.01, api_max_attempts=3, api_base_delay=0),
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "failed"
+    assert calls == 1
+    assert cancelled.is_set()
+    assert any(
+        event.get("type") == "model_failed"
+        and event.get("error_type") == "PartialModelIdleTimeout"
+        for event in outcome.events
+    )
+
+
+@pytest.mark.asyncio
 async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> None:
     turns = 0
 
@@ -696,7 +787,11 @@ async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> Non
         assert kwargs["messages"][-1]["tool_call_id"] == "approved-write"
         return ModelTurn(content="完成")
 
-    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"))
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
+        config=RuntimeConfig(no_progress_limit=4),
+    )
     waiting = await runtime.run(system_prompt="safe", recent_messages=[], mode="auto")
     resumed = await runtime.resume_after_approval(waiting)
     assert resumed.status == "completed"
@@ -974,6 +1069,38 @@ async def test_runtime_aggregates_usage_across_all_model_turns(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_explicit_token_budget_stops_before_executing_another_tool(tmp_path) -> None:
+    calls = 0
+
+    async def model_call(**_kwargs) -> ModelTurn:
+        nonlocal calls
+        calls += 1
+        return ModelTurn(
+            tool_calls=[ModelToolCall("read", "list_files", {"path": "."})],
+            usage={
+                "request_count": 1,
+                "input_tokens": 18,
+                "output_tokens": 2,
+                "total_tokens": 20,
+            },
+        )
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+        config=RuntimeConfig(max_task_tokens=20),
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert calls == 1
+    assert outcome.status == "stopped"
+    assert outcome.stop_reason == "max_task_tokens"
+    assert outcome.tool_calls == 0
+    assert outcome.usage["total_tokens"] == 20
+
+
+@pytest.mark.asyncio
 async def test_approval_resume_carries_usage_forward_without_double_counting(tmp_path) -> None:
     turns = 0
 
@@ -1020,7 +1147,11 @@ async def test_approval_resume_preserves_seen_observations_for_no_progress_guard
             return ModelTurn(tool_calls=[ModelToolCall("read-again", "read_file", {"path": "stable.txt"})])
         return ModelTurn(tool_calls=[ModelToolCall(f"missing-{turns}", f"missing-{turns}", {})])
 
-    runtime = AgentRuntime(model_call=model_call, tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"))
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
+        config=RuntimeConfig(no_progress_limit=4),
+    )
     waiting = await runtime.run(system_prompt="safe", recent_messages=[])
     resumed = await runtime.resume_after_approval(waiting)
     assert resumed.status == "stopped"

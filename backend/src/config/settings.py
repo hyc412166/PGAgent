@@ -16,14 +16,20 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8765
     log_level: str = "INFO"
-    # Zero/None disables aggregate run limits. Loop safety is enforced by the
-    # repeated-call and no-progress guards instead of an arbitrary task size.
+    # Zero/None disables aggregate step/call limits. Repetition and no-progress
+    # heuristics are opt-in; durable task recovery is not cut off by default.
     max_steps: int | None = 0
     max_tool_calls: int | None = 0
-    max_identical_calls: int = 3
-    no_progress_limit: int = 4
-    model_timeout_seconds: float = 90.0
-    max_run_seconds: float | None = 1_800.0
+    max_identical_calls: int = 0
+    no_progress_limit: int = 0
+    # 流式模型连续无事件的 idle 超时；整次任务默认没有墙钟上限。
+    model_timeout_seconds: float = 300.0
+    max_run_seconds: float | None = None
+    model_request_timeout_seconds: float = 300.0
+    model_request_retries: int = 4
+    model_stream_retries: int = 5
+    delegated_wait_timeout_seconds: float = 30.0
+    max_task_tokens: int | None = None
     context_limit_tokens: int = 200_000
     compact_threshold_tokens: int = 180_000
     completion_verification_max_attempts: int = 3

@@ -42,7 +42,7 @@ from src.persistence.database import (
     UsageRecord,
     Workspace,
 )
-from src.agent import AgentRuntime, RunOutcome
+from src.agent import RunOutcome
 from src.attachments.contracts import ATTACHMENT_TOOL_NAMES
 from src.tools.types import ToolResult
 
@@ -71,9 +71,6 @@ from .delegation_format import (
     _model_id_for_delegate,
     _single_line,
 )
-from .runtime_factory import RunRuntimeFactory
-from .runtime_preparer import RunRuntimePreparer
-from .continuation import RunContinuationCodec
 
 _CHILD_FORBIDDEN_ORCHESTRATION_TOOLS = frozenset({
     "task",
@@ -189,6 +186,7 @@ class _SubagentTaskDelegate:
             connection.id == str(binding.get("model_connection_id") or "")
             and connection.enabled
             and connection.provider == str(binding.get("provider") or "")
+            and connection.api_protocol == str(binding.get("api_protocol") or "chat_completions")
             and connection.base_url == str(binding.get("base_url") or "")
             and connection.secret_ref == str(binding.get("secret_ref") or "")
             and _configuration_digest(connection.custom_headers or {})
@@ -230,13 +228,14 @@ class _SubagentTaskDelegate:
         return {
             "awaiting_approval": "delegate_child_awaiting_approval",
             "waiting_background": "delegate_child_waiting_event",
+            "in_progress": "delegate_child_waiting_event",
             "stopped": "delegate_child_stopped",
             "failed": "delegate_child_failed",
         }.get(status, "delegate_child_incomplete") if status != "completed" else None
 
     def _tool_result_from_payload(self, payload: dict[str, Any]) -> ToolResult:
         status = str(payload.get("status") or "failed")
-        waiting_event = status == "waiting_background"
+        waiting_event = status in {"waiting_background", "in_progress"}
         delegation_id = str(payload.get("delegation_id") or payload.get("task_id") or "")
         return ToolResult(
             "task",
@@ -257,7 +256,7 @@ class _SubagentTaskDelegate:
                 # A child approval is not an ordinary failed observation.  The
                 # parent runtime uses this explicit marker to stop without
                 # inventing a final answer while the child remains resumable.
-                "delegated_child_awaiting_approval": status in {"awaiting_approval", "waiting_background"},
+                "delegated_child_awaiting_approval": status in {"awaiting_approval", "waiting_background", "in_progress"},
                 "delegated_child_waiting_event": waiting_event,
             },
         )
@@ -384,6 +383,7 @@ class _SubagentTaskDelegate:
             model_connection_id=connection.id,
             thinking_level=thinking_level,
             custom_headers=dict(connection.custom_headers or {}),
+            api_protocol=connection.api_protocol,
         )
         binding = {
             "delegation_version": 1,
@@ -399,6 +399,7 @@ class _SubagentTaskDelegate:
             "agents_instruction_sources": agents_instruction_sources,
             "model_connection_id": connection.id,
             "provider": connection.provider,
+            "api_protocol": connection.api_protocol,
             "base_url": connection.base_url,
             "secret_ref": connection.secret_ref,
             "model_id": model_id,
@@ -421,6 +422,7 @@ class _SubagentTaskDelegate:
         return {
             "model_connection_id": str(binding.get("model_connection_id") or ""),
             "provider": str(binding.get("provider") or ""),
+            "api_protocol": str(binding.get("api_protocol") or "chat_completions"),
             "model_id": str(binding.get("model_id") or ""),
             "thinking_level": str(binding.get("thinking_level") or "auto"),
             "workflow_profile_id": str(binding.get("workflow_profile_id") or "auto"),
@@ -708,89 +710,35 @@ class _SubagentTaskDelegate:
             "child_agent_name": _single_line(child.name, limit=120),
             "task_title": self._task_title(task),
         })
-        runtime_context = {
-            "runtime_binding": child_binding,
-            "session_id": child_run.session_id,
-            "agent_id": child.id,
-            "workspace_id": child_run.workspace_id,
-            "workspace_root": str(child_binding["workspace_root"]),
-            "allowed_tool_names": list(child_binding["allowed_tool_names"]),
-            "permission_mode": str(child_binding["permission_mode"]),
-            "skill_instructions": child_skill_instructions,
-            "todo_state": [],
-            "memory_use_enabled": child_memory_use_enabled,
-            "memory_session_id": None,
-            "provider": provider_config,
-            "max_run_seconds": child_max_run_seconds,
-            "model_timeout_seconds": (
-                min(float(settings.model_timeout_seconds), child_max_run_seconds)
-                if child_max_run_seconds is not None
-                else settings.model_timeout_seconds
-            ),
-            "terminal_background_job_ids": [],
-            "stream_enabled": False,
-        }
-        assembly = RunRuntimeFactory().create(
-            run_id=child_run_id,
-            context=runtime_context,
-            coordinator=self.coordinator,
-            runtime_type=AgentRuntime,
-        )
-        child_runtime = assembly.runtime
-        child_background_store = assembly.background_store
-        await RunRuntimePreparer().prepare(
-            run_id=child_run_id,
-            runtime=child_runtime,
-            context=runtime_context,
-            progress_sink=type(self.coordinator)._event_sink(child_run_id),
-            registry=assembly.registry,
-        )
-        type(self.coordinator)._install_completion_verifier(
-            child_runtime,
-            {
-                "runtime_binding": child_binding,
-                "background_store": child_background_store,
-            },
-        )
-        try:
-            outcome = await child_runtime.run(
-                system_prompt=str(child_binding["agent_system_prompt"]),
-                agent_instructions=(
-                    "耗时命令可先用 background_run 启动；完成其他独立工作后，必须调用 "
-                    "check_background(wait=true) 等待并读取终态，不能把入队当作完成。"
-                    if {"background_run", "check_background"}.issubset(
-                        set(child_binding["allowed_tool_names"])
-                    ) else ""
-                ),
-                workspace_rules=render_workspace_rules(
-                    str(child_binding["workspace_root"]),
-                    str(child_binding.get("agents_instructions") or ""),
-                ),
-                memory_index=str(child_binding.get("memory_index") or ""),
-                recent_messages=[{"role": "user", "content": str(child_binding["rendered_task"])}],
-                mode="auto",
-            )
-        except asyncio.CancelledError:
-            type(self.coordinator)._persist_failure(child_run_id, RuntimeError("Delegated child execution was cancelled"))
-            raise
-        except Exception as exc:
-            type(self.coordinator)._persist_failure(child_run_id, exc)
+        if not self.coordinator.launch(child_run_id):
+            # 协调器关闭或启动竞态时不会再有 worker 负责落库；此处立即
+            # 将 child/delegation/plan step 统一收敛为失败，避免侧栏永久卡在进行中。
+            with database_module.SessionLocal() as db:
+                child_run_record = db.get(Run, child_run_id)
+                if child_run_record is not None and child_run_record.status not in {"completed", "failed", "stopped"}:
+                    child_run_record.status = "failed"
+                    child_run_record.error_message = "子 Agent 运行未能交给协调器执行"
+                    child_run_record.finished_at = _utcnow()
+                if child_run_record is not None:
+                    self.coordinator.reconcile_delegated_child_terminal(
+                        db,
+                        child_run_record,
+                        status="failed",
+                        error=child_run_record.error_message,
+                        error_code="delegate_execution_error",
+                        runtime_binding=child_binding,
+                    )
+                db.commit()
             return self._blocked_result(
                 task_id=delegation_id,
                 child_run_id=child_run_id,
                 agent=child,
                 code="delegate_execution_error",
-                message=str(exc) or type(exc).__name__,
+                message="子 Agent 运行未能交给协调器执行",
             )
-
-        outcome.runtime_binding = RunContinuationCodec.capture_registry_binding(
-            child_binding,
-            assembly.registry,
-        )
-        type(self.coordinator)._persist_outcome(
+        await self.coordinator.wait_for_run(
             child_run_id,
-            outcome,
-            child_background_store.delivered_terminal_ids(),
+            timeout_seconds=settings.delegated_wait_timeout_seconds,
         )
         with database_module.SessionLocal() as db:
             persisted_delegation = db.get(DelegatedTask, delegation_id)

@@ -24,6 +24,48 @@ from src.tools import create_default_registry
 FIXTURE_SERVER = Path(__file__).parent / "fixtures" / "mcp_echo_server.py"
 
 
+def test_mcp_tool_timeout_defaults_to_five_minutes() -> None:
+    config = McpServerConfig(command="fixture")
+    assert config.tool_timeout_sec == 300
+
+
+@pytest.mark.asyncio
+async def test_mcp_runtime_owns_one_tool_timeout_and_cancels_the_call(tmp_path: Path) -> None:
+    config = McpConfig(mcpServers={
+        "slow": McpServerConfig(command="fixture", tool_timeout_sec=0.02),
+    })
+    runtime = McpSessionRuntime("timeout", tmp_path, config, McpToolCatalogCache())
+    cancelled = asyncio.Event()
+    observed_sdk_timeout: list[float | None] = []
+
+    class FakeClient:
+        async def call_tool(
+            self,
+            _name: str,
+            _arguments: dict,
+            *,
+            read_timeout_seconds: float | None,
+        ) -> object:
+            observed_sdk_timeout.append(read_timeout_seconds)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    server = ConnectedMcpServer("slow", config.servers["slow"], tmp_path)
+    runtime.servers["slow"] = server
+    server.client = FakeClient()  # type: ignore[assignment]
+    server.ready = True
+
+    result = await runtime.call_tool("slow", "echo", {})
+
+    assert result.ok is False
+    assert result.error_code == "mcp_timeout"
+    assert observed_sdk_timeout == [None]
+    assert cancelled.is_set()
+
+
 def _write_config(path: Path, *, required: bool = True) -> None:
     path.write_text(json.dumps({
         "mcpServers": {

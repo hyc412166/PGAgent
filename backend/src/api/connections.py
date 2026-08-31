@@ -35,6 +35,67 @@ def _models_url(base_url: str) -> str:
     return f"{base_url.strip().rstrip('/')}/models"
 
 
+def _protocol_url(base_url: str, protocol: str) -> str:
+    endpoint = "responses" if protocol == "responses" else "chat/completions"
+    return f"{base_url.strip().rstrip('/')}/{endpoint}"
+
+
+def probe_protocol(
+    base_url: str,
+    api_key: str,
+    protocol: str,
+    model_id: str | None,
+    custom_headers: dict[str, str] | None = None,
+) -> ConnectionTestResult:
+    """Verify the selected wire endpoint with the smallest practical model request."""
+
+    if not model_id:
+        return ConnectionTestResult(
+            success=False, category="provider_error",
+            message="检测模型协议前需要先选择模型 ID", retryable=False,
+        )
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers.update(custom_headers or {})
+    if protocol == "responses":
+        payload: dict[str, Any] = {
+            "model": model_id,
+            "input": "ping",
+            "max_output_tokens": 16,
+            "store": False,
+            "stream": True,
+        }
+    else:
+        payload = {"model": model_id, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            if protocol == "responses":
+                # 运行时始终消费 Responses 流；探测也必须走同一条路径，避免
+                # “普通请求成功、首次流式调用才失败”的假阳性。
+                with client.stream(
+                    "POST", _protocol_url(base_url, protocol), headers=headers, json=payload
+                ) as response:
+                    response.read()
+            else:
+                response = client.post(_protocol_url(base_url, protocol), headers=headers, json=payload)
+    except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+        return ConnectionTestResult(success=False, category="network_error", message=f"协议检测失败：{exc}", retryable=True)
+    if response.status_code in {401, 403}:
+        category = "invalid_credentials"
+    elif response.status_code == 429:
+        category = "rate_limited"
+    elif response.status_code >= 500:
+        category = "provider_error"
+    elif response.status_code >= 400:
+        category = "provider_error"
+    else:
+        return ConnectionTestResult(success=True, category="ok", message=f"已确认支持 {protocol}", retryable=False,
+                                    http_status=response.status_code, models=[model_id])
+    return ConnectionTestResult(success=False, category=category,
+                                message=f"{protocol} 协议检测失败（HTTP {response.status_code}）",
+                                retryable=response.status_code in {429} or response.status_code >= 500,
+                                http_status=response.status_code)
+
+
 def _parse_models(payload: Any) -> list[str]:
     if not isinstance(payload, dict):
         return []
@@ -170,13 +231,22 @@ def create_connection(payload: ModelConnectionCreate, db: Session = Depends(get_
                 "hint": "Supply manual_models when this provider does not expose /models",
             },
         )
-    _save_or_503(secret_ref, payload.api_key)
     available_models = result.models or payload.manual_models
     default_model = payload.default_model or (available_models[0] if available_models else None)
+    protocol_result = probe_protocol(
+        payload.base_url, payload.api_key, payload.api_protocol, default_model, payload.custom_headers,
+    )
+    if not protocol_result.success:
+        raise HTTPException(status_code=400, detail={
+            "message": protocol_result.message, "category": protocol_result.category,
+            "retryable": protocol_result.retryable, "http_status": protocol_result.http_status,
+        })
+    _save_or_503(secret_ref, payload.api_key)
     connection = ModelConnection(
         id=connection_id,
         name=payload.name,
         provider=payload.provider,
+        api_protocol=payload.api_protocol,
         base_url=payload.base_url.strip().rstrip("/"),
         secret_ref=secret_ref,
         discovered_models=result.models,
@@ -187,7 +257,7 @@ def create_connection(payload: ModelConnectionCreate, db: Session = Depends(get_
         status="connected" if result.success else "manual",
         last_error=None if result.success else result.message,
         last_checked_at=datetime.now(timezone.utc),
-        capabilities={"model_discovery": result.success},
+        capabilities={"model_discovery": result.success, payload.api_protocol: True},
         enabled=payload.enabled,
     )
     db.add(connection)
@@ -231,6 +301,7 @@ def update_connection(
             value = value.strip().rstrip("/")
         setattr(connection, key, value)
     should_discover = payload.api_key is not None or payload.base_url is not None or payload.custom_headers is not None
+    should_probe = should_discover or payload.api_protocol is not None or payload.default_model is not None
     if should_discover:
         try:
             api_key = payload.api_key or get_api_key(connection.secret_ref)
@@ -256,6 +327,25 @@ def update_connection(
                 status_code=400,
                 detail={"message": result.message, "category": result.category, "retryable": result.retryable},
             )
+    if should_probe:
+        try:
+            api_key = payload.api_key or get_api_key(connection.secret_ref)
+        except SecretStoreError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if not api_key:
+            raise HTTPException(status_code=409, detail="Stored API key is missing")
+        protocol_result = probe_protocol(
+            connection.base_url, api_key, connection.api_protocol,
+            connection.default_model or next(iter(connection.manual_models or connection.discovered_models), None),
+            connection.custom_headers,
+        )
+        if not protocol_result.success:
+            db.rollback()
+            raise HTTPException(status_code=400, detail={
+                "message": protocol_result.message, "category": protocol_result.category,
+                "retryable": protocol_result.retryable,
+            })
+        connection.capabilities = {**connection.capabilities, connection.api_protocol: True}
     if payload.api_key is not None:
         _save_or_503(connection.secret_ref, payload.api_key)
     try:
@@ -282,13 +372,16 @@ def test_connection(connection_id: str, db: Session = Depends(get_db)) -> Connec
             retryable=False,
         )
     else:
-        result = discover_models(connection.base_url, api_key, connection.custom_headers)
+        result = probe_protocol(
+            connection.base_url, api_key, connection.api_protocol,
+            connection.default_model or next(iter(connection.manual_models or connection.discovered_models), None),
+            connection.custom_headers,
+        )
     connection.last_checked_at = datetime.now(timezone.utc)
     connection.status = "connected" if result.success else result.category
     connection.last_error = None if result.success else result.message
     if result.success:
-        connection.discovered_models = result.models
-        connection.capabilities = {**connection.capabilities, "model_discovery": True}
+        connection.capabilities = {**connection.capabilities, connection.api_protocol: True}
     db.commit()
     return result
 

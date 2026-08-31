@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -24,6 +25,7 @@ def run_validation(
     timeout_seconds: float = 120,
     approved: bool = False,
     track_worktree_changes: bool = True,
+    _cancel_event: threading.Event | None = None,
 ) -> ToolResult:
     normalized_kind = str(kind or "test").strip().lower()
     if normalized_kind not in VALIDATION_KINDS:
@@ -36,6 +38,7 @@ def run_validation(
         cwd=cwd,
         timeout_seconds=timeout_seconds,
         approved=approved,
+        _cancel_event=_cancel_event,
     )
     if result.approval_required:
         result.tool_name = "validate"

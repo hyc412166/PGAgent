@@ -174,7 +174,9 @@ class ConnectedMcpServer:
                     httpx2.AsyncClient(headers=dict(self.config.headers), follow_redirects=False)
                 )
                 target = streamable_http_client(str(self.config.url), http_client=http_client)
-            client = Client(target, read_timeout_seconds=self.config.tool_timeout_sec)
+            # PGAgent owns one observable timeout boundary around each call.
+            # Leaving the SDK timer disabled avoids competing cancellations.
+            client = Client(target, read_timeout_seconds=None)
             self.client = await stack.enter_async_context(client)
             self.protocol_version = str(client.protocol_version)
             info = client.server_info
@@ -430,7 +432,7 @@ class McpSessionRuntime:
         try:
             async with server.call_lock if not server.config.supports_parallel_tool_calls else _null_async_context():
                 result = await asyncio.wait_for(
-                    server.client.call_tool(tool_name, arguments, read_timeout_seconds=server.config.tool_timeout_sec),
+                    server.client.call_tool(tool_name, arguments, read_timeout_seconds=None),
                     timeout=server.config.tool_timeout_sec,
                 )
         except asyncio.TimeoutError:
@@ -486,6 +488,8 @@ class McpSessionRuntime:
             return ToolResult("ReadMcpResource", False, f"MCP server {server_name!r} is not connected", error_code="mcp_not_connected")
         try:
             result = await asyncio.wait_for(server.client.read_resource(uri), timeout=server.config.tool_timeout_sec)
+        except asyncio.TimeoutError:
+            return ToolResult("ReadMcpResource", False, "MCP resource read timed out", error_code="mcp_timeout")
         except Exception as exc:
             return ToolResult("ReadMcpResource", False, f"MCP resource read failed: {type(exc).__name__}: {exc}", error_code="mcp_resource_error")
         content = [_model_dump(item) for item in result.contents]

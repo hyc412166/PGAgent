@@ -236,6 +236,37 @@ async def test_delegate_batch_runs_ready_nodes_concurrently_then_dependency(grap
 
 
 @pytest.mark.asyncio
+async def test_delegate_without_step_id_requests_existing_plan_link(graph_db, tmp_path: Path) -> None:
+    class Delegate:
+        prepared: list[dict[str, object]] = []
+
+        def prepare_graph(self, specs, *, call_id=None):  # type: ignore[no-untyped-def]
+            self.prepared = [dict(item) for item in specs]
+
+        async def __call__(self, _task: str, **_kwargs) -> ToolResult:  # type: ignore[no-untyped-def]
+            return ToolResult("task", True, json.dumps({"status": "completed"}))
+
+    delegate = Delegate()
+    result = await builtins.delegate_task_async(
+        WorkspaceSandbox(tmp_path),
+        task="Inspect the failure",
+        agent_id="debugger",
+        delegate=delegate,
+        call_id="generated-call",
+    )
+
+    assert result.ok
+    assert delegate.prepared == [{
+        "id": "delegate-generated-call-1",
+        "task": "Inspect the failure",
+        "agent_id": "debugger",
+        "depends_on": [],
+        "workspace_mode": "shared",
+        "link_existing": True,
+    }]
+
+
+@pytest.mark.asyncio
 async def test_delegate_preflight_failure_settles_failed_and_downstream_steps(
     graph_db, tmp_path: Path
 ) -> None:
@@ -328,3 +359,123 @@ def test_replaying_completed_delegated_graph_keeps_task_completed(graph_db) -> N
         task = db.get(DurableTask, run.task_id)
         assert task.status == "completed"
         assert task.active_step_id is None
+
+
+def test_generated_delegation_links_unique_ready_subagent_plan_step(graph_db) -> None:
+    run_id = _create_run()
+    sync_todos_for_run(run_id, [
+        {
+            "id": "inspect",
+            "content": "Ask a debugging specialist to inspect the failure",
+            "status": "pending",
+            "executor_kind": "subagent",
+            "agent_id": DEFAULT_AGENT_ID,
+        },
+        {
+            "id": "implement",
+            "content": "Implement the fix",
+            "status": "pending",
+            "depends_on": ["inspect"],
+        },
+    ])
+
+    mapped = upsert_delegated_graph(
+        run_id,
+        [{
+            "id": "delegate-call-1",
+            "task": "Inspect the repository and report the root cause",
+            "agent_id": DEFAULT_AGENT_ID,
+            "link_existing": True,
+        }],
+        graph_call_id="call-1",
+    )
+
+    with database.SessionLocal() as db:
+        run = db.get(database.Run, run_id)
+        steps = list(db.query(PlanStep).filter_by(task_id=run.task_id).order_by(PlanStep.position))
+        assert [step.external_id for step in steps] == ["inspect", "implement"]
+        assert mapped["delegate-call-1"] == steps[0].id
+        assert steps[0].title == "Ask a debugging specialist to inspect the failure"
+        assert steps[0].description == "Inspect the repository and report the root cause"
+        assert dependency_map(db, run.task_id) == {
+            "implement": ["inspect"],
+            "inspect": [],
+        }
+
+
+def test_explicit_delegation_step_id_reuses_planned_step(graph_db) -> None:
+    run_id = _create_run()
+    sync_todos_for_run(run_id, [{
+        "id": "inspect",
+        "content": "Inspect the failure",
+        "status": "pending",
+        "executor_kind": "subagent",
+        "agent_id": DEFAULT_AGENT_ID,
+    }])
+
+    mapped = upsert_delegated_graph(
+        run_id,
+        [{
+            "id": "inspect",
+            "task": "Inspect the failure and report evidence",
+            "agent_id": DEFAULT_AGENT_ID,
+        }],
+        graph_call_id="explicit-call",
+    )
+
+    with database.SessionLocal() as db:
+        run = db.get(database.Run, run_id)
+        steps = list(db.query(PlanStep).filter_by(task_id=run.task_id))
+        assert len(steps) == 1
+        assert mapped["inspect"] == steps[0].id
+        assert steps[0].external_id == "inspect"
+
+
+def test_explicit_delegation_reuses_blocked_batch_steps_and_keeps_dependencies(graph_db) -> None:
+    run_id = _create_run()
+    sync_todos_for_run(run_id, [
+        {
+            "id": "inspect",
+            "content": "Inspect the failure",
+            "status": "pending",
+            "executor_kind": "subagent",
+            "agent_id": DEFAULT_AGENT_ID,
+        },
+        {
+            "id": "review",
+            "content": "Review the evidence",
+            "status": "pending",
+            "executor_kind": "subagent",
+            "agent_id": DEFAULT_AGENT_ID,
+            "depends_on": ["inspect"],
+        },
+    ])
+
+    mapped = upsert_delegated_graph(
+        run_id,
+        [
+            {
+                "id": "inspect",
+                "task": "Inspect the failure",
+                "agent_id": DEFAULT_AGENT_ID,
+                "depends_on": [],
+            },
+            {
+                "id": "review",
+                "task": "Review the evidence",
+                "agent_id": DEFAULT_AGENT_ID,
+                "depends_on": ["inspect"],
+            },
+        ],
+        graph_call_id="batch-call",
+    )
+
+    with database.SessionLocal() as db:
+        run = db.get(database.Run, run_id)
+        steps = list(db.query(PlanStep).filter_by(task_id=run.task_id))
+        assert len(steps) == 2
+        assert set(mapped.values()) == {step.id for step in steps}
+        assert dependency_map(db, run.task_id) == {
+            "inspect": [],
+            "review": ["inspect"],
+        }

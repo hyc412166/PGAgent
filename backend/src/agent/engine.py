@@ -276,6 +276,12 @@ class SynchronousModelTimeout(TimeoutError):
     retryable = False
 
 
+class PartialModelIdleTimeout(TimeoutError):
+    """A streamed response went idle after the provider had started output."""
+
+    retryable = False
+
+
 class RunTimeLimitExceeded(TimeoutError):
     """The cumulative active runtime crossed the configured safety fuse."""
 
@@ -295,6 +301,7 @@ class ModelTurn:
     reasoning_content: str = ""
     tool_calls: list[ModelToolCall] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
+    provider_payload: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_response(cls, response: Any) -> "ModelTurn":
@@ -343,6 +350,7 @@ class ModelTurn:
             reasoning_content=str(reasoning or ""),
             tool_calls=calls,
             usage=dict(response_payload.get("usage") or {}),
+            provider_payload=dict(response_payload.get("_pgagent_provider") or {}),
         )
 
 
@@ -350,13 +358,14 @@ class ModelTurn:
 class RuntimeConfig:
     max_steps: int | None = 0
     max_tool_calls: int | None = 0
-    identical_call_limit: int = 3
-    no_progress_limit: int = 4
+    identical_call_limit: int = 0
+    no_progress_limit: int = 0
     max_stagnation_recovery_attempts: int = 1
     api_max_attempts: int = 3
     api_base_delay: float = 0.5
-    model_timeout_seconds: float = 90.0
-    max_run_seconds: float | None = 1_800.0
+    model_timeout_seconds: float = 300.0
+    max_run_seconds: float | None = None
+    max_task_tokens: int | None = None
     observation_history_limit: int = 100_000
     event_sink_timeout_seconds: float = 5.0
     # Context budgeting reserves room for the model response and provider
@@ -423,6 +432,7 @@ class AgentRuntime:
         task_state_provider: TaskStateProvider | None = None,
     ) -> None:
         self.model_call = model_call
+        self._model_manages_retries = bool(getattr(model_call, "manages_retries", False))
         try:
             model_signature = inspect.signature(model_call)
             accepts_var_kwargs = any(
@@ -437,13 +447,20 @@ class AgentRuntime:
                 "on_thought_delta" in model_signature.parameters
                 or accepts_var_kwargs
             )
+            self._model_accepts_activity = (
+                "on_activity" in model_signature.parameters
+                or accepts_var_kwargs
+            )
             self._model_accepts_prompt_cache_key = (
                 "prompt_cache_key" in model_signature.parameters or accepts_var_kwargs
             )
+            self._model_accepts_retry = "on_retry" in model_signature.parameters or accepts_var_kwargs
         except (TypeError, ValueError):
             self._model_accepts_delta = False
             self._model_accepts_thought_delta = False
+            self._model_accepts_activity = False
             self._model_accepts_prompt_cache_key = False
+            self._model_accepts_retry = False
         self.tool_registry = tool_registry
         self.tool_router = tool_registry.router
         self.context_manager = context_manager or ContextManager()
@@ -576,6 +593,19 @@ class AgentRuntime:
             return None
         return max(0.0, limit - self._active_elapsed(prior_seconds, started_at))
 
+    def _task_token_decision(self, usage: Mapping[str, Any] | None) -> GuardDecision:
+        limit = self.config.max_task_tokens
+        if limit is None:
+            return GuardDecision.continue_()
+        consumed = normalize_usage(usage).get("total_tokens", 0)
+        if consumed >= limit:
+            return GuardDecision(
+                True,
+                "max_task_tokens",
+                f"本次运行已使用 {consumed} tokens，达到显式预算 {limit}",
+            )
+        return GuardDecision.continue_()
+
     async def run(
         self,
         *,
@@ -611,6 +641,8 @@ class AgentRuntime:
             raise ValueError("mode 必须是 auto")
         if self.config.max_run_seconds is not None and self.config.max_run_seconds < 0:
             raise ValueError("max_run_seconds 必须大于等于 0")
+        if self.config.max_task_tokens is not None and self.config.max_task_tokens < 0:
+            raise ValueError("max_task_tokens 必须大于等于 0")
         if self.config.observation_history_limit < 1:
             raise ValueError("observation_history_limit 必须大于 0")
         active_started_at = self.clock()
@@ -925,6 +957,16 @@ class AgentRuntime:
                     reason=time_decision.reason,
                 )
                 return stopped
+            token_decision = self._task_token_decision(state.get("usage"))
+            if token_decision.stop:
+                stopped = self._stop_state(state, token_decision)
+                stopped["events"] = await self._publish(
+                    stopped,
+                    "run_stopped",
+                    code=token_decision.code,
+                    reason=token_decision.reason,
+                )
+                return stopped
             step_decision = guard.before_step()
             if step_decision.stop:
                 stopped = self._stop_state(state, step_decision)
@@ -1002,8 +1044,26 @@ class AgentRuntime:
                 async def model_attempt() -> Any:
                     nonlocal offered_tool_names
                     buffered_candidate_deltas.clear()
+                    model_activity_seen = False
+                    timeout_scope: asyncio.Timeout | None = None
+
+                    async def on_activity() -> None:
+                        nonlocal model_activity_seen
+                        model_activity_seen = True
+                        if timeout_scope is None:
+                            return
+                        remaining = self._remaining_run_seconds(
+                            active_elapsed_base, active_started_at
+                        )
+                        idle_seconds = self.config.model_timeout_seconds
+                        if remaining is not None:
+                            idle_seconds = min(idle_seconds, max(remaining, 0.0))
+                        timeout_scope.reschedule(
+                            asyncio.get_running_loop().time() + idle_seconds
+                        )
 
                     async def on_delta(delta: str) -> None:
+                        await on_activity()
                         if self.completion_verifier is not None:
                             buffered_candidate_deltas.append(delta)
                             return
@@ -1017,6 +1077,7 @@ class AgentRuntime:
                         safe_delta = _safe_thought_text(delta)
                         if not safe_delta:
                             return
+                        await on_activity()
                         streamed_thought_deltas.append(safe_delta)
                         await self._publish_transient(
                             "thought_delta",
@@ -1044,8 +1105,17 @@ class AgentRuntime:
                         kwargs["on_delta"] = on_delta
                     if self._model_accepts_thought_delta:
                         kwargs["on_thought_delta"] = on_thought_delta
+                    if self._model_accepts_activity:
+                        kwargs["on_activity"] = on_activity
                     if self._model_accepts_prompt_cache_key and not recovery_prompt:
                         kwargs["prompt_cache_key"] = state.get("prompt_cache_key")
+                    if self._model_accepts_retry:
+                        async def provider_retry(stage: str, attempt: int, delay: float) -> None:
+                            await self._publish_transient(
+                                "model_retry", stage=stage, attempt=attempt,
+                                delay_seconds=round(delay, 3),
+                            )
+                        kwargs["on_retry"] = provider_retry
                     is_async_call = inspect.iscoroutinefunction(self.model_call)
 
                     async def invoke() -> Any:
@@ -1064,17 +1134,16 @@ class AgentRuntime:
                     if remaining_run_seconds is not None and remaining_run_seconds <= 0:
                         raise RunTimeLimitExceeded("active runtime limit reached")
                     request_timeout = self.config.model_timeout_seconds
-                    limited_by_run_fuse = False
                     if remaining_run_seconds is not None and remaining_run_seconds <= request_timeout:
                         request_timeout = remaining_run_seconds
-                        limited_by_run_fuse = True
                     try:
-                        return await asyncio.wait_for(invoke(), timeout=request_timeout)
+                        if not is_async_call:
+                            return await asyncio.wait_for(invoke(), timeout=request_timeout)
+                        async with asyncio.timeout(request_timeout) as active_timeout:
+                            timeout_scope = active_timeout
+                            return await invoke()
                     except asyncio.TimeoutError as exc:
-                        if (
-                            limited_by_run_fuse
-                            and self._run_time_decision(active_elapsed_base, active_started_at).stop
-                        ):
+                        if self._run_time_decision(active_elapsed_base, active_started_at).stop:
                             raise RunTimeLimitExceeded("active runtime limit reached") from exc
                         if not is_async_call:
                             # Retrying would create concurrent orphan threads that may
@@ -1082,15 +1151,23 @@ class AgentRuntime:
                             raise SynchronousModelTimeout(
                                 "同步模型调用超时；为避免并发遗留请求，本次不自动重试"
                             ) from exc
+                        if model_activity_seen:
+                            raise PartialModelIdleTimeout(
+                                "模型流式响应在开始输出后长时间无活动；已停止当前请求以避免重复输出"
+                            ) from exc
                         raise
 
                 while True:
                     try:
-                        response = await call_with_retry(
-                            model_attempt,
-                            max_attempts=self.config.api_max_attempts,
-                            base_delay=self.config.api_base_delay,
-                            on_retry=retry_event,
+                        response = (
+                            await model_attempt()
+                            if self._model_manages_retries
+                            else await call_with_retry(
+                                model_attempt,
+                                max_attempts=self.config.api_max_attempts,
+                                base_delay=self.config.api_base_delay,
+                                on_retry=retry_event,
+                            )
                         )
                         break
                     except Exception as exc:
@@ -1132,6 +1209,16 @@ class AgentRuntime:
                 "usage": merge_usage(state.get("usage"), turn.usage),
                 "stagnation_recovery_prompt": "",
             }
+            token_decision = self._task_token_decision(state.get("usage"))
+            if turn.tool_calls and token_decision.stop:
+                stopped = self._stop_state(state, token_decision)
+                stopped["events"] = await self._publish(
+                    stopped,
+                    "run_stopped",
+                    code=token_decision.code,
+                    reason=token_decision.reason,
+                )
+                return stopped
             if streamed_thought_deltas:
                 state["events"] = await self._publish(
                     state,
@@ -1168,6 +1255,8 @@ class AgentRuntime:
                     }
                     for call in turn.tool_calls
                 ]
+            if turn.provider_payload:
+                assistant_message["_pgagent_provider"] = dict(turn.provider_payload)
             messages = [*state.get("messages", []), assistant_message]
             if turn.tool_calls and turn.content.strip():
                 # This is the model's visible pre-tool progress text, not a
@@ -1697,19 +1786,26 @@ class AgentRuntime:
                 recovery_allowed = (
                     decision.code == "no_progress"
                     and self.tool_registry.workflow_profile_id in {"coding", "debug"}
-                    and self.tool_registry.has_coding_changes
                     and guard.stagnation_recovery_count
                     < max(0, int(self.config.max_stagnation_recovery_attempts or 0))
                 )
                 if recovery_allowed:
                     guard.begin_stagnation_recovery()
-                    prompt = (
-                        "## Coding stagnation recovery\n"
-                        "这是一次且仅一次的恢复轮。停止继续扩展实验，先运行 git status 和 git diff，"
-                        "检查当前工作区是否处于临时回退、对照测试或部分写入状态。恢复预期候选修改，"
-                        "清理临时文件，并执行最小必要验证；不要开始新的探索。如果需要比较 pristine HEAD，"
-                        "使用 validate_baseline，禁止在主工作区临时还原候选文件。"
-                    )
+                    if self.tool_registry.has_coding_changes:
+                        prompt = (
+                            "## Coding stagnation recovery\n"
+                            "这是一次且仅一次的恢复轮。停止继续扩展实验，先运行 git status 和 git diff，"
+                            "检查当前工作区是否处于临时回退、对照测试或部分写入状态。恢复预期候选修改，"
+                            "清理临时文件，并执行最小必要验证；不要开始新的探索。如果需要比较 pristine HEAD，"
+                            "使用 validate_baseline，禁止在主工作区临时还原候选文件。"
+                        )
+                    else:
+                        prompt = (
+                            "## Coding stagnation recovery\n"
+                            "这是一次且仅一次的恢复轮。前面的工具调用没有产生进展。先阅读最近工具结果中的 "
+                            "error_code 和参数约束，不要重复相同调用；改用当前已提供工具支持的参数和工作区相对路径。"
+                            "完成一个最小、可验证的下一步；如果仍无法推进，请明确报告阻塞原因。"
+                        )
                     recovering = {
                         **state,
                         "status": "acting",

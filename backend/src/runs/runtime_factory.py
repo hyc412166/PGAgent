@@ -160,6 +160,7 @@ class RunRuntimeFactory:
                     context.get("model_timeout_seconds") or settings.model_timeout_seconds
                 ),
                 max_run_seconds=context["max_run_seconds"],
+                max_task_tokens=settings.max_task_tokens,
             ),
             task_state_provider=(
                 (lambda key=run_id: task_checkpoint_for_run(key))

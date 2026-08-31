@@ -373,6 +373,16 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
             VALUES
                 ('legacy-workspace', 'Keep me', '', 'C:/legacy', 1,
                  '2026-01-01 00:00:00', '2026-01-01 00:00:00');
+            INSERT INTO model_connections
+                (id, name, provider, base_url, secret_ref, discovered_models,
+                 manual_models, default_model, thinking_level, custom_headers,
+                 capabilities, status, last_error, last_checked_at, enabled,
+                 created_at, updated_at)
+            VALUES
+                ('legacy-connection', 'Legacy model', 'openai_compatible',
+                 'https://legacy.test/v1', 'credential:legacy', '[]', '["legacy-model"]',
+                 'legacy-model', 'auto', '{}', '{}', 'connected', NULL, NULL, 1,
+                 '2026-01-01 00:00:00', '2026-01-01 00:00:00');
             INSERT INTO sessions
                 (id, title, workspace_id, agent_id, context_summary, status, created_at, updated_at)
             VALUES
@@ -384,10 +394,12 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     configure_database(f"sqlite:///{database_path.as_posix()}")
     init_db()
     inspector = inspect(database.engine)
+    connection_columns = {column["name"] for column in inspector.get_columns("model_connections")}
     agent_columns = {column["name"] for column in inspector.get_columns("agents")}
     session_columns = {column["name"] for column in inspector.get_columns("sessions")}
     assert "is_default" in agent_columns
     assert "workflow_profile_id" in agent_columns
+    assert "api_protocol" in connection_columns
     assert {
         "model_connection_id", "model_id", "thinking_level", "permission_mode",
         "use_memories", "mcp_server_names", "context_tokens",
@@ -396,6 +408,7 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     assert "last_compacted_at" not in session_columns
     with database.SessionLocal() as db:
         assert db.get(database.Workspace, "legacy-workspace") is not None
+        assert db.get(database.ModelConnection, "legacy-connection").api_protocol == "chat_completions"
         assert db.get(database.Session, "legacy-session").mcp_server_names == ["filesystem"]
         assert db.get(database.Workspace, DEFAULT_WORKSPACE_ID) is not None
         assert db.get(database.Agent, DEFAULT_AGENT_ID) is not None

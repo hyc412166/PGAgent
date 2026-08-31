@@ -29,7 +29,7 @@ async def test_gateway_maps_openai_compatible_connection_and_thinking(monkeypatc
     async def fake_completion(**kwargs):  # type: ignore[no-untyped-def]
         captured.update(kwargs)
         return {
-            "choices": [{"message": {"content": "ok"}}],
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
             "usage": {
                 "prompt_tokens": 100,
                 "completion_tokens": 20,
@@ -86,7 +86,7 @@ async def test_gateway_hydrates_private_image_refs_only_for_the_provider_call(
     async def fake_completion(**kwargs):  # type: ignore[no-untyped-def]
         captured.update(kwargs)
         return {
-            "choices": [{"message": {"content": "ok"}}],
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
         }
 
@@ -170,7 +170,7 @@ async def test_gateway_leaves_output_uncapped_and_disables_compaction_reasoning(
     async def fake_completion(**kwargs):  # type: ignore[no-untyped-def]
         captured.update(kwargs)
         return {
-            "choices": [{"message": {"content": "{}"}}],
+            "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
         }
 
@@ -209,6 +209,7 @@ async def test_gateway_aggregates_streamed_text_and_usage(monkeypatch: pytest.Mo
     async def chunks():  # type: ignore[no-untyped-def]
         yield {"choices": [{"delta": {"content": "hello "}}]}
         yield {"choices": [{"delta": {"content": "world"}}]}
+        yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
         yield {
             "choices": [],
             "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10},
@@ -245,6 +246,7 @@ async def test_gateway_streams_reasoning_separately_from_answer(monkeypatch: pyt
         yield {"choices": [{"delta": {"reasoning_content": "先检查"}}]}
         yield {"choices": [{"delta": {"reasoning": "天气来源。"}}]}
         yield {"choices": [{"delta": {"content": "今天晴。"}}]}
+        yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
 
     async def fake_completion(**_kwargs):  # type: ignore[no-untyped-def]
         return chunks()
@@ -293,6 +295,7 @@ async def test_gateway_aggregates_streamed_tool_call_fragments(monkeypatch: pyte
                 "function": {"name": "command", "arguments": "ho hi\"}"},
             }]}}],
         }
+        yield {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}
 
     async def fake_completion(**_kwargs):  # type: ignore[no-untyped-def]
         return chunks()
@@ -307,13 +310,20 @@ async def test_gateway_aggregates_streamed_tool_call_fragments(monkeypatch: pyte
         model_id="custom-model",
     ))
 
-    response = await call(messages=[], tools=[], mode="auto")
+    activity_count = 0
+
+    def on_activity() -> None:
+        nonlocal activity_count
+        activity_count += 1
+
+    response = await call(messages=[], tools=[], mode="auto", on_activity=on_activity)
 
     assert response["choices"][0]["message"]["tool_calls"] == [{
         "id": "call-7",
         "type": "function",
         "function": {"name": "run_command", "arguments": "{\"command\":\"echo hi\"}"},
     }]
+    assert activity_count == 3
 
 
 @pytest.mark.asyncio
@@ -331,7 +341,7 @@ async def test_gateway_falls_back_when_provider_explicitly_rejects_streaming(
             raise UnsupportedStreamError("stream is not supported by this provider")
         assert "stream_options" not in kwargs
         return {
-            "choices": [{"message": {"role": "assistant", "content": "one shot"}}],
+            "choices": [{"message": {"role": "assistant", "content": "one shot"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
         }
 

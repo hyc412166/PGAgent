@@ -15,11 +15,13 @@ export function DurableTaskCard({
   onResume,
   onCancel,
   cancelling = false,
+  resuming = false,
 }: {
   task: DurableTask
   onResume: () => void
   onCancel: () => void
   cancelling?: boolean
+  resuming?: boolean
 }) {
   const resumable = task.status === 'paused' || task.status === 'needs_recovery' || task.status === 'blocked'
   const cancellable = ['planning', 'running', 'waiting', 'paused', 'needs_recovery', 'blocked'].includes(task.status)
@@ -37,7 +39,7 @@ export function DurableTaskCard({
     </ol>
     {task.resume_summary ? <p className="durable-task-summary">{task.resume_summary}</p> : null}
     {cancellable ? <div className="durable-task-actions">
-      {resumable ? <button type="button" className="durable-task-resume" onClick={onResume} disabled={cancelling}><Play size={12} />继续此任务</button> : null}
+      {resumable ? <button type="button" className="durable-task-resume" onClick={onResume} disabled={cancelling || resuming} aria-busy={resuming}>{resuming ? <LoaderCircle className="spin" size={12} /> : <Play size={12} />}{resuming ? '正在继续…' : '继续此任务'}</button> : null}
       <button type="button" className="durable-task-cancel" onClick={onCancel} disabled={cancelling} aria-busy={cancelling}>
         {cancelling ? <LoaderCircle className="spin" size={12} /> : <X size={12} />}{cancelling ? '正在取消…' : '取消任务'}
       </button>

@@ -28,7 +28,7 @@ class McpServerConfig(BaseModel):
     enabled: bool = True
     required: bool = False
     startup_timeout_sec: float = Field(default=30.0, gt=0, le=300)
-    tool_timeout_sec: float = Field(default=120.0, gt=0, le=1800)
+    tool_timeout_sec: float = Field(default=300.0, gt=0, le=1800)
     enabled_tools: list[str] | None = None
     disabled_tools: list[str] = Field(default_factory=list)
     supports_parallel_tool_calls: bool = False

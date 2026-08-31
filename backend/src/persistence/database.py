@@ -103,6 +103,9 @@ def configure_database(url: str) -> None:
 
 
 _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
+    "model_connections": {
+        "api_protocol": "VARCHAR(32) NOT NULL DEFAULT 'chat_completions'",
+    },
     "agents": {
         "is_default": "BOOLEAN NOT NULL DEFAULT 0",
         "workflow_profile_id": "VARCHAR(16) NOT NULL DEFAULT 'auto'",

@@ -378,6 +378,7 @@ export interface Connection {
   name: string
   base_url?: string
   provider?: string
+  api_protocol?: 'responses' | 'chat_completions'
   api_key_hint?: string
   api_key?: string
   default_model?: string

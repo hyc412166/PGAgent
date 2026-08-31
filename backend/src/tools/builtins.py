@@ -1177,6 +1177,7 @@ async def delegate_task_async(
         for index, spec in enumerate(specs, start=1):
             if spec.pop("generated_id", False):
                 spec["id"] = f"delegate-{call_id or 'call'}-{index}"[:120]
+                spec["link_existing"] = True
         prepared = _prepare_delegate_graph(delegate, specs, call_id)
         if inspect.isawaitable(prepared):
             await prepared
@@ -1912,7 +1913,7 @@ def run_command(
                         ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
                         capture_output=True,
                         check=False,
-                        timeout=10,
+                        timeout=3,
                     )
                     tree_terminated = killed.returncode == 0
                 except (OSError, subprocess.TimeoutExpired):
@@ -1924,12 +1925,12 @@ def run_command(
                 except ProcessLookupError:
                     tree_terminated = process.poll() is not None
             try:
-                process.wait(timeout=10)
+                process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 # Last-resort root-process cleanup. This cannot prove that every
                 # descendant died, so report the weaker guarantee truthfully.
                 process.kill()
-                process.wait(timeout=5)
+                process.wait(timeout=2)
                 tree_terminated = False
             tree_terminated = tree_terminated and process.poll() is not None
             for reader in readers:

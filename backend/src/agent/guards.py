@@ -34,8 +34,8 @@ class LoopGuard:
             raise ValueError("max_steps 必须大于等于 0")
         if max_calls is not None and max_calls < 0:
             raise ValueError("max_calls 必须大于等于 0")
-        if min(identical_limit, no_progress_limit) < 1:
-            raise ValueError("重复调用和无进展限制必须大于 0")
+        if min(identical_limit, no_progress_limit) < 0:
+            raise ValueError("重复调用和无进展限制必须大于等于 0")
         self.max_steps = max_steps
         self.max_calls = max_calls
         self.identical_limit = identical_limit
@@ -71,7 +71,7 @@ class LoopGuard:
             self.identical_count = 1
         self.calls += 1
 
-        if self.identical_count >= self.identical_limit:
+        if self.identical_limit and self.identical_count >= self.identical_limit:
             return GuardDecision(
                 True,
                 "repeated_tool_call",
@@ -98,7 +98,7 @@ class LoopGuard:
             self.no_progress_count = 0
         else:
             self.no_progress_count += 1
-        if self.no_progress_count >= self.no_progress_limit:
+        if self.no_progress_limit and self.no_progress_count >= self.no_progress_limit:
             return GuardDecision(
                 True,
                 "no_progress",
@@ -133,8 +133,10 @@ class LoopGuard:
         calls = max(int(snapshot.get("calls", 0)), 0)
         self.steps = min(steps, self.max_steps) if self.max_steps else steps
         self.calls = min(calls, self.max_calls) if self.max_calls else calls
-        self.identical_count = min(max(int(snapshot.get("identical_count", 0)), 0), self.identical_limit)
-        self.no_progress_count = min(max(int(snapshot.get("no_progress_count", 0)), 0), self.no_progress_limit)
+        restored_identical = max(int(snapshot.get("identical_count", 0)), 0)
+        restored_progress = max(int(snapshot.get("no_progress_count", 0)), 0)
+        self.identical_count = min(restored_identical, self.identical_limit) if self.identical_limit else restored_identical
+        self.no_progress_count = min(restored_progress, self.no_progress_limit) if self.no_progress_limit else restored_progress
         self.stagnation_recovery_count = max(
             int(snapshot.get("stagnation_recovery_count", 0)),
             0,

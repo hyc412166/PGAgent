@@ -635,6 +635,54 @@ def test_transcript_delta_is_persisted_when_provider_messages_were_compacted(
         assert [row.sequence for row in rows] == [1, 2, 3]
 
 
+def test_responses_native_items_are_persisted_without_visible_content_deduplication(
+    seeded_run: tuple[str, str],
+) -> None:
+    run_id, session_id = seeded_run
+    first_native = {
+        "protocol": "responses",
+        "items": [{
+            "type": "message",
+            "id": "msg-1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "same", "annotations": []}],
+        }],
+    }
+    second_native = {
+        "protocol": "responses",
+        "items": [{
+            "type": "message",
+            "id": "msg-2",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "same", "annotations": []}],
+        }],
+    }
+
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="same",
+        messages=[{"role": "assistant", "content": "same", "_pgagent_provider": second_native}],
+        transcript_delta=[
+            {"role": "assistant", "content": "same", "_pgagent_provider": first_native},
+            {"role": "assistant", "content": "same", "_pgagent_provider": second_native},
+        ],
+        events=[{"type": "run_completed"}],
+        steps=1,
+        tool_calls=0,
+    ))
+
+    with database.SessionLocal() as db:
+        rows = list(db.scalars(
+            select(ChatMessage)
+            .where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.sequence)
+        ))
+        assert len(rows) == 2
+        assert [row.provider_payload["native"]["items"][0]["id"] for row in rows] == ["msg-1", "msg-2"]
+
+
 def test_delegated_terminal_result_appends_revision_without_mutating_placeholder(
     seeded_run: tuple[str, str],
 ) -> None:
