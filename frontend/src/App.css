@@ -174,3 +174,11 @@
   .session-create { position: sticky; z-index: 1; top: 0; background: #fff; }.message.user .message-body { max-width: 90%; }.composer { margin: 0 8px 8px; }.composer-toolbar { align-items: flex-end; }.permission-trigger span { display: none; }.session-settings-trigger { max-width: 180px; }.session-settings-submenu { right: 0; bottom: calc(100% + 7px); width: min(246px, calc(100vw - 48px)); }.capability-level-three { left: 0; bottom: calc(100% + 7px); width: min(250px, calc(100vw - 48px)); }.skill-preview { grid-template-columns: 1fr; }.context-tooltip { width: min(250px, calc(100vw - 48px)); }.usage-mini-totals { position: static; margin-top: 14px; }.usage-mini-totals div { min-width: 0; }.usage-card-grid { grid-template-columns: 1fr; }.usage-models table { min-width: 590px; }.usage-date-filter { grid-template-columns: 1fr; align-items: start; }.usage-date-inputs { justify-content: flex-start; flex-wrap: wrap; }.usage-date-inputs label { align-items: flex-start; flex-direction: column; }.usage-date-inputs input { min-width: min(170px, 44vw); }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+
+/* 模型连接卡片：桌面端保持三列，中等宽度收窄为两列，小屏沿用单列。 */
+@media (min-width: 1101px) {
+  .connection-list { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (min-width: 641px) and (max-width: 1100px) {
+  .connection-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
