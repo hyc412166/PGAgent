@@ -54,6 +54,7 @@ SIDE_EFFECT_OR_NETWORK_TOOLS: Final[frozenset[str]] = frozenset(
         "bash",
         "run_command",
         "validate",
+        "validate_baseline",
         "task",
         "Agent",
         "webfetch",
@@ -107,7 +108,7 @@ HIGH_IMPACT_TOOLS: Final[frozenset[str]] = SIDE_EFFECT_OR_NETWORK_TOOLS
 NETWORK_TOOLS: Final[frozenset[str]] = frozenset({"webfetch", "websearch", "WebFetch", "WebSearch", "RemoteTrigger", "MCP"})
 FILE_WRITE_TOOLS: Final[frozenset[str]] = frozenset({"write", "write_file", "edit", "edit_file"})
 FILE_DELETE_TOOLS: Final[frozenset[str]] = frozenset({"delete"})
-COMMAND_TOOLS: Final[frozenset[str]] = frozenset({"bash", "run_command", "validate", "PowerShell", "REPL", "background_run"})
+COMMAND_TOOLS: Final[frozenset[str]] = frozenset({"bash", "run_command", "validate", "validate_baseline", "PowerShell", "REPL", "background_run"})
 
 _SENSITIVE_FILE_NAMES: Final[frozenset[str]] = frozenset(
     {

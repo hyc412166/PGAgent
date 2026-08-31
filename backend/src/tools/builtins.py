@@ -1558,7 +1558,10 @@ def write_file(
             True,
             f"已写入 {sandbox.relative(target)} ({len(content.encode('utf-8'))} bytes)",
             changed=changed,
-            metadata={"path": sandbox.relative(target)},
+            metadata={
+                "path": sandbox.relative(target),
+                "operation": "update" if previous is not None else "add",
+            },
         )
     except (SandboxViolation, OSError) as exc:
         return ToolResult("write_file", False, str(exc), error_code="write_error")

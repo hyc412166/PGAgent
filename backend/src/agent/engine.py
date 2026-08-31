@@ -352,6 +352,7 @@ class RuntimeConfig:
     max_tool_calls: int | None = 0
     identical_call_limit: int = 3
     no_progress_limit: int = 4
+    max_stagnation_recovery_attempts: int = 1
     api_max_attempts: int = 3
     api_base_delay: float = 0.5
     model_timeout_seconds: float = 90.0
@@ -622,6 +623,19 @@ class AgentRuntime:
             no_progress_limit=self.config.no_progress_limit,
         )
         guard.restore(dict(guard_snapshot or {}))
+
+        def provider_messages(state: RunState) -> list[dict[str, Any]]:
+            """Add one transient recovery instruction without rewriting history."""
+
+            messages = [dict(item) for item in state.get("messages", [])]
+            recovery_prompt = str(state.get("stagnation_recovery_prompt") or "").strip()
+            if not recovery_prompt:
+                return messages
+            insert_at = 0
+            while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+                insert_at += 1
+            messages.insert(insert_at, {"role": "system", "content": recovery_prompt})
+            return messages
 
         def render_instructions(context: Mapping[str, Any]) -> str:
             instructions = context.get("agent_instructions")
@@ -1020,8 +1034,9 @@ class AgentRuntime:
                         for item in model_tools
                         if isinstance(item, dict) and isinstance(item.get("function"), dict)
                     )
+                    recovery_prompt = str(state.get("stagnation_recovery_prompt") or "").strip()
                     kwargs = {
-                        "messages": state.get("messages", []),
+                        "messages": provider_messages(state),
                         "tools": model_tools,
                         "mode": state.get("mode", "auto"),
                     }
@@ -1029,7 +1044,7 @@ class AgentRuntime:
                         kwargs["on_delta"] = on_delta
                     if self._model_accepts_thought_delta:
                         kwargs["on_thought_delta"] = on_thought_delta
-                    if self._model_accepts_prompt_cache_key:
+                    if self._model_accepts_prompt_cache_key and not recovery_prompt:
                         kwargs["prompt_cache_key"] = state.get("prompt_cache_key")
                     is_async_call = inspect.iscoroutinefunction(self.model_call)
 
@@ -1112,7 +1127,11 @@ class AgentRuntime:
                 )
                 return failed
 
-            state = {**state, "usage": merge_usage(state.get("usage"), turn.usage)}
+            state = {
+                **state,
+                "usage": merge_usage(state.get("usage"), turn.usage),
+                "stagnation_recovery_prompt": "",
+            }
             if streamed_thought_deltas:
                 state["events"] = await self._publish(
                     state,
@@ -1675,6 +1694,35 @@ class AgentRuntime:
         async def observe_node(state: RunState) -> RunState:
             decision = guard.record_progress(bool(state.get("current_made_progress")))
             if decision.stop:
+                recovery_allowed = (
+                    decision.code == "no_progress"
+                    and self.tool_registry.workflow_profile_id in {"coding", "debug"}
+                    and self.tool_registry.has_coding_changes
+                    and guard.stagnation_recovery_count
+                    < max(0, int(self.config.max_stagnation_recovery_attempts or 0))
+                )
+                if recovery_allowed:
+                    guard.begin_stagnation_recovery()
+                    prompt = (
+                        "## Coding stagnation recovery\n"
+                        "这是一次且仅一次的恢复轮。停止继续扩展实验，先运行 git status 和 git diff，"
+                        "检查当前工作区是否处于临时回退、对照测试或部分写入状态。恢复预期候选修改，"
+                        "清理临时文件，并执行最小必要验证；不要开始新的探索。如果需要比较 pristine HEAD，"
+                        "使用 validate_baseline，禁止在主工作区临时还原候选文件。"
+                    )
+                    recovering = {
+                        **state,
+                        "status": "acting",
+                        "current_made_progress": False,
+                        "stagnation_recovery_prompt": prompt,
+                    }
+                    recovering["events"] = await self._publish(
+                        recovering,
+                        "stagnation_recovery_started",
+                        attempt=guard.stagnation_recovery_count,
+                        reason=decision.reason,
+                    )
+                    return recovering
                 stopped = self._stop_state(state, decision)
                 stopped["events"] = await self._publish(stopped, "run_stopped", code=decision.code, reason=decision.reason)
                 return stopped
@@ -1714,6 +1762,7 @@ class AgentRuntime:
             "completion_verification_attempts": max(0, int(prior_completion_verification_attempts or 0)),
             "acceptance_report": dict(prior_acceptance_report or {}),
             "memory_citation": {},
+            "stagnation_recovery_prompt": "",
         }
         final = await run_agent_loop(
             initial,

@@ -44,6 +44,8 @@ class LoopGuard:
         self.calls = 0
         self.identical_count = 0
         self.no_progress_count = 0
+        self.stagnation_recovery_count = 0
+        self.stagnation_recovery_pending = False
         self._last_call_fingerprint: str | None = None
 
     @staticmethod
@@ -81,6 +83,17 @@ class LoopGuard:
     record_tool_call = before_tool_call
 
     def record_progress(self, made_progress: bool) -> GuardDecision:
+        if self.stagnation_recovery_pending:
+            self.stagnation_recovery_pending = False
+            if made_progress:
+                self.no_progress_count = 0
+                return GuardDecision.continue_()
+            self.no_progress_count = self.no_progress_limit
+            return GuardDecision(
+                True,
+                "no_progress",
+                "恢复轮仍未产生有效进展",
+            )
         if made_progress:
             self.no_progress_count = 0
         else:
@@ -93,12 +106,21 @@ class LoopGuard:
             )
         return GuardDecision.continue_()
 
+    def begin_stagnation_recovery(self) -> None:
+        """Record one caller-authorized recovery attempt and restart the counter."""
+
+        self.stagnation_recovery_count += 1
+        self.no_progress_count = 0
+        self.stagnation_recovery_pending = True
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "steps": self.steps,
             "calls": self.calls,
             "identical_count": self.identical_count,
             "no_progress_count": self.no_progress_count,
+            "stagnation_recovery_count": self.stagnation_recovery_count,
+            "stagnation_recovery_pending": self.stagnation_recovery_pending,
             "last_call_fingerprint": self._last_call_fingerprint,
         }
 
@@ -113,5 +135,12 @@ class LoopGuard:
         self.calls = min(calls, self.max_calls) if self.max_calls else calls
         self.identical_count = min(max(int(snapshot.get("identical_count", 0)), 0), self.identical_limit)
         self.no_progress_count = min(max(int(snapshot.get("no_progress_count", 0)), 0), self.no_progress_limit)
+        self.stagnation_recovery_count = max(
+            int(snapshot.get("stagnation_recovery_count", 0)),
+            0,
+        )
+        self.stagnation_recovery_pending = bool(
+            snapshot.get("stagnation_recovery_pending", False)
+        )
         fingerprint = snapshot.get("last_call_fingerprint")
         self._last_call_fingerprint = str(fingerprint) if fingerprint else None

@@ -252,6 +252,17 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
         runtime_tool_id="validate",
     ),
     BuiltinTool(
+        id="validate_baseline",
+        name="validate_baseline",
+        label="隔离验证基线",
+        description="在临时 Git worktree 中对 pristine HEAD 运行检查，不替换当前候选代码。",
+        category="developer",
+        risk_level="adaptive",
+        enabled=True,
+        availability="available",
+        runtime_tool_id="validate_baseline",
+    ),
+    BuiltinTool(
         id="review_finding",
         name="review_finding",
         label="记录审查发现",

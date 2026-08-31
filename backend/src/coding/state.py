@@ -42,6 +42,23 @@ class CodingSessionState:
         _context: HookContext,
     ) -> ToolResult:
         change_set = result.metadata.get("change_set")
+        if result.changed and not isinstance(change_set, Mapping):
+            path = str(result.metadata.get("path") or invocation.arguments.get("path") or "").strip()
+            if path:
+                operation = str(result.metadata.get("operation") or "").strip() or {
+                    "delete": "delete",
+                    "write": "update",
+                    "write_file": "update",
+                    "edit": "update",
+                    "edit_file": "update",
+                }.get(invocation.wire_name)
+                if operation:
+                    change_set = {
+                        "status": "observed",
+                        "source": "file_tool",
+                        "file_count": 1,
+                        "files": [{"path": path.replace("\\", "/"), "operation": operation}],
+                    }
         if result.changed and isinstance(change_set, Mapping):
             self.revision += 1
             self.changes.append({

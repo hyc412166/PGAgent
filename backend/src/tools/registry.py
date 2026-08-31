@@ -173,6 +173,19 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["command"],
         },
     },
+    "validate_baseline": {
+        "description": "Run a bounded check against pristine HEAD in an isolated temporary Git worktree without replacing the candidate files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                "kind": {"type": "string", "enum": ["test", "lint", "typecheck", "build", "format_check", "other"]},
+                "cwd": {"type": "string"},
+                "timeout_seconds": {"type": "number"},
+            },
+            "required": ["command"],
+        },
+    },
     "glob": {
         "description": "按 glob pattern 查找工作区文件与目录，不会跟随越界链接。",
         "parameters": {
@@ -386,6 +399,7 @@ PUBLIC_TOOL_NAMES: tuple[str, ...] = (
     "edit",
     "apply_patch",
     "validate",
+    "validate_baseline",
     *ENGINEERING_TOOL_NAMES,
     "glob",
     "grep",
@@ -501,7 +515,7 @@ def _normalize_claw_todos(todos: Iterable[Mapping[str, Any]]) -> list[dict[str, 
 
 
 PLAN_MODE_MUTATING_TOOLS = frozenset({
-    "write", "write_file", "edit", "edit_file", "apply_patch", "delete", "bash", "run_command", "validate",
+    "write", "write_file", "edit", "edit_file", "apply_patch", "delete", "bash", "run_command", "validate", "validate_baseline",
     "PowerShell", "REPL", "NotebookEdit", "RemoteTrigger", "MCP", "MemoryWrite",
     "TodoWrite", "todowrite", "read_inbox",
     "task", "Agent", "TaskCreate", "RunTaskPacket", "TaskStop", "TaskUpdate", "task_create", "task_update",
@@ -615,7 +629,7 @@ class ToolRegistry:
 
     def _register_default(self, name: str) -> None:
         mapping: dict[str, Callable[..., ToolResult]] = {
-            "bash": builtins.run_command,
+            "bash": self._bash,
             "read": builtins.read_file,
             "read_artifact": lambda _sandbox, **kwargs: self._artifact_store.read(**kwargs),
             "list_attachments": lambda _sandbox: self._attachment_store.list(),
@@ -628,6 +642,7 @@ class ToolRegistry:
             "edit": builtins.edit_file,
             "apply_patch": self._apply_patch,
             "validate": self._validate,
+            "validate_baseline": self._validate_baseline,
             "review_finding": self._review_finding,
             "debug_evidence": self._debug_evidence,
             "glob": builtins.glob_files,
@@ -647,7 +662,7 @@ class ToolRegistry:
             "read_file": advanced.read_file_slice,
             "search_files": builtins.search_files,
             "write_file": builtins.write_file,
-            "run_command": builtins.run_command,
+            "run_command": self._bash,
             "edit_file": builtins.edit_file,
             "glob_search": builtins.glob_files,
             "grep_search": lambda sandbox, pattern, path=".", glob="*", case_sensitive=False, head_limit=100, **_kwargs: builtins.grep_files(
@@ -810,11 +825,29 @@ class ToolRegistry:
 
         return apply_patch(sandbox, **kwargs)
 
-    @staticmethod
-    def _validate(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+    def _bash(self, sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+        from src.coding.worktree import annotate_command_changes, capture_worktree_state
+
+        if self.workflow_profile_id not in {"coding", "debug"}:
+            return builtins.run_command(sandbox, **kwargs)
+        before = capture_worktree_state(sandbox.root)
+        result = builtins.run_command(sandbox, **kwargs)
+        return annotate_command_changes(result, sandbox.root, before, source="shell")
+
+    def _validate(self, sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
         from src.coding.validation import run_validation
 
-        return run_validation(sandbox, **kwargs)
+        return run_validation(
+            sandbox,
+            **kwargs,
+            track_worktree_changes=self.workflow_profile_id in {"coding", "debug"},
+        )
+
+    @staticmethod
+    def _validate_baseline(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+        from src.coding.baseline_validation import run_baseline_validation
+
+        return run_baseline_validation(sandbox, **kwargs)
 
     @staticmethod
     def _review_finding(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
@@ -1124,6 +1157,14 @@ class ToolRegistry:
             if item
         )
 
+    @property
+    def workflow_profile_id(self) -> str:
+        return self._workflow_profile.id if self._workflow_profile is not None else "general"
+
+    @property
+    def has_coding_changes(self) -> bool:
+        return bool(self._coding_state.changes)
+
     def runtime_state(self) -> dict[str, Any]:
         """Return only JSON-safe state that must survive approval/resume."""
 
@@ -1255,10 +1296,12 @@ class ToolRegistry:
         # keep their local primitive only as an execution-level safety API.
         if name in {
             "write", "write_file", "edit", "edit_file", "apply_patch",
-            "delete", "bash", "run_command", "validate",
+            "delete", "bash", "run_command", "validate", "validate_baseline",
         }:
             kwargs["approved"] = True
-        if _cancel_event is not None and name in {"bash", "run_command", "check_background"}:
+        if _cancel_event is not None and name in {
+            "bash", "run_command", "validate_baseline", "check_background",
+        }:
             # This is an in-process cancellation signal, not a model/tool
             # argument.  Inject it only after policy approval so it can never
             # leak into ApprovalRequest JSON or the persisted run snapshot.
