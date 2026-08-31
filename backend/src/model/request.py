@@ -52,8 +52,10 @@ def create_model_call(config: ProviderConfig, *, credentials):
                         "tools": responses.function_tools(tools), "stream": True, "store": False,
                         "include": ["reasoning.encrypted_content"],
                     }
-                    if config.thinking_level not in {"off", "auto", ""} and mode != "compaction":
-                        kwargs["reasoning"] = {"effort": config.thinking_level}
+                    if config.thinking_level != "off" and mode != "compaction":
+                        kwargs["reasoning"] = {"summary": "auto"}
+                        if config.thinking_level not in {"auto", ""}:
+                            kwargs["reasoning"]["effort"] = config.thinking_level
                     if prompt_cache_key:
                         kwargs["prompt_cache_key"] = prompt_cache_key
                     return await client.responses.create(**kwargs)
@@ -66,10 +68,11 @@ def create_model_call(config: ProviderConfig, *, credentials):
                 try:
                     if client is not None:
                         if not hasattr(stream, "__aiter__"):
-                            raw = _as_mapping(stream)
+                            raw = _as_mapping(stream, exclude_unset=True)
                             if raw.get("status") != "completed":
                                 raise IncompleteResponse("Responses 返回了未完成的响应")
                             payload = responses.project_items(raw.get("output") or [], raw.get("usage"))
+                            await _emit_delta(on_thought_delta, payload["reasoning_content"])
                         else:
                             payload = await responses.consume(stream, idle_seconds=settings.model_timeout_seconds,
                                 on_delta=on_delta, on_thought_delta=on_thought_delta, on_activity=on_activity)

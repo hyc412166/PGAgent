@@ -14,7 +14,12 @@ def input_items(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for message in messages:
         native = message.get("_pgagent_provider") or {}
         if native.get("protocol") == "responses" and native.get("items"):
-            result.extend(dict(item) for item in native["items"])
+            for item in native["items"]:
+                replay_item = dict(item)
+                # reasoning 的输出状态不能回传给当前上游；也处理已保存的旧历史。
+                if replay_item.get("type") == "reasoning":
+                    replay_item.pop("status", None)
+                result.append(replay_item)
             continue
         role = message.get("role", "user")
         content = message.get("content") or ""
@@ -76,19 +81,41 @@ def project_items(items: list[dict[str, Any]], usage: Mapping[str, Any] | None =
 async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought_delta=None, on_activity=None) -> dict[str, Any]:
     completed: list[dict[str, Any]] = []
     finished: dict[str, Any] | None = None
+    summary_lengths: dict[tuple[str, int], int] = {}
+
+    async def emit_summary(item_id: str, index: int, text: str) -> None:
+        # done 和最终 output 会重带完整摘要，只补发该段尚未展示的尾部。
+        key = (item_id, index)
+        offset = summary_lengths.get(key, 0)
+        await _emit_delta(on_thought_delta, text[offset:])
+        summary_lengths[key] = max(offset, len(text))
+
+    async def emit_item_summary(item: dict[str, Any]) -> None:
+        if item.get("type") == "reasoning":
+            for index, part in enumerate(item.get("summary") or []):
+                await emit_summary(item.get("id", ""), index, part.get("text", ""))
+
     try:
         async for raw in stream_events(stream, idle_seconds):
-            event = _as_mapping(raw)
+            # 保留服务端实际返回的字段，不将 SDK 默认值补进下一轮历史。
+            event = _as_mapping(raw, exclude_unset=True)
             await _emit_activity(on_activity)
             kind = event.get("type")
             if kind == "response.output_text.delta":
                 await _emit_delta(on_delta, str(event.get("delta") or ""))
             elif kind == "response.reasoning_summary_text.delta":
-                await _emit_delta(on_thought_delta, str(event.get("delta") or ""))
+                delta = str(event.get("delta") or "")
+                key = (event.get("item_id", ""), event.get("summary_index", 0))
+                await _emit_delta(on_thought_delta, delta)
+                summary_lengths[key] = summary_lengths.get(key, 0) + len(delta)
+            elif kind == "response.reasoning_summary_text.done":
+                await emit_summary(event.get("item_id", ""), event.get("summary_index", 0),
+                                   str(event.get("text") or ""))
             elif kind == "response.output_item.done":
                 item = _as_mapping(event["item"])
                 if item.get("status") not in {"incomplete", "in_progress"}:
                     completed.append(item)
+                    await emit_item_summary(item)
             elif kind == "response.completed":
                 finished = _as_mapping(event["response"])
                 break
@@ -104,4 +131,7 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
         raise StreamInterrupted("模型响应流中断", completed_items=completed) from exc
     if finished is None:
         raise StreamInterrupted("模型流在 response.completed 之前关闭", completed_items=completed)
-    return project_items(list(finished.get("output") or completed), finished.get("usage"))
+    items = list(finished.get("output") or completed)
+    for item in items:
+        await emit_item_summary(item)
+    return project_items(items, finished.get("usage"))
