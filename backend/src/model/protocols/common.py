@@ -37,11 +37,11 @@ def _litellm_model(provider: str, model_id: str) -> str:
     return model_id if model_id.startswith("openai/") else f"openai/{model_id}"
 
 
-def _as_mapping(value: Any) -> dict[str, Any]:
+def _as_mapping(value: Any, *, exclude_unset: bool = False) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     if hasattr(value, "model_dump"):
-        payload = value.model_dump()
+        payload = value.model_dump(exclude_unset=True) if exclude_unset else value.model_dump()
         if isinstance(payload, Mapping):
             return dict(payload)
     raise TypeError("LiteLLM response must be a mapping or support model_dump")

@@ -9,6 +9,7 @@ from src.model import gateway as model_gateway
 from src.model import request as model_request
 from src.model.gateway import ProviderConfig, build_model_call
 from src.model.streaming import IncompleteResponse
+from src.model.protocols.responses import input_items
 
 
 class FakeResponses:
@@ -116,7 +117,7 @@ async def test_responses_uses_native_items_and_stateless_request(
     request = fake.requests[0]
     assert request["store"] is False
     assert request["include"] == ["reasoning.encrypted_content"]
-    assert request["reasoning"] == {"effort": "high"}
+    assert request["reasoning"] == {"effort": "high", "summary": "auto"}
     assert request["input"][1] == native_call
     assert request["input"][2] == {
         "type": "function_call_output",
@@ -166,7 +167,7 @@ async def test_responses_replays_only_completed_items_after_stream_disconnect(
     response = await call(messages=[{"role": "user", "content": "继续"}], tools=[], mode="auto")
 
     assert len(fake.requests) == 2
-    assert reasoning_item in fake.requests[1]["input"]
+    assert {key: value for key, value in reasoning_item.items() if key != "status"} in fake.requests[1]["input"]
     assert response["content"] == "恢复完成"
     assert response["_pgagent_provider"]["items"] == [reasoning_item, message_item]
     assert response["usage"]["request_count"] == 2
@@ -200,6 +201,120 @@ async def test_responses_returns_completed_tool_call_without_resampling(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("level", "mode", "expected"), [
+    ("auto", "auto", {"summary": "auto"}),
+    ("", "auto", {"summary": "auto"}),
+    ("medium", "auto", {"effort": "medium", "summary": "auto"}),
+    ("off", "auto", None),
+    ("high", "compaction", None),
+])
+async def test_responses_summary_request_respects_thinking_and_compaction(
+    monkeypatch: pytest.MonkeyPatch, level: str, mode: str, expected: dict | None,
+) -> None:
+    async def stream():
+        yield {"type": "response.completed", "response": {"output": []}}
+
+    fake = install_fake_client(monkeypatch, [stream])
+    config = responses_config()
+    config.thinking_level = level
+    await build_model_call(config)(messages=[], tools=[], mode=mode)
+    assert fake.requests[0].get("reasoning") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["delta", "partial", "done", "item", "completed"])
+async def test_responses_displays_summary_once_across_completion_events(
+    monkeypatch: pytest.MonkeyPatch, delivery: str,
+) -> None:
+    item = {"type": "reasoning", "id": "rs-1", "summary": [
+        {"type": "summary_text", "text": "检查条件。"},
+        {"type": "summary_text", "text": "核对结果。"},
+    ], "encrypted_content": "opaque-not-displayable"}
+    second = {"type": "reasoning", "id": "rs-2", "summary": [
+        {"type": "summary_text", "text": "检查条件。"},
+    ]}
+
+    async def stream():
+        for current in [item, second]:
+            for index, part in enumerate(current["summary"]):
+                fields = {"item_id": current["id"], "summary_index": index}
+                if delivery in {"delta", "partial"}:
+                    yield {"type": "response.reasoning_summary_text.delta", **fields,
+                           "delta": part["text"] if delivery == "delta" else part["text"][:2]}
+                if delivery in {"delta", "partial", "done"}:
+                    yield {"type": "response.reasoning_summary_text.done", **fields, "text": part["text"]}
+            if delivery != "completed":
+                yield {"type": "response.output_item.done", "item": current}
+        yield {"type": "response.output_text.delta", "delta": "答案。"}
+        yield {"type": "response.completed", "response": {"output": [item, second, {
+            "type": "message", "content": [{"type": "output_text", "text": "答案。"}],
+        }]}}
+
+    install_fake_client(monkeypatch, [stream])
+    thoughts: list[str] = []
+    answers: list[str] = []
+    response = await build_model_call(responses_config())(
+        messages=[], tools=[], mode="auto", on_thought_delta=thoughts.append, on_delta=answers.append,
+    )
+    assert "".join(thoughts) == "检查条件。核对结果。检查条件。"
+    assert response["reasoning_content"] == "".join(thoughts)
+    assert answers == ["答案。"]
+
+
+@pytest.mark.asyncio
+async def test_responses_encrypted_reasoning_does_not_create_thought_text(monkeypatch):
+    item = {"type": "reasoning", "id": "rs-1", "summary": [], "encrypted_content": "opaque"}
+
+    async def stream():
+        yield {"type": "response.output_item.done", "item": item}
+        yield {"type": "response.completed", "response": {"output": [item]}}
+
+    install_fake_client(monkeypatch, [stream])
+    thoughts: list[str] = []
+    await build_model_call(responses_config())(
+        messages=[], tools=[], mode="auto", on_thought_delta=thoughts.append,
+    )
+    assert thoughts == []
+
+
+@pytest.mark.asyncio
+async def test_responses_nonstream_summary_reaches_thought_callback(monkeypatch):
+    fake = install_fake_client(monkeypatch, [])
+
+    async def create(**kwargs):
+        return {"status": "completed", "output": [{
+            "type": "reasoning", "summary": [{"type": "summary_text", "text": "核对条件。"}],
+        }]}
+
+    monkeypatch.setattr(fake, "create", create)
+    thoughts: list[str] = []
+    await build_model_call(responses_config())(
+        messages=[], tools=[], mode="auto", on_thought_delta=thoughts.append,
+    )
+    assert thoughts == ["核对条件。"]
+
+
+@pytest.mark.asyncio
+async def test_responses_rejected_summary_is_not_silently_removed(monkeypatch):
+    import httpx
+    from openai import BadRequestError
+
+    fake = install_fake_client(monkeypatch, [])
+
+    async def create(**kwargs):
+        fake.requests.append(kwargs)
+        raise BadRequestError("unsupported reasoning.summary", response=httpx.Response(
+            400, request=httpx.Request("POST", "https://provider.test/v1/responses"),
+        ), body={"param": "reasoning.summary"})
+
+    monkeypatch.setattr(fake, "create", create)
+    with pytest.raises(BadRequestError, match="reasoning.summary"):
+        await build_model_call(responses_config())(messages=[], tools=[], mode="auto")
+    assert len(fake.requests) == 1
+    assert fake.requests[0]["reasoning"]["summary"] == "auto"
+
+
+@pytest.mark.asyncio
 async def test_responses_incomplete_event_is_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -215,3 +330,65 @@ async def test_responses_incomplete_event_is_not_retried(
     with pytest.raises(IncompleteResponse, match="max_output_tokens"):
         await call(messages=[{"role": "user", "content": "回答"}], tools=[], mode="auto")
     assert len(fake.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["item_done", "completed", "nonstream"])
+async def test_responses_sdk_does_not_add_unset_fields_to_native_history(monkeypatch, delivery):
+    from openai.types.responses import (
+        Response, ResponseCompletedEvent, ResponseFunctionToolCall,
+        ResponseOutputItemDoneEvent, ResponseReasoningItem,
+    )
+
+    reasoning = ResponseReasoningItem.model_validate({
+        "type": "reasoning", "id": "rs-1", "summary": [], "encrypted_content": "opaque",
+    })
+    function = ResponseFunctionToolCall.model_validate({
+        "type": "function_call", "id": "fc-1", "call_id": "call-1", "name": "websearch",
+        "arguments": '{"query":"天气"}', "status": "completed",
+    })
+    # SDK 未赋值字段仍有默认 None，不能让它们变成下一轮请求的参数。
+    assert reasoning.model_dump()["status"] is None
+    response = Response.model_construct(status="completed", output=[reasoning, function])
+
+    async def stream():
+        if delivery == "item_done":
+            yield ResponseOutputItemDoneEvent.model_construct(type="response.output_item.done", item=reasoning, output_index=0)
+            yield ResponseOutputItemDoneEvent.model_construct(type="response.output_item.done", item=function, output_index=1)
+            raise ConnectionError("断流后返回已完成工具调用")
+        yield ResponseCompletedEvent.model_construct(type="response.completed", response=response)
+
+    fake = install_fake_client(monkeypatch, [stream])
+    if delivery == "nonstream":
+        async def create(**kwargs):
+            return response
+        monkeypatch.setattr(fake, "create", create)
+    result = await build_model_call(responses_config())(messages=[], tools=[], mode="auto")
+    items = result["_pgagent_provider"]["items"]
+    assert items == [reasoning.model_dump(exclude_unset=True), function.model_dump(exclude_unset=True)]
+    assert "status" not in items[0]
+    assert "namespace" not in items[1]
+    assert "caller" not in items[1]
+    assert items[1]["status"] == "completed"
+
+
+@pytest.mark.parametrize("status", [None, "completed"])
+def test_responses_legacy_reasoning_status_is_removed_only_from_request(status):
+    from copy import deepcopy
+
+    items = [
+        {"type": "reasoning", "id": "rs-1", "status": status,
+         "summary": [{"type": "summary_text", "text": "检查天气。"}], "encrypted_content": "opaque"},
+        {"type": "message", "id": "msg-1", "role": "assistant", "status": "completed",
+         "content": [{"type": "output_text", "text": "准备查询。"}]},
+        {"type": "function_call", "id": "fc-1", "call_id": "call-1", "status": "completed",
+         "name": "websearch", "arguments": '{"query":"天气"}'},
+    ]
+    messages = [{"role": "assistant", "_pgagent_provider": {"protocol": "responses", "items": items}},
+                {"role": "tool", "tool_call_id": "call-1", "content": "搜索连接超时"}]
+    original = deepcopy(messages)
+    request_items = input_items(messages)
+    assert request_items[0] == {key: value for key, value in items[0].items() if key != "status"}
+    assert request_items[1:3] == items[1:]
+    assert request_items[3] == {"type": "function_call_output", "call_id": "call-1", "output": "搜索连接超时"}
+    assert messages == original
