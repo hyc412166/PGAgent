@@ -12,6 +12,23 @@ class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ValidationRuntimeConfig(BaseModel):
+    kind: Literal["local", "docker"] = "local"
+    image: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_runtime(self) -> "ValidationRuntimeConfig":
+        image = str(self.image or "").strip()
+        if self.kind == "docker" and not image:
+            raise ValueError("Docker validation runtime requires an image")
+        if image.startswith("-"):
+            raise ValueError("Validation image must be an image reference, not a Docker option")
+        if image and any(character.isspace() or ord(character) < 32 for character in image):
+            raise ValueError("Validation image must not contain whitespace or control characters")
+        self.image = image or None
+        return self
+
+
 class WorkspaceCreate(BaseModel):
     # The project picker normally provides only a directory. Keep ``name``
     # optional for that path while accepting the older explicit-name payload.
@@ -19,6 +36,7 @@ class WorkspaceCreate(BaseModel):
     description: str = ""
     root_path: str = Field(min_length=1)
     enabled: bool = True
+    validation_runtime: ValidationRuntimeConfig = Field(default_factory=ValidationRuntimeConfig)
 
 
 class WorkspaceUpdate(BaseModel):
@@ -26,6 +44,7 @@ class WorkspaceUpdate(BaseModel):
     description: str | None = None
     root_path: str | None = Field(default=None, min_length=1)
     enabled: bool | None = None
+    validation_runtime: ValidationRuntimeConfig | None = None
 
 
 class WorkspaceRead(ORMModel):
@@ -34,6 +53,7 @@ class WorkspaceRead(ORMModel):
     description: str
     root_path: str
     enabled: bool
+    validation_runtime: ValidationRuntimeConfig
     created_at: datetime
     updated_at: datetime
 

@@ -118,7 +118,11 @@ def delegated_run(tmp_path: Path) -> dict[str, str]:
     parent_root.mkdir()
     child_root.mkdir()
     with database.SessionLocal() as db:
-        parent_workspace = Workspace(name="Parent", root_path=str(parent_root))
+        parent_workspace = Workspace(
+            name="Parent",
+            root_path=str(parent_root),
+            validation_runtime={"kind": "docker", "image": "swebench/parent:latest"},
+        )
         child_workspace = Workspace(name="Child profile", root_path=str(child_root))
         parent_connection = ModelConnection(
             name="Parent connection",
@@ -266,6 +270,10 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
                 assert frozen_binding["use_memories"] is False
                 assert "skill_instructions" in frozen_binding
                 assert frozen_binding["workflow_profile_id"] == "review"
+                assert frozen_binding["validation_runtime"] == {
+                    "kind": "docker",
+                    "image": "swebench/parent:latest",
+                }
         # A malicious/buggy provider response that tries to recurse is still
         # rejected by the child registry; the second turn gives a real result.
         if child_calls == 1:
@@ -326,6 +334,10 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         assert frozen["model_id"] == "child-model"
         assert frozen["workflow_profile_id"] == "review"
         assert frozen["allowed_tool_names"] == ["read", "read_artifact"]
+        assert frozen["validation_runtime"] == {
+            "kind": "docker",
+            "image": "swebench/parent:latest",
+        }
 
 
 @pytest.mark.asyncio

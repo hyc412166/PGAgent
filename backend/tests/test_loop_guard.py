@@ -617,6 +617,40 @@ async def test_rate_limit_retries_at_most_three_total_attempts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_managed_retry_is_persisted_before_terminal_failure(tmp_path) -> None:
+    published: list[dict] = []
+
+    async def model_call(*, on_retry=None, **_kwargs) -> ModelTurn:
+        await on_retry("request", 1, 0)
+        raise StatusError(502)
+
+    model_call.manages_retries = True
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+        event_sink=published.append,
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    retry = next(event for event in outcome.events if event["type"] == "model_retry")
+    failed = next(event for event in outcome.events if event["type"] == "model_failed")
+    assert retry == {
+        "type": "model_retry",
+        "stage": "request",
+        "attempt": 1,
+        "delay_seconds": 0,
+    }
+    assert retry in published
+    assert failed["status_code"] == 502
+    assert failed["error_kind"] == "server"
+    assert failed["retry_exhausted"] is True
+    assert failed["retry_attempt_count"] == 1
+    assert outcome.error == "StatusError"
+    assert "HTTP 502" not in str(outcome.error)
+
+
+@pytest.mark.asyncio
 async def test_runtime_stops_repeated_model_tool_call(tmp_path) -> None:
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(tool_calls=[ModelToolCall("same", "list_files", {"path": "."})])

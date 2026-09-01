@@ -222,6 +222,8 @@ def classify_error_details(
         return "model_bad_request"
     if status_number is not None and status_number >= 500:
         return "model_unavailable"
+    if "connection" in name or "connecterror" in name or "network" in name:
+        return "model_unavailable"
     if "modelconfiguration" in name:
         return "model_configuration_error"
     if "tool" in name:
@@ -236,10 +238,12 @@ def classify_error_details(
 
 
 def classify_exception(error: BaseException) -> str:
+    from src.agent.errors import status_code_from_error
+
     return classify_error_details(
         type(error).__name__,
         str(error),
-        status_code=getattr(error, "status_code", None),
+        status_code=status_code_from_error(error),
     )
 
 

@@ -152,12 +152,7 @@ class BackgroundJobManager:
             return [executable, "-NoProfile", "-NonInteractive", "-Command", job.command]
         if job.shell != "command":
             raise ValueError("shell must be command or powershell")
-        parts = builtins._split_command(job.command)
-        if any(marker in parts[0] for marker in ("/", "\\", ":")):
-            raise ValueError("command must use a bare allowlisted executable name")
-        if parts[0].lower() not in {item.lower() for item in builtins.DEFAULT_COMMAND_ALLOWLIST}:
-            raise ValueError(f"command is not allowlisted: {parts[0].lower()}")
-        return parts
+        return builtins.parse_command_argv(job.command)
 
     def _run(self, job_id: str, cancel_event: threading.Event) -> None:
         process: subprocess.Popen[Any] | None = None
@@ -447,7 +442,7 @@ class BackgroundJobToolStore:
             normalized_command = command.strip()
         else:
             try:
-                command_parts = builtins._split_command(command)
+                command_parts = builtins.parse_command_argv(command)
             except ValueError as exc:
                 return ToolResult("background_run", False, str(exc), error_code="invalid_arguments")
             normalized_command = (

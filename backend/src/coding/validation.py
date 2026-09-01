@@ -6,11 +6,11 @@ import threading
 import time
 from typing import Any
 
-from src.tools import builtins
 from src.tools.sandbox import WorkspaceSandbox
 from src.tools.types import ToolResult
 
 from .worktree import annotate_command_changes, capture_worktree_state
+from .validation_runtime import run_in_validation_runtime
 
 
 VALIDATION_KINDS = frozenset({"test", "lint", "typecheck", "build", "format_check", "other"})
@@ -24,6 +24,7 @@ def run_validation(
     cwd: str = ".",
     timeout_seconds: float = 120,
     approved: bool = False,
+    validation_runtime: dict[str, Any] | None = None,
     track_worktree_changes: bool = True,
     _cancel_event: threading.Event | None = None,
 ) -> ToolResult:
@@ -32,13 +33,14 @@ def run_validation(
         return ToolResult("validate", False, f"unsupported validation kind: {kind}", error_code="invalid_arguments")
     started = time.monotonic()
     before = capture_worktree_state(sandbox.root) if track_worktree_changes else None
-    result = builtins.run_command(
+    result = run_in_validation_runtime(
         sandbox,
         command,
+        runtime=validation_runtime,
         cwd=cwd,
         timeout_seconds=timeout_seconds,
         approved=approved,
-        _cancel_event=_cancel_event,
+        cancel_event=_cancel_event,
     )
     if result.approval_required:
         result.tool_name = "validate"

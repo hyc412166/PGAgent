@@ -119,6 +119,7 @@ def create_workspace(
         description=payload.description,
         root_path=root_path,
         enabled=payload.enabled,
+        validation_runtime=payload.validation_runtime.model_dump(exclude_none=True),
     )
     db.add(item)
     _commit(db)

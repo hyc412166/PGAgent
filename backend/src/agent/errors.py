@@ -19,7 +19,7 @@ class APIErrorKind(StrEnum):
     UNKNOWN = "unknown"
 
 
-def _status_code(error: BaseException) -> int | None:
+def status_code_from_error(error: BaseException) -> int | None:
     direct = getattr(error, "status_code", None)
     response = getattr(error, "response", None)
     response_status = getattr(response, "status_code", None)
@@ -33,7 +33,7 @@ def _status_code(error: BaseException) -> int | None:
 
 
 def classify_api_error(error: BaseException) -> APIErrorKind:
-    status = _status_code(error)
+    status = status_code_from_error(error)
     if status in {401, 403}:
         return APIErrorKind.AUTH
     if status == 429:

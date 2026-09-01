@@ -24,7 +24,13 @@ from src.context.assembly import (
     InMemoryArtifactStore,
     compact_tool_results_for_model,
 )
-from .errors import APIErrorKind, call_with_retry
+from .errors import (
+    APIErrorKind,
+    call_with_retry,
+    classify_api_error,
+    is_retryable_api_error,
+    status_code_from_error,
+)
 from .guards import GuardDecision, LoopGuard
 from .step_context import AgentStepContext
 from .loop import run_agent_loop
@@ -1023,7 +1029,11 @@ class AgentRuntime:
             if current_tokens >= self.context_assembler.compaction_threshold:
                 state = await compact_state(state, reason="threshold", phase="before_model")
 
+            retry_attempt_count = 0
+
             async def retry_event(attempt: int, delay: float, kind: APIErrorKind, error: BaseException) -> None:
+                nonlocal retry_attempt_count
+                retry_attempt_count += 1
                 state["events"] = await self._publish(
                     state,
                     "model_retry",
@@ -1127,8 +1137,13 @@ class AgentRuntime:
                         kwargs["prompt_cache_key"] = state.get("prompt_cache_key")
                     if self._model_accepts_retry:
                         async def provider_retry(stage: str, attempt: int, delay: float) -> None:
-                            await self._publish_transient(
-                                "model_retry", stage=stage, attempt=attempt,
+                            nonlocal retry_attempt_count
+                            retry_attempt_count += 1
+                            state["events"] = await self._publish(
+                                state,
+                                "model_retry",
+                                stage=stage,
+                                attempt=attempt,
                                 delay_seconds=round(delay, 3),
                             )
                         kwargs["on_retry"] = provider_retry
@@ -1211,11 +1226,18 @@ class AgentRuntime:
                 )
                 return stopped
             except Exception as exc:
-                failed = {**state, "status": "failed", "error": str(exc)}
+                failed = {**state, "status": "failed", "error": type(exc).__name__}
+                status_code = status_code_from_error(exc)
+                retryable = is_retryable_api_error(exc)
                 failed["events"] = await self._publish(
                     failed,
                     "model_failed",
                     error_type=type(exc).__name__,
+                    error_kind=classify_api_error(exc).value,
+                    status_code=status_code,
+                    retryable=retryable,
+                    retry_exhausted=retryable and retry_attempt_count > 0,
+                    retry_attempt_count=retry_attempt_count,
                     elapsed_ms=round((self.clock() - active_started_at) * 1000),
                 )
                 return failed

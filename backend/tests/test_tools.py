@@ -267,6 +267,17 @@ def test_run_command_enforces_allowlist(tmp_path: Path) -> None:
     assert result.error_code == "command_not_allowed"
 
 
+def test_run_command_blocks_control_tokens_in_windows_batch_arguments(tmp_path: Path) -> None:
+    result = run_command(
+        WorkspaceSandbox(tmp_path),
+        ["npm.cmd", "--version", "&", "echo", "unexpected"],
+        approved=True,
+    )
+    assert not result.ok
+    assert result.error_code == "command_not_allowed"
+    assert "批处理命令参数" in result.content
+
+
 def test_run_command_captures_output_when_approved(tmp_path: Path) -> None:
     result = run_command(
         WorkspaceSandbox(tmp_path),

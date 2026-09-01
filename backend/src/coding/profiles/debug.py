@@ -40,6 +40,8 @@ DEBUG_PROFILE = WorkflowProfile(
         "observations, hypotheses, and the confirmed root cause. Keep hypotheses distinct from confirmed "
         "facts and actively disprove alternatives. Once the root cause is supported, make the smallest "
         "coherent fix, rerun the original reproducer, and add or run a regression check with validate. "
+        "Keep the reproducer faithful to the original data shape, ownership layer, and dispatch path, and trace "
+        "where the affected value is collected, filtered, transformed, and emitted before editing. "
         "Use validate_baseline for pristine-HEAD comparisons so candidate files are never temporarily reverted. "
         "Report the root cause, fix, reproduction result, regression result, and any unresolved uncertainty."
     ),

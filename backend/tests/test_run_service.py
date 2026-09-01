@@ -244,6 +244,40 @@ def test_integration_failure_reply_is_traceable_idempotent_and_sanitized(
         assert "追踪号" in replies[0].content
 
 
+def test_model_failure_status_code_is_preserved_for_classification(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+    outcome = RunOutcome(
+        status="failed",
+        output=None,
+        messages=[],
+        transcript_delta=[],
+        events=[{
+            "type": "model_failed",
+            "error_type": "InternalServerError",
+            "status_code": 502,
+            "retry_exhausted": True,
+        }],
+        error="private upstream response",
+        steps=1,
+        tool_calls=0,
+    )
+
+    RunCoordinator._persist_outcome(run_id, outcome)
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.error_code == "model_unavailable"
+        assert "private upstream response" not in str(run.error_message)
+        reply = db.scalar(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+        ))
+        assert reply is not None
+        assert "private upstream response" not in reply.content
+
+
 def test_parent_failure_fallback_summarizes_mixed_delegated_results(
     accepted_run: tuple[str, str],
 ) -> None:
@@ -1035,6 +1069,12 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
         session = db.get(Session, session_id)
         run = db.get(Run, run_id)
         assert session is not None and run is not None
+        workspace = db.get(Workspace, run.workspace_id)
+        assert workspace is not None
+        workspace.validation_runtime = {
+            "kind": "docker",
+            "image": "swebench/frozen-runtime:latest",
+        }
         session.thinking_level = "auto"
         agent = db.get(Agent, run.agent_id)
         assert agent is not None
@@ -1058,6 +1098,13 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
     # it is only surfaced as safe capability metadata for the task tool.
     assert context["provider"].thinking_level == "low"
     assert context["todo_state"] == []
+    assert context["runtime_binding"]["validation_runtime"] == {
+        "kind": "docker",
+        "image": "swebench/frozen-runtime:latest",
+    }
+    assert context["runtime_binding"]["validation_runtime"] == (
+        _runtime.tool_registry.runtime_state()["validation_runtime"]
+    )
     assert agent.id in context["agent_instructions"]
     assert "Builder" in context["agent_instructions"]
 
@@ -1070,6 +1117,7 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
         assert workspace is not None
         connection.default_model = "changed-model"
         workspace.root_path = "C:/changed-workspace"
+        workspace.validation_runtime = {"kind": "local"}
         db.commit()
 
     _runtime, resumed_context = RunCoordinator._resolve_runtime(
@@ -1081,6 +1129,10 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
     assert resumed_context["provider"].base_url == "https://example.test/v1"
     assert resumed_context["provider"].model_id == "fallback-model"
     assert resumed_context["provider"].model_connection_id == connection_id
+    assert resumed_context["runtime_binding"]["validation_runtime"] == {
+        "kind": "docker",
+        "image": "swebench/frozen-runtime:latest",
+    }
 
     with database.SessionLocal() as db:
         connection = db.get(ModelConnection, connection_id)

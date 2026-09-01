@@ -30,6 +30,7 @@ class Workspace(TimestampMixin, Base):
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     root_path: Mapped[str] = mapped_column(Text, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    validation_runtime: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class ModelConnection(TimestampMixin, Base):

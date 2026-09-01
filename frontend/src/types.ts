@@ -22,6 +22,10 @@ export interface Workspace {
   path?: string
   root_path?: string
   description?: string
+  validation_runtime?: {
+    kind: 'local' | 'docker'
+    image?: string | null
+  }
   created_at?: string
   updated_at?: string
 }

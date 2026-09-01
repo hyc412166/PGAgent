@@ -133,6 +133,7 @@ class RunRuntimeFactory:
             workflow_profile_id=str(binding.get("workflow_profile_id") or "auto"),
             workflow_evidence_state=binding.get("workflow_evidence_state"),
             coding_state=binding.get("coding_state"),
+            validation_runtime=binding.get("validation_runtime"),
             active_builtin_tool_names=binding.get("builtin_active_tools"),
         )
         coordinator.register_tool_canceller(run_id, registry.cancel_active)
