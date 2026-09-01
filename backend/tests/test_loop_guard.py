@@ -8,7 +8,7 @@ import pytest
 
 from src.context.window import ContextManager
 from src.context.assembly import COMPACTION_SECTION_TITLES, ConversationCompactor
-from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage
+from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage, normalize_usage
 from src.agent.errors import APIErrorKind, call_with_retry, classify_api_error
 from src.agent.guards import LoopGuard
 from src.tools import create_default_registry
@@ -38,6 +38,43 @@ def test_usage_merge_rejects_model_identity_drift() -> None:
             {"request_count": 1, "model_connection_id": "connection-1", "model_id": "model-1"},
             {"request_count": 1, "model_connection_id": "connection-2", "model_id": "model-2"},
         )
+
+
+def test_normalize_responses_usage_splits_cached_input_without_double_counting() -> None:
+    raw = {
+        "input_tokens": 100,
+        "input_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 10},
+        "output_tokens": 20,
+        "output_tokens_details": {"reasoning_tokens": 5},
+        "total_tokens": 120,
+    }
+    normalized = normalize_usage(raw)
+    assert normalized == {
+        "request_count": 1,
+        "input_tokens": 60,
+        "output_tokens": 20,
+        "cache_creation_tokens": 10,
+        "cache_read_tokens": 30,
+        "total_tokens": 120,
+        "cost_usd": 0.0,
+        "model_connection_id": None,
+        "model_id": "",
+        "provider": "",
+    }
+    assert normalize_usage(normalized) == normalized
+
+
+def test_normalize_responses_usage_accepts_missing_cache_write_detail() -> None:
+    normalized = normalize_usage({
+        "input_tokens": 80,
+        "input_tokens_details": {"cached_tokens": 48},
+        "output_tokens": 5,
+        "total_tokens": 85,
+    })
+    assert normalized["input_tokens"] == 32
+    assert normalized["cache_creation_tokens"] == 0
+    assert normalized["cache_read_tokens"] == 48
+    assert normalized["total_tokens"] == 85
 
 
 def test_identical_call_is_stopped_on_third_occurrence() -> None:

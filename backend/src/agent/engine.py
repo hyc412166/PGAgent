@@ -192,11 +192,17 @@ def normalize_usage(value: Mapping[str, Any] | None) -> dict[str, Any]:
     prompt_details = raw.get("prompt_tokens_details") or {}
     if not isinstance(prompt_details, Mapping):
         prompt_details = {}
+    input_details = raw.get("input_tokens_details") or {}
+    if not isinstance(input_details, Mapping):
+        input_details = {}
     cache_creation = raw.get(
         "cache_creation_tokens",
         raw.get(
             "cache_creation_input_tokens",
-            raw.get("prompt_cache_miss_tokens", raw.get("cache_miss_tokens", 0)),
+            raw.get(
+                "prompt_cache_miss_tokens",
+                raw.get("cache_miss_tokens", input_details.get("cache_write_tokens", 0)),
+            ),
         ),
     )
     cache_read = raw.get(
@@ -205,7 +211,10 @@ def normalize_usage(value: Mapping[str, Any] | None) -> dict[str, Any]:
             "cache_read_input_tokens",
             raw.get(
                 "prompt_cache_hit_tokens",
-                raw.get("cache_hit_tokens", prompt_details.get("cached_tokens", 0)),
+                raw.get(
+                    "cache_hit_tokens",
+                    prompt_details.get("cached_tokens", input_details.get("cached_tokens", 0)),
+                ),
             ),
         ),
     )
@@ -226,7 +235,14 @@ def normalize_usage(value: Mapping[str, Any] | None) -> dict[str, Any]:
     cache_creation_tokens = safe_int(cache_creation)
     cache_read_tokens = safe_int(cache_read)
     if "input_tokens" in raw:
-        input_tokens = safe_int(raw.get("input_tokens"))
+        raw_input_tokens = safe_int(raw.get("input_tokens"))
+        # Responses input_tokens includes both cached and newly cached input.
+        # Only split it when the provider supplied that protocol's details;
+        # already-normalized usage must remain idempotent.
+        input_tokens = (
+            max(0, raw_input_tokens - cache_creation_tokens - cache_read_tokens)
+            if input_details else raw_input_tokens
+        )
     else:
         # OpenAI-compatible prompt_tokens normally includes cached input. Keep
         # the unified categories disjoint while preserving raw total_tokens.
