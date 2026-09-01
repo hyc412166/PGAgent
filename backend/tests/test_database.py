@@ -540,6 +540,22 @@ def test_workspace_directory_only_is_named_and_deduplicated(
     assert workspace["name"] == "selected-project"
     assert workspace["description"] == ""
     assert Path(workspace["root_path"]).resolve() == root.resolve()
+    assert workspace["validation_runtime"] == {"kind": "local", "image": None}
+
+    configured = client.patch(
+        f"/api/workspaces/{workspace['id']}",
+        json={"validation_runtime": {"kind": "docker", "image": "swebench/test:latest"}},
+    )
+    assert configured.status_code == 200, configured.text
+    assert configured.json()["validation_runtime"] == {
+        "kind": "docker",
+        "image": "swebench/test:latest",
+    }
+    rejected = client.patch(
+        f"/api/workspaces/{workspace['id']}",
+        json={"validation_runtime": {"kind": "docker", "image": "--privileged"}},
+    )
+    assert rejected.status_code == 422
 
     duplicate = client.post(
         "/api/workspaces",
@@ -555,6 +571,32 @@ def test_workspace_filesystem_root_uses_project_fallback_name(client: TestClient
     created = client.post("/api/workspaces", json={"root_path": str(root)})
     assert created.status_code == 201, created.text
     assert created.json()["name"] == "项目"
+
+
+def test_run_listing_supports_stable_pagination(client: TestClient) -> None:
+    session_id = client.post("/api/sessions", json={}).json()["id"]
+    run_ids = [
+        client.post("/api/runs", json={"session_id": session_id, "status": "completed"}).json()["id"]
+        for _ in range(3)
+    ]
+
+    first = client.get(
+        "/api/runs", params={"session_id": session_id, "limit": 2}
+    ).json()
+    second = client.get(
+        "/api/runs",
+        params={
+            "session_id": session_id,
+            "limit": 2,
+            "before_started_at": first[-1]["started_at"],
+            "before_id": first[-1]["id"],
+        },
+    ).json()
+
+    listed = [item["id"] for item in [*first, *second]]
+    assert len(listed) == 3
+    assert len(set(listed)) == 3
+    assert set(listed) == set(run_ids)
 
 
 def test_delete_workspace_keeps_local_files_and_deletes_complete_session_history(

@@ -411,6 +411,7 @@ class _SubagentTaskDelegate:
             "mcp_server_names": list(self.parent_binding.get("mcp_server_names") or []),
             "skill_instructions": skill_instructions,
             "todo_state": [],
+            "validation_runtime": dict(self.parent_binding.get("validation_runtime") or {}),
             "custom_headers_digest": _configuration_digest(connection.custom_headers or {}),
         }
         return provider_config, binding, skill_instructions

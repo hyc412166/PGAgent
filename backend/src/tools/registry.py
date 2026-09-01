@@ -554,11 +554,13 @@ class ToolRegistry:
         workflow_profile_id: str = "auto",
         workflow_evidence_state: Mapping[str, Any] | None = None,
         coding_state: Mapping[str, Any] | None = None,
+        validation_runtime: Mapping[str, Any] | None = None,
         active_builtin_tool_names: Iterable[str] | None = None,
     ) -> None:
         from src.coding.evidence import WorkflowEvidenceState
         from src.coding.profiles import resolve_workflow_profile
         from src.coding.state import CodingSessionState
+        from src.coding.validation_runtime import normalize_validation_runtime
 
         self.sandbox = sandbox
         self.permission_mode = normalize_permission_mode(permission_mode)
@@ -581,6 +583,7 @@ class ToolRegistry:
         self._task_store = task_store
         self._coding_state = CodingSessionState.restore(coding_state)
         self._workflow_evidence = WorkflowEvidenceState.restore(workflow_evidence_state)
+        self._validation_runtime = normalize_validation_runtime(validation_runtime)
         self._active_cancel_lock = threading.RLock()
         self._active_cancel_events: dict[str, threading.Event] = {}
         self._skill_instructions = _normalize_skill_instructions(skill_instructions)
@@ -874,6 +877,7 @@ class ToolRegistry:
         return run_validation(
             sandbox,
             **kwargs,
+            validation_runtime=self._validation_runtime,
             track_worktree_changes=self.workflow_profile_id in {"coding", "debug"},
         )
 
@@ -1212,6 +1216,7 @@ class ToolRegistry:
             ),
             "workflow_evidence_state": self._workflow_evidence.snapshot(),
             "coding_state": self._coding_state.snapshot(),
+            "validation_runtime": dict(self._validation_runtime),
             **self._external_state,
         }
 
@@ -1499,6 +1504,7 @@ def create_default_registry(
     workflow_profile_id: str = "auto",
     workflow_evidence_state: Mapping[str, Any] | None = None,
     coding_state: Mapping[str, Any] | None = None,
+    validation_runtime: Mapping[str, Any] | None = None,
     active_builtin_tool_names: Iterable[str] | None = None,
 ) -> ToolRegistry:
     """Create a sandboxed registry with an explicit, frozen capability list."""
@@ -1520,5 +1526,6 @@ def create_default_registry(
         workflow_profile_id=workflow_profile_id,
         workflow_evidence_state=workflow_evidence_state,
         coding_state=coding_state,
+        validation_runtime=validation_runtime,
         active_builtin_tool_names=active_builtin_tool_names,
     )

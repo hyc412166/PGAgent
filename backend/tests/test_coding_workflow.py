@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from src.coding import patch as patch_module
+from src.coding import validation_runtime as validation_runtime_module
 from src.coding.profiles import resolve_workflow_profile
 from src.tools import create_default_registry
 from src.tools.types import ToolResult
@@ -200,6 +201,83 @@ def test_validate_runs_in_sandboxed_cwd_and_persists_result(tmp_path) -> None:
     assert result.metadata["validation"]["cwd"] == "backend"
     state = registry.runtime_state()["coding_state"]
     assert state["validations"][0]["exit_code"] == 0
+
+
+def test_validate_uses_frozen_docker_runtime_without_exposing_docker(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "backend").mkdir()
+    captured: dict = {}
+
+    def fake_run_command(_sandbox, command, **kwargs) -> ToolResult:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return ToolResult(
+            "run_command",
+            True,
+            "1 passed",
+            metadata={"exit_code": 0, "cwd": "."},
+        )
+
+    monkeypatch.setattr(validation_runtime_module.builtins, "run_command", fake_run_command)
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["validate"],
+        permission_mode="full",
+        validation_runtime={"kind": "docker", "image": "swebench/test-image:latest"},
+    )
+
+    result = registry.execute(
+        "validate",
+        {
+            "command": ["python", "-c", "print('a;b<c>d')"],
+            "kind": "test",
+            "cwd": "backend",
+        },
+    )
+
+    assert result.ok
+    assert captured["command"][:4] == [
+        "docker", "run", "--rm", "--name",
+    ]
+    assert captured["command"][4].startswith("pgagent-validation-")
+    assert "swebench/test-image:latest" in captured["command"]
+    assert captured["command"][10].endswith(":/testbed")
+    assert captured["command"][12] == "/testbed/backend"
+    assert captured["command"][-3:] == ["python", "-c", "print('a;b<c>d')"]
+    assert captured["kwargs"]["allowlist"] == frozenset({"docker", "docker.exe"})
+    assert result.metadata["validation_runtime"] == "docker"
+    assert registry.runtime_state()["validation_runtime"] == {
+        "kind": "docker",
+        "image": "swebench/test-image:latest",
+    }
+
+
+def test_docker_validation_reports_cleanup_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def fake_run_command(_sandbox, _command, **_kwargs) -> ToolResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ToolResult("run_command", False, "timed out", error_code="timeout")
+        return ToolResult("run_command", False, "daemon unavailable", error_code="command_error")
+
+    monkeypatch.setattr(validation_runtime_module.builtins, "run_command", fake_run_command)
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["validate"],
+        permission_mode="full",
+        validation_runtime={"kind": "docker", "image": "swebench/test:latest"},
+    )
+
+    result = registry.execute("validate", {"command": ["python", "--version"]})
+
+    assert not result.ok
+    assert result.metadata["docker_cleanup_succeeded"] is False
+    assert "Docker 容器清理失败" in result.content
 
 
 def test_change_after_validation_marks_the_evidence_stale(tmp_path) -> None:

@@ -47,6 +47,7 @@ DEFAULT_COMMAND_ALLOWLIST = frozenset(
 )
 
 _DANGEROUS_SHELL_TOKENS = ("&&", "||", ";", "|", ">", "<", "`", "$(")
+_WINDOWS_BATCH_CONTROL_TOKENS = ("&", "|", ">", "<", "^", "\r", "\n")
 
 # A coordinator must be able to fan out, but a malformed model response must
 # not be able to create an unbounded number of child runs in one turn.
@@ -1787,7 +1788,6 @@ def _atomic_delete_windows(sandbox: WorkspaceSandbox, path: str) -> str | None:
 def _split_command(command: str | list[str]) -> list[str]:
     if isinstance(command, list):
         parts = [str(part) for part in command]
-        joined = " ".join(parts)
     else:
         joined = command.strip()
         if any(token in joined for token in _DANGEROUS_SHELL_TOKENS):
@@ -1795,9 +1795,29 @@ def _split_command(command: str | list[str]) -> list[str]:
         parts = shlex.split(joined, posix=os.name != "nt")
     if not parts:
         raise ValueError("命令不能为空")
-    if any(any(token in part for token in _DANGEROUS_SHELL_TOKENS) for part in parts):
-        raise ValueError("命令包含被禁止的 shell 链接或重定向符号")
     return [part.strip('"') for part in parts]
+
+
+def parse_command_argv(
+    command: str | list[str],
+    *,
+    allowlist: frozenset[str] = DEFAULT_COMMAND_ALLOWLIST,
+) -> list[str]:
+    """Parse one shell-free command and enforce its executable boundary."""
+
+    normalized = _split_command(command)
+    if any(marker in normalized[0] for marker in ("/", "\\", ":")):
+        raise ValueError("命令必须使用 allowlist 中的裸可执行文件名，不能提供路径")
+    executable = normalized[0].lower()
+    normalized_allowlist = {item.lower() for item in allowlist}
+    if executable not in normalized_allowlist:
+        raise ValueError(f"命令不在允许列表中: {executable}")
+    if executable.endswith((".cmd", ".bat")) and any(
+        any(token in argument for token in _WINDOWS_BATCH_CONTROL_TOKENS)
+        for argument in normalized[1:]
+    ):
+        raise ValueError("批处理命令参数包含被禁止的 shell 链接或重定向符号")
+    return normalized
 
 
 def run_command(
@@ -1823,25 +1843,19 @@ def run_command(
         if not working_directory.is_dir():
             return ToolResult("run_command", False, "cwd is not a directory", error_code="not_directory")
         relative_cwd = sandbox.relative(working_directory)
-        parts = _split_command(command)
-        # Accept a bare allowlisted executable only.  Supplying an arbitrary
-        # path to a program called ``python.exe`` would otherwise defeat the
-        # command allowlist while still running outside the project tree.
-        if any(marker in parts[0] for marker in ("/", "\\", ":")):
+        try:
+            parts = parse_command_argv(command, allowlist=allowlist)
+        except ValueError as exc:
+            message = str(exc)
             return ToolResult(
                 "run_command",
                 False,
-                "命令必须使用 allowlist 中的裸可执行文件名，不能提供路径",
-                error_code="command_not_allowed",
-            )
-        executable = parts[0].lower()
-        normalized_allowlist = {item.lower() for item in allowlist}
-        if executable not in normalized_allowlist:
-            return ToolResult(
-                "run_command",
-                False,
-                f"命令不在允许列表中: {executable}",
-                error_code="command_not_allowed",
+                message,
+                error_code=(
+                    "command_error"
+                    if message.startswith("命令包含被禁止")
+                    else "command_not_allowed"
+                ),
             )
         timeout = min(max(float(timeout_seconds), 0.1), 120.0)
         output_limit = min(max(int(output_limit), 256), 1_000_000)

@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -120,6 +120,9 @@ def list_runs(
     session_id: str | None = None,
     run_status: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    before_started_at: datetime | None = None,
+    before_id: str | None = None,
     db: Session = Depends(get_db),
 ) -> list[RunRead]:
     query = select(Run)
@@ -127,7 +130,16 @@ def list_runs(
         query = query.where(Run.session_id == session_id)
     if run_status:
         query = query.where(Run.status == run_status)
-    runs = list(db.scalars(query.order_by(Run.started_at.desc()).limit(limit)))
+    if (before_started_at is None) != (before_id is None):
+        raise HTTPException(status_code=422, detail="before_started_at and before_id must be provided together")
+    if before_started_at is not None and before_id is not None:
+        query = query.where(or_(
+            Run.started_at < before_started_at,
+            and_(Run.started_at == before_started_at, Run.id < before_id),
+        ))
+    runs = list(db.scalars(
+        query.order_by(Run.started_at.desc(), Run.id.desc()).offset(offset).limit(limit)
+    ))
     session_ids = {run.session_id for run in runs if run.session_id}
     agent_ids = {run.agent_id for run in runs if run.agent_id}
     session_titles = dict(db.execute(

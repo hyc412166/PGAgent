@@ -1374,6 +1374,7 @@ class RunCoordinator:
                     "allowed_tool_names": allowed_tool_names,
                     "skill_instructions": skill_instructions,
                     "todo_state": todo_state,
+                    "validation_runtime": dict(workspace.validation_runtime or {}),
                     "memories_enabled": global_memories_enabled,
                     "use_memories": use_memories,
                     "memory_index": memory_index,
@@ -1770,13 +1771,19 @@ class RunCoordinator:
         outcome: RunOutcome,
         consumed_background_event_ids: Iterable[str] = (),
     ) -> None:
-        event_error_type = next(
+        error_event = next(
             (
-                str(event.get("error_type") or event.get("error_code") or event.get("code") or "")
+                event
                 for event in reversed(outcome.events)
                 if event.get("error_type") or event.get("error_code") or event.get("code")
             ),
-            "",
+            {},
+        )
+        event_error_type = str(
+            error_event.get("error_type")
+            or error_event.get("error_code")
+            or error_event.get("code")
+            or ""
         )
         effective_status = str(outcome.status or "failed")
         effective_stop_reason = outcome.stop_reason
@@ -1788,7 +1795,11 @@ class RunCoordinator:
             normalized_error_code = "empty_model_output"
             safe_error_message = public_error_message(normalized_error_code)
         elif effective_status == "failed":
-            normalized_error_code = classify_error_details(event_error_type, outcome.error)
+            normalized_error_code = classify_error_details(
+                event_error_type,
+                outcome.error,
+                status_code=error_event.get("status_code"),
+            )
             safe_error_message = public_error_message(normalized_error_code)
         elif effective_status == "stopped" and is_terminal_delivery(effective_status, effective_stop_reason):
             normalized_error_code = terminal_error_code(
