@@ -76,7 +76,12 @@ async def test_responses_uses_native_items_and_stateless_request(
             "response": {
                 "status": "completed",
                 "output": [output_item],
-                "usage": {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
+                "usage": {
+                    "input_tokens": 12,
+                    "input_tokens_details": {"cached_tokens": 8, "cache_write_tokens": 0},
+                    "output_tokens": 3,
+                    "total_tokens": 15,
+                },
             },
         }
 
@@ -128,6 +133,9 @@ async def test_responses_uses_native_items_and_stateless_request(
     assert response["content"] == "完成。"
     assert response["_pgagent_provider"]["items"] == [output_item]
     assert response["usage"]["request_count"] == 1
+    assert response["usage"]["input_tokens"] == 4
+    assert response["usage"]["cache_read_tokens"] == 8
+    assert response["usage"]["total_tokens"] == 15
     assert deltas == ["完成。"]
 
 
