@@ -8,7 +8,7 @@ import pytest
 
 from src.context.window import ContextManager
 from src.context.assembly import COMPACTION_SECTION_TITLES, ConversationCompactor
-from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage, normalize_usage
+from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage, normalize_usage, provider_web_search_calls
 from src.agent.errors import APIErrorKind, call_with_retry, classify_api_error
 from src.agent.guards import LoopGuard
 from src.tools import create_default_registry
@@ -30,6 +30,12 @@ class ManualClock:
 
     def advance(self, seconds: float) -> None:
         self.value += seconds
+
+
+def write_call(call_id: str, path: str, content: str) -> ModelToolCall:
+    return ModelToolCall(call_id, "apply_patch", {
+        "patch": f"*** Begin Patch\n*** Add File: {path}\n+{content}\n*** End Patch",
+    })
 
 
 def test_usage_merge_rejects_model_identity_drift() -> None:
@@ -468,7 +474,11 @@ async def test_active_runtime_accumulates_across_approval_pause(tmp_path) -> Non
         if turns == 1:
             clock.advance(0.6)
             return ModelTurn(tool_calls=[
-                ModelToolCall("write", "write_file", {"path": "x.txt", "content": "x"})
+                ModelToolCall(
+                    "write",
+                    "apply_patch",
+                    {"patch": "*** Begin Patch\n*** Add File: x.txt\n+x\n*** End Patch"},
+                )
             ])
         clock.advance(0.5)
         return ModelTurn(content="too late")
@@ -559,7 +569,9 @@ async def test_observation_history_is_not_truncated_to_200_before_approval(tmp_p
         ModelToolCall(f"missing-{index}", f"missing-{index}", {})
         for index in range(250)
     ]
-    calls.append(ModelToolCall("write", "write_file", {"path": "x.txt", "content": "x"}))
+    calls.append(ModelToolCall("patch", "apply_patch", {
+        "patch": "*** Begin Patch\n*** Add File: x.txt\n+x\n*** End Patch",
+    }))
 
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(tool_calls=calls)
@@ -653,7 +665,7 @@ async def test_provider_managed_retry_is_persisted_before_terminal_failure(tmp_p
 @pytest.mark.asyncio
 async def test_runtime_stops_repeated_model_tool_call(tmp_path) -> None:
     async def model_call(**_kwargs) -> ModelTurn:
-        return ModelTurn(tool_calls=[ModelToolCall("same", "list_files", {"path": "."})])
+        return ModelTurn(tool_calls=[ModelToolCall("same", "glob", {"path": "."})])
 
     runtime = AgentRuntime(
         model_call=model_call,
@@ -670,7 +682,7 @@ async def test_runtime_stops_repeated_model_tool_call(tmp_path) -> None:
 async def test_runtime_pauses_before_side_effect(tmp_path) -> None:
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(
-            tool_calls=[ModelToolCall("write-1", "write_file", {"path": "x.txt", "content": "hello"})]
+            tool_calls=[write_call("write-1", "x.txt", "hello")]
         )
 
     runtime = AgentRuntime(
@@ -716,11 +728,7 @@ async def test_coding_runtime_gets_one_recovery_turn_before_no_progress_stop(tmp
         if turn == 1:
             return ModelTurn(
                 tool_calls=[
-                    ModelToolCall(
-                        "edit-1",
-                        "write",
-                        {"path": "candidate.txt", "content": "working candidate\n"},
-                    )
+                    write_call("edit-1", "candidate.txt", "working candidate")
                 ]
             )
         if turn <= 5:
@@ -731,7 +739,7 @@ async def test_coding_runtime_gets_one_recovery_turn_before_no_progress_stop(tmp
         model_call=model_call,
         tool_registry=create_default_registry(
             str(tmp_path),
-            allowed_tool_names=["write", "apply_patch", "validate"],
+            allowed_tool_names=["apply_patch", "validate"],
             workflow_profile_id="coding",
             permission_mode="full",
         ),
@@ -852,7 +860,7 @@ async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> Non
         turns += 1
         if turns == 1:
             return ModelTurn(
-                tool_calls=[ModelToolCall("approved-write", "write_file", {"path": "done.txt", "content": "yes"})]
+                tool_calls=[write_call("approved-write", "done.txt", "yes")]
             )
         assert kwargs["messages"][-1]["role"] == "tool"
         assert kwargs["messages"][-1]["tool_call_id"] == "approved-write"
@@ -869,7 +877,7 @@ async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> Non
     assert resumed.mode == "auto"
     assert resumed.output == "完成"
     assert turns == 2
-    assert (tmp_path / "done.txt").read_text(encoding="utf-8") == "yes"
+    assert (tmp_path / "done.txt").read_text(encoding="utf-8") == "yes\n"
 
 
 @pytest.mark.asyncio
@@ -884,7 +892,7 @@ async def test_production_context_path_keeps_original_task_after_approval_resume
         assert not any("<user_task>" in str(item.get("content") or "") for item in kwargs["messages"])
         if turns == 1:
             return ModelTurn(tool_calls=[
-                ModelToolCall("approved-write", "write_file", {"path": "goal.txt", "content": "kept"})
+                write_call("approved-write", "goal.txt", "kept")
             ])
         return ModelTurn(content="done")
 
@@ -923,8 +931,8 @@ async def test_full_compaction_keeps_current_request_through_approval_resume(tmp
             old_assistant = next(index for index, item in enumerate(messages) if item.get("role") == "assistant")
             assert messages[old_assistant + 1].get("tool_call_id") == "old-read"
             return ModelTurn(tool_calls=[
-                ModelToolCall("approved-write", "write_file", {"path": "report.txt", "content": "approved"}),
-                ModelToolCall("second-read", "read_file", {"path": "report.txt"}),
+                write_call("approved-write", "report.txt", "approved"),
+                ModelToolCall("second-read", "read", {"path": "report.txt"}),
             ])
         assert any(item.get("tool_call_id") == "approved-write" for item in messages)
         return ModelTurn(content="report complete")
@@ -970,7 +978,7 @@ async def test_full_compaction_keeps_current_request_through_approval_resume(tmp
     resumed = await runtime.resume_after_approval(waiting)
     assert resumed.status == "completed"
     assert resumed.output == "report complete"
-    assert (tmp_path / "report.txt").read_text(encoding="utf-8") == "approved"
+    assert (tmp_path / "report.txt").read_text(encoding="utf-8") == "approved\n"
     assert calls == 2
     compacted = [event for event in durable_events if event["type"] == "context_compaction_finished"]
     assert compacted and compacted[-1]["effective"] is True
@@ -986,9 +994,9 @@ async def test_approval_resume_completes_entire_multi_tool_batch(tmp_path) -> No
         turns += 1
         if turns == 1:
             return ModelTurn(tool_calls=[
-                ModelToolCall("read-before", "read_file", {"path": "before.txt"}),
-                ModelToolCall("write-middle", "write_file", {"path": "created.txt", "content": "created"}),
-                ModelToolCall("list-after", "list_files", {"path": "."}),
+                ModelToolCall("read-before", "read", {"path": "before.txt"}),
+                write_call("write-middle", "created.txt", "created"),
+                ModelToolCall("list-after", "glob", {"path": "."}),
             ])
         tool_ids = [message.get("tool_call_id") for message in kwargs["messages"] if message.get("role") == "tool"]
         assert tool_ids[-3:] == ["read-before", "write-middle", "list-after"]
@@ -1001,7 +1009,7 @@ async def test_approval_resume_completes_entire_multi_tool_batch(tmp_path) -> No
     assert resumed.status == "completed"
     assert resumed.output == "batch complete"
     assert resumed.tool_calls == 3
-    assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "created"
+    assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "created\n"
 
 
 @pytest.mark.asyncio
@@ -1013,8 +1021,8 @@ async def test_multi_side_effect_batch_pauses_for_each_approval(tmp_path) -> Non
         turns += 1
         if turns == 1:
             return ModelTurn(tool_calls=[
-                ModelToolCall("write-1", "write_file", {"path": "one.txt", "content": "1"}),
-                ModelToolCall("write-2", "write_file", {"path": "two.txt", "content": "2"}),
+                write_call("write-1", "one.txt", "1"),
+                write_call("write-2", "two.txt", "2"),
             ])
         return ModelTurn(content="done")
 
@@ -1080,8 +1088,8 @@ async def test_resume_guard_stop_is_published_to_event_sink(tmp_path) -> None:
 
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(tool_calls=[
-            ModelToolCall("write", "write_file", {"path": "x.txt", "content": "x"}),
-            ModelToolCall("list", "list_files", {"path": "."}),
+            write_call("write", "x.txt", "x"),
+            ModelToolCall("list", "glob", {"path": "."}),
         ])
 
     runtime = AgentRuntime(
@@ -1115,7 +1123,7 @@ async def test_runtime_aggregates_usage_across_all_model_turns(tmp_path) -> None
         }
         if turn < 3:
             return ModelTurn(
-                tool_calls=[ModelToolCall(f"read-{turn}", "list_files", {"path": ".", "turn": turn})],
+                tool_calls=[ModelToolCall(f"read-{turn}", "glob", {"path": "."})],
                 usage=usage,
             )
         return ModelTurn(content="done", usage=usage)
@@ -1147,7 +1155,7 @@ async def test_explicit_token_budget_stops_before_executing_another_tool(tmp_pat
         nonlocal calls
         calls += 1
         return ModelTurn(
-            tool_calls=[ModelToolCall("read", "list_files", {"path": "."})],
+            tool_calls=[ModelToolCall("read", "glob", {"path": "."})],
             usage={
                 "request_count": 1,
                 "input_tokens": 18,
@@ -1188,7 +1196,7 @@ async def test_approval_resume_carries_usage_forward_without_double_counting(tmp
         }
         if turns == 1:
             return ModelTurn(
-                tool_calls=[ModelToolCall("write", "write_file", {"path": "x.txt", "content": "x"})],
+                tool_calls=[write_call("write", "x.txt", "x")],
                 usage=usage,
             )
         return ModelTurn(content="done", usage=usage)
@@ -1211,11 +1219,11 @@ async def test_approval_resume_preserves_seen_observations_for_no_progress_guard
         turns += 1
         if turns == 1:
             return ModelTurn(tool_calls=[
-                ModelToolCall("read-first", "read_file", {"path": "stable.txt"}),
-                ModelToolCall("approve-write", "write_file", {"path": "new.txt", "content": "new"}),
+                ModelToolCall("read-first", "read", {"path": "stable.txt"}),
+                write_call("approve-write", "new.txt", "new"),
             ])
         if turns == 2:
-            return ModelTurn(tool_calls=[ModelToolCall("read-again", "read_file", {"path": "stable.txt"})])
+            return ModelTurn(tool_calls=[ModelToolCall("read-again", "read", {"path": "stable.txt"})])
         return ModelTurn(tool_calls=[ModelToolCall(f"missing-{turns}", f"missing-{turns}", {})])
 
     runtime = AgentRuntime(
@@ -1227,8 +1235,8 @@ async def test_approval_resume_preserves_seen_observations_for_no_progress_guard
     resumed = await runtime.resume_after_approval(waiting)
     assert resumed.status == "stopped"
     assert resumed.stop_reason == "no_progress"
-    assert turns == 6
-    assert resumed.guard_snapshot["stagnation_recovery_count"] == 1
+    assert turns == 5
+    assert resumed.guard_snapshot["stagnation_recovery_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -1298,15 +1306,14 @@ async def test_assistant_deltas_use_only_transient_stream_sink(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_reasoning_deltas_stream_live_and_finish_as_one_durable_thought(tmp_path) -> None:
+async def test_provider_reasoning_is_not_published_to_the_user_timeline(tmp_path) -> None:
     durable_events: list[dict] = []
     transient_events: list[dict] = []
 
     async def model_call(**kwargs) -> ModelTurn:  # type: ignore[no-untyped-def]
-        await kwargs["on_thought_delta"]("先读取")
-        await kwargs["on_thought_delta"]("天气数据。")
+        assert "on_thought_delta" not in kwargs
         await kwargs["on_delta"]("今天晴。")
-        return ModelTurn(content="今天晴。")
+        return ModelTurn(content="今天晴。", reasoning_content="内部摘要")
 
     runtime = AgentRuntime(
         model_call=model_call,
@@ -1318,10 +1325,48 @@ async def test_reasoning_deltas_stream_live_and_finish_as_one_durable_thought(tm
     outcome = await runtime.run(system_prompt="safe", recent_messages=[])
 
     assert outcome.status == "completed"
-    assert [event["delta"] for event in transient_events if event["type"] == "thought_delta"] == ["先读取", "天气数据。"]
-    summaries = [event for event in durable_events if event["type"] == "thought_summary"]
-    assert summaries[-1]["summary"] == "先读取天气数据。"
-    assert summaries[-1]["step"] == 1
+    assert not any(event["type"] == "thought_delta" for event in transient_events)
+    assert not any(event["type"] == "thought_summary" for event in durable_events)
+
+
+@pytest.mark.asyncio
+async def test_provider_web_search_is_visible_without_local_dispatch(tmp_path) -> None:
+    durable_events: list[dict] = []
+
+    async def model_call(**_kwargs) -> ModelTurn:
+        return ModelTurn(
+            content="检索完成。",
+            provider_payload={
+                "protocol": "responses",
+                "items": [{
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": "latest release",
+                        "sources": [{"url": "https://example.com/release"}],
+                    },
+                }],
+            },
+        )
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+        event_sink=durable_events.append,
+    )
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert outcome.tool_calls == 1
+    assert provider_web_search_calls(outcome.messages[-1]["_pgagent_provider"]) == [{
+        "id": "ws_1", "query": "latest release", "source_count": 1, "ok": True,
+    }]
+    hosted_events = [event for event in durable_events if event.get("tool_call_id") == "ws_1"]
+    assert [event["type"] for event in hosted_events] == ["tool_started", "tool_finished"]
+    assert hosted_events[0]["arguments"] == {"query": {"chars": 14}}
+    assert hosted_events[1]["source_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -1339,7 +1384,7 @@ async def test_tool_step_thought_summary_hides_memory_citation(tmp_path) -> None
                     '<pgagent-memory-citation>{"memory_ids":["m1"],"note":"used"}'
                     "</pgagent-memory-citation>"
                 ),
-                tool_calls=[ModelToolCall("list", "list_files", {"path": "."})],
+                tool_calls=[ModelToolCall("list", "glob", {"path": "."})],
             )
         return ModelTurn(content="done")
 
@@ -1354,6 +1399,35 @@ async def test_tool_step_thought_summary_hides_memory_citation(tmp_path) -> None
     summaries = [event["summary"] for event in durable_events if event["type"] == "thought_summary"]
     assert "I will inspect the workspace." in summaries
     assert all("pgagent-memory-citation" not in summary for summary in summaries)
+    assert not any(event["type"] == "progress" for event in durable_events)
+
+
+@pytest.mark.asyncio
+async def test_tool_step_has_no_fixed_progress_fallback_without_model_status(tmp_path) -> None:
+    durable_events: list[dict] = []
+    calls = 0
+
+    async def model_call(**_kwargs) -> ModelTurn:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelTurn(
+                tool_calls=[
+                    ModelToolCall("list", "glob", {"path": "."}),
+                    ModelToolCall("read", "read", {"path": "missing.txt"}),
+                ],
+            )
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+        event_sink=durable_events.append,
+    )
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert not any(event["type"] in {"progress", "thought_summary"} for event in durable_events)
 
 
 @pytest.mark.asyncio

@@ -271,6 +271,7 @@ export interface Message {
   message_kind?: string
   status?: string
   metadata?: ApiRecord
+  citations?: Array<{ url: string; title: string }>
 }
 
 export interface RunEvent {

@@ -9,8 +9,8 @@ export interface ThoughtToolItem {
 
 /**
  * A user-facing processing item. Tool metadata is sanitized separately;
- * provider reasoning is carried only by the explicit thought stream and is
- * never mixed into the assistant answer or conversation context.
+ * Only model-authored, user-visible progress is shown here. Provider
+ * reasoning summaries remain outside the presentation timeline.
  */
 export type ThoughtActivityKind = 'thought' | 'tool' | 'context' | 'approval' | 'task' | 'event'
 export type ThoughtActivityIcon = 'think' | 'read' | 'write' | 'edit' | 'search' | 'shell' | 'task' | 'approval' | 'context' | 'generic'
@@ -148,17 +148,28 @@ export function displayToolName(name: string): string {
     edit: 'Edit',
     webfetch: 'WebFetch',
     web_fetch: 'WebFetch',
+    web_open: 'Web Open',
     websearch: 'WebSearch',
     web_search: 'WebSearch',
     bash: 'Shell',
+    shell: 'Shell',
     run_command: 'Shell',
+    apply_patch: 'Apply Patch',
+    update_plan: 'Update Plan',
+    todowrite: 'Update Plan',
+    tool_search: 'Tool Search',
+    toolsearch: 'Tool Search',
+    rg: 'Search',
+    glob: 'Glob',
+    git_status: 'Git Status',
+    git_diff: 'Git Diff',
   }
   return (labels[normalized] ?? name.trim()) || 'Tool'
 }
 
 export function thoughtIconForTool(name: string): ThoughtActivityIcon {
   const normalized = name.trim().toLowerCase()
-  if (normalized === 'task' || normalized.includes('delegate')) return 'task'
+  if (normalized === 'task' || normalized === 'update_plan' || normalized === 'todowrite' || normalized.includes('delegate')) return 'task'
   if (normalized.includes('search') || normalized.includes('fetch') || normalized.includes('browse') || normalized.includes('web')) return 'search'
   if (normalized.includes('read') || normalized.includes('list') || normalized.includes('glob') || normalized.includes('file')) return 'read'
   if (normalized.includes('write') || normalized.includes('create') || normalized.includes('delete')) return 'write'
@@ -275,12 +286,13 @@ function safeActivityDetail(event: RunStreamEvent, toolName = ''): string {
   if (normalized.includes('read') || normalized.includes('list') || normalized.includes('glob')) return '读取项目内容'
   if (normalized.includes('write') || normalized.includes('create') || normalized.includes('edit') || normalized.includes('patch')) return '准备修改项目文件'
   if (normalized.includes('search') || normalized.includes('fetch') || normalized.includes('browse') || normalized.includes('web')) return '查找相关资料'
+  if (normalized === 'update_plan' || normalized === 'todowrite') return '更新任务计划'
   if (normalized === 'task' || normalized.includes('delegate')) return '编排专长子 Agent'
   if (normalized.includes('bash') || normalized.includes('command') || normalized.includes('shell') || normalized.includes('exec')) return '准备执行命令'
   return ''
 }
 
-const safeProgressTypes = new Set(['progress', 'agent_progress', 'thought_summary', 'activity_update'])
+const safeProgressTypes = new Set(['agent_progress', 'thought_summary', 'activity_update'])
 const contextActivityTypes = new Set(['context_prepared', 'context_resumed', 'context_compacted', 'context_compaction_started', 'context_compaction_finished', 'context_compaction_failed'])
 
 function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): ThoughtActivityItem | null {
@@ -354,7 +366,7 @@ function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): Tho
   }
   if (type === 'model_retry') {
     const attempt = typeof event.attempt === 'number' ? `第 ${event.attempt} 次重试` : '正在重试模型'
-    return { id: firstString(event.event_id, event.id) || `retry-${itemIndex}`, kind: 'event', icon: 'think', title: '重试模型', detail: progress || attempt, status: 'running' }
+    return { id: 'model-retry', kind: 'event', icon: 'think', title: '重试模型', detail: progress || attempt, status: 'running' }
   }
   if (type === 'completion_verification_started' || type === 'completion_verification_passed' || type === 'completion_verification_rejected') {
     const passed = type.endsWith('passed')
@@ -395,25 +407,25 @@ export function updateThoughtTimeline(
 ): ThoughtTimelineState {
   const type = firstString(event.type, event.event_type).toLowerCase()
   const start = state.startedAt ?? (type === 'model_step_started' || type === 'mcp_connecting' || toolStartTypes.has(type) ? now : null)
-  if (type === 'thought_delta' || type === 'thought_summary') {
-    const rawText = type === 'thought_delta'
-      ? firstString(event.delta)
-      : firstString(event.summary, record(event.payload)?.summary)
+  const payload = record(event.payload)
+  if (type === 'thought_delta' || (type === 'thought_summary' && (event.complete === true || payload?.complete === true))) {
+    return start === state.startedAt ? state : { ...state, startedAt: start }
+  }
+  if (type === 'thought_summary') {
+    const rawText = firstString(event.summary, payload?.summary)
     const text = cleanThoughtText(rawText)
     if (!text) return start === state.startedAt ? state : { ...state, startedAt: start }
     const items = [...(state.items || [])]
     const id = thoughtItemId(event, items.length)
     let index = items.findIndex((item) => item.id === id)
     if (index < 0) index = items.findLastIndex((item) => item.kind === 'thought' && item.status === 'running')
-    const complete = type === 'thought_summary' && event.complete === true
     if (index < 0) {
-      items.push({ id, kind: 'thought', icon: 'think', title: '思考', detail: text, status: complete ? 'completed' : 'running' })
+      items.push({ id, kind: 'thought', icon: 'think', title: '思考', detail: text, status: 'running' })
     } else {
       const current = items[index]
       items[index] = {
         ...current,
-        detail: type === 'thought_delta' ? cleanThoughtText(current.detail + text) : text,
-        status: complete ? 'completed' : current.status,
+        detail: text,
       }
     }
     const resolvedId = index < 0 ? id : items[index].id
@@ -421,7 +433,7 @@ export function updateThoughtTimeline(
       ...state,
       startedAt: start ?? now,
       items,
-      activeItemId: complete ? (state.activeItemId === resolvedId ? undefined : state.activeItemId) : resolvedId,
+      activeItemId: resolvedId,
     }
   }
   if (toolStartTypes.has(type)) {
@@ -498,18 +510,12 @@ export function updateThoughtTimeline(
 
   if (terminalTypes.has(type) || (type === 'run_state' && (event.terminal === true || terminalStatuses.has(String(event.status || ''))))) {
     const conclusion = safeProgressText(event) || state.conclusion
-    const partialThought = terminalTypes.has(type) ? cleanThoughtText(firstString(event.partial_thought)) : ''
     const terminalFailed = Boolean(event.error)
       || type === 'model_failed'
       || type === 'integration_failed'
       || type === 'failed'
       || String(event.status || '') === 'failed'
     const items = (state.items || []).map((item) => item.status === 'running' ? { ...item, status: terminalFailed ? 'failed' as const : 'completed' as const } : item)
-    if (partialThought) {
-      const thoughtIndex = items.findLastIndex((item) => item.kind === 'thought')
-      if (thoughtIndex >= 0) items[thoughtIndex] = { ...items[thoughtIndex], detail: partialThought }
-      else items.push({ id: `thought-interrupted-${items.length}`, kind: 'thought', icon: 'think', title: '思考', detail: partialThought, status: 'completed' })
-    }
     return {
       ...state,
       startedAt: start,

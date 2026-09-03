@@ -281,6 +281,11 @@ class ChatMessageCreate(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class MessageCitation(BaseModel):
+    url: str
+    title: str
+
+
 class ChatMessageRead(ORMModel):
     id: str
     session_id: str
@@ -291,6 +296,7 @@ class ChatMessageRead(ORMModel):
     turn_id: str | None
     message_kind: str
     extra: dict[str, Any] = Field(serialization_alias="metadata")
+    citations: list[MessageCitation] = Field(default_factory=list)
     created_at: datetime
 
 

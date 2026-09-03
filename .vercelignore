@@ -1,0 +1,13 @@
+.agents/
+.codex/
+.git/
+.omo/
+.pytest_cache/
+backend/
+data/
+docs/
+frontend/
+scripts/
+tests/
+*.bat
+.env*

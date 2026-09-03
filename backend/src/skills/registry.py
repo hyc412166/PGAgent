@@ -428,6 +428,22 @@ def _static_market_token() -> str | None:
     return os.getenv("SKILLS_SH_API_TOKEN") or os.getenv("PGAGENT_SKILLS_SH_API_TOKEN")
 
 
+def _market_gateway() -> tuple[str, str] | None:
+    base_url = (os.getenv("PGAGENT_SKILL_MARKET_URL") or "").strip().rstrip("/")
+    client_token = (os.getenv("PGAGENT_SKILL_MARKET_CLIENT_TOKEN") or "").strip()
+    if not base_url and not client_token:
+        return None
+    if not base_url or not client_token:
+        raise HTTPException(
+            status_code=409,
+            detail="PGAGENT_SKILL_MARKET_URL and PGAGENT_SKILL_MARKET_CLIENT_TOKEN must be configured together",
+        )
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise HTTPException(status_code=409, detail="PGAGENT_SKILL_MARKET_URL must be an HTTPS origin or base path")
+    return base_url, client_token
+
+
 def _market_token() -> str | None:
     return _static_market_token() or os.getenv("VERCEL_OIDC_TOKEN")
 
@@ -494,12 +510,55 @@ def _refresh_vercel_oidc_token(*, failed_token: str | None = None) -> str:
 
 
 def market_status() -> tuple[bool, str | None]:
+    try:
+        if _market_gateway() is not None:
+            return True, None
+    except HTTPException as exc:
+        return False, str(exc.detail)
     if _market_token():
         return True, None
-    return False, "配置 SKILLS_SH_API_TOKEN（skills.sh 所需的 Bearer/OIDC 令牌）后可搜索市场。"
+    return False, "配置 PGAGENT_SKILL_MARKET_URL 和客户端令牌后可使用长期在线市场。"
 
 
 def _skills_sh_json(path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    gateway = _market_gateway()
+    if gateway is not None:
+        base_url, client_token = gateway
+        prefix = "/api/v1/"
+        if not path.startswith(prefix):
+            raise HTTPException(status_code=500, detail="Unsupported skills.sh API path")
+        request_url = f"{base_url}/api/market/{path.removeprefix(prefix)}"
+        try:
+            response = httpx.get(
+                request_url,
+                params=params,
+                headers={"Authorization": f"Bearer {client_token}", "Accept": "application/json"},
+                timeout=25.0,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Skill marketplace gateway request failed: {exc}") from exc
+        if response.status_code == 401:
+            raise HTTPException(status_code=502, detail="Skill marketplace gateway rejected the configured client token")
+        if response.status_code == 429:
+            raise HTTPException(status_code=429, detail="Skill marketplace rate limit reached; retry later")
+        if response.status_code == 502:
+            try:
+                gateway_error = response.json()
+            except ValueError:
+                gateway_error = None
+            if isinstance(gateway_error, dict) and gateway_error.get("error") == "oidc_rejected":
+                raise HTTPException(status_code=502, detail="skills.sh rejected the gateway OIDC token")
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Skill marketplace gateway returned HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="Skill marketplace gateway returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="Skill marketplace gateway returned an invalid payload")
+        return payload
+
     token = _market_token()
     if not token:
         raise HTTPException(status_code=409, detail="skills.sh marketplace token is not configured")

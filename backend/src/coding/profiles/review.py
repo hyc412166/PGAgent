@@ -8,7 +8,7 @@ from .base import WorkflowProfile
 REVIEW_PROFILE = WorkflowProfile(
     id="review",
     direct_tool_names=frozenset({
-        "ToolSearch",
+        "tool_search",
         "file_info",
         "git_diff",
         "git_status",
@@ -21,8 +21,8 @@ REVIEW_PROFILE = WorkflowProfile(
         "rg",
         "skill",
         "validate",
-        "webfetch",
-        "websearch",
+        "web_open",
+        "web_search",
     }),
     instructions=(
         "## Code review workflow\n"

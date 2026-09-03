@@ -29,3 +29,4 @@ class RunState(TypedDict, total=False):
     memory_citation: dict[str, Any]
     prompt_cache_key: str
     stagnation_recovery_prompt: str
+    hosted_tool_calls: int

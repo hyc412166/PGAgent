@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "node -e \"\"",
+  "outputDirectory": "public",
+  "functions": {
+    "api/market.ts": {
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/market/:path*",
+      "destination": "/api/market?path=:path*"
+    }
+  ]
+}

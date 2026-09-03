@@ -1,4 +1,4 @@
-"""Claude-Code-style model and tool execution runtime."""
+"""Model and tool execution runtime."""
 
 from __future__ import annotations
 
@@ -77,13 +77,6 @@ def _safe_event_text(value: Any, limit: int = 320) -> str:
     return text[:limit]
 
 
-def _safe_thought_text(value: Any, limit: int = 20_000) -> str:
-    """Keep readable model reasoning for the user's private run timeline."""
-
-    text = str(value or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
-    return text[:limit]
-
-
 def safe_tool_argument_summary(tool_name: str, arguments: Mapping[str, Any] | None) -> dict[str, Any]:
     """Build timeline-safe tool metadata without persisting private payloads.
 
@@ -146,6 +139,23 @@ def safe_approval_request_summary(pending: Mapping[str, Any]) -> dict[str, Any]:
         **safe_tool_argument_summary(tool_name, pending.get("arguments") if isinstance(pending.get("arguments"), Mapping) else {}),
         "remaining_call_count": len(pending.get("remaining_calls") or []),
     }
+
+
+def provider_web_search_calls(provider_payload: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Project provider-hosted searches into timeline events, not local calls."""
+
+    calls: list[dict[str, Any]] = []
+    for index, item in enumerate((provider_payload or {}).get("items") or []):
+        if not isinstance(item, Mapping) or item.get("type") != "web_search_call":
+            continue
+        action = item.get("action") if isinstance(item.get("action"), Mapping) else {}
+        calls.append({
+            "id": str(item.get("id") or f"web-search-{index + 1}"),
+            "query": str(action.get("query") or ""),
+            "source_count": len(action.get("sources") or []),
+            "ok": item.get("status") not in {"failed", "incomplete"},
+        })
+    return calls
 
 
 def is_context_overflow_error(error: BaseException) -> bool:
@@ -465,10 +475,6 @@ class AgentRuntime:
                 "on_delta" in model_signature.parameters
                 or accepts_var_kwargs
             )
-            self._model_accepts_thought_delta = (
-                "on_thought_delta" in model_signature.parameters
-                or accepts_var_kwargs
-            )
             self._model_accepts_activity = (
                 "on_activity" in model_signature.parameters
                 or accepts_var_kwargs
@@ -479,7 +485,6 @@ class AgentRuntime:
             self._model_accepts_retry = "on_retry" in model_signature.parameters or accepts_var_kwargs
         except (TypeError, ValueError):
             self._model_accepts_delta = False
-            self._model_accepts_thought_delta = False
             self._model_accepts_activity = False
             self._model_accepts_prompt_cache_key = False
             self._model_accepts_retry = False
@@ -1064,7 +1069,6 @@ class AgentRuntime:
 
             try:
                 buffered_candidate_deltas: list[str] = []
-                streamed_thought_deltas: list[str] = []
                 offered_tool_names: frozenset[str] = frozenset()
 
                 async def model_attempt() -> Any:
@@ -1099,18 +1103,6 @@ class AgentRuntime:
                             step=guard.steps,
                         )
 
-                    async def on_thought_delta(delta: str) -> None:
-                        safe_delta = _safe_thought_text(delta)
-                        if not safe_delta:
-                            return
-                        await on_activity()
-                        streamed_thought_deltas.append(safe_delta)
-                        await self._publish_transient(
-                            "thought_delta",
-                            delta=safe_delta,
-                            step=guard.steps,
-                        )
-
                     step_context = AgentStepContext(
                         step_number=guard.steps,
                         tool_plan=self.tool_router.capture_plan(),
@@ -1129,8 +1121,6 @@ class AgentRuntime:
                     }
                     if self._model_accepts_delta:
                         kwargs["on_delta"] = on_delta
-                    if self._model_accepts_thought_delta:
-                        kwargs["on_thought_delta"] = on_thought_delta
                     if self._model_accepts_activity:
                         kwargs["on_activity"] = on_activity
                     if self._model_accepts_prompt_cache_key and not recovery_prompt:
@@ -1247,6 +1237,29 @@ class AgentRuntime:
                 "usage": merge_usage(state.get("usage"), turn.usage),
                 "stagnation_recovery_prompt": "",
             }
+            hosted_calls = provider_web_search_calls(turn.provider_payload)
+            if hosted_calls:
+                state["hosted_tool_calls"] = int(state.get("hosted_tool_calls") or 0) + len(hosted_calls)
+            for hosted_call in hosted_calls:
+                hosted_started_at = self.clock()
+                state["events"] = await self._publish(
+                    state,
+                    "tool_started",
+                    tool_name="web_search",
+                    tool_call_id=hosted_call["id"],
+                    **safe_tool_argument_summary("web_search", {"query": hosted_call["query"]}),
+                    elapsed_ms=round((hosted_started_at - active_started_at) * 1000),
+                    thought_duration_ms=round((hosted_started_at - thought_started_at) * 1000),
+                )
+                state["events"] = await self._publish(
+                    state,
+                    "tool_finished",
+                    tool_name="web_search",
+                    tool_call_id=hosted_call["id"],
+                    ok=hosted_call["ok"],
+                    source_count=hosted_call["source_count"],
+                    duration_ms=round((self.clock() - hosted_started_at) * 1000),
+                )
             token_decision = self._task_token_decision(state.get("usage"))
             if turn.tool_calls and token_decision.stop:
                 stopped = self._stop_state(state, token_decision)
@@ -1257,15 +1270,6 @@ class AgentRuntime:
                     reason=token_decision.reason,
                 )
                 return stopped
-            if streamed_thought_deltas:
-                state["events"] = await self._publish(
-                    state,
-                    "thought_summary",
-                    summary=_safe_thought_text("".join(streamed_thought_deltas)),
-                    phase="model",
-                    step=guard.steps,
-                    complete=True,
-                )
             time_decision = self._run_time_decision(active_elapsed_base, active_started_at)
             if time_decision.stop:
                 stopped = self._stop_state(state, time_decision)
@@ -1296,7 +1300,7 @@ class AgentRuntime:
             if turn.provider_payload:
                 assistant_message["_pgagent_provider"] = dict(turn.provider_payload)
             messages = [*state.get("messages", []), assistant_message]
-            if turn.tool_calls and turn.content.strip():
+            if turn.tool_calls and visible_content.strip():
                 # This is the model's visible pre-tool progress text, not a
                 # provider reasoning field.  Keep it bounded and expose it as
                 # a safe activity summary so it does not become a chat bubble.
@@ -1323,7 +1327,7 @@ class AgentRuntime:
                             "output": visible_content,
                             "messages": current_run_messages,
                             "events": state.get("events", []),
-                            "tool_calls": guard.calls,
+                            "tool_calls": guard.calls + int(state.get("hosted_tool_calls") or 0),
                             "pending_approval": state.get("pending_approval"),
                             "attempt": attempt,
                         })
@@ -1910,7 +1914,7 @@ class AgentRuntime:
             messages=final.get("messages", []),
             events=final.get("events", []),
             steps=guard.steps,
-            tool_calls=guard.calls,
+            tool_calls=guard.calls + int(final.get("hosted_tool_calls") or 0),
             mode=mode,
             stop_reason=final.get("stop_reason"),
             error=final.get("error"),

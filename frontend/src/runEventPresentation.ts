@@ -80,6 +80,7 @@ const factLabels: Record<string, string> = {
   question_chars: '问题长度',
   reason: '原因',
   remaining_call_count: '剩余调用',
+  source_count: '来源数量',
   removed_messages: '移除历史消息',
   requires_next_message: '需要下一条消息',
   servers: 'MCP 服务',

@@ -21,6 +21,7 @@ describe('MCP live progress', () => {
     }} />)
 
     expect(markup).toContain('正在连接 MCP 服务…')
+    expect(markup).toContain('执行详情')
     expect(markup).toContain('playwright')
     expect(markup).not.toContain('通用思考文案')
   })

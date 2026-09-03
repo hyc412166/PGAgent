@@ -73,7 +73,7 @@ Review profile 额外形成只读工作流上限：即使 Agent 配置误选了�
 
 Skill registry 仅管理本地副本和元数据：`SKILL.md` 必须为 UTF-8，frontmatter/首段描述会被安全解析；符号链接、目录穿越、超大文件和超限文件数会被拒绝。GitHub ZIP 会验证 HTTPS GitHub 主机、重定向、ZIP 路径和大小；市场/远程安装先返回文件预览，只有 `confirm=true` 才复制到 `data/skills`。导入或关联 Skill 不会执行其内容。
 
-市场搜索使用 skills.sh 官方 `/api/v1/skills/search` 和 detail/files 接口，令牌来自 `SKILLS_SH_API_TOKEN`（也兼容 `PGAGENT_SKILLS_SH_API_TOKEN` 或 `VERCEL_OIDC_TOKEN`）。没有令牌时 API 返回 `available=false`，而不是伪造公开 marketplace 数据。运行时会把已选工具、Skill 和 permission mode 放进会话运行配置快照；只有明确实现的工具执行层才可据此授权实际操作。
+市场搜索使用 skills.sh 官方 `/api/v1/skills/search` 和 detail/files 接口。生产链路优先经过根目录 `api/market` 的 Vercel 网关：本地后端用 `PGAGENT_SKILL_MARKET_CLIENT_TOKEN` 访问固定路由，网关在请求上下文中取得 Vercel OIDC，再向 skills.sh 发起请求；OIDC 不持久化到本机。网关地址和客户端令牌必须同时配置，缺少任一项时市场显式不可用。未配置网关时兼容 `SKILLS_SH_API_TOKEN`、`PGAGENT_SKILLS_SH_API_TOKEN` 或 `VERCEL_OIDC_TOKEN`，用于现有部署和本地开发。运行时会把已选工具、Skill 和 permission mode 放进会话运行配置快照；只有明确实现的工具执行层才可据此授权实际操作。
 
 ## 上下文
 

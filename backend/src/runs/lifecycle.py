@@ -1383,6 +1383,12 @@ class RunCoordinator:
                     "custom_headers_digest": _configuration_digest(connection.custom_headers or {}),
                 }
 
+            if memory_use_enabled:
+                for tool_name in ("MemorySearch", "MemoryRead", "MemoryList"):
+                    if tool_name not in allowed_tool_names:
+                        allowed_tool_names.append(tool_name)
+                frozen_binding["allowed_tool_names"] = allowed_tool_names
+
             delegate_catalog_prompt = "" if frozen_binding.get("delegation_version") else _delegate_catalog_prompt(db, run)
             terminal_background_job_ids: list[str] = []
             if not frozen_binding.get("delegation_version"):
@@ -1468,6 +1474,7 @@ class RunCoordinator:
                 "workspace_id": workspace.id,
                 "memory_use_enabled": memory_use_enabled,
                 "terminal_background_job_ids": list(terminal_background_job_ids),
+                "expose_legacy_tools": bool(runtime_binding),
                 "compaction_state": compaction_state,
                 "context_sequence": transcript_sequence,
             }

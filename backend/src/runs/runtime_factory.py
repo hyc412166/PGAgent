@@ -135,6 +135,7 @@ class RunRuntimeFactory:
             coding_state=binding.get("coding_state"),
             validation_runtime=binding.get("validation_runtime"),
             active_builtin_tool_names=binding.get("builtin_active_tools"),
+            expose_legacy_tools=bool(context.get("expose_legacy_tools")),
         )
         coordinator.register_tool_canceller(run_id, registry.cancel_active)
         runtime = runtime_type(

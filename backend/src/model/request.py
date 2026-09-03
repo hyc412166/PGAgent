@@ -47,15 +47,17 @@ def create_model_call(config: ProviderConfig, *, credentials):
                     requests += 1
                     if client is None:
                         return await chat_completions.create(config, api_key, current_messages, tools, mode, prompt_cache_key)
+                    response_tool_defs = responses.response_tools(tools)
+                    include = ["reasoning.encrypted_content"]
+                    if any(tool.get("type") in {"web_search", "web_search_preview"} for tool in response_tool_defs):
+                        include.append("web_search_call.action.sources")
                     kwargs: dict[str, Any] = {
                         "model": config.model_id, "input": responses.input_items(current_messages),
-                        "tools": responses.function_tools(tools), "stream": True, "store": False,
-                        "include": ["reasoning.encrypted_content"],
+                        "tools": response_tool_defs, "stream": True, "store": False,
+                        "include": include,
                     }
-                    if config.thinking_level != "off" and mode != "compaction":
-                        kwargs["reasoning"] = {"summary": "auto"}
-                        if config.thinking_level not in {"auto", ""}:
-                            kwargs["reasoning"]["effort"] = config.thinking_level
+                    if config.thinking_level not in {"off", "auto", ""} and mode != "compaction":
+                        kwargs["reasoning"] = {"effort": config.thinking_level}
                     if prompt_cache_key:
                         kwargs["prompt_cache_key"] = prompt_cache_key
                     return await client.responses.create(**kwargs)

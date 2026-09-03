@@ -299,7 +299,7 @@ export function useRunTransport(options: RunTransportOptions) {
         thought: updateThoughtTimeline(previous.thought, parsed),
       }))
       if (waitingApproval) void refreshApprovalsForSession(sessionId)
-      if (parsed.type === 'tool_finished' && ['todowrite', 'TodoWrite'].includes(String(parsed.tool_name || ''))) {
+      if (parsed.type === 'tool_finished' && ['update_plan', 'todowrite', 'TodoWrite'].includes(String(parsed.tool_name || ''))) {
         void refreshDurableTask()
       }
       if (delegatedChildEvent) {

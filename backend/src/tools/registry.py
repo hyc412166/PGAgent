@@ -10,8 +10,8 @@ from typing import Any
 from src.attachments.contracts import ATTACHMENT_TOOL_NAMES
 
 from . import advanced, builtins
-from .advanced_contract import ADVANCED_TOOL_SCHEMAS, CLAW_TOOL_NAMES, LEARN_TOOL_NAMES
-from .engineering_contract import ENGINEERING_TOOL_NAMES, ENGINEERING_TOOL_SCHEMAS
+from .advanced_contract import ADVANCED_TOOL_SCHEMAS
+from .engineering_contract import ENGINEERING_TOOL_SCHEMAS
 from .policy import normalize_permission_mode
 from .invocation import ToolInvocation
 from .name import ToolName
@@ -29,10 +29,8 @@ from .types import ToolResult
 from .validation import InvocationValidationHook
 
 
-# The familiar Claude-Code-style names are the public API.  Legacy names stay
-# registered only for existing persisted runs and tests; production calls pass
-# an explicit DB-backed ``allowed_tool_names`` list so unselected tools never
-# appear in the provider schema.
+# Canonical names form the new Codex-style model surface. Legacy schemas and
+# executors stay registered only so persisted runs can replay their exact calls.
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "bash": {
         "description": "在工作区中运行受控 allowlist 命令；短命令直接返回，超过 yield 窗口会返回可继续读取的持久 session_id。",
@@ -246,13 +244,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "task": {
-        "description": "把一个或多个相互独立的子任务并行委派给已启用的子 Agent。单任务使用 task+agent_id；如果该任务已由 todowrite 规划为 subagent，必须把其稳定 id 作为 step_id。多个任务使用 tasks 数组并为已规划项沿用 id。系统会并行启动并在全部结束后返回结构化结果。子 Agent 只能使用它自身被勾选且不超过当前会话权限的工具，且不能再次委派。",
+        "description": "把一个或多个相互独立的子任务并行委派给已启用的子 Agent。单任务使用 task+agent_id；如果该任务已由 update_plan 规划为 subagent，必须把其稳定 id 作为 step_id。多个任务使用 tasks 数组并为已规划项沿用 id。系统会并行启动并在全部结束后返回结构化结果。子 Agent 只能使用它自身被勾选且不超过当前会话权限的工具，且不能再次委派。",
         "parameters": {
             "type": "object",
             "properties": {
                 "task": {"type": "string"},
                 "agent_id": {"type": "string"},
-                "step_id": {"type": "string", "description": "对应 todowrite 中已规划子 Agent 步骤的稳定 id。"},
+                "step_id": {"type": "string", "description": "对应 update_plan 中已规划子 Agent 步骤的稳定 id。"},
                 "depends_on": {"type": "array", "items": {"type": "string"}},
                 "tasks": {
                     "type": "array",
@@ -389,44 +387,89 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 TOOL_SCHEMAS.update(ENGINEERING_TOOL_SCHEMAS)
 TOOL_SCHEMAS.update(ADVANCED_TOOL_SCHEMAS)
 
+# Canonical names reuse the proven executors while presenting one unambiguous
+# vocabulary to new model calls.
+TOOL_SCHEMAS["shell"] = dict(TOOL_SCHEMAS["bash"])
+TOOL_SCHEMAS["update_plan"] = dict(TOOL_SCHEMAS["todowrite"])
+TOOL_SCHEMAS["tool_search"] = dict(TOOL_SCHEMAS["ToolSearch"])
+TOOL_SCHEMAS["web_search"] = dict(TOOL_SCHEMAS["websearch"])
+TOOL_SCHEMAS["web_open"] = {
+    "description": "提取公开网页的结构化正文；使用 offset 和 max_chars 分页读取，原始 HTML 不进入上下文。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string"},
+            "offset": {"type": "integer", "minimum": 0},
+            "max_chars": {"type": "integer", "minimum": 1_000, "maximum": 20_000},
+            "timeout_seconds": {"type": "number"},
+        },
+        "required": ["url"],
+    },
+}
+TOOL_SCHEMAS["web.run"] = {
+    "description": "Codex 风格联网工具；在一次调用中执行搜索、打开、查找、截图、财经、天气、体育或时间查询。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "search_query": {"type": "array", "items": {"type": "object"}},
+            "open": {"type": "array", "items": {"type": "object"}},
+            "click": {"type": "array", "items": {"type": "object"}},
+            "find": {"type": "array", "items": {"type": "object"}},
+            "screenshot": {"type": "array", "items": {"type": "object"}},
+            "finance": {"type": "array", "items": {"type": "object"}},
+            "weather": {"type": "array", "items": {"type": "object"}},
+            "sports": {"type": "array", "items": {"type": "object"}},
+            "time": {"type": "array", "items": {"type": "object"}},
+        },
+    },
+}
+
 
 PUBLIC_TOOL_NAMES: tuple[str, ...] = (
-    "bash",
+    "shell",
     "read",
     "read_artifact",
     *ATTACHMENT_TOOL_NAMES,
-    "write",
-    "delete",
-    "edit",
     "apply_patch",
     "validate",
     "validate_baseline",
-    *ENGINEERING_TOOL_NAMES,
+    "review_finding",
+    "debug_evidence",
     "glob",
-    "grep",
     "rg",
-    "webfetch",
-    "websearch",
+    "web_search",
+    "web_open",
+    "web.run",
     "task",
-    "todowrite",
+    "update_plan",
+    "tool_search",
     "question",
     "skill",
     "git_status",
     "git_diff",
-    "file_info",
-    *CLAW_TOOL_NAMES,
-    *LEARN_TOOL_NAMES,
+    "write_stdin",
 )
-LEGACY_TOOL_NAMES: tuple[str, ...] = (
-    "list_files",
-    "read_file",
-    "search_files",
-    "get_current_time",
-    "write_file",
-    "run_command",
+LEGACY_TOOL_NAMES: tuple[str, ...] = tuple(
+    name for name in TOOL_SCHEMAS if name not in PUBLIC_TOOL_NAMES
 )
 ALL_TOOL_NAMES: tuple[str, ...] = (*PUBLIC_TOOL_NAMES, *LEGACY_TOOL_NAMES)
 _CANONICAL_MEMORY_TOOL_NAMES = frozenset({"MemoryWrite", "MemoryRead", "MemoryList", "MemorySearch"})
+_HIDDEN_COMPATIBILITY_TOOL_NAMES = frozenset(LEGACY_TOOL_NAMES) - _CANONICAL_MEMORY_TOOL_NAMES
+_GENERAL_DIRECT_TOOL_NAMES = frozenset({
+    "shell",
+    "read",
+    "read_artifact",
+    "glob",
+    "rg",
+    "web_search",
+    "web_open",
+    "web.run",
+    "apply_patch",
+    "update_plan",
+    "task",
+    "question",
+    "tool_search",
+})
 
 # A provider batch containing only these tools is safe to execute concurrently:
 # none mutates workspace/runtime state and result ordering is restored to the
@@ -440,6 +483,7 @@ PARALLEL_READ_ONLY_TOOL_NAMES = frozenset({
     "rg",
     "webfetch",
     "websearch",
+    "web_open",
     "skill",
     "git_status",
     "git_diff",
@@ -455,6 +499,7 @@ PARALLEL_READ_ONLY_TOOL_NAMES = frozenset({
     "Skill",
     "load_skill",
     "ToolSearch",
+    "tool_search",
     "Sleep",
     "idle",
     "task_get",
@@ -516,9 +561,9 @@ def _normalize_claw_todos(todos: Iterable[Mapping[str, Any]]) -> list[dict[str, 
 
 
 PLAN_MODE_MUTATING_TOOLS = frozenset({
-    "write", "write_file", "edit", "edit_file", "apply_patch", "delete", "bash", "run_command", "validate", "validate_baseline",
+    "write", "write_file", "edit", "edit_file", "apply_patch", "delete", "shell", "bash", "run_command", "validate", "validate_baseline",
     "PowerShell", "REPL", "NotebookEdit", "RemoteTrigger", "MCP", "MemoryWrite",
-    "TodoWrite", "todowrite", "read_inbox",
+    "update_plan", "TodoWrite", "todowrite", "read_inbox",
     "task", "Agent", "TaskCreate", "RunTaskPacket", "TaskStop", "TaskUpdate", "task_create", "task_update",
     "claim_task", "spawn_teammate", "send_message", "broadcast", "shutdown_request",
     "plan_approval", "TeamCreate", "TeamDelete", "WorkerCreate", "WorkerObserve",
@@ -556,6 +601,7 @@ class ToolRegistry:
         coding_state: Mapping[str, Any] | None = None,
         validation_runtime: Mapping[str, Any] | None = None,
         active_builtin_tool_names: Iterable[str] | None = None,
+        expose_legacy_tools: bool = False,
     ) -> None:
         from src.coding.evidence import WorkflowEvidenceState
         from src.coding.profiles import resolve_workflow_profile
@@ -600,12 +646,16 @@ class ToolRegistry:
         selected = tuple(dict.fromkeys(
             str(name).strip() for name in source_names if str(name).strip()
         ))
+        self._frozen_legacy_tool_names = frozenset(
+            name for name in selected
+            if expose_legacy_tools and name in _HIDDEN_COMPATIBILITY_TOOL_NAMES
+        )
         self._workflow_profile = resolve_workflow_profile(
             workflow_profile_id,
             selected,
         )
-        self._defer_low_frequency_tools = (
-            allowed_tool_names is not None and "ToolSearch" in selected
+        self._defer_low_frequency_tools = allowed_tool_names is not None and bool(
+            {"tool_search", "ToolSearch"}.intersection(selected)
         )
         for name in selected:
             if name in _CANONICAL_MEMORY_TOOL_NAMES and self._memory_store is None:
@@ -615,7 +665,7 @@ class ToolRegistry:
             if name in ATTACHMENT_TOOL_NAMES and self._attachment_store is None:
                 continue
             self._register_default(name)
-        if "ToolSearch" in self.enabled_tool_names:
+        if {"tool_search", "ToolSearch"}.intersection(self.enabled_tool_names):
             self.activate_deferred_tools(active_builtin_tool_names or ())
         self.pipeline = InvocationPipeline(
             workspace_root=str(self.sandbox.root),
@@ -633,6 +683,7 @@ class ToolRegistry:
 
     def _register_default(self, name: str) -> None:
         mapping: dict[str, Callable[..., ToolResult]] = {
+            "shell": self._bash,
             "bash": self._bash,
             "read": builtins.read_file,
             "read_artifact": lambda _sandbox, **kwargs: self._artifact_store.read(**kwargs),
@@ -654,8 +705,12 @@ class ToolRegistry:
             "rg": builtins.ripgrep_search,
             "webfetch": builtins.web_fetch,
             "websearch": builtins.web_search,
+            "web_search": builtins.web_search,
+            "web_open": builtins.web_open,
+            "web.run": builtins.web_run,
             "task": lambda sandbox, **kwargs: builtins.delegate_task(sandbox, delegate=self._task_delegate, **kwargs),
             "todowrite": lambda sandbox, todos: self._write_todos(sandbox, todos),
+            "update_plan": lambda sandbox, todos: self._write_todos(sandbox, todos),
             "question": builtins.ask_question,
             "skill": lambda sandbox, **kwargs: builtins.load_skill(sandbox, skill_instructions=self._skill_instructions, **kwargs),
             "git_status": builtins.git_status,
@@ -693,6 +748,7 @@ class ToolRegistry:
                 delegate=self._task_delegate,
             ),
             "ToolSearch": self._tool_search,
+            "tool_search": self._tool_search,
             "NotebookEdit": advanced.notebook_edit,
             "Sleep": advanced.sleep_tool,
             "SendUserMessage": advanced.send_user_message,
@@ -919,11 +975,13 @@ class ToolRegistry:
 
     def _apply_workflow_presentation(self, runtime: ToolRuntime) -> None:
         profile = self._workflow_profile
-        if profile is None:
-            return
         name = runtime.identity.wire_name
+        if name in _HIDDEN_COMPATIBILITY_TOOL_NAMES and name not in self._frozen_legacy_tool_names:
+            runtime.presentation = ToolPresentation.hidden()
+            return
         if (
-            profile.read_only_tool_ceiling
+            profile is not None
+            and profile.read_only_tool_ceiling
             and not runtime.execution.read_only
             and name not in profile.allowed_non_read_only_tool_names
         ):
@@ -932,8 +990,9 @@ class ToolRegistry:
         if (
             self._defer_low_frequency_tools
             and runtime.origin.source == "builtin"
-            and name not in profile.direct_tool_names
+            and name not in (profile.direct_tool_names if profile is not None else _GENERAL_DIRECT_TOOL_NAMES)
             and name not in ATTACHMENT_TOOL_NAMES
+            and name not in _CANONICAL_MEMORY_TOOL_NAMES
         ):
             runtime.presentation = ToolPresentation.deferred()
             self._builtin_deferred_tools.add(name)
@@ -1506,6 +1565,7 @@ def create_default_registry(
     coding_state: Mapping[str, Any] | None = None,
     validation_runtime: Mapping[str, Any] | None = None,
     active_builtin_tool_names: Iterable[str] | None = None,
+    expose_legacy_tools: bool = False,
 ) -> ToolRegistry:
     """Create a sandboxed registry with an explicit, frozen capability list."""
 
@@ -1528,4 +1588,5 @@ def create_default_registry(
         coding_state=coding_state,
         validation_runtime=validation_runtime,
         active_builtin_tool_names=active_builtin_tool_names,
+        expose_legacy_tools=expose_legacy_tools,
     )

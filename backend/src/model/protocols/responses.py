@@ -49,8 +49,35 @@ def input_items(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def function_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{"type": "function", **tool["function"], "strict": tool["function"].get("strict", False)} for tool in tools]
+def response_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project the shared tool catalog into native Responses tool definitions."""
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        kind = tool.get("type")
+        if kind == "function" and isinstance(tool.get("function"), Mapping):
+            function = dict(tool["function"])
+            if function.get("name") == "web_search":
+                # The registry stays protocol-neutral: Chat Completions uses
+                # the local fallback, while Responses receives its hosted tool.
+                result.append({"type": "web_search"})
+                continue
+            function["strict"] = function.get("strict", False)
+            result.append({"type": "function", **function})
+        else:
+            # Hosted tools such as web_search are executed by the Responses
+            # service and already use the API's native shape.
+            result.append(dict(tool))
+    return result
+
+
+# Output items executed by the provider.  They remain in native history but do
+# not become PGAgent function calls for the local dispatcher.
+_HOSTED_OUTPUT_ITEMS = {
+    "web_search_call",
+    "file_search_call",
+    "code_interpreter_call",
+    "image_generation_call",
+}
 
 
 def project_items(items: list[dict[str, Any]], usage: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -71,6 +98,8 @@ def project_items(items: list[dict[str, Any]], usage: Mapping[str, Any] | None =
             calls.append({"id": item["call_id"], "type": "function", "function": {
                 "name": item["name"], "arguments": item["arguments"],
             }})
+        elif kind in _HOSTED_OUTPUT_ITEMS:
+            continue
         else:
             raise IncompleteResponse(f"模型返回了未授权的输出项类型：{kind}")
     return {"content": "".join(text), "reasoning_content": "".join(summaries),

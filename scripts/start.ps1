@@ -15,24 +15,36 @@ if (-not (Test-Path -LiteralPath $FrontendIndex)) {
     try { npm run build } finally { Pop-Location }
 }
 
-# Import only the OIDC value into the PGAgent process; never print it.
+# Import only the supported marketplace values into the PGAgent process; never print secrets.
 if (Test-Path -LiteralPath $LocalEnvironmentFile) {
-    $oidcLine = Get-Content -LiteralPath $LocalEnvironmentFile | Where-Object {
-        $_ -match '^\s*VERCEL_OIDC_TOKEN\s*='
-    } | Select-Object -Last 1
-    if ($oidcLine -match '^\s*VERCEL_OIDC_TOKEN\s*=\s*(.*?)\s*$') {
-        $oidcToken = $matches[1]
-        if (
-            $oidcToken.Length -ge 2 -and
-            (($oidcToken.StartsWith('"') -and $oidcToken.EndsWith('"')) -or
-             ($oidcToken.StartsWith("'") -and $oidcToken.EndsWith("'")))
-        ) {
-            $oidcToken = $oidcToken.Substring(1, $oidcToken.Length - 2)
+    $localEnvironmentLines = Get-Content -LiteralPath $LocalEnvironmentFile
+    $marketEnvironmentLoaded = $false
+    foreach ($environmentKey in @(
+        'VERCEL_OIDC_TOKEN',
+        'PGAGENT_SKILL_MARKET_URL',
+        'PGAGENT_SKILL_MARKET_CLIENT_TOKEN'
+    )) {
+        $escapedKey = [regex]::Escape($environmentKey)
+        $environmentLine = $localEnvironmentLines | Where-Object {
+            $_ -match "^\s*$escapedKey\s*="
+        } | Select-Object -Last 1
+        if ($environmentLine -match "^\s*$escapedKey\s*=\s*(.*?)\s*$") {
+            $environmentValue = $matches[1]
+            if (
+                $environmentValue.Length -ge 2 -and
+                (($environmentValue.StartsWith('"') -and $environmentValue.EndsWith('"')) -or
+                 ($environmentValue.StartsWith("'") -and $environmentValue.EndsWith("'")))
+            ) {
+                $environmentValue = $environmentValue.Substring(1, $environmentValue.Length - 2)
+            }
+            if ($environmentValue) {
+                Set-Item -LiteralPath "Env:$environmentKey" -Value $environmentValue
+                $marketEnvironmentLoaded = $true
+            }
         }
-        if ($oidcToken) {
-            $env:VERCEL_OIDC_TOKEN = $oidcToken
-            Write-Host 'Loaded local Skill marketplace authentication.' -ForegroundColor DarkGray
-        }
+    }
+    if ($marketEnvironmentLoaded) {
+        Write-Host 'Loaded local Skill marketplace configuration.' -ForegroundColor DarkGray
     }
 }
 

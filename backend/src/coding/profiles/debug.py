@@ -8,10 +8,10 @@ from .base import WorkflowProfile
 DEBUG_PROFILE = WorkflowProfile(
     id="debug",
     direct_tool_names=frozenset({
-        "ToolSearch",
+        "tool_search",
         "apply_patch",
         "background_run",
-        "bash",
+        "shell",
         "check_background",
         "debug_evidence",
         "edit",
@@ -25,13 +25,13 @@ DEBUG_PROFILE = WorkflowProfile(
         "read_artifact",
         "rg",
         "skill",
-        "todowrite",
+        "update_plan",
         "validate",
         "validate_baseline",
-        "webfetch",
-        "websearch",
         "write",
         "write_stdin",
+        "web_open",
+        "web_search",
     }),
     instructions=(
         "## Debug workflow\n"

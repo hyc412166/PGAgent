@@ -50,7 +50,7 @@ def test_small_tool_output_remains_verbatim_without_artifact() -> None:
     assert prepared.artifact_ref is None
 
 
-def test_tool_results_below_aggregate_trigger_keep_the_same_message_list() -> None:
+def test_individually_large_tool_result_is_externalized_below_aggregate_trigger() -> None:
     messages = [
         {"role": "user", "content": "work"},
         {"role": "tool", "tool_call_id": "small", "name": "read", "content": "x" * 300_000},
@@ -62,10 +62,12 @@ def test_tool_results_below_aggregate_trigger_keep_the_same_message_list() -> No
         budgeter=ToolOutputBudgeter(store),
     )
 
-    assert result.messages is messages
-    assert result.changed is False
-    assert result.before_chars == result.after_chars == 300_000
-    assert result.artifact_refs == []
+    assert result.messages is not messages
+    assert result.changed is True
+    assert result.before_chars == 300_000
+    assert result.after_chars < 30_000
+    assert result.messages[1]["content"].startswith("<persisted-tool-output>")
+    assert store.get(result.artifact_refs[0].artifact_id) == b"x" * 300_000
 
 
 def test_tool_results_are_externalized_largest_first_until_target() -> None:
@@ -83,20 +85,21 @@ def test_tool_results_are_externalized_largest_first_until_target() -> None:
     )
 
     assert result.changed is True
-    assert result.compacted_count == 2
+    assert result.compacted_count == 3
     assert result.before_chars == 310_001
     assert result.after_chars <= 150_000
     assert result.messages[0]["content"].startswith("<persisted-tool-output>")
     assert result.messages[1]["content"].startswith("<persisted-tool-output>")
-    assert result.messages[2]["content"] == contents[2]
+    assert result.messages[2]["content"].startswith("<persisted-tool-output>")
     assert messages[0]["content"] == contents[0]
     assert [store.get(ref.artifact_id) for ref in result.artifact_refs] == [
         contents[0].encode(),
         contents[1].encode(),
+        contents[2].encode(),
     ]
 
 
-def test_two_most_recent_tool_results_remain_verbatim() -> None:
+def test_two_most_recent_tool_results_are_still_bounded_individually() -> None:
     contents = ["a" * 160_000, "b" * 80_000, "c" * 70_000]
     messages = [
         {"role": "tool", "tool_call_id": f"call-{index}", "name": "read", "content": content}
@@ -109,10 +112,10 @@ def test_two_most_recent_tool_results_remain_verbatim() -> None:
     )
 
     assert result.messages[0]["content"].startswith("<persisted-tool-output>")
-    assert result.messages[1]["content"] == contents[1]
-    assert result.messages[2]["content"] == contents[2]
-    assert result.compacted_count == 1
-    assert result.target_reached is False
+    assert result.messages[1]["content"].startswith("<persisted-tool-output>")
+    assert result.messages[2]["content"].startswith("<persisted-tool-output>")
+    assert result.compacted_count == 3
+    assert result.target_reached is True
 
 
 def test_small_aggregate_results_pass_through_when_preview_cannot_reduce() -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import (
     JSON,
@@ -328,6 +330,33 @@ class ChatMessage(Base):
     # the provider's exact assistant message.
     provider_payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    @property
+    def citations(self) -> list[dict[str, Any]]:
+        native = self.provider_payload.get("native") if isinstance(self.provider_payload, dict) else None
+        items = native.get("items") if isinstance(native, dict) else None
+        citations: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for item in items or []:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for part in item.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                for annotation in part.get("annotations") or []:
+                    if not isinstance(annotation, dict) or annotation.get("type") != "url_citation":
+                        continue
+                    url = str(annotation.get("url") or "")[:2_048]
+                    try:
+                        parsed = urlsplit(url)
+                        valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+                    except ValueError:
+                        valid = False
+                    if not valid or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    citations.append({"url": url, "title": str(annotation.get("title") or url)[:500]})
+        return citations
 
 
 def next_chat_message_sequence(db: OrmSession, session_id: str) -> int:
