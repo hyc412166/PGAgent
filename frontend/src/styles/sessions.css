@@ -252,6 +252,11 @@
 }
 
 .message.assistant .message-content { padding: 1px 0; }
+.message-citations { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+.message-citations > strong { width: 100%; color: var(--muted-2); font-size: 0.625rem; font-weight: 600; }
+.message-citations a { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 5px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface-soft); font-size: 0.6875rem; text-decoration: none; }
+.message-citations a:hover { border-color: var(--blue); color: var(--blue); }
+.message-citations a span { display: grid; place-items: center; flex: 0 0 auto; width: 17px; height: 17px; border-radius: 5px; background: var(--surface); font-size: 0.625rem; }
 
 .message.user .message-body { max-width: min(78%, 630px); }
 .message.user .message-content {

@@ -30,12 +30,15 @@ LEARN_TOOL_NAMES = {
 }
 
 
-def test_default_registry_exposes_complete_claw_and_learn_tool_contract(tmp_path) -> None:
+def test_default_registry_keeps_claw_and_learn_contract_hidden_for_replay(tmp_path) -> None:
     registry = create_default_registry(str(tmp_path), permission_mode="full")
     names = set(registry.enabled_tool_names)
 
     assert CLAW_TOOL_NAMES <= names
     assert LEARN_TOOL_NAMES <= names
+    visible = {item["function"]["name"] for item in registry.schemas}
+    assert visible.isdisjoint(CLAW_TOOL_NAMES)
+    assert visible.isdisjoint(LEARN_TOOL_NAMES)
 
 
 def test_explicit_empty_tool_selection_is_actually_empty(tmp_path) -> None:

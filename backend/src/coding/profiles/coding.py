@@ -8,10 +8,10 @@ from .base import WorkflowProfile
 CODING_PROFILE = WorkflowProfile(
     id="coding",
     direct_tool_names=frozenset({
-        "ToolSearch",
+        "tool_search",
         "apply_patch",
         "background_run",
-        "bash",
+        "shell",
         "check_background",
         "delete",
         "edit",
@@ -26,19 +26,19 @@ CODING_PROFILE = WorkflowProfile(
         "rg",
         "skill",
         "task",
-        "todowrite",
+        "update_plan",
         "validate",
         "validate_baseline",
-        "webfetch",
-        "websearch",
         "write",
         "write_stdin",
+        "web_open",
+        "web_search",
     }),
     instructions=(
         "## Coding workflow\n"
         "Work toward a completed, verified repository change. Read project instructions and inspect the "
         "owning implementation, callers, and relevant tests before editing. Use rg when available for fast repository "
-        "navigation and use ToolSearch for lower-frequency capabilities. Keep the plan proportional to "
+        "navigation and use tool_search for lower-frequency capabilities. Keep the plan proportional to "
         "the task, preserve unrelated user changes, and prefer apply_patch for existing source files. "
         "After editing, inspect git status/diff and run the narrowest relevant checks with validate. "
         "A regression reproducer must preserve the issue's original data shape, ownership layer, and dispatch path; "

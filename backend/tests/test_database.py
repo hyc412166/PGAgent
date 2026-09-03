@@ -775,6 +775,58 @@ def test_defaults_are_seeded_protected_and_used_for_new_sessions(client: TestCli
     assert body["context_tokens"] == 0
 
 
+def test_init_migrates_saved_agent_tools_to_canonical_surface(client: TestClient) -> None:
+    child = client.post("/api/agents", json={"name": "Legacy tools"}).json()
+    with database.SessionLocal() as db:
+        db.add_all([
+            database.AgentTool(agent_id=child["id"], tool_id="bash"),
+            database.AgentTool(agent_id=child["id"], tool_id="todowrite"),
+            database.AgentTool(agent_id=child["id"], tool_id="ToolSearch"),
+            database.AgentTool(agent_id=child["id"], tool_id="WebFetch"),
+            database.AgentTool(agent_id=child["id"], tool_id="read_file"),
+            database.AgentTool(agent_id=child["id"], tool_id="write"),
+            database.AgentTool(agent_id=child["id"], tool_id="edit"),
+            database.AgentTool(agent_id=child["id"], tool_id="file_info"),
+            database.AgentTool(agent_id=child["id"], tool_id="background_run"),
+            database.AgentTool(agent_id=child["id"], tool_id="check_background"),
+        ])
+        db.commit()
+
+    init_db()
+
+    with database.SessionLocal() as db:
+        migrated = db.get(database.Agent, child["id"])
+        assert migrated is not None
+    assert migrated.tool_ids == [
+        "apply_patch", "read", "shell", "tool_search", "update_plan", "web_open", "write_stdin",
+    ]
+
+
+def test_message_api_exposes_responses_web_search_citations(client: TestClient) -> None:
+    session = client.post("/api/sessions", json={}).json()
+    with database.SessionLocal() as db:
+        db.add(database.ChatMessage(
+            session_id=session["id"],
+            role="assistant",
+            content="检索完成。",
+            sequence=1,
+            provider_payload={"native": {"protocol": "responses", "items": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "检索完成。", "annotations": [{
+                    "type": "url_citation",
+                    "title": "Example News",
+                    "url": "https://example.com/news",
+                }]}],
+            }]}},
+        ))
+        db.commit()
+
+    messages = client.get(f"/api/sessions/{session['id']}/messages").json()
+    assert messages[-1]["citations"] == [{
+        "url": "https://example.com/news", "title": "Example News",
+    }]
+
+
 def test_sessions_always_use_the_fixed_coordinator(client: TestClient) -> None:
     child = client.post("/api/agents", json={"name": "Specialist child"}).json()
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import html
 import asyncio
+import base64
 import inspect
 import ipaddress
 import json
@@ -17,10 +18,13 @@ import socket
 import subprocess
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator, Mapping
-from urllib.parse import parse_qs, quote_plus, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -53,7 +57,9 @@ _WINDOWS_BATCH_CONTROL_TOKENS = ("&", "|", ">", "<", "^", "\r", "\n")
 # not be able to create an unbounded number of child runs in one turn.
 MAX_PARALLEL_DELEGATED_TASKS = 8
 MAX_WEB_RESPONSE_BYTES = 1_000_000
-MAX_WEB_TEXT_CHARS = 100_000
+DEFAULT_WEB_PAGE_CHARS = 12_000
+MAX_WEB_PAGE_CHARS = 20_000
+MAX_WEB_REDIRECTS = 5
 MAX_SKILL_INSTRUCTION_CHARS = 40_000
 MAX_TODOS = 100
 
@@ -64,6 +70,73 @@ class UnsafeWebUrlError(ValueError):
 
 class WebHostResolutionError(RuntimeError):
     """The URL is syntactically safe but its public host could not resolve."""
+
+
+class _ReadableHtmlParser(HTMLParser):
+    """Extract document metadata and readable text without retaining markup."""
+
+    _SKIPPED = frozenset({"script", "style", "noscript", "svg", "canvas", "template"})
+    _BLOCKS = frozenset({
+        "article", "aside", "blockquote", "br", "div", "footer", "h1", "h2", "h3",
+        "h4", "h5", "h6", "header", "li", "main", "nav", "ol", "p", "pre", "section",
+        "table", "td", "th", "tr", "ul",
+    })
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.title_parts: list[str] = []
+        self.metadata: dict[str, str] = {}
+        self._skip_depth = 0
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        name = tag.lower()
+        if name in self._SKIPPED:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        attributes = {str(key).lower(): str(value or "") for key, value in attrs}
+        if name == "title":
+            self._in_title = True
+        elif name == "meta":
+            key = (attributes.get("property") or attributes.get("name") or "").lower()
+            value = attributes.get("content", "").strip()
+            if key and value:
+                self.metadata.setdefault(key, value)
+        if name in self._BLOCKS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        name = tag.lower()
+        if name in self._SKIPPED:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if self._skip_depth:
+            return
+        if name == "title":
+            self._in_title = False
+        if name in self._BLOCKS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        value = data.strip()
+        if not value:
+            return
+        if self._in_title:
+            self.title_parts.append(value)
+        self.parts.append(value)
+
+    def readable_text(self) -> str:
+        lines = []
+        for line in " ".join(self.parts).splitlines():
+            normalized = " ".join(line.split())
+            if normalized and (not lines or lines[-1] != normalized):
+                lines.append(normalized)
+        return "\n".join(lines)
 
 
 def _approval(tool_name: str, arguments: dict[str, Any], reason: str) -> ToolResult:
@@ -568,14 +641,7 @@ def _is_public_ip(address: str) -> bool:
         candidate = ipaddress.ip_address(address)
     except ValueError:
         return False
-    return not (
-        candidate.is_private
-        or candidate.is_loopback
-        or candidate.is_link_local
-        or candidate.is_multicast
-        or candidate.is_reserved
-        or candidate.is_unspecified
-    )
+    return candidate.is_global
 
 
 def _validate_public_http_url(url: str) -> tuple[str, str]:
@@ -640,94 +706,163 @@ def web_fetch(
     *,
     timeout_seconds: float = 15,
     max_bytes: int = MAX_WEB_RESPONSE_BYTES,
+    offset: int = 0,
+    max_chars: int = DEFAULT_WEB_PAGE_CHARS,
+    _tool_name: str = "webfetch",
 ) -> ToolResult:
-    """Fetch a public HTTP(S) resource with bounded response handling.
-
-    Redirects are deliberately *not* followed.  A model may make a separate
-    explicit fetch for the reported public redirect URL, causing it to pass the
-    same SSRF checks again.
-    """
+    """Open a public page as bounded structured text, validating every redirect."""
 
     try:
-        safe_url, host = _validate_public_http_url(url)
         timeout = min(max(float(timeout_seconds), 1.0), 30.0)
         byte_limit = min(max(int(max_bytes), 1_024), MAX_WEB_RESPONSE_BYTES)
+        page_offset = max(int(offset), 0)
+        page_limit = min(max(int(max_chars), 1_000), MAX_WEB_PAGE_CHARS)
         headers = {
-            "User-Agent": "PGAgent/0.1 (+local safe webfetch)",
+            "User-Agent": "PGAgent/0.1 (+local safe web open)",
             "Accept": "text/plain,text/html,application/json,application/xml,text/xml;q=0.9,*/*;q=0.1",
         }
-        body = bytearray()
+        requested_url = str(url or "").strip()
+        current_url = requested_url
+        redirects: list[str] = []
         with httpx.Client(
             follow_redirects=False,
             timeout=httpx.Timeout(timeout),
             trust_env=False,
             headers=headers,
         ) as client:
-            with client.stream("GET", safe_url) as response:
-                if not _response_peer_is_public(response):
-                    return ToolResult("webfetch", False, "连接目标不是公共网络地址", error_code="unsafe_url")
-                if 300 <= response.status_code < 400:
-                    location = response.headers.get("location", "")
-                    return ToolResult(
-                        "webfetch",
-                        True,
-                        "服务器返回重定向；出于安全不会自动跟随。请确认后使用返回的 URL 再次抓取。",
-                        metadata={
-                            "url": safe_url,
-                            "host": host,
-                            "status_code": response.status_code,
-                            "redirect_url": location,
-                            "redirect_followed": False,
-                        },
-                    )
-                for chunk in response.iter_bytes():
-                    remaining = byte_limit - len(body)
-                    if remaining <= 0:
-                        break
-                    body.extend(chunk[:remaining])
-                    if len(chunk) > remaining:
-                        break
-                truncated = len(body) >= byte_limit
-                content_type = response.headers.get("content-type", "").lower()
-                if not any(marker in content_type for marker in ("text/", "json", "xml", "javascript")):
-                    return ToolResult(
-                        "webfetch",
-                        response.is_success,
-                        "已读取非文本响应；为避免将二进制内容写入上下文，不返回正文。",
-                        error_code=None if response.is_success else "http_error",
-                        metadata={
-                            "url": safe_url,
-                            "host": host,
-                            "status_code": response.status_code,
-                            "content_type": content_type or "unknown",
-                            "bytes_read": len(body),
-                            "truncated": truncated,
-                        },
-                    )
-                encoding = response.encoding or "utf-8"
-                text = bytes(body).decode(encoding, errors="replace")
-                text_truncated = len(text) > MAX_WEB_TEXT_CHARS
-                text = text[:MAX_WEB_TEXT_CHARS]
-                return ToolResult(
-                    "webfetch",
-                    response.is_success,
-                    text if text else f"HTTP {response.status_code}（空响应）",
-                    error_code=None if response.is_success else "http_error",
-                    metadata={
-                        "url": safe_url,
-                        "host": host,
-                        "status_code": response.status_code,
-                        "content_type": content_type or "unknown",
-                        "bytes_read": len(body),
-                        "truncated": truncated or text_truncated,
-                    },
-                )
+            for redirect_count in range(MAX_WEB_REDIRECTS + 1):
+                safe_url, host = _validate_public_http_url(current_url)
+                body = bytearray()
+                with client.stream("GET", safe_url) as response:
+                    if not _response_peer_is_public(response):
+                        return ToolResult(_tool_name, False, "连接目标不是公共网络地址", error_code="unsafe_url")
+                    if 300 <= response.status_code < 400:
+                        location = response.headers.get("location", "").strip()
+                        if not location:
+                            return ToolResult(_tool_name, False, "服务器返回了缺少目标地址的重定向", error_code="http_error")
+                        if redirect_count >= MAX_WEB_REDIRECTS:
+                            return ToolResult(_tool_name, False, "网页重定向次数过多", error_code="too_many_redirects")
+                        current_url = urljoin(safe_url, location)
+                        # Validation occurs at the start of the next loop before any request.
+                        redirects.append(current_url)
+                        continue
+                    for chunk in response.iter_bytes():
+                        remaining = byte_limit - len(body)
+                        if remaining <= 0:
+                            break
+                        body.extend(chunk[:remaining])
+                        if len(chunk) > remaining:
+                            break
+                    status_code = response.status_code
+                    content_type = response.headers.get("content-type", "").lower()
+                    encoding = response.encoding or "utf-8"
+                    break
+            else:  # pragma: no cover - bounded loop always returns or breaks
+                raise RuntimeError("redirect loop ended unexpectedly")
+
+        truncated_bytes = len(body) >= byte_limit
+        metadata = {
+            "url": safe_url,
+            "requested_url": requested_url,
+            "host": host,
+            "status_code": status_code,
+            "content_type": content_type or "unknown",
+            "bytes_read": len(body),
+            "redirects": redirects,
+        }
+        if not 200 <= status_code < 300:
+            return ToolResult(
+                _tool_name,
+                False,
+                f"网页请求失败：HTTP {status_code}。错误响应正文未放入上下文。",
+                error_code="http_error",
+                metadata=metadata,
+            )
+        if not any(marker in content_type for marker in ("text/", "json", "xml", "javascript")):
+            return ToolResult(
+                _tool_name,
+                True,
+                "已读取非文本响应；为避免将二进制内容写入上下文，不返回正文。",
+                metadata={**metadata, "truncated": truncated_bytes},
+            )
+
+        decoded = bytes(body).decode(encoding, errors="replace")
+        title = ""
+        description = ""
+        published_at = ""
+        if "html" in content_type or re.search(r"<html\b", decoded[:2_000], re.IGNORECASE):
+            parser = _ReadableHtmlParser()
+            parser.feed(decoded)
+            readable = parser.readable_text()
+            title = " ".join(parser.title_parts).strip()
+            description = (
+                parser.metadata.get("description")
+                or parser.metadata.get("og:description")
+                or parser.metadata.get("twitter:description")
+                or ""
+            )
+            published_at = (
+                parser.metadata.get("article:published_time")
+                or parser.metadata.get("date")
+                or parser.metadata.get("datepublished")
+                or ""
+            )
+        elif "json" in content_type:
+            try:
+                readable = json.dumps(json.loads(decoded), ensure_ascii=False, indent=2)
+            except json.JSONDecodeError:
+                readable = decoded
+        else:
+            readable = _clean_html_text(decoded) if "xml" in content_type else decoded
+
+        readable = readable.strip()
+        page = readable[page_offset:page_offset + page_limit]
+        next_offset = page_offset + len(page) if page_offset + len(page) < len(readable) else None
+        payload = {
+            "title": title[:500] or None,
+            "url": safe_url,
+            "description": " ".join(description.split())[:1_000] or None,
+            "published_at": published_at[:200] or None,
+            "content": page,
+        }
+        return ToolResult(
+            _tool_name,
+            True,
+            json.dumps(payload, ensure_ascii=False),
+            metadata={
+                **metadata,
+                "offset": page_offset,
+                "next_offset": next_offset,
+                "total_chars": len(readable),
+                "truncated": truncated_bytes or next_offset is not None,
+            },
+        )
     except (UnsafeWebUrlError, ValueError) as exc:
-        return ToolResult("webfetch", False, str(exc), error_code="unsafe_url")
+        return ToolResult(_tool_name, False, str(exc), error_code="unsafe_url")
     except WebHostResolutionError:
-        return ToolResult("webfetch", False, "网络请求失败: 无法解析目标主机", error_code="network_error")
+        return ToolResult(_tool_name, False, "网络请求失败: 无法解析目标主机", error_code="network_error")
     except httpx.HTTPError as exc:
-        return ToolResult("webfetch", False, f"网络请求失败: {type(exc).__name__}", error_code="network_error")
+        return ToolResult(_tool_name, False, f"网络请求失败: {type(exc).__name__}", error_code="network_error")
+
+
+def web_open(
+    sandbox: WorkspaceSandbox,
+    url: str,
+    *,
+    timeout_seconds: float = 15,
+    offset: int = 0,
+    max_chars: int = DEFAULT_WEB_PAGE_CHARS,
+) -> ToolResult:
+    """Structured replacement for webfetch; the legacy entry point remains executable."""
+
+    return web_fetch(
+        sandbox,
+        url,
+        timeout_seconds=timeout_seconds,
+        offset=offset,
+        max_chars=max_chars,
+        _tool_name="web_open",
+    )
 
 
 def _clean_html_text(value: str) -> str:
@@ -779,36 +914,212 @@ def web_search(
     if not search_query or len(search_query) > 500:
         return ToolResult("websearch", False, "query 不能为空或过长", error_code="invalid_query")
     result_limit = min(max(int(limit), 1), 10)
-    response = web_fetch(
-        sandbox,
-        f"https://html.duckduckgo.com/html/?q={quote_plus(search_query)}",
-        timeout_seconds=15,
-        max_bytes=MAX_WEB_RESPONSE_BYTES,
-    )
-    if not response.ok:
+    try:
+        search_url, _host = _validate_public_http_url(
+            f"https://html.duckduckgo.com/html/?q={quote_plus(search_query)}"
+        )
+        with httpx.Client(
+            follow_redirects=False,
+            timeout=httpx.Timeout(15),
+            trust_env=False,
+            headers={"User-Agent": "PGAgent/0.1 (+local search)"},
+        ) as client:
+            body = bytearray()
+            with client.stream("GET", search_url) as response:
+                if not _response_peer_is_public(response):
+                    return ToolResult("websearch", False, "连接目标不是公共网络地址", error_code="unsafe_url")
+                response.raise_for_status()
+                for chunk in response.iter_bytes():
+                    remaining = MAX_WEB_RESPONSE_BYTES - len(body)
+                    if remaining <= 0:
+                        break
+                    body.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        break
+                encoding = response.encoding or "utf-8"
+                status_code = response.status_code
+        markup = bytes(body).decode(encoding, errors="replace")
+    except (UnsafeWebUrlError, WebHostResolutionError, httpx.HTTPError):
         return ToolResult(
             "websearch",
             False,
-            f"搜索服务当前不可用: {response.content}",
-            error_code=response.error_code or "search_provider_unavailable",
+            "搜索服务当前不可用",
+            error_code="search_provider_unavailable",
             metadata={"provider": "duckduckgo_html"},
         )
-    results = _duckduckgo_results(response.content, result_limit)
+    results = _duckduckgo_results(markup, result_limit)
     if not results:
         return ToolResult(
             "websearch",
             False,
             "搜索服务未返回可解析的公开结果；没有伪造搜索结果。",
             error_code="search_provider_unavailable",
-            metadata={"provider": "duckduckgo_html", "source_status": response.metadata.get("status_code")},
+            metadata={"provider": "duckduckgo_html", "source_status": status_code},
         )
     lines = [f"{index}. {title}\n   {url}" for index, (title, url) in enumerate(results, start=1)]
     return ToolResult(
         "websearch",
         True,
         "\n".join(lines),
-        metadata={"provider": "duckduckgo_html", "count": len(results), "query": search_query},
+        metadata={
+            "provider": "duckduckgo_html",
+            "count": len(results),
+            "query": search_query,
+            "results": [
+                {"ref_id": f"search{index}", "title": title, "url": url}
+                for index, (title, url) in enumerate(results, start=1)
+            ],
+        },
     )
+
+
+def _public_json(url: str, *, params: Mapping[str, Any] | None = None) -> tuple[dict[str, Any] | list[Any] | None, str | None]:
+    try:
+        safe_url, _ = _validate_public_http_url(url)
+        with httpx.Client(timeout=httpx.Timeout(15), trust_env=False, headers={"User-Agent": "PGAgent/0.1"}) as client:
+            response = client.get(safe_url, params=dict(params or {}))
+            if not _response_peer_is_public(response):
+                return None, "unsafe_url"
+            response.raise_for_status()
+            payload = response.json()
+        return payload, None
+    except (UnsafeWebUrlError, WebHostResolutionError):
+        return None, "unsafe_url"
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+        return None, "network_error"
+
+
+def web_weather(sandbox: WorkspaceSandbox, *, location: str, days: int = 3) -> ToolResult:
+    del sandbox
+    place = str(location or "").strip()
+    if not place or len(place) > 200:
+        return ToolResult("web.run", False, "location 不能为空且不能超过 200 个字符", error_code="invalid_arguments")
+    geo, error = _public_json("https://geocoding-api.open-meteo.com/v1/search", params={"name": place, "count": 1, "language": "zh", "format": "json"})
+    if error or not isinstance(geo, Mapping) or not geo.get("results"):
+        return ToolResult("web.run", False, "无法找到天气地点", error_code=error or "not_found")
+    hit = geo["results"][0]
+    forecast, error = _public_json("https://api.open-meteo.com/v1/forecast", params={"latitude": hit["latitude"], "longitude": hit["longitude"], "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m", "daily": "temperature_2m_max,temperature_2m_min,weather_code", "forecast_days": min(max(int(days), 1), 7), "timezone": "auto"})
+    if error or not isinstance(forecast, Mapping):
+        return ToolResult("web.run", False, "天气服务当前不可用", error_code=error or "network_error")
+    return ToolResult("web.run", True, json.dumps({"location": hit, "forecast": forecast}, ensure_ascii=False), metadata={"provider": "open-meteo"})
+
+
+def web_finance(sandbox: WorkspaceSandbox, *, ticker: str, type: str = "equity") -> ToolResult:
+    del sandbox
+    symbol = str(ticker or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9.\-^=]{1,20}", symbol):
+        return ToolResult("web.run", False, "ticker 格式无效", error_code="invalid_arguments")
+    payload, error = _public_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(symbol)}", params={"range": "1d", "interval": "5m"})
+    if error or not isinstance(payload, Mapping):
+        return ToolResult("web.run", False, "行情服务当前不可用", error_code=error or "network_error")
+    result = ((payload.get("chart") or {}).get("result") or [None])[0]
+    if not isinstance(result, Mapping):
+        return ToolResult("web.run", False, "未找到行情数据", error_code="not_found")
+    meta = result.get("meta") or {}
+    return ToolResult("web.run", True, json.dumps({"ticker": symbol, "asset_type": type, "quote": meta}, ensure_ascii=False), metadata={"provider": "yahoo-finance"})
+
+
+def web_sports(sandbox: WorkspaceSandbox, *, league: str, date: str | None = None, team: str | None = None) -> ToolResult:
+    del sandbox
+    competition = str(league or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9._-]{2,20}", competition):
+        return ToolResult("web.run", False, "league 格式无效", error_code="invalid_arguments")
+    params = {"dates": date} if date else {}
+    if team:
+        params["limit"] = 100
+    payload, error = _public_json(f"https://site.api.espn.com/apis/site/v2/sports/{competition}/scoreboard", params=params)
+    if error or not isinstance(payload, Mapping):
+        return ToolResult("web.run", False, "体育数据服务当前不可用", error_code=error or "network_error")
+    return ToolResult("web.run", True, json.dumps({"league": competition, "events": payload.get("events", [])}, ensure_ascii=False)[:40_000], metadata={"provider": "espn"})
+
+
+def web_screenshot(sandbox: WorkspaceSandbox, *, url: str, full_page: bool = False) -> ToolResult:
+    del sandbox
+    try:
+        safe_url, _ = _validate_public_http_url(url)
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(safe_url, wait_until="domcontentloaded", timeout=20_000)
+            data = page.screenshot(type="png", full_page=bool(full_page))
+            browser.close()
+        return ToolResult("web.run", True, "网页截图已生成", metadata={"mime_type": "image/png", "data_base64": base64.b64encode(data).decode("ascii"), "url": safe_url})
+    except (ImportError, Exception) as exc:
+        return ToolResult("web.run", False, f"网页截图不可用: {type(exc).__name__}", error_code="tool_unavailable")
+
+
+def web_run(
+    sandbox: WorkspaceSandbox,
+    *,
+    search_query: list[Mapping[str, Any]] | None = None,
+    open: list[Mapping[str, Any]] | None = None,
+    click: list[Mapping[str, Any]] | None = None,
+    find: list[Mapping[str, Any]] | None = None,
+    screenshot: list[Mapping[str, Any]] | None = None,
+    finance: list[Mapping[str, Any]] | None = None,
+    weather: list[Mapping[str, Any]] | None = None,
+    sports: list[Mapping[str, Any]] | None = None,
+    time: list[Mapping[str, Any]] | None = None,
+    pages: Mapping[str, Any] | None = None,
+) -> ToolResult:
+    """Execute the public Codex web.run command shape using PGAgent primitives."""
+
+    stored_pages = dict(pages or {})
+    output: list[dict[str, Any]] = []
+    for item in search_query or []:
+        query = str(item.get("q") or item.get("query") or "").strip()
+        result = web_search(sandbox, query, limit=int(item.get("limit") or 5))
+        output.append({"type": "search_query", "query": query, "ok": result.ok, "content": result.content})
+        for hit in result.metadata.get("results", []) if isinstance(result.metadata, Mapping) else []:
+            stored_pages[str(hit.get("ref_id"))] = hit
+    for item in open or []:
+        ref_id = str(item.get("ref_id") or item.get("url") or "").strip()
+        target = stored_pages.get(ref_id, {})
+        url = str(target.get("url") if isinstance(target, Mapping) else target or ref_id)
+        result = web_open(
+            sandbox,
+            url,
+            offset=max(0, int(item.get("offset") or 0)),
+            max_chars=min(20_000, max(1_000, int(item.get("max_chars") or DEFAULT_WEB_PAGE_CHARS))),
+        )
+        output.append({"type": "open", "ref_id": ref_id, "url": url, "ok": result.ok, "content": result.content})
+        if result.ok:
+            stored_pages[ref_id] = {"url": url, "content": result.content}
+    for item in click or []:
+        ref_id = str(item.get("ref_id") or "").strip()
+        links = stored_pages.get(ref_id, {}).get("links", []) if isinstance(stored_pages.get(ref_id), Mapping) else []
+        link_id = str(item.get("id") or item.get("link_id") or "")
+        target_url = next((str(link.get("url")) for link in links if str(link.get("id")) == link_id), "")
+        if not target_url:
+            output.append({"type": "click", "ref_id": ref_id, "id": link_id, "ok": False, "error": "link_not_found"})
+            continue
+        result = web_open(sandbox, target_url)
+        output.append({"type": "click", "ref_id": ref_id, "id": link_id, "ok": result.ok, "content": result.content})
+    for item in find or []:
+        ref_id = str(item.get("ref_id") or "").strip()
+        pattern = str(item.get("pattern") or "")
+        content = str(stored_pages.get(ref_id, {}).get("content") or "")
+        index = content.casefold().find(pattern.casefold()) if pattern else -1
+        output.append({"type": "find", "ref_id": ref_id, "pattern": pattern, "ok": index >= 0, "index": index})
+    for item in screenshot or []:
+        result = web_screenshot(sandbox, url=str(item.get("url") or item.get("ref_id") or ""), full_page=bool(item.get("full_page")))
+        output.append({"type": "screenshot", "ok": result.ok, "content": result.content, "metadata": result.metadata})
+    for item in finance or []:
+        result = web_finance(sandbox, ticker=str(item.get("ticker") or item.get("symbol") or ""), type=str(item.get("type") or "equity"))
+        output.append({"type": "finance", "ok": result.ok, "content": result.content, "error_code": result.error_code})
+    for item in weather or []:
+        result = web_weather(sandbox, location=str(item.get("location") or item.get("city") or ""), days=int(item.get("days") or 3))
+        output.append({"type": "weather", "ok": result.ok, "content": result.content, "error_code": result.error_code})
+    for item in sports or []:
+        result = web_sports(sandbox, league=str(item.get("league") or ""), date=item.get("date"), team=item.get("team"))
+        output.append({"type": "sports", "ok": result.ok, "content": result.content, "error_code": result.error_code})
+    for item in time or []:
+        result = get_current_time(timezone_name=str(item.get("timezone") or item.get("timezone_name") or "") or None)
+        output.append({"type": "time", "ok": result.ok, "content": result.content, "error_code": result.error_code})
+    if not output:
+        return ToolResult("web.run", False, "至少提供一个 search_query、open、click 或 find 命令", error_code="invalid_command")
+    return ToolResult("web.run", True, json.dumps(output, ensure_ascii=False)[:40_000], metadata={"commands": output, "pages": stored_pages})
 
 
 def _normalize_todos(value: Any) -> list[dict[str, Any]]:
@@ -1407,9 +1718,14 @@ def load_skill(
 
 
 def get_current_time(*, timezone_name: str | None = None) -> ToolResult:
-    # v0.1 uses the host's configured local timezone. The optional name is kept in
-    # metadata so a future provider can add IANA timezone conversion without an API break.
-    now = datetime.now().astimezone()
+    requested = str(timezone_name or "").strip()
+    if requested:
+        try:
+            now = datetime.now(ZoneInfo(requested))
+        except ZoneInfoNotFoundError:
+            return ToolResult("get_current_time", False, f"未知时区: {requested}", error_code="invalid_timezone")
+    else:
+        now = datetime.now().astimezone()
     return ToolResult(
         "get_current_time",
         True,

@@ -25,4 +25,17 @@ describe('message image presentation', () => {
     expect(markup.indexOf('message-image-gallery')).toBeLessThan(markup.indexOf('message-content'))
     expect(markup).not.toContain('image/png ·')
   })
+
+  it('renders Responses web search citations as user-visible source links', () => {
+    const markup = renderToStaticMarkup(<MessageBubble message={{
+      id: 'message-2',
+      role: 'assistant',
+      content: '检索完成。',
+      citations: [{ url: 'https://example.com/news', title: 'Example News' }],
+    }} />)
+
+    expect(markup).toContain('aria-label="参考来源"')
+    expect(markup).toContain('href="https://example.com/news"')
+    expect(markup).toContain('Example News')
+  })
 })

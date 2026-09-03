@@ -307,15 +307,13 @@ def compact_tool_results_for_model(
     target_chars: int = 150_000,
     keep_recent_tool_results: int = 2,
 ) -> ToolResultCompaction:
-    """Externalize the largest historical tool results only after aggregate pressure.
+    """Externalize individually large results, then handle aggregate pressure.
 
-    The common path returns the original list unchanged. Once the aggregate
-    provider-visible tool-result content exceeds ``trigger_chars``, raw results
-    that can be shortened with a full preview are processed from largest to
-    smallest, excluding the newest ``keep_recent_tool_results`` observations.
-    Existing artifact previews are not shortened or nested. If these
-    replacements cannot reach ``target_chars``, the bounded result is passed
-    through and normal transcript-compaction thresholds remain authoritative.
+    Any one result above the budgeter's per-result limit is persisted before its
+    next model exposure, including a recent result. If the remaining aggregate
+    provider-visible content exceeds ``trigger_chars``, older raw results are
+    then processed largest-first until ``target_chars`` is reached. Existing
+    artifact previews are never shortened or nested.
     """
 
     if trigger_chars <= target_chars or target_chars < 0 or keep_recent_tool_results < 0:
@@ -326,7 +324,12 @@ def compact_tool_results_for_model(
         if message.get("role") == "tool" and isinstance(message.get("content"), str)
     ]
     before_chars = sum(len(str(messages[index].get("content") or "")) for index in tool_indexes)
-    if before_chars <= trigger_chars:
+    individually_large = [
+        index for index in tool_indexes
+        if len(str(messages[index].get("content") or "")) > budgeter.max_chars
+        if not str(messages[index].get("content") or "").startswith("<persisted-tool-output>")
+    ]
+    if before_chars <= trigger_chars and not individually_large:
         return ToolResultCompaction(
             messages=messages,
             before_chars=before_chars,
@@ -337,6 +340,30 @@ def compact_tool_results_for_model(
     refs: list[ArtifactRef] = []
     current_chars = before_chars
     compacted_count = 0
+    for index in individually_large:
+        message = messages[index]
+        content = str(message.get("content") or "")
+        prepared = budgeter.externalize(
+            tool_call_id=str(message.get("tool_call_id") or ""),
+            tool_name=str(message.get("name") or "tool"),
+            output=content,
+        )
+        compacted_messages[index] = {**message, "content": prepared.content}
+        current_chars += len(prepared.content) - len(content)
+        if prepared.artifact_ref is not None:
+            refs.append(prepared.artifact_ref)
+        compacted_count += 1
+
+    if before_chars <= trigger_chars:
+        return ToolResultCompaction(
+            messages=compacted_messages,
+            artifact_refs=refs,
+            before_chars=before_chars,
+            after_chars=current_chars,
+            compacted_count=compacted_count,
+            target_reached=current_chars <= target_chars,
+        )
+
     protected_indexes = set(
         tool_indexes[-keep_recent_tool_results:]
         if keep_recent_tool_results
@@ -346,6 +373,7 @@ def compact_tool_results_for_model(
         (
             index for index in tool_indexes
             if index not in protected_indexes
+            if index not in individually_large
             if not str(messages[index].get("content") or "").startswith("<persisted-tool-output>")
         ),
         key=lambda index: (-len(str(messages[index].get("content") or "")), index),

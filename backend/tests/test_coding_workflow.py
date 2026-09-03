@@ -28,6 +28,7 @@ def test_apply_patch_updates_multiple_files_and_records_change_evidence(tmp_path
     registry = create_default_registry(
         str(tmp_path),
         allowed_tool_names=["apply_patch", "validate", "ToolSearch", "read", "git_diff"],
+        workflow_profile_id="coding",
         permission_mode="smart",
     )
 
@@ -285,6 +286,7 @@ def test_change_after_validation_marks_the_evidence_stale(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
         allowed_tool_names=["apply_patch", "validate"],
+        workflow_profile_id="coding",
         permission_mode="full",
     )
 
@@ -631,24 +633,24 @@ def test_validate_baseline_does_not_prune_unrelated_missing_worktree(tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_coding_profile_keeps_review_core_visible_and_activates_low_frequency_tools(tmp_path) -> None:
+async def test_general_surface_activates_selected_low_frequency_tools(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
         allowed_tool_names=[
-            "ToolSearch", "apply_patch", "validate", "read", "grep", "git_diff", "GitBlame",
+            "tool_search", "apply_patch", "validate", "read", "rg", "git_diff",
         ],
         permission_mode="full",
     )
 
     assert set(registry.model_visible_tool_names) == {
-        "ToolSearch", "apply_patch", "validate", "read", "grep", "git_diff",
+        "tool_search", "apply_patch", "read", "rg",
     }
-    search = await registry.execute_async("ToolSearch", {"query": "select:GitBlame"})
-    assert json.loads(search.content)[0]["name"] == "GitBlame"
-    assert search.metadata["activated_tools"] == ["GitBlame"]
-    assert "GitBlame" in registry.model_visible_tool_names
+    search = await registry.execute_async("tool_search", {"query": "select:validate"})
+    assert json.loads(search.content)[0]["name"] == "validate"
+    assert search.metadata["activated_tools"] == ["validate"]
+    assert "validate" in registry.model_visible_tool_names
     snapshot = registry.runtime_state()
-    assert snapshot["builtin_active_tools"] == ["GitBlame"]
+    assert snapshot["builtin_active_tools"] == ["validate"]
 
     resumed = create_default_registry(
         str(tmp_path),
@@ -657,7 +659,7 @@ async def test_coding_profile_keeps_review_core_visible_and_activates_low_freque
         coding_state=snapshot["coding_state"],
         active_builtin_tool_names=snapshot["builtin_active_tools"],
     )
-    assert "GitBlame" in resumed.model_visible_tool_names
+    assert "validate" in resumed.model_visible_tool_names
 
 
 def test_coding_profile_does_not_defer_tools_when_tool_search_is_unavailable(tmp_path) -> None:
@@ -667,8 +669,32 @@ def test_coding_profile_does_not_defer_tools_when_tool_search_is_unavailable(tmp
         permission_mode="full",
     )
 
-    assert registry.model_visible_tool_names == ("apply_patch", "write")
+    assert registry.model_visible_tool_names == ("apply_patch",)
     assert registry.workflow_prompt == ""
+
+
+@pytest.mark.asyncio
+async def test_canonical_surface_hides_legacy_aliases_but_keeps_them_executable(tmp_path) -> None:
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=[
+            "tool_search", "shell", "update_plan", "read", "git_diff",
+            "bash", "todowrite", "ToolSearch", "read_file", "WebSearch",
+        ],
+        permission_mode="full",
+    )
+
+    assert set(registry.model_visible_tool_names) == {
+        "tool_search", "shell", "update_plan", "read",
+    }
+    assert {"bash", "todowrite", "ToolSearch", "read_file", "WebSearch"}.issubset(
+        registry.enabled_tool_names
+    )
+    search = await registry.execute_async("tool_search", {"query": "WebSearch"})
+    assert json.loads(search.content) == []
+    legacy = registry.execute("read_file", {"path": "missing.txt"})
+    assert not legacy.ok
+    assert legacy.error_code == "path_error"
 
 
 @pytest.mark.asyncio
@@ -676,7 +702,7 @@ async def test_explicit_review_profile_records_and_restores_structured_findings(
     registry = create_default_registry(
         str(tmp_path),
         allowed_tool_names=[
-            "ToolSearch", "read", "rg", "git_diff", "validate", "review_finding",
+            "tool_search", "read", "rg", "git_diff", "validate", "review_finding",
             "apply_patch", "MCP", "TeamCreate", "read_inbox",
         ],
         workflow_profile_id="review",
@@ -706,7 +732,7 @@ async def test_explicit_review_profile_records_and_restores_structured_findings(
     assert "Evidence: update() writes storage but does not invalidate _cached." in registry.workflow_prompt
     assert "apply_patch" not in registry.model_visible_tool_names
     assert {"MCP", "TeamCreate", "read_inbox"}.isdisjoint(registry.model_visible_tool_names)
-    search = await registry.execute_async("ToolSearch", {"query": "select:apply_patch"})
+    search = await registry.execute_async("tool_search", {"query": "select:apply_patch"})
     assert json.loads(search.content) == []
     assert search.metadata["activated_tools"] == []
 
@@ -735,9 +761,9 @@ async def test_explicit_review_profile_records_and_restores_structured_findings(
         exposure="deferred",
         owner="mcp:repo",
     )
-    hidden = await registry.execute_async("ToolSearch", {"query": "select:mcp__repo__mutate"})
+    hidden = await registry.execute_async("tool_search", {"query": "select:mcp__repo__mutate"})
     assert json.loads(hidden.content) == []
-    visible = await registry.execute_async("ToolSearch", {"query": "select:mcp__repo__inspect"})
+    visible = await registry.execute_async("tool_search", {"query": "select:mcp__repo__inspect"})
     assert visible.metadata["activated_tools"] == ["mcp__repo__inspect"]
     assert "mcp__repo__inspect" in registry.model_visible_tool_names
 
@@ -791,9 +817,9 @@ def test_explicit_debug_profile_keeps_hypotheses_distinct_from_root_cause(tmp_pa
     assert "Location: src/parser.py:18" in registry.workflow_prompt
 
 
-def test_workflow_profile_resolution_preserves_auto_compatibility() -> None:
+def test_workflow_profile_resolution_keeps_auto_general() -> None:
     assert resolve_workflow_profile("review", ["read"]).id == "review"
     assert resolve_workflow_profile("debug", ["read"]).id == "debug"
     assert resolve_workflow_profile("general", ["apply_patch", "validate"]) is None
-    assert resolve_workflow_profile("auto", ["apply_patch", "validate"]).id == "coding"
+    assert resolve_workflow_profile("auto", ["apply_patch", "validate"]) is None
     assert resolve_workflow_profile("auto", ["read", "rg"]) is None

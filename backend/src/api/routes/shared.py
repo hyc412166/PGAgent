@@ -142,6 +142,7 @@ _PUBLIC_EVENT_NUMBER_FIELDS = frozenset({
     "output_chars",
     "question_chars",
     "remaining_call_count",
+    "source_count",
     "step",
     "thought_duration_ms",
     "tool_count",

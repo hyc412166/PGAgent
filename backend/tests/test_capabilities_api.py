@@ -77,36 +77,34 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
     assert response.status_code == 200
     tools = response.json()
     by_id = {item["id"]: item for item in tools}
-    assert {
-        "bash",
+    assert set(by_id) == {
+        "shell",
+        "write_stdin",
         "read",
-        "write",
-        "delete",
-        "edit",
+        "read_artifact",
         "glob",
-        "grep",
-        "webfetch",
-        "websearch",
+        "rg",
+        "web_search",
+        "web_open",
         "task",
-        "todowrite",
+        "update_plan",
+        "tool_search",
         "question",
         "skill",
         "git_status",
         "git_diff",
-        "file_info",
         "apply_patch",
         "validate",
+        "validate_baseline",
         "review_finding",
         "debug_evidence",
-    }.issubset(by_id)
-    assert by_id["bash"]["runtime_tool_id"] == "bash"
+    }
+    assert by_id["shell"]["runtime_tool_id"] == "shell"
     assert by_id["read"]["risk_level"] == "low"
-    assert by_id["write"]["risk_level"] == "adaptive"
-    assert by_id["write"]["requires_approval"] is False
-    assert by_id["delete"]["runtime_tool_id"] == "delete"
-    assert by_id["delete"]["requires_approval"] is True
+    assert by_id["apply_patch"]["risk_level"] == "adaptive"
     assert by_id["git_diff"]["risk_level"] == "low"
-    assert by_id["file_info"]["availability"] == "available"
+    assert by_id["web_search"]["availability"] == "available"
+    assert by_id["web_open"]["runtime_tool_id"] == "web_open"
     assert by_id["review_finding"]["risk_level"] == "low"
     assert by_id["debug_evidence"]["runtime_tool_id"] == "debug_evidence"
     assert {"availability", "enabled", "is_builtin"}.issubset(by_id["skill"])
@@ -200,22 +198,22 @@ def test_agent_and_session_capability_relations_persist_through_api(
         json={
             "name": "Research helper",
             "workflow_profile_id": "review",
-            "tool_ids": ["read", "bash", "read"],
+            "tool_ids": ["read", "shell", "read"],
             "skill_ids": [skill["id"]],
         },
     )
     assert agent_response.status_code == 201, agent_response.text
     agent = agent_response.json()
-    assert agent["tool_ids"] == ["bash", "read"]
+    assert agent["tool_ids"] == ["read", "shell"]
     assert agent["skill_ids"] == [skill["id"]]
     assert agent["workflow_profile_id"] == "review"
 
     updated_agent = test_client.patch(
         f"/api/agents/{agent['id']}",
-        json={"workflow_profile_id": "debug", "tool_ids": ["write"], "skill_ids": []},
+        json={"workflow_profile_id": "debug", "tool_ids": ["apply_patch"], "skill_ids": []},
     )
     assert updated_agent.status_code == 200
-    assert updated_agent.json()["tool_ids"] == ["write"]
+    assert updated_agent.json()["tool_ids"] == ["apply_patch"]
     assert updated_agent.json()["skill_ids"] == []
     assert updated_agent.json()["workflow_profile_id"] == "debug"
 
@@ -285,6 +283,8 @@ def test_market_status_does_not_pretend_an_unauthenticated_skills_sh_search_work
     monkeypatch.delenv("SKILLS_SH_API_TOKEN", raising=False)
     monkeypatch.delenv("PGAGENT_SKILLS_SH_API_TOKEN", raising=False)
     monkeypatch.delenv("VERCEL_OIDC_TOKEN", raising=False)
+    monkeypatch.delenv("PGAGENT_SKILL_MARKET_URL", raising=False)
+    monkeypatch.delenv("PGAGENT_SKILL_MARKET_CLIENT_TOKEN", raising=False)
     status_response = test_client.get("/api/skills/market/status")
     assert status_response.status_code == 200
     assert status_response.json()["available"] is False
@@ -296,6 +296,60 @@ def test_market_status_does_not_pretend_an_unauthenticated_skills_sh_search_work
     assert browse_response.status_code == 200
     assert browse_response.json()["available"] is False
     assert browse_response.json()["items"] == []
+
+
+def test_market_gateway_takes_precedence_and_keeps_its_client_token_server_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PGAGENT_SKILL_MARKET_URL", "https://pgagent-skills.vercel.app/")
+    monkeypatch.setenv("PGAGENT_SKILL_MARKET_CLIENT_TOKEN", "gateway-client-token")
+    monkeypatch.setenv("SKILLS_SH_API_TOKEN", "legacy-direct-token")
+    requests: list[dict[str, object]] = []
+
+    def fake_get(url: str, **kwargs: object) -> skill_service.httpx.Response:
+        requests.append({"url": url, **kwargs})
+        return skill_service.httpx.Response(200, json={"data": []})
+
+    monkeypatch.setattr(skill_service.httpx, "get", fake_get)
+
+    assert skill_service.market_status() == (True, None)
+    assert skill_service._skills_sh_json(
+        "/api/v1/skills/search", params={"q": "react", "limit": 20}
+    ) == {"data": []}
+    assert requests == [
+        {
+            "url": "https://pgagent-skills.vercel.app/api/market/skills/search",
+            "params": {"q": "react", "limit": 20},
+            "headers": {"Authorization": "Bearer gateway-client-token", "Accept": "application/json"},
+            "timeout": 25.0,
+            "follow_redirects": False,
+        }
+    ]
+
+
+def test_market_gateway_requires_url_and_client_token_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PGAGENT_SKILL_MARKET_URL", "https://pgagent-skills.vercel.app")
+    monkeypatch.delenv("PGAGENT_SKILL_MARKET_CLIENT_TOKEN", raising=False)
+
+    available, message = skill_service.market_status()
+
+    assert available is False
+    assert message is not None and "must be configured together" in message
+    with pytest.raises(skill_service.HTTPException, match="must be configured together"):
+        skill_service._skills_sh_json("/api/v1/skills")
+
+
+def test_market_gateway_distinguishes_an_upstream_oidc_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PGAGENT_SKILL_MARKET_URL", "https://pgagent-skills.vercel.app")
+    monkeypatch.setenv("PGAGENT_SKILL_MARKET_CLIENT_TOKEN", "gateway-client-token")
+    monkeypatch.setattr(
+        skill_service.httpx,
+        "get",
+        lambda *_args, **_kwargs: skill_service.httpx.Response(502, json={"error": "oidc_rejected"}),
+    )
+
+    with pytest.raises(skill_service.HTTPException, match="rejected the gateway OIDC token"):
+        skill_service._skills_sh_json("/api/v1/skills")
 
 
 def test_skills_sh_retries_once_with_a_refreshed_vercel_oidc_token(

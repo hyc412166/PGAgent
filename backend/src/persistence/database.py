@@ -440,6 +440,60 @@ def _default_workspace_root() -> Path:
     return PROJECT_ROOT / "data" / "workspaces" / "default"
 
 
+def _migrate_agent_tool_surface() -> None:
+    """Move saved Agent selections onto the canonical Codex-style catalog.
+
+    Run snapshots keep their frozen tool names and are intentionally untouched;
+    ``ToolRegistry`` retains hidden executors for those historic calls.
+    """
+
+    aliases = {
+        "write": "apply_patch",
+        "write_file": "apply_patch",
+        "edit": "apply_patch",
+        "edit_file": "apply_patch",
+        "delete": "apply_patch",
+        "file_info": "read",
+        "list_files": "glob",
+        "search_files": "rg",
+        "bash": "shell",
+        "run_command": "shell",
+        "PowerShell": "shell",
+        "background_run": "shell",
+        "check_background": "write_stdin",
+        "todowrite": "update_plan",
+        "TodoWrite": "update_plan",
+        "ToolSearch": "tool_search",
+        "websearch": "web_search",
+        "WebSearch": "web_search",
+        "webfetch": "web_open",
+        "WebFetch": "web_open",
+        "web_fetch": "web_open",
+        "read_file": "read",
+        "glob_search": "glob",
+        "grep": "rg",
+        "grep_search": "rg",
+        "GitStatus": "git_status",
+        "GitDiff": "git_diff",
+    }
+    canonical = set(BUILTIN_TOOL_IDS)
+    with SessionLocal() as db:
+        rows = list(db.query(AgentTool).all())
+        by_agent: dict[str, set[str]] = {}
+        for row in rows:
+            target = row.tool_id if row.tool_id in canonical else aliases.get(row.tool_id)
+            if target in canonical:
+                by_agent.setdefault(row.agent_id, set()).add(target)
+        if rows:
+            db.execute(delete(AgentTool))
+            db.add_all(
+                AgentTool(agent_id=agent_id, tool_id=tool_id)
+                for agent_id, tool_ids in by_agent.items()
+                for tool_id in sorted(tool_ids)
+            )
+            db.commit()
+
+
 def _seed_defaults() -> None:
     root = _default_workspace_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -530,6 +584,7 @@ def init_db() -> None:
     _migrate_sqlite_columns()
     _drop_retired_session_context_columns()
     _migrate_sqlite_indexes()
+    _migrate_agent_tool_surface()
     _seed_defaults()
 
 

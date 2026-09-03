@@ -17,7 +17,8 @@ def test_registry_exposes_only_selected_tools_and_enforces_permission_modes(tmp_
         allowed_tool_names=["read", "write", "webfetch"],
         permission_mode="ask",
     )
-    assert [item["function"]["name"] for item in ask_registry.schemas] == ["read", "write", "webfetch"]
+    assert [item["function"]["name"] for item in ask_registry.schemas] == ["read"]
+    assert {"write", "webfetch"} <= set(ask_registry.enabled_tool_names)
     assert ask_registry.execute("grep", {"pattern": "x"}).error_code == "tool_not_enabled"
     assert ask_registry.execute("write", {"path": "draft.txt", "content": "secret"}).approval_required
     assert ask_registry.execute("webfetch", {"url": "https://example.com"}).approval_required
@@ -51,6 +52,40 @@ def test_registry_exposes_only_selected_tools_and_enforces_permission_modes(tmp_
     blocked_command = full_registry.execute("bash", {"command": ["not-an-allowed-command"]})
     assert not blocked_command.ok
     assert blocked_command.error_code == "command_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_frozen_legacy_run_can_call_another_legacy_tool_after_approval(tmp_path) -> None:
+    turns = 0
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal turns
+        turns += 1
+        assert "write_file" in [item["function"]["name"] for item in kwargs["tools"]]
+        if turns == 1:
+            return ModelTurn(tool_calls=[ModelToolCall("first", "write_file", {"path": "one.txt", "content": "1"})])
+        if turns == 2:
+            return ModelTurn(tool_calls=[ModelToolCall("second", "write_file", {"path": "two.txt", "content": "2"})])
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=["write_file"],
+            permission_mode="ask",
+            expose_legacy_tools=True,
+        ),
+    )
+    first = await runtime.run(system_prompt="safe", recent_messages=[])
+    second = await runtime.resume_after_approval(first)
+    completed = await runtime.resume_after_approval(second)
+
+    assert first.status == "awaiting_approval"
+    assert second.status == "awaiting_approval"
+    assert completed.status == "completed"
+    assert (tmp_path / "one.txt").read_text(encoding="utf-8") == "1"
+    assert (tmp_path / "two.txt").read_text(encoding="utf-8") == "2"
 
 
 def test_timeline_redacts_patch_and_stdin_payloads() -> None:
@@ -149,7 +184,7 @@ def test_permission_modes_keep_their_distinct_boundaries_for_the_same_write(tmp_
     assert full.execute("write", {"path": ".env", "content": "API_KEY=demo"}).ok
 
 
-def test_delete_is_public_and_smart_mode_always_requires_approval(tmp_path) -> None:
+def test_legacy_delete_is_hidden_but_still_requires_approval(tmp_path) -> None:
     target = tmp_path / "obsolete.txt"
     target.write_text("old", encoding="utf-8")
     registry = create_default_registry(
@@ -158,7 +193,8 @@ def test_delete_is_public_and_smart_mode_always_requires_approval(tmp_path) -> N
         permission_mode="smart",
     )
 
-    assert [item["function"]["name"] for item in registry.schemas] == ["delete"]
+    assert registry.schemas == []
+    assert "delete" in registry.enabled_tool_names
     pending = registry.execute("delete", {"path": "obsolete.txt"})
     assert pending.approval_required
     assert target.exists()
@@ -215,7 +251,7 @@ async def test_runtime_never_persists_raw_malformed_tool_arguments(tmp_path) -> 
             return {
                 "tool_calls": [{
                     "id": "bad-json-runtime",
-                    "function": {"name": "write", "arguments": malformed},
+                    "function": {"name": "apply_patch", "arguments": malformed},
                 }]
             }
         assert kwargs["messages"][-1]["role"] == "tool"
@@ -226,7 +262,7 @@ async def test_runtime_never_persists_raw_malformed_tool_arguments(tmp_path) -> 
         model_call=model_call,
         tool_registry=create_default_registry(
             str(tmp_path),
-            allowed_tool_names=["write"],
+            allowed_tool_names=["apply_patch"],
             permission_mode="full",
         ),
     )
@@ -620,9 +656,9 @@ async def test_aggregate_tool_results_are_budgeted_before_nine_section_compactio
     tool_results = [item for item in provider_messages if item.get("role") == "tool"]
     assert sum(len(str(item.get("content") or "")) for item in tool_results) <= 150_000
     assert str(tool_results[0]["content"]).startswith("<persisted-tool-output>")
-    assert tool_results[1]["content"] == "b" * 110_001
+    assert str(tool_results[1]["content"]).startswith("<persisted-tool-output>")
     assert [item["content"] for item in tool_results[-2:]] == ["recent-one", "recent-two"]
-    assert len(outcome.artifact_refs) == 1
+    assert len(outcome.artifact_refs) == 2
 
 
 @pytest.mark.asyncio
@@ -715,9 +751,9 @@ async def test_timeline_never_persists_write_content_or_api_key(tmp_path) -> Non
         return ModelTurn(
             tool_calls=[
                 ModelToolCall(
-                    "write-1",
-                    "write",
-                    {"path": "safe.txt", "content": "TOP SECRET BODY", "api_key": "super-secret-key"},
+                    "patch-1",
+                    "apply_patch",
+                    {"patch": "*** Begin Patch\n+TOP SECRET BODY\n*** End Patch", "api_key": "super-secret-key"},
                 )
             ]
         )
@@ -726,7 +762,7 @@ async def test_timeline_never_persists_write_content_or_api_key(tmp_path) -> Non
         model_call=model_call,
         tool_registry=create_default_registry(
             str(tmp_path),
-            allowed_tool_names=["write"],
+            allowed_tool_names=["apply_patch"],
             permission_mode="ask",
         ),
     )
@@ -734,7 +770,7 @@ async def test_timeline_never_persists_write_content_or_api_key(tmp_path) -> Non
 
     assert outcome.status == "awaiting_approval"
     started = next(event for event in outcome.events if event["type"] == "tool_started")
-    assert started["arguments"]["content"] == "[redacted]"
+    assert started["arguments"]["patch"] == "[redacted]"
     assert started["arguments"]["api_key"] == "[redacted]"
     assert "TOP SECRET BODY" not in str(started)
     assert "super-secret-key" not in str(started)

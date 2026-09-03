@@ -69,8 +69,9 @@ API Key 不写入 SQLite，保存到 Windows Credential Manager；数据库只�
 - `GET /api/tools`：内置工具目录，字段包括 `id/name/label/description/category/risk_level/enabled/is_builtin/availability` 和可选的 `runtime_tool_id`。
 - `GET /api/usage/runs/{run_id}`：读取单次运行的精确 Token/缓存/成本明细；无 provider 用量回报时返回 `null`。
 - `GET /api/skills`、`POST /api/skills/import`：列出或安全导入本地 `SKILL.md` 文件夹。
-- `GET /api/skills/market/status`、`POST /api/skills/market/search`：skills.sh 市场状态与搜索。市场 API 需要环境变量 `SKILLS_SH_API_TOKEN`（或 Vercel OIDC token）；未配置时会明确返回 `available=false`，不会伪造搜索结果。
-- 本地启动只读取 `.env.local` 中已有的短期 OIDC token，不再连带运行刷新脚本；运行中若 skills.sh 返回 401，后端会按需刷新一次并重试。刷新失败不会阻止 PGAgent 的其他本地功能。
+- `GET /api/skills/market/status`、`POST /api/skills/market/search`：skills.sh 市场状态与搜索。推荐同时配置 `PGAGENT_SKILL_MARKET_URL` 和 `PGAGENT_SKILL_MARKET_CLIENT_TOKEN`，由长期在线网关取得请求级 Vercel OIDC；客户端密钥只在 PGAgent 后端与网关之间传递。未配置网关时仍兼容 `SKILLS_SH_API_TOKEN`、`PGAGENT_SKILLS_SH_API_TOKEN` 或本地 Vercel OIDC。
+- 网关位于根目录 `api/market`，只接受固定的 skills.sh 查询与详情路由，不是任意 HTTP 代理。部署到 Vercel 后，在项目环境变量中设置 `PGAGENT_MARKET_CLIENT_TOKEN` 并开启 OIDC Federation；本地 `.env.local` 使用相同值作为 `PGAGENT_SKILL_MARKET_CLIENT_TOKEN`。生产地址可直接使用 Vercel 提供的 HTTPS 域名。
+- 未配置网关的本地启动只读取 `.env.local` 中已有的短期 OIDC token；运行中若 skills.sh 返回 401，后端会按需刷新一次并重试。刷新失败不会阻止 PGAgent 的其他本地功能。
 - `POST /api/skills/market/install`：传入 `market_id` 或受限的公开 GitHub 仓库/ZIP `source_url`。默认只返回候选 Skill 与文件预览；再次携带 `confirm=true` 才会复制，不执行任何 Skill 脚本。
 - `AgentCreate/AgentUpdate` 支持 `tool_ids`、`skill_ids`；`SessionCreate/SessionUpdate` 支持 `permission_mode`、`skill_ids`。相应 Read 响应始终返回这些字段。固定 PGAgent 主控展示全套内置工具，不能修改或删除。
 - `GET /api/mcp`：只读查看已配置 server 和当前会话连接状态，不返回 command 参数、HTTP Header 或环境变量值。
@@ -118,6 +119,10 @@ npm run dev
 npm run build
 npm run lint
 npm test -- --run
+
+# Skill 市场网关
+cd C:\Users\xxr\Desktop\agent_test\PGAgent
+npm run test:gateway
 ```
 
 后端开发服务：

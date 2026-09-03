@@ -168,6 +168,12 @@ export const MessageBubble = memo(function MessageBubble({ message }: { message:
           })}
         </div>}
         {!!message.content && <div className="message-content">{message.content}</div>}
+        {!!message.citations?.length && <div className="message-citations" aria-label="参考来源">
+          <strong>参考来源</strong>
+          {message.citations.map((citation, index) => <a key={`${citation.url}-${index}`} href={citation.url} target="_blank" rel="noreferrer">
+            <span>{index + 1}</span>{citation.title || citation.url}
+          </a>)}
+        </div>}
         {!!fileAttachments.length && <div className="message-attachments" aria-label="消息附件">
           {fileAttachments.map((attachment) => {
             const href = message.session_id
@@ -224,7 +230,7 @@ function hasActivityDetails(items: ThoughtActivityItem[]) {
 
 function ThoughtActivityList({ items, live = false, activeItemId }: { items: ThoughtActivityItem[]; live?: boolean; activeItemId?: string }) {
   if (!items.length) return null
-  return <div className={`thought-activity-list ${live ? 'is-live' : ''}`} aria-label="处理过程">
+  return <div className={`thought-activity-list ${live ? 'is-live' : ''}`} aria-label="执行详情">
     {items.map((item) => <div key={item.id} className={`thought-activity kind-${item.kind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
       <ThoughtActivityIcon icon={item.icon} />
       <div className="thought-activity-copy"><strong>{item.title}</strong>{item.detail && <span title={item.detail}>{item.detail}</span>}</div>
@@ -237,12 +243,12 @@ export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({
   const duration = formatThoughtDuration(timeline.elapsedMs)
   const items = fallbackThoughtItems(timeline)
   const hasDetails = hasActivityDetails(items)
-  const summary = timeline.conclusion || '处理完成'
+  const summary = timeline.conclusion || '执行完成'
 
   return <article className={`completed-thought ${hasDetails && expanded ? 'expanded' : ''} ${hasDetails ? '' : 'no-details'}`}>
     {hasDetails ? <button type="button" className="completed-thought-toggle" aria-expanded={expanded} aria-controls={`thought-details-${runId}`} onClick={() => setExpanded((value) => !value)}>
-      <span className="completed-thought-duration">已处理 {duration}</span><span className="completed-thought-summary">{summary}</span><ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
-    </button> : <span className="completed-thought-duration completed-thought-static">已处理 {duration}</span>}
+      <span className="completed-thought-duration">执行详情 · 用时 {duration}</span><span className="completed-thought-summary">{summary}</span><ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
+    </button> : <span className="completed-thought-duration completed-thought-static">用时 {duration}</span>}
     {hasDetails && expanded && <div id={`thought-details-${runId}`}><ThoughtActivityList items={items} /></div>}
   </article>
 })
@@ -278,7 +284,7 @@ export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun
       <div className="message-avatar"><PenguinMark size={21} /></div>
       <div className="message-body"><div className="message-meta"><strong>PGAgent</strong><span className="live-phase">{phase}</span></div>
         {hasDetails && <div className={`live-thought ${expanded ? 'expanded' : ''}`}>
-          <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `已处理 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '处理过程'}</span></button>
+          <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
           {expanded && <ThoughtActivityList items={items} live activeItemId={liveRun.thought.activeItemId} />}
         </div>}
         {liveRun.draft && <div className="message-content">{liveRun.draft}</div>}{liveRun.error && <p className="live-error">{liveRun.error}</p>}

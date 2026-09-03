@@ -1,7 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import { emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, safeToolTarget, summarizeThoughtConclusion, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from './thoughtTimeline'
+import { displayToolName, emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, safeToolTarget, summarizeThoughtConclusion, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from './thoughtTimeline'
 
 describe('实时 Thought 时间线', () => {
+  it('展示规范工具名并兼容旧会话别名', () => {
+    expect(displayToolName('shell')).toBe('Shell')
+    expect(displayToolName('bash')).toBe('Shell')
+    expect(displayToolName('web_search')).toBe('WebSearch')
+    expect(displayToolName('web_open')).toBe('Web Open')
+    expect(displayToolName('update_plan')).toBe('Update Plan')
+    expect(displayToolName('todowrite')).toBe('Update Plan')
+    expect(displayToolName('tool_search')).toBe('Tool Search')
+  })
+
   it('累计思考耗时并跟踪工具的开始与完成', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started' }, 1_000)
     const reading = updateThoughtTimeline(started, { type: 'tool_started', tool_name: 'read_file', tool_call_id: 'call-1', arguments: { path: '.gitignore', content: '不可展示' } }, 1_250)
@@ -43,7 +53,7 @@ describe('实时 Thought 时间线', () => {
     ]))
   })
 
-  it('只展示安全进度摘要，不把原始 reasoning 或敏感参数带入时间线', () => {
+  it('只展示模型主动输出的安全进度，不展示后端固定 progress', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, {
       type: 'model_step_started',
       summary: '正在检查项目结构',
@@ -51,26 +61,29 @@ describe('实时 Thought 时间线', () => {
       arguments: { api_key: 'secret-value' },
     }, 1_000)
     const activity = updateThoughtTimeline(started, {
-      type: 'progress',
-      progress: '已完成目录扫描',
+      type: 'thought_summary',
+      summary: '已完成目录扫描',
       reasoning: '仍然不能展示',
     }, 1_100)
-    expect(activity.items.map((item) => item.detail)).toEqual(['正在检查项目结构', '已完成目录扫描'])
+    const ignored = updateThoughtTimeline(activity, {
+      type: 'progress',
+      progress: '后端固定播报',
+    }, 1_200)
+    expect(ignored.items.map((item) => item.detail)).toEqual(['已完成目录扫描'])
     expect(JSON.stringify(activity.items)).not.toContain('隐藏思维链')
   })
 
-  it('把实时思考增量连续追加到当前思考项，并由最终摘要收束', () => {
+  it('隐藏 provider reasoning，只保留模型可见阶段进度', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
     const first = updateThoughtTimeline(started, { type: 'thought_delta', step: 1, delta: '先检查' }, 1_050)
-    const second = updateThoughtTimeline(first, { type: 'thought_delta', step: 1, delta: '天气来源。' }, 1_100)
-    const finished = updateThoughtTimeline(second, { type: 'thought_summary', step: 1, summary: '先检查天气来源。', complete: true }, 1_150)
+    const providerSummary = updateThoughtTimeline(first, { type: 'thought_summary', step: 1, summary: 'Planning weather retrieval', complete: true }, 1_100)
+    const visible = updateThoughtTimeline(providerSummary, { type: 'thought_summary', summary: '我先检查天气来源，再核对发布时间。' }, 1_150)
 
-    expect(second.items).toEqual([
-      expect.objectContaining({ id: 'thought-step-1', title: '思考', detail: '先检查天气来源。', status: 'running' }),
+    expect(visible.items).toEqual([
+      expect.objectContaining({ id: 'thought-step-1', title: '思考', detail: '我先检查天气来源，再核对发布时间。', status: 'running' }),
     ])
-    expect(second.activeItemId).toBe('thought-step-1')
-    expect(finished.items[0]).toMatchObject({ detail: '先检查天气来源。', status: 'completed' })
-    expect(finished.activeItemId).toBeUndefined()
+    expect(JSON.stringify(visible.items)).not.toContain('Planning weather retrieval')
+    expect(visible.activeItemId).toBe('thought-step-1')
   })
 
   it('只把当前正在运行的步骤标记为呼吸灯目标', () => {
@@ -135,12 +148,21 @@ describe('实时 Thought 时间线', () => {
     expect(connected.activeItemId).toBeUndefined()
   })
 
-  it('中断后用服务端快照补齐可能漏掉的最后一段思考', () => {
+  it('中断后不显示服务端保存的 provider reasoning 片段', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 2 }, 1_000)
     const partial = updateThoughtTimeline(started, { type: 'thought_delta', step: 2, delta: '正在分析' }, 1_100)
     const stopped = updateThoughtTimeline(partial, { type: 'run_stopped', partial_thought: '正在分析天气数据。' }, 1_200)
 
-    expect(stopped.items[0]).toMatchObject({ detail: '正在分析天气数据。', status: 'completed' })
+    expect(stopped.items[0]).toMatchObject({ title: '思考', detail: '', status: 'completed' })
+  })
+
+  it('后续模型重试覆盖当前重试行', () => {
+    const first = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_retry', attempt: 1, event_id: 'retry-1' }, 1_000)
+    const second = updateThoughtTimeline(first, { type: 'model_retry', attempt: 2, event_id: 'retry-2' }, 1_100)
+
+    expect(second.items).toEqual([
+      expect.objectContaining({ id: 'model-retry', title: '重试模型', detail: '第 2 次重试' }),
+    ])
   })
 
   it('为默认收起的处理摘要提取安全、简短的结论首行', () => {
