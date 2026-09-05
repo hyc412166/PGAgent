@@ -21,8 +21,7 @@ REVIEW_PROFILE = WorkflowProfile(
         "rg",
         "skill",
         "validate",
-        "web_open",
-        "web_search",
+        "web.run",
     }),
     instructions=(
         "## Code review workflow\n"

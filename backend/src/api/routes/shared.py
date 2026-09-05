@@ -256,6 +256,9 @@ def _public_tool_argument_summary(value: Any) -> dict[str, Any]:
             continue
         if key == "command" and isinstance(raw_value, dict):
             command: dict[str, Any] = {}
+            command_text = _public_event_text(raw_value.get("text"), limit=320)
+            if command_text is not None:
+                command["text"] = command_text
             executable = _public_event_text(raw_value.get("executable"), limit=120)
             if executable is not None:
                 command["executable"] = executable
@@ -268,9 +271,12 @@ def _public_tool_argument_summary(value: Any) -> dict[str, Any]:
         if isinstance(raw_value, dict):
             metadata = {
                 metadata_key: metadata_value
-                for metadata_key in ("chars", "count", "argument_count", "provided")
+                for metadata_key in ("text", "chars", "count", "argument_count", "provided")
                 if isinstance((metadata_value := raw_value.get(metadata_key)), (int, float, bool))
             }
+            text_value = _public_event_text(raw_value.get("text"), limit=320)
+            if text_value is not None:
+                metadata["text"] = text_value
             if metadata:
                 public[key] = metadata
             continue

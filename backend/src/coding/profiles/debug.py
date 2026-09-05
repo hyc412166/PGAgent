@@ -30,8 +30,7 @@ DEBUG_PROFILE = WorkflowProfile(
         "validate_baseline",
         "write",
         "write_stdin",
-        "web_open",
-        "web_search",
+        "web.run",
     }),
     instructions=(
         "## Debug workflow\n"

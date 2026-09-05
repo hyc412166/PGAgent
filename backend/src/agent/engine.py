@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Sequence
@@ -77,6 +78,15 @@ def _safe_event_text(value: Any, limit: int = 320) -> str:
     return text[:limit]
 
 
+def _safe_argument_text(value: Any, limit: int = 320) -> str:
+    """Keep useful command/query context while removing common secret values."""
+
+    text = _safe_event_text(value, limit)
+    text = re.sub(r"(?i)(--?(?:api[-_]?key|token|password|secret)|(?:api[-_]?key|token|password|secret))\s*(?:=|:)\s*[^\s]+", r"\1=[redacted]", text)
+    text = re.sub(r"(?i)(authorization\s*:\s*)[^\s]+", r"\1[redacted]", text)
+    return text
+
+
 def safe_tool_argument_summary(tool_name: str, arguments: Mapping[str, Any] | None) -> dict[str, Any]:
     """Build timeline-safe tool metadata without persisting private payloads.
 
@@ -96,9 +106,10 @@ def safe_tool_argument_summary(tool_name: str, arguments: Mapping[str, Any] | No
             continue
         if key == "command":
             if isinstance(value, list) and value:
-                summary[key] = {"executable": str(value[0])[:120], "argument_count": max(0, len(value) - 1)}
+                rendered = " ".join(_safe_argument_text(item, 120) for item in value)
+                summary[key] = {"text": _safe_argument_text(rendered), "executable": str(value[0])[:120], "argument_count": max(0, len(value) - 1)}
             elif isinstance(value, str):
-                summary[key] = {"provided": True, "chars": len(value)}
+                summary[key] = {"text": _safe_argument_text(value), "chars": len(value)}
             else:
                 summary[key] = {"provided": bool(value)}
             continue
@@ -113,9 +124,7 @@ def safe_tool_argument_summary(tool_name: str, arguments: Mapping[str, Any] | No
             summary[key] = {"count": len(value)}
             continue
         if isinstance(value, str):
-            # ``query`` and regular expressions can also contain private data;
-            # activity needs the fact and size, not their literal text.
-            summary[key] = {"chars": len(value)} if key in {"query", "pattern", "question", "task"} else value[:300]
+            summary[key] = {"text": _safe_argument_text(value), "chars": len(value)} if key in {"query", "pattern", "question", "task"} else value[:300]
         elif isinstance(value, (int, float, bool)) or value is None:
             summary[key] = value
         elif isinstance(value, (list, tuple, set)):

@@ -461,8 +461,6 @@ _GENERAL_DIRECT_TOOL_NAMES = frozenset({
     "read_artifact",
     "glob",
     "rg",
-    "web_search",
-    "web_open",
     "web.run",
     "apply_patch",
     "update_plan",
@@ -470,6 +468,10 @@ _GENERAL_DIRECT_TOOL_NAMES = frozenset({
     "question",
     "tool_search",
 })
+# Network primitives are part of the core runtime contract.  They must remain
+# directly available even when a custom workflow selects the deferred-tool
+# discovery surface.
+_CORE_DIRECT_TOOL_NAMES = frozenset({"web.run"})
 
 # A provider batch containing only these tools is safe to execute concurrently:
 # none mutates workspace/runtime state and result ordering is restored to the
@@ -991,6 +993,7 @@ class ToolRegistry:
             self._defer_low_frequency_tools
             and runtime.origin.source == "builtin"
             and name not in (profile.direct_tool_names if profile is not None else _GENERAL_DIRECT_TOOL_NAMES)
+            and name not in _CORE_DIRECT_TOOL_NAMES
             and name not in ATTACHMENT_TOOL_NAMES
             and name not in _CANONICAL_MEMORY_TOOL_NAMES
         ):

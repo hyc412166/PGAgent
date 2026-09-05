@@ -1365,7 +1365,7 @@ async def test_provider_web_search_is_visible_without_local_dispatch(tmp_path) -
     }]
     hosted_events = [event for event in durable_events if event.get("tool_call_id") == "ws_1"]
     assert [event["type"] for event in hosted_events] == ["tool_started", "tool_finished"]
-    assert hosted_events[0]["arguments"] == {"query": {"chars": 14}}
+    assert hosted_events[0]["arguments"] == {"query": {"text": "latest release", "chars": 14}}
     assert hosted_events[1]["source_count"] == 1
 
 
