@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     model_timeout_seconds: float = 300.0
     max_run_seconds: float | None = None
     model_request_timeout_seconds: float = 300.0
-    model_request_retries: int = 4
+    model_request_retries: int = 5
     model_stream_retries: int = 5
     delegated_wait_timeout_seconds: float = 30.0
     max_task_tokens: int | None = None

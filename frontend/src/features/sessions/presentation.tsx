@@ -229,9 +229,10 @@ function hasActivityDetails(items: ThoughtActivityItem[]) {
 }
 
 function ThoughtActivityList({ items, live = false, activeItemId }: { items: ThoughtActivityItem[]; live?: boolean; activeItemId?: string }) {
-  if (!items.length) return null
+  const visibleItems = items.filter((item) => item.kind !== 'thought' || Boolean(item.detail.trim()))
+  if (!visibleItems.length) return null
   return <div className={`thought-activity-list ${live ? 'is-live' : ''}`} aria-label="执行详情">
-    {items.map((item) => <div key={item.id} className={`thought-activity kind-${item.kind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
+    {visibleItems.map((item) => <div key={item.id} className={`thought-activity kind-${item.kind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
       <ThoughtActivityIcon icon={item.icon} />
       <div className="thought-activity-copy"><strong>{item.title}</strong>{item.detail && <span title={item.detail}>{item.detail}</span>}</div>
     </div>)}

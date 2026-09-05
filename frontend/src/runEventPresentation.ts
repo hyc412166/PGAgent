@@ -137,11 +137,15 @@ function formatDuration(milliseconds: number): string {
 function formatArgumentValue(key: string, value: unknown): string {
   const structured = record(value)
   if (key === 'command' && structured) {
+    const commandText = text(structured.text)
+    if (commandText) return commandText
     const executable = text(structured.executable) || '已提供命令'
     const count = number(structured.argument_count)
     return count === undefined ? executable : `${executable} · ${count} 个参数`
   }
   if (structured) {
+    const textValue = text(structured.text)
+    if (textValue) return textValue
     const chars = number(structured.chars)
     if (chars !== undefined) return `${chars} 个字符`
     const count = number(structured.count)

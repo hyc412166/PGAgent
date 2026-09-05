@@ -266,9 +266,12 @@ function safeArgumentDetail(event: RunStreamEvent): string {
     const count = typeof command.argument_count === 'number' ? command.argument_count : undefined
     return count === undefined ? `执行 ${String(command.executable)}` : `执行 ${String(command.executable)}（${count} 个参数）`
   }
+  if (typeof command?.text === 'string' && command.text.trim()) return command.text.trim()
   const query = record(args.query)
+  if (typeof query?.text === 'string' && query.text.trim()) return `查询：${query.text.trim()}`
   if (query?.chars !== undefined) return `搜索查询（${String(query.chars)} 字符）`
   const task = record(args.task)
+  if (typeof task?.text === 'string' && task.text.trim()) return `任务：${task.text.trim()}`
   if (task?.chars !== undefined) return `编排子 Agent（任务 ${String(task.chars)} 字符）`
   const remaining = record(args.remaining_call_count)
   if (remaining?.count !== undefined) return `还有 ${String(remaining.count)} 个待处理调用`
@@ -392,7 +395,9 @@ function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): Tho
   if (type.startsWith('delegated_child_')) {
     const completed = type.endsWith('completed')
     const failed = type.endsWith('failed') || type.endsWith('stopped')
-    return { id: firstString(event.event_id, event.id, event.task_id, event.child_run_id) || `task-${itemIndex}`, kind: 'task', icon: 'task', title: completed ? '子 Agent 已返回' : failed ? '子 Agent 已停止' : '子 Agent 工作中', detail: progress || (completed ? '已收到子 Agent 的凝练结果' : failed ? '子 Agent 未完成任务' : '正在处理专长任务'), status: completed ? 'completed' : failed ? 'failed' : 'running' }
+    const payload = record(event.payload)
+    const taskTitle = firstString(event.task_title, payload?.task_title, event.task, payload?.task)
+    return { id: firstString(event.event_id, event.id, event.task_id, event.child_run_id) || `task-${itemIndex}`, kind: 'task', icon: 'task', title: completed ? '子 Agent 已返回' : failed ? '子 Agent 已停止' : '子 Agent 工作中', detail: taskTitle || progress || (completed ? '已收到子 Agent 的凝练结果' : failed ? '子 Agent 未完成任务' : '正在处理专长任务'), status: completed ? 'completed' : failed ? 'failed' : 'running' }
   }
   if (safeProgressTypes.has(type) && progress) {
     return { id: firstString(event.event_id, event.id) || `activity-${itemIndex}`, kind: 'event', icon: 'think', title: '进度', detail: progress, status: 'running' }
