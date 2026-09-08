@@ -1,3 +1,9 @@
+"""验证 MCP 运行时的 stdio 连接、工具发现、调用、审批属性、故障恢复与进程生命周期。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -21,15 +27,18 @@ from src.mcp import runtime as mcp_runtime_module
 from src.tools import create_default_registry
 
 
+# FIXTURE_SERVER 指向本地 stdio MCP 测试进程入口，运行时用例通过它验证真实子进程发现与调用链路。
 FIXTURE_SERVER = Path(__file__).parent / "fixtures" / "mcp_echo_server.py"
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_mcp_tool_timeout_defaults_to_five_minutes 精确标识本用例的具体条件。
 def test_mcp_tool_timeout_defaults_to_five_minutes() -> None:
     config = McpServerConfig(command="fixture")
     assert config.tool_timeout_sec == 300
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_mcp_runtime_owns_one_tool_timeout_and_cancels_the_call 精确标识本用例的具体条件。
 async def test_mcp_runtime_owns_one_tool_timeout_and_cancels_the_call(tmp_path: Path) -> None:
     config = McpConfig(mcpServers={
         "slow": McpServerConfig(command="fixture", tool_timeout_sec=0.02),
@@ -38,7 +47,9 @@ async def test_mcp_runtime_owns_one_tool_timeout_and_cancels_the_call(tmp_path: 
     cancelled = asyncio.Event()
     observed_sdk_timeout: list[float | None] = []
 
+    # 测试替身类：FakeClient 保存该局部场景的可控状态。
     class FakeClient:
+        # 辅助方法：call_tool 实现测试替身在此调用阶段需要的最小行为。
         async def call_tool(
             self,
             _name: str,
@@ -66,6 +77,7 @@ async def test_mcp_runtime_owns_one_tool_timeout_and_cancels_the_call(tmp_path: 
     assert cancelled.is_set()
 
 
+# 辅助函数：_write_config 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _write_config(path: Path, *, required: bool = True) -> None:
     path.write_text(json.dumps({
         "mcpServers": {
@@ -81,6 +93,7 @@ def _write_config(path: Path, *, required: bool = True) -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_configuration_change_during_startup_retries_with_new_snapshot 精确标识本用例的具体条件。
 async def test_configuration_change_during_startup_retries_with_new_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -94,6 +107,7 @@ async def test_configuration_change_during_startup_retries_with_new_snapshot(
     release_first = asyncio.Event()
     commands: list[str | None] = []
 
+    # 辅助方法：controlled_start 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_start(runtime: McpSessionRuntime) -> None:
         commands.append(runtime.config.servers["echo"].command)
         if len(commands) == 1:
@@ -105,6 +119,7 @@ async def test_configuration_change_during_startup_retries_with_new_snapshot(
     get_task = asyncio.create_task(pool.get("race-session", str(tmp_path)))
     await first_started.wait()
 
+    # 辅助方法：write_new_config 实现测试替身在此调用阶段需要的最小行为。
     def write_new_config() -> None:
         config_file.write_text(json.dumps({
             "mcpServers": {"echo": {"command": "new-command"}}
@@ -121,6 +136,7 @@ async def test_configuration_change_during_startup_retries_with_new_snapshot(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_stale_startup_failure_retries_after_configuration_change 精确标识本用例的具体条件。
 async def test_stale_startup_failure_retries_after_configuration_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -133,6 +149,7 @@ async def test_stale_startup_failure_retries_after_configuration_change(
     first_started = asyncio.Event()
     release_first = asyncio.Event()
 
+    # 辅助方法：controlled_start 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_start(runtime: McpSessionRuntime) -> None:
         if runtime.config.servers["echo"].command == "broken-command":
             first_started.set()
@@ -144,6 +161,7 @@ async def test_stale_startup_failure_retries_after_configuration_change(
     get_task = asyncio.create_task(pool.get("stale-failure-session", str(tmp_path)))
     await first_started.wait()
 
+    # 辅助方法：write_fixed_config 实现测试替身在此调用阶段需要的最小行为。
     def write_fixed_config() -> None:
         config_file.write_text(json.dumps({
             "mcpServers": {"echo": {"command": "fixed-command"}}
@@ -159,6 +177,7 @@ async def test_stale_startup_failure_retries_after_configuration_change(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_pool_identity_includes_startup_policy 精确标识本用例的具体条件。
 async def test_runtime_pool_identity_includes_startup_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -169,6 +188,7 @@ async def test_runtime_pool_identity_includes_startup_policy(
     }), encoding="utf-8")
     monkeypatch.setattr(settings, "mcp_config_path", str(config_file))
 
+    # 辅助方法：controlled_start 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_start(_runtime: McpSessionRuntime) -> None:
         return None
 
@@ -197,6 +217,7 @@ async def test_runtime_pool_identity_includes_startup_policy(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_startup_discovery_failure_finishes_transport_exit 精确标识本用例的具体条件。
 async def test_startup_discovery_failure_finishes_transport_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -204,16 +225,20 @@ async def test_startup_discovery_failure_finishes_transport_exit(
 ) -> None:
     exit_state = {"started": False, "finished": False, "cancelled": False}
 
+    # 测试替身类：FailingClient 保存该局部场景的可控状态。
     class FailingClient:
         protocol_version = "test"
         server_info = None
 
+        # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
+        # 辅助方法：__aenter__ 实现测试替身在此调用阶段需要的最小行为。
         async def __aenter__(self):
             return self
 
+        # 辅助方法：__aexit__ 实现测试替身在此调用阶段需要的最小行为。
         async def __aexit__(self, *_args: object) -> None:
             exit_state["started"] = True
             try:
@@ -223,6 +248,7 @@ async def test_startup_discovery_failure_finishes_transport_exit(
                 exit_state["cancelled"] = True
                 raise
 
+        # 辅助方法：list_tools 实现测试替身在此调用阶段需要的最小行为。
         async def list_tools(self, **_kwargs: object):
             raise failure_type("discovery failed")
 
@@ -242,6 +268,7 @@ async def test_startup_discovery_failure_finishes_transport_exit(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_mcp_config_expands_environment_and_validates_transport 精确标识本用例的具体条件。
 async def test_mcp_config_expands_environment_and_validates_transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PGAGENT_TEST_MCP_TOKEN", "secret-value")
     config_file = tmp_path / "mcp.json"
@@ -269,6 +296,7 @@ async def test_mcp_config_expands_environment_and_validates_transport(tmp_path: 
     }]
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_disabled_server_does_not_expand_missing_environment 精确标识本用例的具体条件。
 def test_disabled_server_does_not_expand_missing_environment(tmp_path: Path) -> None:
     config_file = tmp_path / "mcp.json"
     config_file.write_text(json.dumps({
@@ -289,6 +317,7 @@ def test_disabled_server_does_not_expand_missing_environment(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_invalid_config_status_does_not_echo_expanded_secret 精确标识本用例的具体条件。
 async def test_invalid_config_status_does_not_echo_expanded_secret(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PGAGENT_INVALID_MCP_SECRET", "TOP-SECRET-DO-NOT-LEAK")
     config_file = tmp_path / "mcp.json"
@@ -310,6 +339,7 @@ async def test_invalid_config_status_does_not_echo_expanded_secret(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_optional_stdio_failure_does_not_hide_ready_server 精确标识本用例的具体条件。
 async def test_optional_stdio_failure_does_not_hide_ready_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_file = tmp_path / "mcp.json"
     config_file.write_text(json.dumps({
@@ -343,6 +373,7 @@ async def test_optional_stdio_failure_does_not_hide_ready_server(tmp_path: Path,
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_session_selection_only_starts_selected_mcp_servers 精确标识本用例的具体条件。
 async def test_session_selection_only_starts_selected_mcp_servers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -376,6 +407,7 @@ async def test_session_selection_only_starts_selected_mcp_servers(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_empty_session_selection_does_not_create_an_mcp_runtime 精确标识本用例的具体条件。
 async def test_empty_session_selection_does_not_create_an_mcp_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -397,6 +429,7 @@ async def test_empty_session_selection_does_not_create_an_mcp_runtime(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_failed_optional_server_reconnects_on_next_attachment 精确标识本用例的具体条件。
 async def test_failed_optional_server_reconnects_on_next_attachment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -414,6 +447,7 @@ async def test_failed_optional_server_reconnects_on_next_attachment(
     monkeypatch.setattr(settings, "mcp_config_path", str(config_file))
     attempts = 0
 
+    # 辅助方法：controlled_start 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_start(server: ConnectedMcpServer) -> None:
         nonlocal attempts
         attempts += 1
@@ -427,9 +461,11 @@ async def test_failed_optional_server_reconnects_on_next_attachment(
             annotations=SimpleNamespace(read_only_hint=False),
         )]
 
+    # 辅助方法：controlled_refresh 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_refresh(server: ConnectedMcpServer) -> None:
         return None
 
+    # 辅助方法：controlled_close 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_close(server: ConnectedMcpServer) -> None:
         server.client = None
 
@@ -453,6 +489,7 @@ async def test_failed_optional_server_reconnects_on_next_attachment(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_mcp_attachment_reports_connection_progress 精确标识本用例的具体条件。
 async def test_mcp_attachment_reports_connection_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_file = tmp_path / "mcp.json"
     _write_config(config_file)
@@ -476,6 +513,7 @@ async def test_mcp_attachment_reports_connection_progress(tmp_path: Path, monkey
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_warm_catalog_keeps_optional_stdio_server_dormant_until_tool_call 精确标识本用例的具体条件。
 async def test_warm_catalog_keeps_optional_stdio_server_dormant_until_tool_call(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -520,6 +558,7 @@ async def test_warm_catalog_keeps_optional_stdio_server_dormant_until_tool_call(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_main_and_subagent_own_distinct_runtimes_under_one_session 精确标识本用例的具体条件。
 async def test_main_and_subagent_own_distinct_runtimes_under_one_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -560,6 +599,7 @@ async def test_main_and_subagent_own_distinct_runtimes_under_one_session(
     ("startup_policy", "required", "expected_starts", "expected_status"),
     [("eager", False, 1, "ready"), ("lazy_when_cached", True, 0, "dormant")],
 )
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_startup_policy_controls_warm_catalog_even_for_required_servers 精确标识本用例的具体条件。
 async def test_startup_policy_controls_warm_catalog_even_for_required_servers(
     tmp_path: Path,
     startup_policy: str,
@@ -582,6 +622,7 @@ async def test_startup_policy_controls_warm_catalog_even_for_required_servers(
     )
     starts = 0
 
+    # 辅助方法：controlled_start 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_start(server: ConnectedMcpServer) -> None:
         nonlocal starts
         starts += 1
@@ -605,6 +646,7 @@ async def test_startup_policy_controls_warm_catalog_even_for_required_servers(
     await runtime.close()
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_tool_catalog_cache_expires_and_evicts_lru_entries 精确标识本用例的具体条件。
 def test_tool_catalog_cache_expires_and_evicts_lru_entries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -627,6 +669,7 @@ def test_tool_catalog_cache_expires_and_evicts_lru_entries(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_changed_catalog_is_cached_but_not_called_with_frozen_schema 精确标识本用例的具体条件。
 async def test_changed_catalog_is_cached_but_not_called_with_frozen_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -637,11 +680,15 @@ async def test_changed_catalog_is_cached_but_not_called_with_frozen_schema(
     cache = McpToolCatalogCache()
     description = "version one"
 
+    # 测试替身类：FakeContent 保存该局部场景的可控状态。
     class FakeContent:
+        # 辅助方法：model_dump 实现测试替身在此调用阶段需要的最小行为。
         def model_dump(self, **_kwargs: object) -> dict[str, str]:
             return {"type": "text", "text": "ok"}
 
+    # 测试替身类：FakeClient 保存该局部场景的可控状态。
     class FakeClient:
+        # 辅助方法：call_tool 实现测试替身在此调用阶段需要的最小行为。
         async def call_tool(self, *_args: object, **_kwargs: object) -> object:
             return SimpleNamespace(
                 content=[FakeContent()],
@@ -649,6 +696,7 @@ async def test_changed_catalog_is_cached_but_not_called_with_frozen_schema(
                 is_error=False,
             )
 
+    # 辅助方法：controlled_start 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_start(server: ConnectedMcpServer) -> None:
         server.dormant = False
         server.client = FakeClient()  # type: ignore[assignment]
@@ -659,6 +707,7 @@ async def test_changed_catalog_is_cached_but_not_called_with_frozen_schema(
             annotations=SimpleNamespace(read_only_hint=True),
         )]
 
+    # 辅助方法：controlled_close 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_close(server: ConnectedMcpServer) -> None:
         server.client = None
 
@@ -689,6 +738,7 @@ async def test_changed_catalog_is_cached_but_not_called_with_frozen_schema(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_concurrent_warm_calls_share_one_server_start 精确标识本用例的具体条件。
 async def test_concurrent_warm_calls_share_one_server_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -705,12 +755,15 @@ async def test_concurrent_warm_calls_share_one_server_start(
     client_published = asyncio.Event()
     release_discovery = asyncio.Event()
 
+    # 测试替身类：FakeClient 保存该局部场景的可控状态。
     class FakeClient:
+        # 辅助方法：call_tool 实现测试替身在此调用阶段需要的最小行为。
         async def call_tool(self, *_args: object, **_kwargs: object) -> object:
             nonlocal tool_calls
             tool_calls += 1
             return SimpleNamespace(content=[], structured_content=None, is_error=False)
 
+    # 辅助方法：controlled_start 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_start(server: ConnectedMcpServer) -> None:
         nonlocal starts
         starts += 1
@@ -725,6 +778,7 @@ async def test_concurrent_warm_calls_share_one_server_start(
             annotations=SimpleNamespace(read_only_hint=True),
         )]
 
+    # 辅助方法：controlled_close 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_close(server: ConnectedMcpServer) -> None:
         server.client = None
 
@@ -754,6 +808,7 @@ async def test_concurrent_warm_calls_share_one_server_start(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_close_during_lazy_start_prevents_connection_and_tool_call 精确标识本用例的具体条件。
 async def test_close_during_lazy_start_prevents_connection_and_tool_call(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -769,12 +824,15 @@ async def test_close_during_lazy_start_prevents_connection_and_tool_call(
     release_startup = asyncio.Event()
     tool_calls = 0
 
+    # 测试替身类：FakeClient 保存该局部场景的可控状态。
     class FakeClient:
+        # 辅助方法：call_tool 实现测试替身在此调用阶段需要的最小行为。
         async def call_tool(self, *_args: object, **_kwargs: object) -> object:
             nonlocal tool_calls
             tool_calls += 1
             return SimpleNamespace(content=[], structured_content=None, is_error=False)
 
+    # 辅助方法：controlled_start 实现测试替身在此调用阶段需要的最小行为。
     async def controlled_start(server: ConnectedMcpServer) -> None:
         server.dormant = False
         startup_entered.set()
@@ -807,6 +865,7 @@ async def test_close_during_lazy_start_prevents_connection_and_tool_call(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_approval_does_not_wake_cached_server_before_grant 精确标识本用例的具体条件。
 async def test_approval_does_not_wake_cached_server_before_grant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -847,6 +906,7 @@ async def test_approval_does_not_wake_cached_server_before_grant(
         ([McpToolBinding("ok", "echo", "mcp__ok__echo", "echo", {"type": "object"}, True, True)], ["ready", "failed"], "mcp_degraded"),
     ],
 )
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_mcp_progress_uses_connection_health_not_tool_count 精确标识本用例的具体条件。
 async def test_mcp_progress_uses_connection_health_not_tool_count(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -858,13 +918,17 @@ async def test_mcp_progress_uses_connection_health_not_tool_count(
     _write_config(config_file)
     monkeypatch.setattr(settings, "mcp_config_path", str(config_file))
 
+    # 测试替身类：FakeRuntime 保存该局部场景的可控状态。
     class FakeRuntime:
+        # 辅助方法：refresh_tools 实现测试替身在此调用阶段需要的最小行为。
         async def refresh_tools(self, *, reconnect_failed: bool = False) -> list[McpToolBinding]:
             return bindings
 
+        # 辅助方法：accept_current_catalog 实现测试替身在此调用阶段需要的最小行为。
         def accept_current_catalog(self) -> None:
             return None
 
+        # 辅助方法：status 实现测试替身在此调用阶段需要的最小行为。
         def status(self) -> dict:
             return {
                 "servers": [
@@ -873,7 +937,9 @@ async def test_mcp_progress_uses_connection_health_not_tool_count(
                 ]
             }
 
+    # 测试替身类：FakePool 保存该局部场景的可控状态。
     class FakePool:
+        # 辅助方法：acquire 实现测试替身在此调用阶段需要的最小行为。
         async def acquire(self, _session_key: str, _workspace_root: str, **_kwargs: object):
             return FakeRuntime(), False
 
@@ -892,6 +958,7 @@ async def test_mcp_progress_uses_connection_health_not_tool_count(
     assert events[-1]["tool_count"] == len(bindings)
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_public_server_info_only_exposes_name_and_version 精确标识本用例的具体条件。
 def test_public_server_info_only_exposes_name_and_version() -> None:
     assert _public_server_info({
         "name": "fixture",
@@ -901,6 +968,7 @@ def test_public_server_info_only_exposes_name_and_version() -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_stdio_mcp_discovery_approval_call_and_shutdown 精确标识本用例的具体条件。
 async def test_stdio_mcp_discovery_approval_call_and_shutdown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_file = tmp_path / "mcp.json"
     _write_config(config_file)
@@ -965,6 +1033,7 @@ async def test_stdio_mcp_discovery_approval_call_and_shutdown(tmp_path: Path, mo
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_same_session_uses_distinct_stdio_runtime_per_workspace 精确标识本用例的具体条件。
 async def test_same_session_uses_distinct_stdio_runtime_per_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_file = tmp_path / "mcp.json"
     _write_config(config_file)
@@ -990,6 +1059,7 @@ async def test_same_session_uses_distinct_stdio_runtime_per_workspace(tmp_path: 
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_frozen_mcp_catalog_rejects_definition_drift 精确标识本用例的具体条件。
 async def test_frozen_mcp_catalog_rejects_definition_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_file = tmp_path / "mcp.json"
     _write_config(config_file)
@@ -1011,6 +1081,7 @@ async def test_frozen_mcp_catalog_rejects_definition_drift(tmp_path: Path, monke
 
 
 @pytest.mark.asyncio
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_deferred_mcp_tool_exposure_survives_run_resume 精确标识本用例的具体条件。
 async def test_deferred_mcp_tool_exposure_survives_run_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1041,6 +1112,7 @@ async def test_deferred_mcp_tool_exposure_survives_run_resume(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_legacy_eager_snapshot_keeps_all_mcp_tools_visible_on_resume 精确标识本用例的具体条件。
 async def test_legacy_eager_snapshot_keeps_all_mcp_tools_visible_on_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1066,6 +1138,7 @@ async def test_legacy_eager_snapshot_keeps_all_mcp_tools_visible_on_resume(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_agent_loads_deferred_mcp_tool_on_the_turn_after_search 精确标识本用例的具体条件。
 async def test_agent_loads_deferred_mcp_tool_on_the_turn_after_search(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1077,6 +1150,7 @@ async def test_agent_loads_deferred_mcp_tool_on_the_turn_after_search(
     await attach_mcp_tools(registry, session_key="mcp-agent-session", workspace_root=str(tmp_path))
     visible_by_turn: list[set[str]] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         visible = {item["function"]["name"] for item in kwargs["tools"]}
         visible_by_turn.append(visible)
@@ -1109,6 +1183,7 @@ async def test_agent_loads_deferred_mcp_tool_on_the_turn_after_search(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_same_turn_search_cannot_execute_a_newly_activated_tool 精确标识本用例的具体条件。
 async def test_same_turn_search_cannot_execute_a_newly_activated_tool(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1120,6 +1195,7 @@ async def test_same_turn_search_cannot_execute_a_newly_activated_tool(
     await attach_mcp_tools(registry, session_key="mcp-same-turn-session", workspace_root=str(tmp_path))
     calls = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         nonlocal calls
         calls += 1
@@ -1146,6 +1222,7 @@ async def test_same_turn_search_cannot_execute_a_newly_activated_tool(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_hidden_generic_mcp_call_is_rejected_when_not_offered 精确标识本用例的具体条件。
 async def test_hidden_generic_mcp_call_is_rejected_when_not_offered(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1157,6 +1234,7 @@ async def test_hidden_generic_mcp_call_is_rejected_when_not_offered(
     await attach_mcp_tools(registry, session_key="mcp-hidden-session", workspace_root=str(tmp_path))
     calls = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         nonlocal calls
         calls += 1
@@ -1177,6 +1255,7 @@ async def test_hidden_generic_mcp_call_is_rejected_when_not_offered(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_mcp_search_is_local_and_approval_exempt_in_ask_mode 精确标识本用例的具体条件。
 async def test_mcp_search_is_local_and_approval_exempt_in_ask_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1196,6 +1275,7 @@ async def test_mcp_search_is_local_and_approval_exempt_in_ask_mode(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_mcp_capability_is_hidden_when_no_server_is_enabled 精确标识本用例的具体条件。
 async def test_mcp_capability_is_hidden_when_no_server_is_enabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

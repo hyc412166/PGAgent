@@ -1,7 +1,10 @@
+// 本测试文件验证 sessionStream 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
 import { appendAssistantDelta, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
 
+// 测试分组：会话 SSE 事件。
 describe('会话 SSE 事件', () => {
+  // 测试场景：所有没有持久化回复的终态都显示兜底提示。
   it('所有没有持久化回复的终态都显示兜底提示', () => {
     expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: '已连续 4 步没有产生有效进展' }, new Set())).toBe(true)
     expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: 'user_interrupted' }, new Set())).toBe(true)
@@ -16,6 +19,7 @@ describe('会话 SSE 事件', () => {
     expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'completed' }, new Set())).toBe(false)
   })
 
+  // 测试场景：按 run 或 turn 标识判断当前运行是否已有持久化终态回复。
   it('按 run 或 turn 标识判断当前运行是否已有持久化终态回复', () => {
     const messages = [
       { role: 'assistant', turn_id: 'turn-1', message_kind: 'terminal', metadata: { run_id: 'run-1' } },
@@ -25,6 +29,7 @@ describe('会话 SSE 事件', () => {
     expect(hasPersistedRunReply(messages, 'missing', 'turn-1')).toBe(true)
     expect(hasPersistedRunReply(messages, 'run-2')).toBe(false)
   })
+  // 测试场景：解析生命周期与文本增量。
   it('解析生命周期与文本增量', () => {
     const delta = parseRunStreamEvent('{"type":"assistant_delta","delta":"你好"}')
     expect(delta).toEqual({ type: 'assistant_delta', delta: '你好' })
@@ -32,11 +37,13 @@ describe('会话 SSE 事件', () => {
     expect(runStreamPhase(delta!)).toBe('正在回复…')
   })
 
+  // 测试场景：在中断终态用服务端 partial_output 补齐丢失的流片段。
   it('在中断终态用服务端 partial_output 补齐丢失的流片段', () => {
     expect(appendAssistantDelta('你好', { type: 'run_stopped', partial_output: '你好，世界' })).toBe('你好，世界')
     expect(appendAssistantDelta('你好，世界', { type: 'run_stopped', partial_output: '你好' })).toBe('你好，世界')
   })
 
+  // 测试场景：识别工具、审批与终态。
   it('识别工具、审批与终态', () => {
     expect(runStreamPhase({ type: 'tool_started', tool_name: 'read_file' })).toBe('正在调用 read_file…')
     expect(runStreamPhase({ type: 'tool_call', tool_name: 'webfetch' })).toBe('正在调用 webfetch…')
@@ -51,6 +58,7 @@ describe('会话 SSE 事件', () => {
     expect(runStatusPhase('awaiting_approval')).toBe('等待你的审批')
   })
 
+  // 测试场景：后台和子 Agent 等待态保持 SSE 打开而不是误判为终态。
   it('后台和子 Agent 等待态保持 SSE 打开而不是误判为终态', () => {
     expect(isResumableWaitingRun({ status: 'stopped', stop_reason: 'waiting_background' })).toBe(true)
     expect(isResumableWaitingRun({ status: 'stopped', stop_reason: 'delegated_child_waiting_event' })).toBe(true)
@@ -61,11 +69,13 @@ describe('会话 SSE 事件', () => {
     expect(runStreamPhase({ type: 'run_stopped', reason: 'delegated_child_waiting_event' })).toBe('等待子 Agent 返回…')
   })
 
+  // 测试场景：忽略无法识别的损坏事件。
   it('忽略无法识别的损坏事件', () => {
     expect(parseRunStreamEvent('not-json')).toBeNull()
     expect(parseRunStreamEvent('纯文本', 'assistant_delta')).toEqual({ type: 'assistant_delta', delta: '纯文本' })
   })
 
+  // 测试场景：按 event_id 去重重放的文本增量。
   it('按 event_id 去重重放的文本增量', () => {
     const seen = new Set<string>()
     const event = { type: 'assistant_delta', delta: '不会重复', event_id: 'run-1-event-8' }
@@ -75,6 +85,7 @@ describe('会话 SSE 事件', () => {
     expect(rememberRunStreamEvent(seen, { type: 'assistant_delta', delta: '下一段' }, 'run-1-event-9')).toBe(false)
   })
 
+  // 测试场景：会话切换后拒绝旧消息和旧运行的异步结果。
   it('会话切换后拒绝旧消息和旧运行的异步结果', () => {
     const oldMessages = [{ id: 'old-message' }]
     expect(visibleSessionItems('session-old', 'session-new', oldMessages)).toEqual([])
@@ -83,6 +94,7 @@ describe('会话 SSE 事件', () => {
     expect(isCurrentSessionRun('session-new', '', 'run-new', 'session-new', 'run-new')).toBe(true)
   })
 
+  // 测试场景：审批响应不能覆盖已经先到达的 SSE 状态。
   it('审批响应不能覆盖已经先到达的 SSE 状态', () => {
     expect(shouldMarkApprovalResuming('awaiting_approval', 'run-1', 'run-1')).toBe(true)
     expect(shouldMarkApprovalResuming('live', 'run-1', 'run-1')).toBe(false)
@@ -90,11 +102,13 @@ describe('会话 SSE 事件', () => {
     expect(shouldMarkApprovalResuming('idle', '', 'run-1')).toBe(false)
     expect(shouldMarkApprovalResuming('awaiting_approval', 'run-2', 'run-1')).toBe(false)
   })
+  // 测试场景：refreshes the session after a rejected child approval。
   it('refreshes the session after a rejected child approval', () => {
     expect(shouldRefreshConversationAfterApprovalDecision('reject')).toBe(true)
     expect(shouldRefreshConversationAfterApprovalDecision('approve')).toBe(false)
   })
 
+  // 测试场景：shows MCP startup before the first model thought。
   it('shows MCP startup before the first model thought', () => {
     expect(runStreamPhase({ type: 'mcp_catalog_loading' })).toBe('正在准备 MCP 工具目录…')
     expect(runStreamPhase({ type: 'mcp_connecting' })).toBe('正在按需连接 MCP 服务…')
@@ -104,6 +118,7 @@ describe('会话 SSE 事件', () => {
     expect(runStreamPhase({ type: 'mcp_degraded' })).toBe('部分 MCP 服务不可用，本轮继续使用已连接工具')
   })
 
+  // 测试场景：历史会话必须等消息和思考记录完成装载后才启动到底部的平滑滚动。
   it('历史会话必须等消息和思考记录完成装载后才启动到底部的平滑滚动', () => {
     expect(shouldStartHistoryScroll(true, false, true)).toBe(false)
     expect(shouldStartHistoryScroll(true, true, false)).toBe(true)

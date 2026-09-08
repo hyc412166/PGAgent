@@ -1,3 +1,9 @@
+"""验证持久化任务与计划步骤的创建、更新、取消、恢复、压缩检查点和续接绑定。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -32,13 +38,16 @@ from src.sessions.delivery import stage_user_turn
 
 
 @pytest.fixture()
+# 测试夹具：task_db 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def task_db(tmp_path: Path):
+    # 临时数据库保存运行、持久任务与计划步骤，用于检查停止、恢复和续接后的状态转换。
     configure_database(f"sqlite:///{(tmp_path / 'task-state.db').as_posix()}")
     init_db()
     yield
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 辅助函数：_stage 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _stage(content: str, *, status: str = "received") -> tuple[str, str]:
     with database.SessionLocal() as db:
         session = Session(
@@ -62,6 +71,7 @@ def _stage(content: str, *, status: str = "received") -> tuple[str, str]:
         return session.id, run.id
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_todowrite_creates_and_updates_one_durable_plan 精确标识本用例的具体条件。
 def test_todowrite_creates_and_updates_one_durable_plan(task_db) -> None:
     session_id, run_id = _stage("实现带测试的缓存重构")
 
@@ -96,6 +106,7 @@ def test_todowrite_creates_and_updates_one_durable_plan(task_db) -> None:
         assert task.active_step_id is None
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_todowrite_cannot_reopen_a_completed_step 精确标识本用例的具体条件。
 def test_todowrite_cannot_reopen_a_completed_step(task_db) -> None:
     _session_id, run_id = _stage("Preserve completed work")
     sync_todos_for_run(run_id, [
@@ -123,6 +134,7 @@ def test_todowrite_cannot_reopen_a_completed_step(task_db) -> None:
         assert task.active_step_id == next_step.id
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_empty_todowrite_does_not_create_a_phantom_task 精确标识本用例的具体条件。
 def test_empty_todowrite_does_not_create_a_phantom_task(task_db) -> None:
     _session_id, run_id = _stage("简单回答")
     sync_todos_for_run(run_id, [])
@@ -131,18 +143,21 @@ def test_empty_todowrite_does_not_create_a_phantom_task(task_db) -> None:
         assert db.query(DurableTask).count() == 0
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_continuation_request_accepts_common_resume_wording 精确标识本用例的具体条件。
 def test_continuation_request_accepts_common_resume_wording() -> None:
     assert is_continuation_request("继续刚刚没完成的工作？")
     assert is_continuation_request("接着之前的步骤做")
     assert is_continuation_request("continue where we left off")
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_task_cancellation_request_accepts_explicit_short_commands 精确标识本用例的具体条件。
 def test_task_cancellation_request_accepts_explicit_short_commands() -> None:
     assert is_task_cancellation_request("取消这个任务")
     assert is_task_cancellation_request("cancel this task")
     assert not is_task_cancellation_request("取消这个任务后，帮我创建另一个发布任务")
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_cancel_durable_task_is_terminal_and_preserves_completed_steps 精确标识本用例的具体条件。
 def test_cancel_durable_task_is_terminal_and_preserves_completed_steps(task_db) -> None:
     _session_id, run_id = _stage("Cancel a durable task")
     sync_todos_for_run(run_id, [
@@ -165,6 +180,7 @@ def test_cancel_durable_task_is_terminal_and_preserves_completed_steps(task_db) 
         assert all(step.completed_at is not None for step in steps)
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_late_todowrite_cannot_reopen_a_stopped_task 精确标识本用例的具体条件。
 def test_late_todowrite_cannot_reopen_a_stopped_task(task_db) -> None:
     _session_id, run_id = _stage("停止竞态", status="acting")
     sync_todos_for_run(run_id, [
@@ -189,12 +205,14 @@ def test_late_todowrite_cannot_reopen_a_stopped_task(task_db) -> None:
         assert step is not None and step.status == "needs_recovery"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_todowrite_requires_stable_step_ids 精确标识本用例的具体条件。
 def test_todowrite_requires_stable_step_ids(task_db) -> None:
     _session_id, run_id = _stage("稳定步骤")
     with pytest.raises(ValueError, match="stable id"):
         sync_todos_for_run(run_id, [{"content": "无标识步骤", "status": "pending"}])
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_failed_graph_step_is_retained_for_model_recovery 精确标识本用例的具体条件。
 def test_failed_graph_step_is_retained_for_model_recovery(task_db) -> None:
     _session_id, run_id = _stage("恢复失败步骤")
     sync_todos_for_run(run_id, [
@@ -218,6 +236,7 @@ def test_failed_graph_step_is_retained_for_model_recovery(task_db) -> None:
         assert failed.status == "in_progress"
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_compaction_checkpoint_preserves_recovery_evidence_and_dependencies 精确标识本用例的具体条件。
 def test_compaction_checkpoint_preserves_recovery_evidence_and_dependencies(task_db) -> None:
     _session_id, run_id = _stage("Resume the durable plan")
     sync_todos_for_run(run_id, [
@@ -244,6 +263,7 @@ def test_compaction_checkpoint_preserves_recovery_evidence_and_dependencies(task
     assert test_state["depends_on"] == ["inspect"]
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_restart_marks_active_step_for_recovery_and_continuation_binds_new_run 精确标识本用例的具体条件。
 def test_restart_marks_active_step_for_recovery_and_continuation_binds_new_run(task_db) -> None:
     session_id, interrupted_run_id = _stage("实现恢复功能", status="acting")
     sync_todos_for_run(interrupted_run_id, [
@@ -282,6 +302,7 @@ def test_restart_marks_active_step_for_recovery_and_continuation_binds_new_run(t
         assert "接入运行恢复" in prompt
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_user_stop_pauses_task_and_marks_active_step_for_verification 精确标识本用例的具体条件。
 def test_user_stop_pauses_task_and_marks_active_step_for_verification(task_db) -> None:
     _session_id, run_id = _stage("暂停后继续", status="acting")
     sync_todos_for_run(run_id, [

@@ -1,4 +1,5 @@
-/* Skills, marketplace and dense data */
+/* 本文件定义 catalog-usage 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
+/* 技能、市场与高密度数据列表。 */
 
 .skills-page,
 .usage-page { width: min(1140px, 100%); }

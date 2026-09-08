@@ -1,4 +1,6 @@
 """Assemble one AgentRuntime from an already resolved durable run context."""
+# 文件职责：负责运行创建、恢复、流式传输和生命周期中的 runtime_factory 子模块。
+# 逻辑关系：上层通过 runs/runtime_factory.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
@@ -22,26 +24,45 @@ from src.tools.registry import ToolRegistry
 from .dependencies import build_model_call
 
 
+# 类职责：定义 CoordinatorRuntimePort 在本领域中的数据与行为。
+# 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class CoordinatorRuntimePort(Protocol):
+    # 函数职责：完成 register_tool_canceller 对应的业务处理。
+    # 参数关系：run_id 表示当前运行标识；callback 表示当前步骤使用的 callback 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def register_tool_canceller(self, run_id: str, callback: Any) -> None: ...
 
+    # 函数职责：完成 event_sink 对应的业务处理。
+    # 参数关系：run_id 表示当前运行标识。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @classmethod
     def _event_sink(cls, run_id: str) -> Any: ...
 
+    # 函数职责：流式传输 sink 对应的数据或流程。
+    # 参数关系：run_id 表示当前运行标识。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @classmethod
     def _stream_sink(cls, run_id: str) -> Any: ...
 
 
+# 类职责：定义 RuntimeAssembly 在本领域中的数据与行为。
 @dataclass(slots=True)
 class RuntimeAssembly:
+    # 变量说明：runtime 表示当前步骤使用的 runtime 值。
     runtime: AgentRuntime
+    # 变量说明：background_store 表示当前步骤使用的 background_store 值。
     background_store: BackgroundJobToolStore
+    # 变量说明：registry 表示当前步骤使用的 registry 值。
     registry: ToolRegistry
 
 
+# 类职责：定义 RunRuntimeFactory 在本领域中的数据与行为。
 class RunRuntimeFactory:
     """Create stores, tools and AgentRuntime without owning run persistence."""
 
+    # 函数职责：完成 create 对应的业务处理。
+    # 参数关系：run_id 表示当前运行标识；context 表示当前步骤使用的 context 值；coordinator 表示当前步骤使用的 coordinator 值；runtime_type 表示当前步骤使用的 runtime_type 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def create(
         self,
         *,
@@ -50,14 +71,19 @@ class RunRuntimeFactory:
         coordinator: CoordinatorRuntimePort,
         runtime_type: type[AgentRuntime] = AgentRuntime,
     ) -> RuntimeAssembly:
+        # 变量说明：binding 表示当前步骤使用的 binding 值。
         binding = dict(context["runtime_binding"])
+        # 变量说明：delegated 表示当前步骤使用的 delegated 值。
         delegated = bool(binding.get("delegation_version"))
+        # 变量说明：session_id 表示所属会话标识。
         session_id = context.get("session_id")
 
+        # 变量说明：task_delegate 表示当前步骤使用的 task_delegate 值。
         task_delegate = None
         if not delegated:
             from .delegation import _SubagentTaskDelegate
 
+            # 变量说明：task_delegate 表示当前步骤使用的 task_delegate 值。
             task_delegate = _SubagentTaskDelegate(
                 coordinator=coordinator,
                 parent_run_id=run_id,
@@ -67,6 +93,7 @@ class RunRuntimeFactory:
                 permission_mode=str(context["permission_mode"]),
             )
 
+        # 变量说明：background_store 表示当前步骤使用的 background_store 值。
         background_store = BackgroundJobToolStore(
             run_id=run_id,
             workspace_id=str(context["workspace_id"]),
@@ -78,7 +105,9 @@ class RunRuntimeFactory:
             context.get("terminal_background_job_ids") or ()
         )
 
+        # 变量说明：delegated_teammate_id 表示delegated_teammate 对象的唯一标识。
         delegated_teammate_id = str(binding.get("teammate_id") or "")
+        # 变量说明：team_store 表示当前步骤使用的 team_store 值。
         team_store = (
             TeamToolStore(
                 run_id=str(binding.get("parent_run_id") or run_id),
@@ -89,14 +118,18 @@ class RunRuntimeFactory:
             if not delegated or delegated_teammate_id
             else None
         )
+        # 变量说明：task_store 表示当前步骤使用的 task_store 值。
         task_store = None if delegated else TaskGraphToolStore(run_id=run_id)
+        # 变量说明：runtime_artifact_store 表示当前步骤使用的 runtime_artifact_store 值。
         runtime_artifact_store = FilesystemArtifactStore(
             settings.data_dir / "artifacts" / str(session_id or run_id)
         )
+        # 变量说明：attachment_store 表示当前步骤使用的 attachment_store 值。
         attachment_store = (
             AttachmentToolStore(str(session_id), runtime_artifact_store)
             if session_id else None
         )
+        # 变量说明：registry 表示当前步骤使用的 registry 值。
         registry = create_default_registry(
             context["workspace_root"],
             allowed_tool_names=context["allowed_tool_names"],
@@ -138,6 +171,7 @@ class RunRuntimeFactory:
             expose_legacy_tools=bool(context.get("expose_legacy_tools")),
         )
         coordinator.register_tool_canceller(run_id, registry.cancel_active)
+        # 变量说明：runtime 表示当前步骤使用的 runtime 值。
         runtime = runtime_type(
             model_call=bind_attachment_store(
                 build_model_call(context["provider"]),

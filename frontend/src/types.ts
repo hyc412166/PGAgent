@@ -1,11 +1,15 @@
+// 本文件集中定义前端与后端接口共享的数据结构；页面、状态管理和请求层均以这些类型约束数据流。
+// ApiRecord 表示尚未收窄的后端对象，转换函数会从中安全提取字段。
 export type ApiRecord = Record<string, unknown>
 
+// Health 是健康检查返回值，用于显示服务版本和依赖状态。
 export interface Health {
   status?: string
   name?: string
   version?: string
 }
 
+// McpServer 描述可由会话选择的 MCP 进程配置及其连接健康状态。
 export interface McpServer {
   name: string
   command: string
@@ -16,6 +20,7 @@ export interface McpServer {
   tool_count: number
 }
 
+// Workspace 表示项目根目录；Session 通过 workspace_id 归属到项目树。
 export interface Workspace {
   id: string
   name: string
@@ -30,6 +35,7 @@ export interface Workspace {
   updated_at?: string
 }
 
+// MemoryRecord 是持久记忆条目，包含来源、类型、状态和检索元数据。
 export interface MemoryRecord {
   id: string
   scope: 'global' | 'workspace' | 'session'
@@ -49,6 +55,7 @@ export interface MemoryRecord {
   updated_at?: string
 }
 
+// PersonalizationSettings 保存会注入 Agent 上下文的用户级自定义指令。
 export interface PersonalizationSettings {
   custom_instructions: string
   effective_instructions: string
@@ -58,10 +65,12 @@ export interface PersonalizationSettings {
   max_characters: number
 }
 
+// MemorySettings 控制全局记忆能力是否启用。
 export interface MemorySettings {
   enabled: boolean
 }
 
+// AgentProfile 聚合角色提示、默认模型/思考等级以及允许使用的工具和技能。
 export interface AgentProfile {
   id: string
   name: string
@@ -84,6 +93,7 @@ export interface AgentProfile {
   created_at?: string
 }
 
+// Session 是一次持续对话的配置与元数据，后续 Message、Run 均通过 session_id 关联。
 export interface Session {
   id: string
   title?: string
@@ -101,9 +111,11 @@ export interface Session {
   updated_at?: string
 }
 
+// ThinkingLevel 和 PermissionMode 是编辑器可提交的两组枚举配置。
 export type ThinkingLevel = 'off' | 'auto' | 'low' | 'medium' | 'high' | 'xhigh'
 export type PermissionMode = 'ask' | 'smart' | 'full'
 
+// ToolCatalogItem 描述 Agent 能力选择器中的内置工具。
 export interface ToolCatalogItem {
   id: string
   name: string
@@ -117,6 +129,7 @@ export interface ToolCatalogItem {
   requires_approval?: boolean
 }
 
+// SkillCatalogItem 表示已安装技能及其本地来源信息。
 export interface SkillCatalogItem {
   id: string
   slug?: string
@@ -130,6 +143,7 @@ export interface SkillCatalogItem {
   installed_at?: string
 }
 
+// SkillMarketplaceItem 是远程市场卡片数据，可进一步获取安装预览。
 export interface SkillMarketplaceItem {
   id: string
   slug?: string
@@ -145,6 +159,7 @@ export interface SkillMarketplaceItem {
   is_duplicate?: boolean
 }
 
+// SkillMarketplaceSearch 描述市场状态或搜索响应中的结果与提示信息。
 export interface SkillMarketplaceSearch {
   provider?: string
   available?: boolean
@@ -152,8 +167,10 @@ export interface SkillMarketplaceSearch {
   items?: SkillMarketplaceItem[]
 }
 
+// SkillMarketplaceView 是市场浏览榜单的固定视图集合。
 export type SkillMarketplaceView = 'all-time' | 'trending' | 'hot' | 'curated'
 
+// SkillMarketplaceCategory 把市场条目按稳定分类 ID 组织为榜单。
 export interface SkillMarketplaceCategory {
   id: string
   label?: string
@@ -166,6 +183,7 @@ export interface SkillMarketplaceCategory {
   refreshed_at?: string
 }
 
+// SkillMarketplaceLeaderboards 在基础市场响应上增加分类榜与建议刷新间隔。
 export interface SkillMarketplaceLeaderboards extends SkillMarketplaceSearch {
   categories?: SkillMarketplaceCategory[]
   updated_at?: string
@@ -177,6 +195,7 @@ export interface SkillMarketplaceLeaderboards extends SkillMarketplaceSearch {
   cached?: boolean
 }
 
+// SkillMarketplaceBrowse 表示某一榜单视图的浏览结果。
 export interface SkillMarketplaceBrowse extends SkillMarketplaceSearch {
   view?: SkillMarketplaceView
   page?: number
@@ -184,6 +203,7 @@ export interface SkillMarketplaceBrowse extends SkillMarketplaceSearch {
   total?: number | null
 }
 
+// SkillInstallPreview 列出安装前将写入的文件和安全提示。
 export interface SkillInstallPreview {
   installed: boolean
   source_url: string
@@ -193,6 +213,7 @@ export interface SkillInstallPreview {
   message?: string
 }
 
+// SessionContext 描述当前上下文窗口用量、压缩阈值及压缩状态。
 export interface SessionContext {
   used_tokens: number
   limit_tokens: number
@@ -201,11 +222,13 @@ export interface SessionContext {
   last_compaction_at?: string
 }
 
+// FolderSelection 是桌面文件夹选择接口的结果。
 export interface FolderSelection {
   path?: string
   cancelled?: boolean
 }
 
+// UsageSummary 汇总给定日期范围内的 token、费用、会话和运行总量。
 export interface UsageSummary {
   total_requests: number
   input_tokens: number
@@ -217,6 +240,7 @@ export interface UsageSummary {
   cache_hit_rate: number
 }
 
+// ModelUsage 按模型连接聚合 token、费用和调用次数。
 export interface ModelUsage {
   provider?: string
   model_id: string
@@ -227,6 +251,7 @@ export interface ModelUsage {
   cache_hit_rate: number
 }
 
+// UsageBreakdownItem 是用量排行组件消费的统一行结构。
 export interface UsageBreakdownItem {
   id: string
   title: string
@@ -238,6 +263,7 @@ export interface UsageBreakdownItem {
   cache_hit_rate: number
 }
 
+// UsageSession 表示按会话聚合的用量明细。
 export interface UsageSession {
   session_id: string | null
   title: string | null
@@ -248,6 +274,7 @@ export interface UsageSession {
   cache_hit_rate: number
 }
 
+// UsageWorkspace 表示按项目工作区聚合的用量明细。
 export interface UsageWorkspace {
   workspace_id: string | null
   name: string | null
@@ -259,6 +286,7 @@ export interface UsageWorkspace {
   cache_hit_rate: number
 }
 
+// Message 是持久化对话消息；metadata 用于关联 run_id、附件和终态来源。
 export interface Message {
   id: string
   session_id?: string
@@ -274,8 +302,12 @@ export interface Message {
   citations?: Array<{ url: string; title: string }>
 }
 
+// RunEvent 是已落盘运行事件，结构与实时 SSE 相近但包含服务端时间戳和 payload。
 export interface RunEvent {
   id?: string
+  run_id?: string
+  sequence?: number
+  trace_id?: string | null
   step?: number
   type?: string
   event_type?: string
@@ -285,6 +317,21 @@ export interface RunEvent {
   payload?: ApiRecord
 }
 
+// RunEventFilters 与 RunEventPage 对应运行诊断接口的筛选条件和游标分页结果。
+export interface RunEventFilters {
+  event_type?: string
+  step?: number
+  errors_only?: boolean
+  before?: number
+  limit?: number
+}
+
+export interface RunEventPage {
+  items: RunEvent[]
+  next_before: number | null
+}
+
+// Run 描述一轮 Agent 执行的生命周期、结果、错误、计划和关联事件。
 export interface Run {
   id: string
   session_id?: string
@@ -315,6 +362,7 @@ export interface Run {
   events?: RunEvent[]
 }
 
+// PlanStep 表示运行计划中的单个可跟踪步骤及其完成状态。
 export interface PlanStep {
   id: string
   external_id: string
@@ -339,6 +387,7 @@ export interface PlanStep {
   last_run_id?: string
 }
 
+// DurableTask 表示可跨页面持续执行的后台任务及其最近进度。
 export interface DurableTask {
   id: string
   session_id: string
@@ -354,6 +403,7 @@ export interface DurableTask {
   steps: PlanStep[]
 }
 
+// RunUsage 是单次运行的精确 token 与费用记录。
 export interface RunUsage {
   run_id: string
   provider?: string | null
@@ -368,6 +418,7 @@ export interface RunUsage {
   cache_hit_rate: number
 }
 
+// Approval 描述不可直接执行的工具动作及用户审批状态。
 export interface Approval {
   id: string
   run_id?: string
@@ -378,6 +429,7 @@ export interface Approval {
   created_at?: string
 }
 
+// Connection 保存模型供应商连接配置、发现到的模型及健康检查结果。
 export interface Connection {
   id: string
   name: string
@@ -404,6 +456,7 @@ export interface Connection {
  *
  * Delegations are runtime records owned by a parent run/session.
  */
+// DelegatedTask 表示父运行委派给子 Agent 的任务及其关联运行结果。
 export interface DelegatedTask {
   id: string
   parent_run_id?: string
@@ -421,6 +474,7 @@ export interface DelegatedTask {
   updated_at?: string
 }
 
+// Teammate 描述当前会话协作树中另一个 Agent 的运行状态。
 export interface Teammate {
   id: string
   team_id: string
@@ -437,6 +491,7 @@ export interface Teammate {
   updated_at?: string
 }
 
+// DashboardData 是总览页消费的服务端聚合指标集合。
 export interface DashboardData {
   workspace_count?: number
   workspaces?: number

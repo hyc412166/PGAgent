@@ -1,3 +1,4 @@
+// 本文件实现 ModelsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { AlertCircle, KeyRound, LoaderCircle, Pencil, Plus, RefreshCw, Sparkles, Trash2 } from 'lucide-react'
 import { type FormEvent, useState } from 'react'
 import { api, describeError } from '../../api'
@@ -7,8 +8,11 @@ import { EmptyState, ErrorState, Field, LoadingState, PageHeader, SlidePanel, St
 import { useApiData } from '../../shared/hooks/useApiData'
 import type { Connection } from '../../types'
 
+// ModelsPage 管理模型连接、模型发现、默认思考等级与连接启停状态。
 function ModelsPage() {
+  // connections 是所有卡片的后端权威数据，任何写操作成功后均通过 refresh 重新对齐。
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
+  // 编辑面板与各 busy ID 分离，使发现、启停、思考等级和删除能给出精确行级反馈。
   const [panelOpen, setPanelOpen] = useState(false)
   const [editingConnection, setEditingConnection] = useState<Connection | null>(null)
   const [saving, setSaving] = useState(false)

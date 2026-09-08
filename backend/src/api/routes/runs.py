@@ -1,4 +1,6 @@
 """Run records and run-event endpoints."""
+# 文件职责：负责HTTP 接口、数据契约与依赖装配中的 runs 子模块。
+# 逻辑关系：上层通过 api/routes/runs.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
@@ -56,6 +58,7 @@ from src.api.schemas import (
     MemoryUpdate,
     RunCreate,
     RunEventCreate,
+    RunEventPage,
     RunEventRead,
     RunRead,
     RunUpdate,
@@ -71,6 +74,7 @@ from src.memory.service import recall_memories, refresh_memory_markdown_projecti
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
 from src.tasks.state import latest_resumable_task, task_payload
 from src.agents.collaboration import cleanup_session_worktrees
+# 变量说明：router 表示当前步骤使用的 router 值。
 router = APIRouter(prefix="/api", tags=["runs"])
 
 from src.api.routes.shared import (
@@ -84,8 +88,12 @@ from src.api.routes.shared import (
     _require_enabled_model_connection,
     _workspace_name_from_root,
 )
+from src.persistence.run_events import append_run_event
 
 
+# 函数职责：执行 read 对应的数据或流程。
+# 参数关系：run 表示当前步骤使用的 run 值；session_titles 表示当前流程使用的 session_titles 集合；agent_names 表示当前流程使用的 agent_names 集合；db 表示当前数据库会话。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _run_read(
     run: Run,
     *,
@@ -94,14 +102,20 @@ def _run_read(
     db: Session | None = None,
 ) -> RunRead:
     if session_titles is None:
+        # 变量说明：session 表示当前步骤使用的 session 值。
         session = db.get(ChatSession, run.session_id) if db is not None and run.session_id else None
+        # 变量说明：session_title 表示当前步骤使用的 session_title 值。
         session_title = session.title if session is not None else None
     else:
+        # 变量说明：session_title 表示当前步骤使用的 session_title 值。
         session_title = session_titles.get(run.session_id or "")
     if agent_names is None:
+        # 变量说明：agent 表示当前步骤使用的 agent 值。
         agent = db.get(Agent, run.agent_id) if db is not None and run.agent_id else None
+        # 变量说明：agent_name 表示当前步骤使用的 agent_name 值。
         agent_name = agent.name if agent is not None else None
     else:
+        # 变量说明：agent_name 表示当前步骤使用的 agent_name 值。
         agent_name = agent_names.get(run.agent_id or "")
     return RunRead.model_validate(run).model_copy(update={
         "session_title": session_title,
@@ -109,12 +123,19 @@ def _run_read(
     })
 
 
+# 函数职责：完成 message_excerpt 对应的业务处理。
+# 参数关系：content 表示待处理或返回的正文内容；limit 表示当前步骤使用的 limit 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _message_excerpt(content: str, limit: int = 180) -> str:
+    # 变量说明：normalized 表示当前步骤使用的 normalized 值。
     normalized = " ".join(content.replace("\x00", "").split())
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 1].rstrip() + "…"
 
+# 函数职责：列出 runs 对应的数据或流程。
+# 参数关系：session_id 表示所属会话标识；run_status 表示当前流程使用的 run_status 集合；limit 表示当前步骤使用的 limit 值；offset 表示当前步骤使用的 offset 值；before_started_at 表示before_started_at 对应的时间信息；before_id 表示before 对象的唯一标识；db 表示当前数据库会话。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 @router.get("/runs", response_model=list[RunRead])
 def list_runs(
     session_id: str | None = None,
@@ -125,26 +146,35 @@ def list_runs(
     before_id: str | None = None,
     db: Session = Depends(get_db),
 ) -> list[RunRead]:
+    # 变量说明：query 表示当前步骤使用的 query 值。
     query = select(Run)
     if session_id:
+        # 变量说明：query 表示当前步骤使用的 query 值。
         query = query.where(Run.session_id == session_id)
     if run_status:
+        # 变量说明：query 表示当前步骤使用的 query 值。
         query = query.where(Run.status == run_status)
     if (before_started_at is None) != (before_id is None):
         raise HTTPException(status_code=422, detail="before_started_at and before_id must be provided together")
     if before_started_at is not None and before_id is not None:
+        # 变量说明：query 表示当前步骤使用的 query 值。
         query = query.where(or_(
             Run.started_at < before_started_at,
             and_(Run.started_at == before_started_at, Run.id < before_id),
         ))
+    # 变量说明：runs 表示当前流程使用的 runs 集合。
     runs = list(db.scalars(
         query.order_by(Run.started_at.desc(), Run.id.desc()).offset(offset).limit(limit)
     ))
+    # 变量说明：session_ids 表示session 对象标识集合。
     session_ids = {run.session_id for run in runs if run.session_id}
+    # 变量说明：agent_ids 表示agent 对象标识集合。
     agent_ids = {run.agent_id for run in runs if run.agent_id}
+    # 变量说明：session_titles 表示当前流程使用的 session_titles 集合。
     session_titles = dict(db.execute(
         select(ChatSession.id, ChatSession.title).where(ChatSession.id.in_(session_ids))
     ).all()) if session_ids else {}
+    # 变量说明：agent_names 表示当前流程使用的 agent_names 集合。
     agent_names = dict(db.execute(
         select(Agent.id, Agent.name).where(Agent.id.in_(agent_ids))
     ).all()) if agent_ids else {}
@@ -154,13 +184,19 @@ def list_runs(
     ]
 
 
+# 函数职责：创建 run 对应的数据或流程。
+# 参数关系：payload 表示跨层传递的数据载荷；db 表示当前数据库会话。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 @router.post("/runs", response_model=RunRead, status_code=status.HTTP_201_CREATED)
 def create_run(payload: RunCreate, db: Session = Depends(get_db)) -> RunRead:
+    # 变量说明：data 表示当前处理的数据。
     data = payload.model_dump()
     if data.get("session_id"):
+        # 变量说明：chat_session 表示当前步骤使用的 chat_session 值。
         chat_session = _require(db, ChatSession, data["session_id"], "Session")
         data["agent_id"] = DEFAULT_AGENT_ID
         data["workspace_id"] = data.get("workspace_id") or chat_session.workspace_id or DEFAULT_WORKSPACE_ID
+    # 变量说明：item 表示当前步骤使用的 item 值。
     item = Run(**data)
     db.add(item)
     _commit(db)
@@ -168,13 +204,20 @@ def create_run(payload: RunCreate, db: Session = Depends(get_db)) -> RunRead:
     return _run_read(item, db=db)
 
 
+# 函数职责：读取 run 对应的数据或流程。
+# 参数关系：run_id 表示当前运行标识；db 表示当前数据库会话。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 @router.get("/runs/{run_id}", response_model=RunRead)
 def get_run(run_id: str, db: Session = Depends(get_db)) -> RunRead:
     return _run_read(_require(db, Run, run_id, "Run"), db=db)
 
 
+# 函数职责：更新 run 对应的数据或流程。
+# 参数关系：run_id 表示当前运行标识；payload 表示跨层传递的数据载荷；db 表示当前数据库会话。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 @router.patch("/runs/{run_id}", response_model=RunRead)
 def update_run(run_id: str, payload: RunUpdate, db: Session = Depends(get_db)) -> RunRead:
+    # 变量说明：item 表示当前步骤使用的 item 值。
     item = _require(db, Run, run_id, "Run")
     _apply(item, payload)
     _commit(db)
@@ -182,44 +225,86 @@ def update_run(run_id: str, payload: RunUpdate, db: Session = Depends(get_db)) -
     return _run_read(item, db=db)
 
 
-@router.get("/runs/{run_id}/events", response_model=list[RunEventRead])
-def list_run_events(run_id: str, db: Session = Depends(get_db)) -> list[RunEventRead]:
+# 函数职责：列出 run_events 对应的数据或流程。
+# 参数关系：run_id 表示当前运行标识；db 表示当前数据库会话。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
+@router.get("/runs/{run_id}/events", response_model=RunEventPage)
+def list_run_events(
+    run_id: str,
+    event_type: list[str] | None = Query(default=None),
+    step: int | None = Query(default=None, ge=0),
+    errors_only: bool = Query(default=False),
+    before: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=100, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> RunEventPage:
+    # 变量说明：run 表示当前步骤使用的 run 值。
     run = _require(db, Run, run_id, "Run")
+    # 变量说明：user_message 表示当前步骤使用的 user_message 值。
     user_message = db.scalar(
         select(ChatMessage.content)
         .where(ChatMessage.turn_id == run.turn_id, ChatMessage.role == "user")
         .order_by(ChatMessage.sequence.asc(), ChatMessage.created_at.asc())
         .limit(1)
     ) if run.turn_id else None
+    # 变量说明：message_excerpt 表示当前步骤使用的 message_excerpt 值。
     message_excerpt = _message_excerpt(user_message) if user_message else None
-    events = list(
-        db.scalars(select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.created_at.asc()))
-    )
+    # 变量说明：events 表示运行事件集合。
+    events = list(db.scalars(select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.sequence.desc(), RunEvent.id.desc())))
+    # 变量说明：public_events 表示当前流程使用的 public_events 集合。
     public_events: list[RunEventRead] = []
     for event in events:
+        # 变量说明：public 表示当前步骤使用的 public 值。
         public = _public_run_event(event)
-        if public is None:
+        if public is None or (before is not None and (event.sequence or 0) >= before):
+            continue
+        if event_type and event.event_type not in set(event_type):
+            continue
+        if step is not None and event.step != step:
+            continue
+        if errors_only and not (
+            "failed" in event.event_type or "error" in event.event_type or "retry" in event.event_type
+            or (isinstance(event.payload, dict) and (event.payload.get("error_code") or event.payload.get("ok") is False))
+        ):
             continue
         if message_excerpt and public.event_type in {"context_prepared", "context_resumed"}:
+            # 变量说明：public 表示当前步骤使用的 public 值。
             public = public.model_copy(update={
                 "payload": {**public.payload, "message_excerpt": message_excerpt},
             })
         public_events.append(public)
-    return public_events
+    # SQL 采用倒序抓取最近事件；返回前翻回时间正序，便于 UI 连续追加历史页。
+    page_items = list(reversed(public_events[:limit]))
+    next_before = public_events[limit - 1].sequence if len(public_events) > limit else None
+    return RunEventPage(items=page_items, next_before=next_before)
 
 
-@router.post(
-    "/runs/{run_id}/events", response_model=RunEventRead, status_code=status.HTTP_201_CREATED
-)
+# 函数职责：创建 run_event 对应的数据或流程。
+# 参数关系：run_id 表示当前运行标识；payload 表示跨层传递的数据载荷；db 表示当前数据库会话。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
+@router.post("/runs/{run_id}/events", response_model=RunEventRead, status_code=status.HTTP_201_CREATED)
 def create_run_event(
     run_id: str, payload: RunEventCreate, db: Session = Depends(get_db)
-) -> RunEvent:
+) -> RunEventRead:
     _require(db, Run, run_id, "Run")
-    item = RunEvent(run_id=run_id, **payload.model_dump())
-    db.add(item)
+    if "checkpoint" in payload.event_type.casefold() or payload.event_type.casefold().endswith("_snapshot"):
+        raise HTTPException(status_code=422, detail="该事件类型仅供运行恢复使用")
+    item = append_run_event(db, run_id=run_id, **payload.model_dump())
     _commit(db)
     db.refresh(item)
-    return item
+    public = _public_run_event(item)
+    if public is None:
+        public = RunEventRead(
+            id=item.id,
+            run_id=item.run_id,
+            event_type=item.event_type,
+            trace_id=item.trace_id,
+            sequence=item.sequence,
+            step=item.step,
+            payload={},
+            created_at=item.created_at,
+        )
+    return public
 
 
 # Approvals ------------------------------------------------------------------

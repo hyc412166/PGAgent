@@ -1,4 +1,6 @@
 """Tool registry, executable capability selection, and provider schemas."""
+# 文件职责：维护工具名称、供应商 schema、处理函数和运行时元数据的统一注册表，并按当前会话能力筛选可见工具。
+# 逻辑关系：AgentRuntime 从注册表取得模型可见定义；模型返回工具调用后，注册表经 InvocationPipeline、ToolRouter、授权策略和调度器执行具体工具并返回观察结果。
 
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ from .validation import InvocationValidationHook
 
 # Canonical names form the new Codex-style model surface. Legacy schemas and
 # executors stay registered only so persisted runs can replay their exact calls.
+# 变量说明：TOOL_SCHEMAS 表示当前流程使用的 TOOL_SCHEMAS 集合。
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "bash": {
         "description": "在工作区中运行受控 allowlist 命令；短命令直接返回，超过 yield 窗口会返回可继续读取的持久 session_id。",
@@ -389,10 +392,15 @@ TOOL_SCHEMAS.update(ADVANCED_TOOL_SCHEMAS)
 
 # Canonical names reuse the proven executors while presenting one unambiguous
 # vocabulary to new model calls.
+# 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
 TOOL_SCHEMAS["shell"] = dict(TOOL_SCHEMAS["bash"])
+# 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
 TOOL_SCHEMAS["update_plan"] = dict(TOOL_SCHEMAS["todowrite"])
+# 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
 TOOL_SCHEMAS["tool_search"] = dict(TOOL_SCHEMAS["ToolSearch"])
+# 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
 TOOL_SCHEMAS["web_search"] = dict(TOOL_SCHEMAS["websearch"])
+# 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
 TOOL_SCHEMAS["web_open"] = {
     "description": "提取公开网页的结构化正文；使用 offset 和 max_chars 分页读取，原始 HTML 不进入上下文。",
     "parameters": {
@@ -406,6 +414,7 @@ TOOL_SCHEMAS["web_open"] = {
         "required": ["url"],
     },
 }
+# 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
 TOOL_SCHEMAS["web.run"] = {
     "description": "Codex 风格联网工具；在一次调用中执行搜索、打开、查找、截图、财经、天气、体育或时间查询。",
     "parameters": {
@@ -425,6 +434,7 @@ TOOL_SCHEMAS["web.run"] = {
 }
 
 
+# 变量说明：PUBLIC_TOOL_NAMES 表示当前流程使用的 PUBLIC_TOOL_NAMES 集合。
 PUBLIC_TOOL_NAMES: tuple[str, ...] = (
     "shell",
     "read",
@@ -449,12 +459,17 @@ PUBLIC_TOOL_NAMES: tuple[str, ...] = (
     "git_diff",
     "write_stdin",
 )
+# 变量说明：LEGACY_TOOL_NAMES 表示当前流程使用的 LEGACY_TOOL_NAMES 集合。
 LEGACY_TOOL_NAMES: tuple[str, ...] = tuple(
     name for name in TOOL_SCHEMAS if name not in PUBLIC_TOOL_NAMES
 )
+# 变量说明：ALL_TOOL_NAMES 表示当前流程使用的 ALL_TOOL_NAMES 集合。
 ALL_TOOL_NAMES: tuple[str, ...] = (*PUBLIC_TOOL_NAMES, *LEGACY_TOOL_NAMES)
+# 变量说明：_CANONICAL_MEMORY_TOOL_NAMES 表示当前流程使用的 _CANONICAL_MEMORY_TOOL_NAMES 集合。
 _CANONICAL_MEMORY_TOOL_NAMES = frozenset({"MemoryWrite", "MemoryRead", "MemoryList", "MemorySearch"})
+# 变量说明：_HIDDEN_COMPATIBILITY_TOOL_NAMES 表示当前流程使用的 _HIDDEN_COMPATIBILITY_TOOL_NAMES 集合。
 _HIDDEN_COMPATIBILITY_TOOL_NAMES = frozenset(LEGACY_TOOL_NAMES) - _CANONICAL_MEMORY_TOOL_NAMES
+# 变量说明：_GENERAL_DIRECT_TOOL_NAMES 表示当前流程使用的 _GENERAL_DIRECT_TOOL_NAMES 集合。
 _GENERAL_DIRECT_TOOL_NAMES = frozenset({
     "shell",
     "read",
@@ -471,11 +486,13 @@ _GENERAL_DIRECT_TOOL_NAMES = frozenset({
 # Network primitives are part of the core runtime contract.  They must remain
 # directly available even when a custom workflow selects the deferred-tool
 # discovery surface.
+# 变量说明：_CORE_DIRECT_TOOL_NAMES 表示当前流程使用的 _CORE_DIRECT_TOOL_NAMES 集合。
 _CORE_DIRECT_TOOL_NAMES = frozenset({"web.run"})
 
 # A provider batch containing only these tools is safe to execute concurrently:
 # none mutates workspace/runtime state and result ordering is restored to the
 # assistant's original tool-call order before messages are appended.
+# 变量说明：PARALLEL_READ_ONLY_TOOL_NAMES 表示当前流程使用的 PARALLEL_READ_ONLY_TOOL_NAMES 集合。
 PARALLEL_READ_ONLY_TOOL_NAMES = frozenset({
     "read",
     "read_artifact",
@@ -529,32 +546,48 @@ PARALLEL_READ_ONLY_TOOL_NAMES = frozenset({
 
 # Rendering does not change the workspace, but it does create one session-private
 # derivative artifact and therefore must not run concurrently with other renders.
+# 变量说明：READ_ONLY_TOOL_NAMES 表示当前流程使用的 READ_ONLY_TOOL_NAMES 集合。
 READ_ONLY_TOOL_NAMES = PARALLEL_READ_ONLY_TOOL_NAMES | {"render_pdf_page"}
 
 
+# 函数职责：规范化 skill_instructions 对应的数据或流程。
+# 参数关系：value 表示当前字段或计算值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _normalize_skill_instructions(value: Iterable[Mapping[str, Any] | str] | None) -> dict[str, dict[str, Any]]:
+    # 变量说明：catalog 表示当前步骤使用的 catalog 值。
     catalog: dict[str, dict[str, Any]] = {}
     for index, raw in enumerate(value or (), start=1):
         if isinstance(raw, str):
+            # 变量说明：item 表示当前步骤使用的 item 值。
             item = {"id": f"skill-{index}", "name": f"Skill {index}", "content": raw}
         elif isinstance(raw, Mapping):
+            # 变量说明：item 表示当前步骤使用的 item 值。
             item = dict(raw)
         else:
             continue
+        # 变量说明：item_id 表示item 对象的唯一标识。
         item_id = str(item.get("id") or item.get("slug") or item.get("name") or f"skill-{index}").strip()
         if not item_id:
             continue
+        # 变量说明：item 的索引项 表示该语句创建或更新的目标数据。
         item["id"] = item_id
+        # 变量说明：item 的索引项 表示该语句创建或更新的目标数据。
         item["name"] = str(item.get("name") or item.get("slug") or item_id).strip()
+        # 变量说明：content 表示待处理或返回的正文内容。
         content = str(item.get("content", item.get("instructions", "")) or "")
         item["content"] = content[:builtins.MAX_SKILL_INSTRUCTION_CHARS]
         catalog[item_id] = item
     return catalog
 
 
+# 函数职责：规范化 claw_todos 对应的数据或流程。
+# 参数关系：todos 表示当前流程使用的 todos 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _normalize_claw_todos(todos: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    # 变量说明：normalized 表示当前步骤使用的 normalized 值。
     normalized: list[dict[str, Any]] = []
     for raw in todos:
+        # 变量说明：item 表示当前步骤使用的 item 值。
         item = dict(raw)
         if "activeForm" in item and "active_form" not in item:
             item["active_form"] = item.pop("activeForm")
@@ -562,6 +595,7 @@ def _normalize_claw_todos(todos: Iterable[Mapping[str, Any]]) -> list[dict[str, 
     return normalized
 
 
+# 变量说明：PLAN_MODE_MUTATING_TOOLS 表示当前流程使用的 PLAN_MODE_MUTATING_TOOLS 集合。
 PLAN_MODE_MUTATING_TOOLS = frozenset({
     "write", "write_file", "edit", "edit_file", "apply_patch", "delete", "shell", "bash", "run_command", "validate", "validate_baseline",
     "PowerShell", "REPL", "NotebookEdit", "RemoteTrigger", "MCP", "MemoryWrite",
@@ -574,6 +608,7 @@ PLAN_MODE_MUTATING_TOOLS = frozenset({
 })
 
 
+# 类职责：定义 ToolRegistry 在本领域中的数据与行为。
 class ToolRegistry:
     """One run's explicit capability boundary.
 
@@ -582,6 +617,9 @@ class ToolRegistry:
     exposure state is frozen with the rest of the runtime binding.
     """
 
+    # 函数职责：初始化实例依赖与初始状态。
+    # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；allowed_tool_names 表示当前流程使用的 allowed_tool_names 集合；permission_mode 表示当前步骤使用的 permission_mode 值；skill_instructions 表示当前流程使用的 skill_instructions 集合；todo_state 表示当前步骤使用的 todo_state 值；todo_change_sink 表示当前步骤使用的 todo_change_sink 值；memory_store 表示当前步骤使用的 memory_store 值；artifact_store 表示当前步骤使用的 artifact_store 值；其余参数沿用调用方提供的扩展选项。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def __init__(
         self,
         sandbox: WorkspaceSandbox,
@@ -610,52 +648,85 @@ class ToolRegistry:
         from src.coding.state import CodingSessionState
         from src.coding.validation_runtime import normalize_validation_runtime
 
+        # 变量说明：sandbox 表示当前步骤使用的 sandbox 值。
         self.sandbox = sandbox
+        # 变量说明：permission_mode 表示当前步骤使用的 permission_mode 值。
         self.permission_mode = normalize_permission_mode(permission_mode)
+        # 变量说明：_tools 表示当前流程使用的 _tools 集合。
         self._tools: dict[str, Callable[..., ToolResult]] = {}
+        # 变量说明：_schemas 表示当前流程使用的 _schemas 集合。
         self._schemas: dict[str, dict[str, Any]] = dict(TOOL_SCHEMAS)
+        # 变量说明：_activated_deferred_tools 表示当前流程使用的 _activated_deferred_tools 集合。
         self._activated_deferred_tools: set[str] = set()
+        # 变量说明：_builtin_deferred_tools 表示当前流程使用的 _builtin_deferred_tools 集合。
         self._builtin_deferred_tools: set[str] = set()
+        # 变量说明：_external_state 表示当前步骤使用的 _external_state 值。
         self._external_state: dict[str, Any] = {}
+        # 变量说明：_known_tools 表示当前流程使用的 _known_tools 集合。
         self._known_tools = set(TOOL_SCHEMAS)
+        # 变量说明：_runtimes 表示当前流程使用的 _runtimes 集合。
         self._runtimes: dict[ToolName, ToolRuntime] = {}
+        # 变量说明：_wire_index 表示当前步骤使用的 _wire_index 值。
         self._wire_index: dict[str, ToolName] = {}
+        # 变量说明：_known_wire_names 表示当前流程使用的 _known_wire_names 集合。
         self._known_wire_names = set(TOOL_SCHEMAS)
+        # 变量说明：_task_delegate 表示当前步骤使用的 _task_delegate 值。
         self._task_delegate = task_delegate
+        # 变量说明：_todo_change_sink 表示当前步骤使用的 _todo_change_sink 值。
         self._todo_change_sink = todo_change_sink
+        # 变量说明：_memory_store 表示当前步骤使用的 _memory_store 值。
         self._memory_store = memory_store
+        # 变量说明：_artifact_store 表示当前步骤使用的 _artifact_store 值。
         self._artifact_store = artifact_store
+        # 变量说明：_attachment_store 表示当前步骤使用的 _attachment_store 值。
         self._attachment_store = attachment_store
+        # 变量说明：_background_store 表示当前步骤使用的 _background_store 值。
         self._background_store = background_store
+        # 变量说明：_team_store 表示当前步骤使用的 _team_store 值。
         self._team_store = team_store
+        # 变量说明：_task_store 表示当前步骤使用的 _task_store 值。
         self._task_store = task_store
+        # 变量说明：_coding_state 表示当前步骤使用的 _coding_state 值。
         self._coding_state = CodingSessionState.restore(coding_state)
+        # 变量说明：_workflow_evidence 表示当前步骤使用的 _workflow_evidence 值。
         self._workflow_evidence = WorkflowEvidenceState.restore(workflow_evidence_state)
+        # 变量说明：_validation_runtime 表示当前步骤使用的 _validation_runtime 值。
         self._validation_runtime = normalize_validation_runtime(validation_runtime)
+        # 变量说明：_active_cancel_lock 表示当前步骤使用的 _active_cancel_lock 值。
         self._active_cancel_lock = threading.RLock()
+        # 变量说明：_active_cancel_events 表示当前流程使用的 _active_cancel_events 集合。
         self._active_cancel_events: dict[str, threading.Event] = {}
+        # 变量说明：_skill_instructions 表示当前流程使用的 _skill_instructions 集合。
         self._skill_instructions = _normalize_skill_instructions(skill_instructions)
+        # 变量说明：_todo_state 表示当前步骤使用的 _todo_state 值。
         self._todo_state: list[dict[str, Any]] = []
         if todo_state is not None:
             try:
+                # 变量说明：normalized 表示当前步骤使用的 normalized 值。
                 normalized = builtins._normalize_todos(list(todo_state))
             except (TypeError, ValueError):
                 # A corrupt old snapshot must not make a user conversation
                 # unresumable.  New writes are strictly validated below.
+                # 变量说明：normalized 表示当前步骤使用的 normalized 值。
                 normalized = []
             self._todo_state[:] = normalized
+        # 变量说明：source_names 表示当前流程使用的 source_names 集合。
         source_names = ALL_TOOL_NAMES if allowed_tool_names is None else allowed_tool_names
+        # 变量说明：selected 表示当前步骤使用的 selected 值。
         selected = tuple(dict.fromkeys(
             str(name).strip() for name in source_names if str(name).strip()
         ))
+        # 变量说明：_frozen_legacy_tool_names 表示当前流程使用的 _frozen_legacy_tool_names 集合。
         self._frozen_legacy_tool_names = frozenset(
             name for name in selected
             if expose_legacy_tools and name in _HIDDEN_COMPATIBILITY_TOOL_NAMES
         )
+        # 变量说明：_workflow_profile 表示当前步骤使用的 _workflow_profile 值。
         self._workflow_profile = resolve_workflow_profile(
             workflow_profile_id,
             selected,
         )
+        # 变量说明：_defer_low_frequency_tools 表示当前流程使用的 _defer_low_frequency_tools 集合。
         self._defer_low_frequency_tools = allowed_tool_names is not None and bool(
             {"tool_search", "ToolSearch"}.intersection(selected)
         )
@@ -669,21 +740,31 @@ class ToolRegistry:
             self._register_default(name)
         if {"tool_search", "ToolSearch"}.intersection(self.enabled_tool_names):
             self.activate_deferred_tools(active_builtin_tool_names or ())
+        # 变量说明：pipeline 表示当前步骤使用的 pipeline 值。
         self.pipeline = InvocationPipeline(
             workspace_root=str(self.sandbox.root),
             permission_mode=self.permission_mode,
             prepare_hooks=(InvocationValidationHook(),),
             post_hooks=(self._coding_state, self._workflow_evidence),
         )
+        # 变量说明：router 表示当前步骤使用的 router 值。
         self.router = ToolRouter(self, self.pipeline)
 
+    # 函数职责：完成 write_todos 对应的业务处理。
+    # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；todos 表示当前流程使用的 todos 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _write_todos(self, sandbox: WorkspaceSandbox, todos: list[dict[str, Any]]) -> ToolResult:
+        # 变量说明：result 表示本步骤产生的结果。
         result = builtins.todo_write(sandbox, todos=todos, todo_state=self._todo_state)
         if result.ok and self._todo_change_sink is not None:
             self._todo_change_sink([dict(item) for item in self._todo_state])
         return result
 
+    # 函数职责：完成 register_default 对应的业务处理。
+    # 参数关系：name 表示当前对象名称。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _register_default(self, name: str) -> None:
+        # 变量说明：mapping 表示当前步骤使用的 mapping 值。
         mapping: dict[str, Callable[..., ToolResult]] = {
             "shell": self._bash,
             "bash": self._bash,
@@ -877,24 +958,35 @@ class ToolRegistry:
                 lambda _sandbox, **kwargs: self._task_store.claim(**kwargs)
             ) if self._task_store is not None else advanced.task_claim,
         }
+        # 变量说明：function 表示当前步骤使用的 function 值。
         function = mapping.get(name)
         if function is not None:
             self.register(name, function)
 
+    # 函数职责：应用 patch 对应的数据或流程。
+    # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；kwargs 表示当前流程使用的 kwargs 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @staticmethod
     def _apply_patch(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
         from src.coding.patch import apply_patch
 
         return apply_patch(sandbox, **kwargs)
 
+    # 函数职责：完成 bash 对应的业务处理。
+    # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；kwargs 表示当前流程使用的 kwargs 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _bash(self, sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
         from src.coding.worktree import annotate_command_changes, capture_worktree_state
 
+        # 变量说明：yield_time_ms 表示当前流程使用的 yield_time_ms 集合。
         yield_time_ms = kwargs.pop("yield_time_ms", kwargs.pop("yield-time_ms", 10_000))
+        # 变量说明：cancel_event 表示当前步骤使用的 cancel_event 值。
         cancel_event = kwargs.pop("_cancel_event", None)
         kwargs.pop("approved", None)
         if self._background_store is not None and yield_time_ms is not None:
+            # 变量说明：before 表示当前步骤使用的 before 值。
             before = capture_worktree_state(sandbox.root) if self.workflow_profile_id in {"coding", "debug"} else None
+            # 变量说明：started 表示当前步骤使用的 started 值。
             started = self._background_store.start(
                 command=kwargs.pop("command"),
                 cwd=str(kwargs.pop("cwd", ".")),
@@ -902,7 +994,9 @@ class ToolRegistry:
             )
             if not started.ok:
                 return started
+            # 变量说明：job_id 表示job 对象的唯一标识。
             job_id = str(started.metadata["background_job_id"])
+            # 变量说明：result 表示本步骤产生的结果。
             result = self._background_store.check(
                 task_id=job_id,
                 wait=True,
@@ -910,16 +1004,22 @@ class ToolRegistry:
                 output_offset=0,
                 _cancel_event=cancel_event,
             )
+            # 变量说明：metadata 表示当前步骤使用的 metadata 值。
             result.metadata = {**started.metadata, **result.metadata}
             if before is not None and not result.metadata.get("background_job_active"):
                 return annotate_command_changes(result, sandbox.root, before, source="shell")
             return result
         if self.workflow_profile_id not in {"coding", "debug"}:
             return builtins.run_command(sandbox, approved=True, _cancel_event=cancel_event, **kwargs)
+        # 变量说明：before 表示当前步骤使用的 before 值。
         before = capture_worktree_state(sandbox.root)
+        # 变量说明：result 表示本步骤产生的结果。
         result = builtins.run_command(sandbox, approved=True, _cancel_event=cancel_event, **kwargs)
         return annotate_command_changes(result, sandbox.root, before, source="shell")
 
+    # 函数职责：完成 powershell 对应的业务处理。
+    # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；kwargs 表示当前流程使用的 kwargs 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _powershell(self, sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
         if self._background_store is not None and bool(kwargs.get("run_in_background")):
             return self._background_store.start(
@@ -929,6 +1029,9 @@ class ToolRegistry:
             )
         return advanced.powershell(sandbox, **kwargs)
 
+    # 函数职责：完成 validate 对应的业务处理。
+    # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；kwargs 表示当前流程使用的 kwargs 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _validate(self, sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
         from src.coding.validation import run_validation
 
@@ -939,46 +1042,68 @@ class ToolRegistry:
             track_worktree_changes=self.workflow_profile_id in {"coding", "debug"},
         )
 
+    # 函数职责：校验 baseline 对应的数据或流程。
+    # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；kwargs 表示当前流程使用的 kwargs 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @staticmethod
     def _validate_baseline(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
         from src.coding.baseline_validation import run_baseline_validation
 
         return run_baseline_validation(sandbox, **kwargs)
 
+    # 函数职责：完成 review_finding 对应的业务处理。
+    # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；kwargs 表示当前流程使用的 kwargs 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @staticmethod
     def _review_finding(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
         from src.coding.evidence import record_review_finding
 
         return record_review_finding(sandbox, **kwargs)
 
+    # 函数职责：完成 debug_evidence 对应的业务处理。
+    # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；kwargs 表示当前流程使用的 kwargs 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @staticmethod
     def _debug_evidence(sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
         from src.coding.evidence import record_debug_evidence
 
         return record_debug_evidence(sandbox, **kwargs)
 
+    # 函数职责：完成 tool_search 对应的业务处理。
+    # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；query 表示当前步骤使用的 query 值；max_results 表示当前流程使用的 max_results 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _tool_search(
         self,
         sandbox: WorkspaceSandbox,
         query: str,
         max_results: int = 20,
     ) -> ToolResult:
+        # 变量说明：catalog 表示当前步骤使用的 catalog 值。
         catalog = {
             runtime.identity.wire_name: runtime.schema
             for runtime in self._runtimes.values()
             if runtime.presentation.discoverable
         }
+        # 变量说明：result 表示本步骤产生的结果。
         result = advanced.tool_search(sandbox, query, catalog, max_results=max_results)
+        # 变量说明：raw 表示当前步骤使用的 raw 值。
         raw = str(query or "").strip()
         if raw.casefold().startswith("select:"):
+            # 变量说明：requested 表示当前步骤使用的 requested 值。
             requested = [item.strip() for item in raw[len("select:"):].split(",") if item.strip()]
             result.metadata["activated_tools"] = list(self.activate_deferred_tools(requested))
         return result
 
+    # 函数职责：应用 workflow_presentation 对应的数据或流程。
+    # 参数关系：runtime 表示当前步骤使用的 runtime 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _apply_workflow_presentation(self, runtime: ToolRuntime) -> None:
+        # 变量说明：profile 表示当前步骤使用的 profile 值。
         profile = self._workflow_profile
+        # 变量说明：name 表示当前对象名称。
         name = runtime.identity.wire_name
         if name in _HIDDEN_COMPATIBILITY_TOOL_NAMES and name not in self._frozen_legacy_tool_names:
+            # 变量说明：presentation 表示当前步骤使用的 presentation 值。
             runtime.presentation = ToolPresentation.hidden()
             return
         if (
@@ -987,6 +1112,7 @@ class ToolRegistry:
             and not runtime.execution.read_only
             and name not in profile.allowed_non_read_only_tool_names
         ):
+            # 变量说明：presentation 表示当前步骤使用的 presentation 值。
             runtime.presentation = ToolPresentation.hidden()
             return
         if (
@@ -997,12 +1123,17 @@ class ToolRegistry:
             and name not in ATTACHMENT_TOOL_NAMES
             and name not in _CANONICAL_MEMORY_TOOL_NAMES
         ):
+            # 变量说明：presentation 表示当前步骤使用的 presentation 值。
             runtime.presentation = ToolPresentation.deferred()
             self._builtin_deferred_tools.add(name)
 
+    # 函数职责：完成 register 对应的业务处理。
+    # 参数关系：name 表示当前对象名称；function 表示当前步骤使用的 function 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def register(self, name: str, function: Callable[..., ToolResult]) -> None:
         if name not in self._schemas:
             raise ValueError(f"工具没有 provider schema: {name}")
+        # 变量说明：runtime 表示当前步骤使用的 runtime 值。
         runtime = ToolRuntime(
             identity=ToolIdentity(ToolName.builtin(name), name),
             origin=ToolOrigin(owner="pgagent", trusted=True, source="builtin"),
@@ -1015,10 +1146,15 @@ class ToolRegistry:
             executor=lambda invocation, selected=name: self._invoke_builtin_runtime(selected, invocation),
         )
         self.register_runtime(runtime)
+        # 变量说明：映射 的索引项 表示该语句创建或更新的目标数据。
         self._tools[name] = function
+        # 变量说明：映射 的索引项 表示该语句创建或更新的目标数据。
         self._schemas[name] = dict(TOOL_SCHEMAS[name])
         self._activated_deferred_tools.discard(name)
 
+    # 函数职责：完成 register_external 对应的业务处理。
+    # 参数关系：name 表示当前对象名称；schema 表示当前步骤使用的 schema 值；function 表示当前步骤使用的 function 值；read_only 表示当前步骤使用的 read_only 值；parallel 表示当前步骤使用的 parallel 值；exposure 表示当前步骤使用的 exposure 值；approval_exempt 表示当前步骤使用的 approval_exempt 值；owner 表示当前步骤使用的 owner 值；其余参数沿用调用方提供的扩展选项。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def register_external(
         self,
         name: str,
@@ -1039,11 +1175,13 @@ class ToolRegistry:
         if exposure not in {"direct", "deferred", "hidden"}:
             raise ValueError(f"unsupported tool exposure: {exposure}")
 
+        # 变量说明：presentation 表示当前步骤使用的 presentation 值。
         presentation = {
             "direct": ToolPresentation.direct(),
             "deferred": ToolPresentation.deferred(),
             "hidden": ToolPresentation.hidden(),
         }[exposure]
+        # 变量说明：runtime 表示当前步骤使用的 runtime 值。
         runtime = ToolRuntime(
             identity=ToolIdentity(ToolName.external(owner, raw_name or name), name),
             origin=ToolOrigin(owner=owner, trusted=trusted, source="external"),
@@ -1057,10 +1195,14 @@ class ToolRegistry:
             executor=lambda invocation, selected=function: self._invoke_external_runtime(invocation, selected),
         )
         self.register_runtime(runtime, replace_existing=replace_existing)
+        # 变量说明：映射 的索引项 表示该语句创建或更新的目标数据。
         self._schemas[name] = dict(schema)
         self._known_tools.add(name)
         self._activated_deferred_tools.discard(name)
 
+    # 函数职责：完成 register_runtime 对应的业务处理。
+    # 参数关系：runtime 表示当前步骤使用的 runtime 值；replace_existing 表示当前步骤使用的 replace_existing 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def register_runtime(
         self,
         runtime: ToolRuntime,
@@ -1069,14 +1211,20 @@ class ToolRegistry:
     ) -> None:
         """Register one runtime with deterministic trusted/external collision handling."""
 
+        # 变量说明：canonical 表示当前步骤使用的 canonical 值。
         canonical = runtime.identity.canonical_name
+        # 变量说明：wire_name 表示当前步骤使用的 wire_name 值。
         wire_name = runtime.identity.wire_name
+        # 变量说明：wire_names 表示当前流程使用的 wire_names 集合。
         wire_names = tuple(dict.fromkeys((wire_name, *runtime.identity.aliases)))
+        # 变量说明：conflicts 表示当前流程使用的 conflicts 集合。
         conflicts: dict[ToolName, ToolRuntime] = {}
+        # 变量说明：canonical_existing 表示当前步骤使用的 canonical_existing 值。
         canonical_existing = self._runtimes.get(canonical)
         if canonical_existing is not None:
             conflicts[canonical_existing.identity.canonical_name] = canonical_existing
         for candidate in wire_names:
+            # 变量说明：owner 表示当前步骤使用的 owner 值。
             owner = self._wire_index.get(candidate)
             if owner is not None:
                 conflicts[owner] = self._runtimes[owner]
@@ -1086,6 +1234,7 @@ class ToolRegistry:
                 for existing in conflicts.values():
                     self._remove_runtime(existing)
             elif any(existing.origin.trusted for existing in conflicts.values()) and not runtime.origin.trusted:
+                # 变量说明：existing 表示当前步骤使用的 existing 值。
                 existing = next(item for item in conflicts.values() if item.origin.trusted)
                 raise ValueError(
                     f"external tool {canonical} conflicts with trusted tool "
@@ -1097,6 +1246,7 @@ class ToolRegistry:
                 for existing in conflicts.values():
                     self._remove_runtime(existing)
             else:
+                # 变量说明：existing_names 表示当前流程使用的 existing_names 集合。
                 existing_names = ", ".join(
                     str(existing.identity.canonical_name) for existing in conflicts.values()
                 )
@@ -1105,50 +1255,86 @@ class ToolRegistry:
                 )
 
         self._apply_workflow_presentation(runtime)
+        # 变量说明：映射 的索引项 表示该语句创建或更新的目标数据。
         self._runtimes[canonical] = runtime
         for candidate in wire_names:
+            # 变量说明：映射 的索引项 表示该语句创建或更新的目标数据。
             self._wire_index[candidate] = canonical
         self._known_wire_names.add(wire_name)
 
+    # 函数职责：移除 runtime 对应的数据或流程。
+    # 参数关系：runtime 表示当前步骤使用的 runtime 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _remove_runtime(self, runtime: ToolRuntime) -> None:
+        # 变量说明：canonical 表示当前步骤使用的 canonical 值。
         canonical = runtime.identity.canonical_name
         self._runtimes.pop(canonical, None)
         for wire_name, owner in tuple(self._wire_index.items()):
             if owner == canonical:
                 self._wire_index.pop(wire_name, None)
 
+    # 函数职责：完成 resolve 对应的业务处理。
+    # 参数关系：name 表示当前对象名称。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def resolve(self, name: ToolName) -> ToolRuntime | None:
         return self._runtimes.get(name)
 
+    # 函数职责：解析 wire_name 对应的数据或流程。
+    # 参数关系：name 表示当前对象名称。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def resolve_wire_name(self, name: str) -> ToolRuntime | None:
+        # 变量说明：canonical 表示当前步骤使用的 canonical 值。
         canonical = self._wire_index.get(str(name))
         return self._runtimes.get(canonical) if canonical is not None else None
 
+    # 函数职责：完成 knows_wire_name 对应的业务处理。
+    # 参数关系：name 表示当前对象名称。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def knows_wire_name(self, name: str) -> bool:
         return str(name) in self._known_wire_names
 
+    # 函数职责：完成 runtimes 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property
     def runtimes(self) -> tuple[ToolRuntime, ...]:
         return tuple(self._runtimes.values())
 
+    # 函数职责：完成 activated_tool_names 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property
     def activated_tool_names(self) -> tuple[str, ...]:
         return tuple(sorted(self._activated_deferred_tools))
 
+    # 函数职责：完成 schema_for 对应的业务处理。
+    # 参数关系：name 表示当前对象名称。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def schema_for(self, name: str) -> dict[str, Any]:
         return dict(self._schemas[name])
 
+    # 函数职责：完成 set_external_state 对应的业务处理。
+    # 参数关系：key 表示用于查找或映射的键；value 表示当前字段或计算值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def set_external_state(self, key: str, value: Any) -> None:
+        # 变量说明：映射 的索引项 表示该语句创建或更新的目标数据。
         self._external_state[key] = value
 
+    # 函数职责：完成 hide_model_tool 对应的业务处理。
+    # 参数关系：name 表示当前对象名称。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def hide_model_tool(self, name: str) -> None:
         if name in self.enabled_tool_names:
+            # 变量说明：runtime 表示当前步骤使用的 runtime 值。
             runtime = self.resolve_wire_name(name)
             if runtime is not None:
+                # 变量说明：presentation 表示当前步骤使用的 presentation 值。
                 runtime.presentation = ToolPresentation.hidden()
             self._activated_deferred_tools.discard(name)
 
+    # 函数职责：完成 activate_deferred_tools 对应的业务处理。
+    # 参数关系：names 表示当前流程使用的 names 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def activate_deferred_tools(self, names: Iterable[str]) -> tuple[str, ...]:
+        # 变量说明：activated 表示当前步骤使用的 activated 值。
         activated = tuple(
             name for name in names
             if (
@@ -1159,19 +1345,27 @@ class ToolRegistry:
             )
         )
         self._activated_deferred_tools.update(activated)
+        # 变量说明：builtin_active 表示当前步骤使用的 builtin_active 值。
         builtin_active = sorted(name for name in self._activated_deferred_tools if name in self._builtin_deferred_tools)
+        # 变量说明：external_active 表示当前步骤使用的 external_active 值。
         external_active = sorted(
             name for name in self._activated_deferred_tools
             if name not in self._builtin_deferred_tools
         )
+        # 变量说明：映射 的索引项 表示该语句创建或更新的目标数据。
         self._external_state["builtin_active_tools"] = builtin_active
+        # 变量说明：映射 的索引项 表示该语句创建或更新的目标数据。
         self._external_state["mcp_active_tools"] = external_active
         return activated
 
+    # 函数职责：完成 enabled_tool_names 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property
     def enabled_tool_names(self) -> tuple[str, ...]:
         return tuple(runtime.identity.wire_name for runtime in self._runtimes.values())
 
+    # 函数职责：完成 model_visible_tool_names 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property
     def model_visible_tool_names(self) -> tuple[str, ...]:
         return tuple(
@@ -1183,7 +1377,11 @@ class ToolRegistry:
             )
         )
 
+    # 函数职责：完成 can_execute_batch_in_parallel 对应的业务处理。
+    # 参数关系：names 表示当前流程使用的 names 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def can_execute_batch_in_parallel(self, names: Iterable[str]) -> bool:
+        # 变量说明：normalized 表示当前步骤使用的 normalized 值。
         normalized = tuple(str(name) for name in names)
         return len(normalized) > 1 and all(
             (runtime := self.resolve_wire_name(name)) is not None
@@ -1191,6 +1389,8 @@ class ToolRegistry:
             for name in normalized
         )
 
+    # 函数职责：完成 schemas 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property
     def schemas(self) -> list[dict[str, Any]]:
         return [
@@ -1204,27 +1404,36 @@ class ToolRegistry:
             for name in self.model_visible_tool_names
         ]
 
+    # 函数职责：完成 skill_catalog_prompt 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property
     def skill_catalog_prompt(self) -> str:
         if "skill" not in self._tools or not self._skill_instructions:
             return ""
+        # 变量说明：lines 表示当前流程使用的 lines 集合。
         lines = [
             "本会话已选择以下 Skill。仅在需要其详细工作流时调用 skill 工具按 id 加载；不要猜测或执行 Skill 中未明确允许的脚本："
         ]
         for item in self._skill_instructions.values():
+            # 变量说明：description 表示当前步骤使用的 description 值。
             description = str(item.get("description") or "").strip().replace("\n", " ")[:300]
+            # 变量说明：suffix 表示当前步骤使用的 suffix 值。
             suffix = f" — {description}" if description else ""
             lines.append(f"- {item['id']}: {item['name']}{suffix}")
         return "\n".join(lines)
 
+    # 函数职责：完成 deferred_tool_catalog_prompt 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property
     def deferred_tool_catalog_prompt(self) -> str:
+        # 变量说明：lines 表示当前流程使用的 lines 集合。
         lines: list[str] = []
         if self._builtin_deferred_tools:
             lines.append(
                 f"{len(self._builtin_deferred_tools)} low-frequency built-in tools are available on demand. "
                 "Use ToolSearch with `select:<tool-name>` to activate one."
             )
+        # 变量说明：sources 表示当前流程使用的 sources 集合。
         sources = self._external_state.get("mcp_namespaces")
         if not isinstance(sources, list) or not sources:
             return "\n".join(lines)
@@ -1235,17 +1444,23 @@ class ToolRegistry:
         for source in sources:
             if not isinstance(source, Mapping):
                 continue
+            # 变量说明：namespace 表示当前步骤使用的 namespace 值。
             namespace = str(source.get("namespace") or "").strip()
+            # 变量说明：count 表示当前步骤使用的 count 值。
             count = source.get("tool_count")
             if namespace:
                 lines.append(f"- {namespace}: {count} tools")
         return "\n".join(lines)
 
+    # 函数职责：完成 workflow_prompt 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property
     def workflow_prompt(self) -> str:
         if self._workflow_profile is None:
             return ""
+        # 变量说明：coding_evidence 表示当前步骤使用的 coding_evidence 值。
         coding_evidence = self._coding_state.prompt_summary()
+        # 变量说明：workflow_evidence 表示当前步骤使用的 workflow_evidence 值。
         workflow_evidence = self._workflow_evidence.prompt_summary(self._workflow_profile.id)
         return "\n".join(
             item
@@ -1257,14 +1472,20 @@ class ToolRegistry:
             if item
         )
 
+    # 函数职责：完成 workflow_profile_id 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property
     def workflow_profile_id(self) -> str:
         return self._workflow_profile.id if self._workflow_profile is not None else "general"
 
+    # 函数职责：完成 has_coding_changes 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property
     def has_coding_changes(self) -> bool:
         return bool(self._coding_state.changes)
 
+    # 函数职责：完成 runtime_state 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def runtime_state(self) -> dict[str, Any]:
         """Return only JSON-safe state that must survive approval/resume."""
 
@@ -1282,6 +1503,8 @@ class ToolRegistry:
             **self._external_state,
         }
 
+    # 函数职责：完成 cancel_active 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def cancel_active(self) -> None:
         """Signal synchronous tools currently running in worker threads.
 
@@ -1293,10 +1516,14 @@ class ToolRegistry:
         """
 
         with self._active_cancel_lock:
+            # 变量说明：events 表示运行事件集合。
             events = tuple(self._active_cancel_events.values())
         for event in events:
             event.set()
 
+    # 函数职责：异步完成 invoke_builtin_runtime 对应的业务处理。
+    # 参数关系：name 表示当前对象名称；invocation 表示当前步骤使用的 invocation 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     async def _invoke_builtin_runtime(
         self,
         name: str,
@@ -1309,11 +1536,15 @@ class ToolRegistry:
             call_id=invocation.call_id,
         )
 
+    # 函数职责：异步完成 invoke_external_runtime 对应的业务处理。
+    # 参数关系：invocation 表示当前步骤使用的 invocation 值；function 表示当前步骤使用的 function 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     async def _invoke_external_runtime(
         self,
         invocation: ToolInvocation,
         function: Callable[[dict[str, Any]], Awaitable[ToolResult]],
     ) -> ToolResult:
+        # 变量说明：kwargs 表示当前流程使用的 kwargs 集合。
         kwargs = dict(invocation.arguments)
         if "_raw" in kwargs or "_invalid_json" in kwargs:
             return ToolResult(
@@ -1322,6 +1553,7 @@ class ToolRegistry:
                 "MCP 工具参数不是有效的 JSON 对象",
                 error_code="invalid_tool_arguments",
             )
+        # 变量说明：runtime 表示当前步骤使用的 runtime 值。
         runtime = self.resolve(invocation.tool_name)
         if (
             runtime is not None
@@ -1344,15 +1576,23 @@ class ToolRegistry:
                 error_code="invalid_arguments",
             )
 
+    # 函数职责：完成 rename_result 对应的业务处理。
+    # 参数关系：result 表示本步骤产生的结果；tool_name 表示当前步骤使用的 tool_name 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @staticmethod
     def _rename_result(result: ToolResult, tool_name: str) -> ToolResult:
         """Keep provider call, ToolResult and approval resume names identical."""
 
+        # 变量说明：tool_name 表示当前步骤使用的 tool_name 值。
         result.tool_name = tool_name
         if result.approval_request is not None:
+            # 变量说明：tool_name 表示当前步骤使用的 tool_name 值。
             result.approval_request.tool_name = tool_name
         return result
 
+    # 函数职责：执行 builtin_legacy 对应的数据或流程。
+    # 参数关系：name 表示当前对象名称；arguments 表示当前流程使用的 arguments 集合；approved 表示当前步骤使用的 approved 值；_cancel_event 表示当前步骤使用的 _cancel_event 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _execute_builtin_legacy(
         self,
         name: str,
@@ -1361,13 +1601,18 @@ class ToolRegistry:
         approved: bool = False,
         _cancel_event: threading.Event | None = None,
     ) -> ToolResult:
+        # 变量说明：function 表示当前步骤使用的 function 值。
         function = self._tools.get(name)
         if function is None:
+            # 变量说明：error_code 表示当前步骤使用的 error_code 值。
             error_code = "tool_not_enabled" if name in self._known_tools else "unknown_tool"
             return ToolResult(name, False, f"当前会话未启用工具: {name}", error_code=error_code)
+        # 变量说明：kwargs 表示当前流程使用的 kwargs 集合。
         kwargs = dict(arguments or {})
         if "_raw" in kwargs or "_invalid_json" in kwargs:
+            # 变量说明：raw_value 表示当前步骤使用的 raw_value 值。
             raw_value = kwargs.get("_raw")
+            # 变量说明：raw_chars 表示当前流程使用的 raw_chars 集合。
             raw_chars = len(raw_value) if isinstance(raw_value, str) else int(kwargs.get("_argument_chars") or kwargs.get("_raw_chars") or 0)
             return ToolResult(
                 name,
@@ -1399,6 +1644,7 @@ class ToolRegistry:
             "write", "write_file", "edit", "edit_file", "apply_patch",
             "delete", "bash", "run_command", "validate", "validate_baseline",
         }:
+            # 变量说明：kwargs 的索引项 表示该语句创建或更新的目标数据。
             kwargs["approved"] = True
         if _cancel_event is not None and name in {
             "bash", "run_command", "validate", "validate_baseline", "check_background",
@@ -1406,6 +1652,7 @@ class ToolRegistry:
             # This is an in-process cancellation signal, not a model/tool
             # argument.  Inject it only after policy approval so it can never
             # leak into ApprovalRequest JSON or the persisted run snapshot.
+            # 变量说明：kwargs 的索引项 表示该语句创建或更新的目标数据。
             kwargs["_cancel_event"] = _cancel_event
         try:
             return self._rename_result(function(self.sandbox, **kwargs), name)
@@ -1414,6 +1661,9 @@ class ToolRegistry:
         except Exception as exc:  # A tool failure must never crash the model loop.
             return ToolResult(name, False, f"工具执行失败: {type(exc).__name__}", error_code="tool_error")
 
+    # 函数职责：异步执行 async_legacy 对应的数据或流程。
+    # 参数关系：name 表示当前对象名称；arguments 表示当前流程使用的 arguments 集合；approved 表示当前步骤使用的 approved 值；call_id 表示call 对象的唯一标识。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     async def _execute_async_legacy(
         self,
         name: str,
@@ -1431,7 +1681,9 @@ class ToolRegistry:
             # wait until a long command returns.  A worker thread keeps the
             # stop endpoint responsive; the coordinator cancels the awaiting
             # runtime task and discards the eventual worker result.
+            # 变量说明：cancel_key 表示当前步骤使用的 cancel_key 值。
             cancel_key = str(call_id or f"tool-{id(arguments)}")
+            # 变量说明：cancel_event 表示当前步骤使用的 cancel_event 值。
             cancel_event = threading.Event()
             with self._active_cancel_lock:
                 self._active_cancel_events[cancel_key] = cancel_event
@@ -1446,13 +1698,18 @@ class ToolRegistry:
             finally:
                 with self._active_cancel_lock:
                     self._active_cancel_events.pop(cancel_key, None)
+        # 变量说明：function 表示当前步骤使用的 function 值。
         function = self._tools.get(name)
         if function is None:
+            # 变量说明：error_code 表示当前步骤使用的 error_code 值。
             error_code = "tool_not_enabled" if name in self._known_tools else "unknown_tool"
             return ToolResult(name, False, f"当前会话未启用工具: {name}", error_code=error_code)
+        # 变量说明：provider_kwargs 表示当前流程使用的 provider_kwargs 集合。
         provider_kwargs = dict(arguments or {})
+        # 变量说明：kwargs 表示当前流程使用的 kwargs 集合。
         kwargs = dict(provider_kwargs)
         if name == "Agent":
+            # 变量说明：kwargs 表示当前流程使用的 kwargs 集合。
             kwargs = {
                 "task": kwargs.get("prompt"),
                 "agent_id": kwargs.get("subagent_type") or kwargs.get("name"),
@@ -1466,6 +1723,7 @@ class ToolRegistry:
             )
         # Reject malformed calls before an approval UI is created for a task
         # that cannot possibly be dispatched.
+        # 变量说明：_ 表示当前步骤使用的 _ 值；validation_error_code 表示当前步骤使用的 validation_error_code 值；validation_error 表示当前步骤使用的 validation_error 值。
         _, validation_error_code, validation_error = builtins.normalize_delegate_requests(
             kwargs.get("task"), kwargs.get("agent_id"), kwargs.get("tasks")
         )
@@ -1477,6 +1735,7 @@ class ToolRegistry:
             except TypeError as exc:
                 return ToolResult(name, False, f"工具参数无效: {exc}", error_code="invalid_arguments")
         try:
+            # 变量说明：result 表示本步骤产生的结果。
             result = await builtins.delegate_task_async(
                 self.sandbox,
                 delegate=self._task_delegate,
@@ -1489,6 +1748,9 @@ class ToolRegistry:
         except Exception as exc:  # Delegate faults must obey normal loop recovery.
             return ToolResult(name, False, f"工具执行失败: {type(exc).__name__}", error_code="tool_error")
 
+    # 函数职责：完成 execute 对应的业务处理。
+    # 参数关系：name 表示当前对象名称；arguments 表示当前流程使用的 arguments 集合；approved 表示当前步骤使用的 approved 值；_cancel_event 表示当前步骤使用的 _cancel_event 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def execute(
         self,
         name: str,
@@ -1511,15 +1773,20 @@ class ToolRegistry:
         except RuntimeError:
             return asyncio.run(self.execute_async(name, arguments, approved=approved))
 
+        # 变量说明：result 表示本步骤产生的结果。
         result: list[ToolResult] = []
+        # 变量说明：error 表示当前捕获或准备上报的错误。
         error: list[BaseException] = []
 
+        # 函数职责：完成 run 对应的业务处理。
+        # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
         def run() -> None:
             try:
                 result.append(asyncio.run(self.execute_async(name, arguments, approved=approved)))
             except BaseException as exc:
                 error.append(exc)
 
+        # 变量说明：worker 表示当前步骤使用的 worker 值。
         worker = threading.Thread(target=run, name=f"pgagent-sync-tool-{name}")
         worker.start()
         worker.join()
@@ -1527,6 +1794,9 @@ class ToolRegistry:
             raise error[0]
         return result[0]
 
+    # 函数职责：异步执行 async 对应的数据或流程。
+    # 参数关系：name 表示当前对象名称；arguments 表示当前流程使用的 arguments 集合；approved 表示当前步骤使用的 approved 值；call_id 表示call 对象的唯一标识。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     async def execute_async(
         self,
         name: str,
@@ -1537,7 +1807,9 @@ class ToolRegistry:
     ) -> ToolResult:
         """Compatibility facade routed through the unified invocation pipeline."""
 
+        # 变量说明：effective_call_id 表示effective_call 对象的唯一标识。
         effective_call_id = str(call_id or f"tool-{id(arguments)}")
+        # 变量说明：outcome 表示当前步骤使用的 outcome 值。
         outcome = await self.router.dispatch(
             name,
             arguments,
@@ -1548,6 +1820,9 @@ class ToolRegistry:
         return self.router.result(outcome)
 
 
+# 函数职责：创建 default_registry 对应的数据或流程。
+# 参数关系：workspace_root 表示当前步骤使用的 workspace_root 值；allowed_tool_names 表示当前流程使用的 allowed_tool_names 集合；permission_mode 表示当前步骤使用的 permission_mode 值；skill_instructions 表示当前流程使用的 skill_instructions 集合；todo_state 表示当前步骤使用的 todo_state 值；todo_change_sink 表示当前步骤使用的 todo_change_sink 值；memory_store 表示当前步骤使用的 memory_store 值；artifact_store 表示当前步骤使用的 artifact_store 值；其余参数沿用调用方提供的扩展选项。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def create_default_registry(
     workspace_root: str,
     *,

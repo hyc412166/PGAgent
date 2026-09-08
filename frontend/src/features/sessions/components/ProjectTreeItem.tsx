@@ -1,7 +1,9 @@
+// 本文件实现 ProjectTreeItem 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { ChevronRight, Folder, LoaderCircle, Trash2 } from 'lucide-react'
 import type { FocusEvent, MouseEvent, ReactNode } from 'react'
 import type { Workspace } from '../../../types'
 
+// ProjectTreeItemProps 包含项目节点、其会话子项以及悬浮/删除交互回调。
 type ProjectTreeItemProps = {
   workspace: Workspace
   expanded: boolean
@@ -15,6 +17,7 @@ type ProjectTreeItemProps = {
   onHideHoverCard: () => void
 }
 
+// ProjectTreeItem 渲染可展开项目节点，并将子会话内容交由 renderSession 回调生成。
 export function ProjectTreeItem({
   workspace,
   expanded,

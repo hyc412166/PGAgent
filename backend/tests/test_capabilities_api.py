@@ -1,3 +1,9 @@
+"""验证能力目录、技能导入删除、市场访问、OIDC 刷新以及代理和会话能力绑定 API。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import io
@@ -31,7 +37,9 @@ from src.runs.service import coordinator
 
 
 @pytest.fixture()
+# 测试夹具：client 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, dict[str, list]]:
+    # 临时数据库保存能力绑定；scheduled 记录草稿启动请求，test_client 驱动能力与市场路由。
     configure_database(f"sqlite:///{(tmp_path / 'capabilities.db').as_posix()}")
     init_db()
     managed_root = tmp_path / "managed-skills"
@@ -51,6 +59,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient,
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 辅助函数：_write_local_skill 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _write_local_skill(root: Path, *, name: str = "Demo Local Skill") -> Path:
     source = root / "source-skill"
     (source / "scripts").mkdir(parents=True)
@@ -62,6 +71,7 @@ def _write_local_skill(root: Path, *, name: str = "Demo Local Skill") -> Path:
     return source
 
 
+# 辅助函数：_import_skill 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _import_skill(test_client: TestClient, tmp_path: Path) -> dict:
     source = _write_local_skill(tmp_path)
     response = test_client.post("/api/skills/import", json={"source_path": str(source)})
@@ -69,6 +79,7 @@ def _import_skill(test_client: TestClient, tmp_path: Path) -> dict:
     return response.json()
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_tool_catalog_and_fixed_master_advertise_stable_tool_ids 精确标识本用例的具体条件。
 def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -117,6 +128,7 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
     assert locked.status_code == 409
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_local_skill_import_copies_files_without_execution_and_lists_metadata 精确标识本用例的具体条件。
 def test_local_skill_import_copies_files_without_execution_and_lists_metadata(
     client: tuple[TestClient, dict[str, list]], tmp_path: Path
 ) -> None:
@@ -140,6 +152,7 @@ def test_local_skill_import_copies_files_without_execution_and_lists_metadata(
     assert duplicate.status_code == 409
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_delete_skill_removes_managed_files_and_capability_bindings 精确标识本用例的具体条件。
 def test_delete_skill_removes_managed_files_and_capability_bindings(
     client: tuple[TestClient, dict[str, list]], tmp_path: Path
 ) -> None:
@@ -164,6 +177,7 @@ def test_delete_skill_removes_managed_files_and_capability_bindings(
     assert test_client.get(f"/api/sessions/{chat_session['id']}").json()["skill_ids"] == []
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_delete_skill_refuses_to_remove_files_outside_managed_storage 精确标识本用例的具体条件。
 def test_delete_skill_refuses_to_remove_files_outside_managed_storage(
     client: tuple[TestClient, dict[str, list]], tmp_path: Path
 ) -> None:
@@ -188,6 +202,7 @@ def test_delete_skill_refuses_to_remove_files_outside_managed_storage(
     assert [item["id"] for item in test_client.get("/api/skills").json()] == [skill_id]
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_agent_and_session_capability_relations_persist_through_api 精确标识本用例的具体条件。
 def test_agent_and_session_capability_relations_persist_through_api(
     client: tuple[TestClient, dict[str, list]], tmp_path: Path
 ) -> None:
@@ -235,6 +250,7 @@ def test_agent_and_session_capability_relations_persist_through_api(
     assert updated_session.json()["skill_ids"] == []
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_draft_launch_persists_permission_and_skills_and_binds_them_to_idempotency 精确标识本用例的具体条件。
 def test_draft_launch_persists_permission_and_skills_and_binds_them_to_idempotency(
     client: tuple[TestClient, dict[str, list]], tmp_path: Path
 ) -> None:
@@ -276,6 +292,7 @@ def test_draft_launch_persists_permission_and_skills_and_binds_them_to_idempoten
         assert db.query(Run).count() == 1
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_market_status_does_not_pretend_an_unauthenticated_skills_sh_search_works 精确标识本用例的具体条件。
 def test_market_status_does_not_pretend_an_unauthenticated_skills_sh_search_works(
     client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -298,6 +315,7 @@ def test_market_status_does_not_pretend_an_unauthenticated_skills_sh_search_work
     assert browse_response.json()["items"] == []
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_market_gateway_takes_precedence_and_keeps_its_client_token_server_side 精确标识本用例的具体条件。
 def test_market_gateway_takes_precedence_and_keeps_its_client_token_server_side(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -306,6 +324,7 @@ def test_market_gateway_takes_precedence_and_keeps_its_client_token_server_side(
     monkeypatch.setenv("SKILLS_SH_API_TOKEN", "legacy-direct-token")
     requests: list[dict[str, object]] = []
 
+    # 局部测试函数：fake_get 模拟该步骤的返回结果或异常。
     def fake_get(url: str, **kwargs: object) -> skill_service.httpx.Response:
         requests.append({"url": url, **kwargs})
         return skill_service.httpx.Response(200, json={"data": []})
@@ -327,6 +346,7 @@ def test_market_gateway_takes_precedence_and_keeps_its_client_token_server_side(
     ]
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_market_gateway_requires_url_and_client_token_together 精确标识本用例的具体条件。
 def test_market_gateway_requires_url_and_client_token_together(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PGAGENT_SKILL_MARKET_URL", "https://pgagent-skills.vercel.app")
     monkeypatch.delenv("PGAGENT_SKILL_MARKET_CLIENT_TOKEN", raising=False)
@@ -339,6 +359,7 @@ def test_market_gateway_requires_url_and_client_token_together(monkeypatch: pyte
         skill_service._skills_sh_json("/api/v1/skills")
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_market_gateway_distinguishes_an_upstream_oidc_rejection 精确标识本用例的具体条件。
 def test_market_gateway_distinguishes_an_upstream_oidc_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PGAGENT_SKILL_MARKET_URL", "https://pgagent-skills.vercel.app")
     monkeypatch.setenv("PGAGENT_SKILL_MARKET_CLIENT_TOKEN", "gateway-client-token")
@@ -352,6 +373,7 @@ def test_market_gateway_distinguishes_an_upstream_oidc_rejection(monkeypatch: py
         skill_service._skills_sh_json("/api/v1/skills")
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_skills_sh_retries_once_with_a_refreshed_vercel_oidc_token 精确标识本用例的具体条件。
 def test_skills_sh_retries_once_with_a_refreshed_vercel_oidc_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -360,6 +382,7 @@ def test_skills_sh_retries_once_with_a_refreshed_vercel_oidc_token(
     monkeypatch.setenv("VERCEL_OIDC_TOKEN", "expired-token")
     authorizations: list[str] = []
 
+    # 局部测试函数：fake_get 模拟该步骤的返回结果或异常。
     def fake_get(_url: str, **kwargs: object) -> skill_service.httpx.Response:
         headers = kwargs["headers"]
         assert isinstance(headers, dict)
@@ -368,6 +391,7 @@ def test_skills_sh_retries_once_with_a_refreshed_vercel_oidc_token(
             return skill_service.httpx.Response(401)
         return skill_service.httpx.Response(200, json={"data": []})
 
+    # 局部测试函数：fake_refresh 模拟该步骤的返回结果或异常。
     def fake_refresh(*, failed_token: str | None = None) -> str:
         assert failed_token == "expired-token"
         monkeypatch.setenv("VERCEL_OIDC_TOKEN", "fresh-token")
@@ -380,6 +404,7 @@ def test_skills_sh_retries_once_with_a_refreshed_vercel_oidc_token(
     assert authorizations == ["Bearer expired-token", "Bearer fresh-token"]
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_vercel_oidc_refresh_runs_the_bounded_script_and_updates_process_environment 精确标识本用例的具体条件。
 def test_vercel_oidc_refresh_runs_the_bounded_script_and_updates_process_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -388,6 +413,7 @@ def test_vercel_oidc_refresh_runs_the_bounded_script_and_updates_process_environ
     monkeypatch.setenv("VERCEL_OIDC_TOKEN", "expired-token")
     calls: list[dict[str, object]] = []
 
+    # 局部测试函数：fake_run 模拟该步骤的返回结果或异常。
     def fake_run(command: list[str], **kwargs: object) -> skill_service.subprocess.CompletedProcess[str]:
         calls.append({"command": command, **kwargs})
         environment_file.write_text("VERCEL_OIDC_TOKEN=fresh-token\n", encoding="utf-8")
@@ -403,11 +429,13 @@ def test_vercel_oidc_refresh_runs_the_bounded_script_and_updates_process_environ
     assert skill_service.os.environ["VERCEL_OIDC_TOKEN"] == "fresh-token"
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_vercel_oidc_refresh_reports_timeout_without_exposing_subprocess_output 精确标识本用例的具体条件。
 def test_vercel_oidc_refresh_reports_timeout_without_exposing_subprocess_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("VERCEL_OIDC_TOKEN", "expired-token")
 
+    # 局部测试函数：fake_run 模拟该步骤的返回结果或异常。
     def fake_run(_command: list[str], **_kwargs: object) -> None:
         raise skill_service.subprocess.TimeoutExpired("powershell.exe", 90, output="secret-output")
 
@@ -418,6 +446,7 @@ def test_vercel_oidc_refresh_reports_timeout_without_exposing_subprocess_output(
     assert "secret-output" not in str(exc_info.value.detail)
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_skills_sh_stops_after_one_failed_oidc_retry 精确标识本用例的具体条件。
 def test_skills_sh_stops_after_one_failed_oidc_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SKILLS_SH_API_TOKEN", raising=False)
     monkeypatch.delenv("PGAGENT_SKILLS_SH_API_TOKEN", raising=False)
@@ -425,11 +454,13 @@ def test_skills_sh_stops_after_one_failed_oidc_retry(monkeypatch: pytest.MonkeyP
     requests = 0
     refreshes = 0
 
+    # 局部测试函数：fake_get 模拟该步骤的返回结果或异常。
     def fake_get(_url: str, **_kwargs: object) -> skill_service.httpx.Response:
         nonlocal requests
         requests += 1
         return skill_service.httpx.Response(401)
 
+    # 局部测试函数：fake_refresh 模拟该步骤的返回结果或异常。
     def fake_refresh(*, failed_token: str | None = None) -> str:
         nonlocal refreshes
         assert failed_token == "expired-token"
@@ -445,15 +476,18 @@ def test_skills_sh_stops_after_one_failed_oidc_retry(monkeypatch: pytest.MonkeyP
     assert refreshes == 1
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_skills_sh_does_not_replace_an_explicit_static_market_token 精确标识本用例的具体条件。
 def test_skills_sh_does_not_replace_an_explicit_static_market_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SKILLS_SH_API_TOKEN", "explicit-token")
     refresh_called = False
 
+    # 局部测试函数：fake_get 模拟该步骤的返回结果或异常。
     def fake_get(_url: str, **_kwargs: object) -> skill_service.httpx.Response:
         return skill_service.httpx.Response(401)
 
+    # 局部测试函数：fake_refresh 模拟该步骤的返回结果或异常。
     def fake_refresh(*, failed_token: str | None = None) -> str:
         nonlocal refresh_called
         refresh_called = True
@@ -467,6 +501,7 @@ def test_skills_sh_does_not_replace_an_explicit_static_market_token(
     assert refresh_called is False
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_market_browse_normalizes_leaderboard_views_without_exposing_file_contents 精确标识本用例的具体条件。
 def test_market_browse_normalizes_leaderboard_views_without_exposing_file_contents(
     client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -474,6 +509,7 @@ def test_market_browse_normalizes_leaderboard_views_without_exposing_file_conten
     monkeypatch.setenv("PGAGENT_SKILLS_SH_API_TOKEN", "test-market-token")
     calls: list[tuple[str, dict | None]] = []
 
+    # 局部测试函数：fake_skills_sh 模拟该步骤的返回结果或异常。
     def fake_skills_sh(path: str, *, params: dict | None = None) -> dict:
         calls.append((path, params))
         return {
@@ -522,6 +558,7 @@ def test_market_browse_normalizes_leaderboard_views_without_exposing_file_conten
     assert "must never appear here" not in response.text
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_market_browse_flattens_curated_owners_and_marks_official_skills 精确标识本用例的具体条件。
 def test_market_browse_flattens_curated_owners_and_marks_official_skills(
     client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -554,6 +591,7 @@ def test_market_browse_flattens_curated_owners_and_marks_official_skills(
     assert body["items"][0]["official_owner"] == "official-maker"
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_market_leaderboards_cache_five_topic_rankings_and_keep_sensitive_fields_private 精确标识本用例的具体条件。
 def test_market_leaderboards_cache_five_topic_rankings_and_keep_sensitive_fields_private(
     client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -563,6 +601,7 @@ def test_market_leaderboards_cache_five_topic_rankings_and_keep_sensitive_fields
     calls: list[dict[str, object]] = []
     installs = [21, 90, 8, 72, 55, 31, 49, 7]
 
+    # 局部测试函数：fake_skills_sh 模拟该步骤的返回结果或异常。
     def fake_skills_sh(path: str, *, params: dict | None = None) -> dict:
         assert path == "/api/v1/skills/search"
         assert params is not None
@@ -611,6 +650,7 @@ def test_market_leaderboards_cache_five_topic_rankings_and_keep_sensitive_fields
     assert len(calls) == 5
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_market_leaderboards_expire_after_ttl_and_support_manual_refresh 精确标识本用例的具体条件。
 def test_market_leaderboards_expire_after_ttl_and_support_manual_refresh(
     client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -621,6 +661,7 @@ def test_market_leaderboards_expire_after_ttl_and_support_manual_refresh(
     monkeypatch.setattr(skill_service.time, "monotonic", lambda: clock["value"])
     calls: list[dict[str, object]] = []
 
+    # 局部测试函数：fake_skills_sh 模拟该步骤的返回结果或异常。
     def fake_skills_sh(path: str, *, params: dict | None = None) -> dict:
         assert path == "/api/v1/skills/search"
         assert params is not None
@@ -664,6 +705,7 @@ def test_market_leaderboards_expire_after_ttl_and_support_manual_refresh(
     assert len(calls) == 20
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_market_leaderboards_are_explicitly_unavailable_without_a_market_token 精确标识本用例的具体条件。
 def test_market_leaderboards_are_explicitly_unavailable_without_a_market_token(
     client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -674,6 +716,7 @@ def test_market_leaderboards_are_explicitly_unavailable_without_a_market_token(
     monkeypatch.setattr(skill_service, "_market_leaderboard_cache", None)
     upstream_called = False
 
+    # 局部测试函数：fake_skills_sh 模拟该步骤的返回结果或异常。
     def fake_skills_sh(path: str, *, params: dict | None = None) -> dict:
         nonlocal upstream_called
         upstream_called = True
@@ -690,6 +733,7 @@ def test_market_leaderboards_are_explicitly_unavailable_without_a_market_token(
     assert upstream_called is False
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_github_zip_is_previewed_before_confirmed_install 精确标识本用例的具体条件。
 def test_github_zip_is_previewed_before_confirmed_install(
     client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -726,6 +770,7 @@ def test_github_zip_is_previewed_before_confirmed_install(
     assert install.json()["skill"]["source"] == "github"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_skill_relations_are_real_database_rows 精确标识本用例的具体条件。
 def test_skill_relations_are_real_database_rows(
     client: tuple[TestClient, dict[str, list]], tmp_path: Path
 ) -> None:

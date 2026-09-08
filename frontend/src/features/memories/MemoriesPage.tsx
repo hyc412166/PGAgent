@@ -1,3 +1,4 @@
+// 本文件实现 MemoriesPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { AlertCircle, CheckCircle2, Database, History, Search, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { api, describeError } from '../../api'
@@ -5,12 +6,16 @@ import { EmptyState, ErrorState, LoadingState, PageHeader, ToggleSwitch } from '
 import { useApiData } from '../../shared/hooks/useApiData'
 import { formatDate } from '../../shared/lib/display'
 import type { MemoryRecord, MemorySettings } from '../../types'
+// MemoryRecall 描述一次会话请求实际召回了哪些记忆，用于审计记忆与回答之间的关联。
 type MemoryRecall = { message_id: string; session_id: string; turn_id?: string; request: string; memories: Array<{ id: string; name?: string; memory_type?: string }>; created_at?: string }
 
+// MemoriesPage 展示有效记忆和最近召回记录，并管理全局持久记忆开关。
 function MemoriesPage() {
+  // memories/recalls/settings 分别来自独立接口，避免切换全局开关时重载只读历史。
   const memories = useApiData<MemoryRecord[]>([], () => api.list<MemoryRecord>('/api/memories?memory_status=active', ['memories']), [])
   const recalls = useApiData<MemoryRecall[]>([], () => api.list<MemoryRecall>('/api/memory-recalls?limit=20', ['memory_recalls']), [])
   const memorySettings = useApiData<MemorySettings | null>(null, () => api.get<MemorySettings>('/api/memories/settings'), [])
+  // query 过滤记忆；其余状态反馈开关保存过程、失败和短暂成功提示。
   const [query, setQuery] = useState('')
   const [error, setError] = useState('')
   const [memorySaving, setMemorySaving] = useState(false)

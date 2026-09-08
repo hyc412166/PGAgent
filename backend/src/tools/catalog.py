@@ -4,26 +4,42 @@ Only canonical tools intended for new Agents belong here. Historic Claude,
 Claw, and pre-Codex PGAgent names remain executable in ``ToolRegistry`` so an
 already persisted run can resume, but they are absent from this catalog.
 """
+# 文件职责：负责工具定义、授权、注册、调度与执行中的 catalog 子模块。
+# 逻辑关系：上层通过 tools/catalog.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 
+# 类职责：定义 BuiltinTool 在本领域中的数据与行为。
 @dataclass(frozen=True, slots=True)
 class BuiltinTool:
+    # 变量说明：id 表示当前对象的唯一标识。
     id: str
+    # 变量说明：name 表示当前对象名称。
     name: str
+    # 变量说明：label 表示当前步骤使用的 label 值。
     label: str
+    # 变量说明：description 表示当前步骤使用的 description 值。
     description: str
+    # 变量说明：category 表示当前步骤使用的 category 值。
     category: str
+    # 变量说明：risk_level 表示当前步骤使用的 risk_level 值。
     risk_level: str
+    # 变量说明：enabled 表示当前步骤使用的 enabled 值。
     enabled: bool = True
+    # 变量说明：availability 表示当前步骤使用的 availability 值。
     availability: str = "available"
+    # 变量说明：runtime_tool_id 表示runtime_tool 对象的唯一标识。
     runtime_tool_id: str | None = None
+    # 变量说明：requires_approval 表示当前步骤使用的 requires_approval 值。
     requires_approval: bool = False
 
 
+# 函数职责：完成 tool 对应的业务处理。
+# 参数关系：name 表示当前对象名称；label 表示当前步骤使用的 label 值；description 表示当前步骤使用的 description 值；category 表示当前步骤使用的 category 值；risk_level 表示当前步骤使用的 risk_level 值；requires_approval 表示当前步骤使用的 requires_approval 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _tool(
     name: str,
     label: str,
@@ -45,6 +61,7 @@ def _tool(
     )
 
 
+# 变量说明：BUILTIN_TOOL_CATALOG 表示当前步骤使用的 BUILTIN_TOOL_CATALOG 值。
 BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
     _tool("shell", "运行命令", "在当前项目目录执行受控命令；长任务可返回持久 session_id。", "execution", "adaptive"),
     _tool("write_stdin", "继续命令", "向持久命令会话写入输入或读取后续输出。", "execution", "adaptive"),
@@ -68,5 +85,7 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
     _tool("question", "向用户提问", "信息不足时提出澄清问题并等待用户回复。", "interaction"),
 )
 
+# 变量说明：BUILTIN_TOOL_BY_ID 表示BUILTIN_TOOL_BY 对象的唯一标识。
 BUILTIN_TOOL_BY_ID = {item.id: item for item in BUILTIN_TOOL_CATALOG}
+# 变量说明：BUILTIN_TOOL_IDS 表示BUILTIN_TOOL 对象标识集合。
 BUILTIN_TOOL_IDS = tuple(item.id for item in BUILTIN_TOOL_CATALOG)

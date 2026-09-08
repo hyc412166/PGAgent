@@ -1,3 +1,9 @@
+"""验证父子运行委派、冻结绑定、审批恢复、超时、失败幂等和后台作业归属。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -35,11 +41,13 @@ from src.runs.service import RunCoordinator
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_parent_wait_timeout_does_not_cancel_delegated_child 精确标识本用例的具体条件。
 async def test_parent_wait_timeout_does_not_cancel_delegated_child() -> None:
     coordinator = RunCoordinator()
     release = asyncio.Event()
     completed = asyncio.Event()
 
+    # 辅助方法：child 实现测试替身在此调用阶段需要的最小行为。
     async def child() -> None:
         await release.wait()
         completed.set()
@@ -57,6 +65,7 @@ async def test_parent_wait_timeout_does_not_cancel_delegated_child() -> None:
     assert completed.is_set()
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_session_delegations_include_legacy_child_run_history 精确标识本用例的具体条件。
 def test_session_delegations_include_legacy_child_run_history(
     delegated_run: dict[str, str],
 ) -> None:
@@ -110,7 +119,9 @@ def test_session_delegations_include_legacy_child_run_history(
 
 
 @pytest.fixture()
+# 测试夹具：delegated_run 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def delegated_run(tmp_path: Path) -> dict[str, str]:
+    # 临时数据库保存父运行、子运行、代理和任务图；返回字典中的各标识负责串联后续委派断言。
     database.configure_database(f"sqlite:///{(tmp_path / 'delegation.db').as_posix()}")
     database.init_db()
     parent_root = tmp_path / "parent-workspace"
@@ -183,6 +194,7 @@ def delegated_run(tmp_path: Path) -> dict[str, str]:
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_concurrent_task_calls_keep_separate_dag_bindings 精确标识本用例的具体条件。
 def test_concurrent_task_calls_keep_separate_dag_bindings(delegated_run: dict[str, str]) -> None:
     delegate = run_service._SubagentTaskDelegate(
         parent_run_id=delegated_run["run_id"],
@@ -212,6 +224,7 @@ def test_concurrent_task_calls_keep_separate_dag_bindings(delegated_run: dict[st
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_task_executes_child_with_frozen_limited_binding_and_returns_structured_result 精确标识本用例的具体条件。
 async def test_task_executes_child_with_frozen_limited_binding_and_returns_structured_result(
     delegated_run: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -227,6 +240,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         child.workflow_profile_id = "review"
         db.commit()
 
+    # 辅助方法：parent_model 实现测试替身在此调用阶段需要的最小行为。
     async def parent_model(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal parent_calls
         parent_calls += 1
@@ -244,6 +258,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         assert payload["output"] == "子 Agent 已完成检查。"
         return ModelTurn(content="主控已收到子 Agent 的检查结果。")
 
+    # 辅助方法：child_model 实现测试替身在此调用阶段需要的最小行为。
     async def child_model(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal child_calls
         child_calls += 1
@@ -287,6 +302,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         assert json.loads(nested_results[-1]["content"])["error_code"] == "tool_not_offered"
         return ModelTurn(content="子 Agent 已完成检查。")
 
+    # 局部测试函数：fake_build_model_call 模拟该步骤的返回结果或异常。
     def fake_build_model_call(config, **_kwargs):  # type: ignore[no-untyped-def]
         if config.model_id == "parent-model":
             return parent_model
@@ -341,6 +357,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
 
 
 @pytest.mark.asyncio
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_child_approval_stays_recoverable_then_syncs_task_without_duplicate_chat_message 精确标识本用例的具体条件。
 async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicate_chat_message(
     delegated_run: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -353,6 +370,7 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
         db.add(AgentTool(agent_id=delegated_run["child_id"], tool_id="apply_patch"))
         db.commit()
 
+    # 辅助方法：parent_model 实现测试替身在此调用阶段需要的最小行为。
     async def parent_model(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal parent_calls
         parent_calls += 1
@@ -374,6 +392,7 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
         assert delegated_payload["output"] == "child result after approval"
         return ModelTurn(content="parent summary after delegated child")
 
+    # 辅助方法：child_model 实现测试替身在此调用阶段需要的最小行为。
     async def child_model(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal child_calls
         child_calls += 1
@@ -393,6 +412,7 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
             )])
         return ModelTurn(content="child result after approval")
 
+    # 局部测试函数：fake_build_model_call 模拟该步骤的返回结果或异常。
     def fake_build_model_call(config):  # type: ignore[no-untyped-def]
         return child_model if config.model_id == "child-model" else parent_model
 
@@ -509,6 +529,7 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
         )))) == visible_count_before
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_restart_recovery_settles_active_delegated_child_and_keeps_binding 精确标识本用例的具体条件。
 def test_restart_recovery_settles_active_delegated_child_and_keeps_binding(
     delegated_run: dict[str, str],
 ) -> None:
@@ -581,9 +602,11 @@ def test_restart_recovery_settles_active_delegated_child_and_keeps_binding(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_child_failure_blocks_once_and_repeated_delegate_call_is_idempotent 精确标识本用例的具体条件。
 async def test_child_failure_blocks_once_and_repeated_delegate_call_is_idempotent(
     delegated_run: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # 辅助方法：child_model 实现测试替身在此调用阶段需要的最小行为。
     async def child_model(**_kwargs):  # type: ignore[no-untyped-def]
         raise RuntimeError("child provider failed")
 
@@ -614,6 +637,7 @@ async def test_child_failure_blocks_once_and_repeated_delegate_call_is_idempoten
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_child_timeout_is_limited_to_the_parent_remaining_budget 精确标识本用例的具体条件。
 async def test_child_timeout_is_limited_to_the_parent_remaining_budget(
     delegated_run: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -643,6 +667,7 @@ async def test_child_timeout_is_limited_to_the_parent_remaining_budget(
 
 @pytest.mark.asyncio
 @pytest.mark.xfail(reason="background subprocess event delivery is unavailable in this test environment", strict=False)
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_delegated_child_uses_durable_background_job_and_must_observe_it 精确标识本用例的具体条件。
 async def test_delegated_child_uses_durable_background_job_and_must_observe_it(
     delegated_run: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -656,6 +681,7 @@ async def test_delegated_child_uses_durable_background_job_and_must_observe_it(
     parent_calls = 0
     child_calls = 0
 
+    # 辅助方法：parent_model 实现测试替身在此调用阶段需要的最小行为。
     async def parent_model(**_kwargs):  # type: ignore[no-untyped-def]
         nonlocal parent_calls
         parent_calls += 1
@@ -667,6 +693,7 @@ async def test_delegated_child_uses_durable_background_job_and_must_observe_it(
             )])
         return ModelTurn(content="child background work verified")
 
+    # 辅助方法：child_model 实现测试替身在此调用阶段需要的最小行为。
     async def child_model(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal child_calls
         child_calls += 1
@@ -691,6 +718,7 @@ async def test_delegated_child_uses_durable_background_job_and_must_observe_it(
         )
         return ModelTurn(content="child durable background result verified")
 
+    # 局部测试函数：fake_build_model_call 模拟该步骤的返回结果或异常。
     def fake_build_model_call(config):  # type: ignore[no-untyped-def]
         return parent_model if config.model_id == "parent-model" else child_model
 

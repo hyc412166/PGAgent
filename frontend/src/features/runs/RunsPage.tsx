@@ -1,13 +1,15 @@
+// 本文件实现 RunsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { Activity, AlertCircle, Bot, Database, History, LoaderCircle, RefreshCw } from 'lucide-react'
 import { useState } from 'react'
-import { api } from '../../api'
+import { api, describeError } from '../../api'
 import { EmptyState, ErrorState, LoadingState, PageHeader, SlidePanel, StatusBadge } from '../../components/ui'
 import { statusText } from '../../components/status'
 import { useApiData } from '../../shared/hooks/useApiData'
 import { formatCost, formatTokens } from '../../shared/lib/display'
-import type { Run, RunUsage } from '../../types'
+import type { Run, RunEventFilters, RunEventPage, RunUsage } from '../../types'
 import { formatRunEventOffset, formatRunEventTime, presentRunEvent, runDisplayTitle, runSecondaryLabel } from '../../runEventPresentation'
 
+// RunRow 将单条运行压缩为可选择的列表行，状态、时间和目标信息均来自 Run。
 function RunRow({ run, onClick }: { run: Run; onClick?: () => void }) {
   return (
     <button className="run-row" onClick={onClick} disabled={!onClick}>
@@ -20,6 +22,7 @@ function RunRow({ run, onClick }: { run: Run; onClick?: () => void }) {
   )
 }
 
+// RunsPage 读取运行历史并按状态筛选；选择记录后由 RunDetails 展开事件和用量。
 function RunsPage() {
   const runs = useApiData<Run[]>([], () => api.list<Run>('/api/runs', ['runs']), [])
   const [selected, setSelected] = useState<Run | null>(null)
@@ -37,11 +40,44 @@ function RunsPage() {
   )
 }
 
+const initialRunEventFilters: RunEventFilters = { event_type: '', step: undefined, errors_only: false, limit: 50 }
+
+// RunEventFilterControls 只收集后端支持的诊断筛选，不在浏览器重做事件语义判断。
+function RunEventFilterControls({ filters, onChange }: { filters: RunEventFilters; onChange: (filters: RunEventFilters) => void }) {
+  return <div className="filter-bar" role="group" aria-label="运行事件筛选">
+    <label>事件类型<input value={filters.event_type || ''} placeholder="例如 model_retry" onChange={(event) => onChange({ ...filters, event_type: event.target.value, before: undefined })} /></label>
+    <label>步骤<input type="number" min={0} value={filters.step ?? ''} placeholder="全部" onChange={(event) => onChange({ ...filters, step: event.target.value === '' ? undefined : Number(event.target.value), before: undefined })} /></label>
+    <label><input type="checkbox" checked={filters.errors_only || false} onChange={(event) => onChange({ ...filters, errors_only: event.target.checked, before: undefined })} />仅看错误</label>
+  </div>
+}
+
+// 游标页按接口返回顺序追加；筛选变化由数据钩子重新创建第一页。
+function appendRunEventPage(current: RunEventPage, incoming: RunEventPage): RunEventPage {
+  return { items: [...current.items, ...incoming.items], next_before: incoming.next_before }
+}
+
+// RunDetails 以 run.id 并行加载事件时间线与计费用量，形成运行诊断详情。
 function RunDetails({ run }: { run: Run }) {
-  const events = useApiData<Run['events']>([], () => api.list<NonNullable<Run['events']>[number]>(`/api/runs/${run.id}/events`, ['events']), [run.id])
+  const [filters, setFilters] = useState<RunEventFilters>(initialRunEventFilters)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [loadMoreError, setLoadMoreError] = useState('')
+  const events = useApiData<RunEventPage>({ items: [], next_before: null }, () => api.listRunEvents(run.id, filters), [run.id, filters.event_type, filters.step, filters.errors_only, filters.limit])
   const usage = useApiData<RunUsage | null>(null, () => api.get<RunUsage | null>(`/api/usage/runs/${run.id}`), [run.id])
-  const timeline = run.events?.length ? run.events : events.data
-  const timelineStartedAt = timeline?.[0]?.created_at || run.started_at
+  const timeline = events.data.items
+  const timelineStartedAt = run.started_at || timeline.at(-1)?.created_at
+  async function loadMore() {
+    if (events.data.next_before === null || loadingMore) return
+    setLoadingMore(true)
+    setLoadMoreError('')
+    try {
+      const incoming = await api.listRunEvents(run.id, { ...filters, before: events.data.next_before })
+      events.setState({ data: appendRunEventPage(events.data, incoming), loading: false, error: '' })
+    } catch (error) {
+      setLoadMoreError(describeError(error))
+    } finally {
+      setLoadingMore(false)
+    }
+  }
   return (
     <div className="run-detail">
       <div className="detail-hero"><StatusBadge status={run.status} /><strong>{statusText[run.phase || run.status || ''] ?? run.phase ?? run.status ?? '暂无阶段信息'}</strong></div>
@@ -52,6 +88,7 @@ function RunDetails({ run }: { run: Run }) {
       </> : usage.initialLoading ? <p className="run-usage-note"><LoaderCircle className="spin" size={14} />正在读取本次 Token 用量…</p> : <p className="run-usage-note"><Database size={14} />本次运行没有返回可统计的 Token 明细。</p>}
       {run.stop_reason && <div className="stop-reason"><AlertCircle size={17} /><div><strong>停止原因</strong><p>{run.stop_reason}</p></div></div>}
       <h3>事件时间线</h3>
+      <RunEventFilterControls filters={filters} onChange={setFilters} />
       {events.error ? <ErrorState message={events.error} onRetry={events.reload} /> : events.loading ? <LoadingState /> : timeline?.length ? <div className="timeline run-event-timeline">{timeline.map((event, index) => {
         const presented = presentRunEvent(event)
         const type = event.type || event.event_type || 'runtime_event'
@@ -65,8 +102,10 @@ function RunDetails({ run }: { run: Run }) {
           </article>
         </div>
       })}</div> : <EmptyState icon={Activity} title="暂无事件详情" description="后端记录运行事件后会在这里展示。" />}
+      {loadMoreError && <p className="inline-error">{loadMoreError}</p>}
+      {events.data.next_before !== null && <button type="button" className="button button-secondary" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? <><LoaderCircle className="spin" size={14} />正在加载…</> : '加载更多'}</button>}
     </div>
   )
 }
 
-export { RunRow, RunsPage }
+export { appendRunEventPage, RunEventFilterControls, RunRow, RunsPage }

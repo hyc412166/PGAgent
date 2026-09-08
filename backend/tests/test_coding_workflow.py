@@ -1,3 +1,9 @@
+"""验证编码工作流中的补丁应用、沙箱读取搜索、命令变更取证、验证执行、基线工作树及工作流配置。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +20,7 @@ from src.tools import create_default_registry
 from src.tools.types import ToolResult
 
 
+# 辅助函数：_init_git_repository 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _init_git_repository(path) -> None:
     subprocess.run(["git", "init", "--quiet"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.email", "pgagent-test@example.com"], cwd=path, check=True)
@@ -22,6 +29,7 @@ def _init_git_repository(path) -> None:
     subprocess.run(["git", "commit", "--quiet", "-m", "baseline"], cwd=path, check=True)
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_apply_patch_updates_multiple_files_and_records_change_evidence 精确标识本用例的具体条件。
 def test_apply_patch_updates_multiple_files_and_records_change_evidence(tmp_path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "app.py").write_bytes(b"value = 1\r\n")
@@ -50,6 +58,7 @@ def test_apply_patch_updates_multiple_files_and_records_change_evidence(tmp_path
     assert "Validation status: not_run" in registry.workflow_prompt
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_apply_patch_validates_every_hunk_before_writing_any_file 精确标识本用例的具体条件。
 def test_apply_patch_validates_every_hunk_before_writing_any_file(tmp_path) -> None:
     first = tmp_path / "first.txt"
     second = tmp_path / "second.txt"
@@ -78,6 +87,7 @@ def test_apply_patch_validates_every_hunk_before_writing_any_file(tmp_path) -> N
     assert second.read_text(encoding="utf-8") == "actual\n"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_apply_patch_rolls_back_an_earlier_file_when_a_later_commit_fails 精确标识本用例的具体条件。
 def test_apply_patch_rolls_back_an_earlier_file_when_a_later_commit_fails(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -93,6 +103,7 @@ def test_apply_patch_rolls_back_an_earlier_file_when_a_later_commit_fails(
     )
     real_replace = patch_module.os.replace
 
+    # 辅助方法：fail_second_commit 实现测试替身在此调用阶段需要的最小行为。
     def fail_second_commit(source, target):  # type: ignore[no-untyped-def]
         if str(target).endswith("second.txt"):
             raise PermissionError("second target is read-only")
@@ -118,6 +129,7 @@ def test_apply_patch_rolls_back_an_earlier_file_when_a_later_commit_fails(
     assert list(tmp_path.glob(".pgagent-patch-*")) == []
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_smart_patch_policy_only_escalates_irreversible_or_sensitive_boundaries 精确标识本用例的具体条件。
 def test_smart_patch_policy_only_escalates_irreversible_or_sensitive_boundaries(tmp_path) -> None:
     (tmp_path / "obsolete.txt").write_text("old\n", encoding="utf-8")
     registry = create_default_registry(
@@ -146,6 +158,7 @@ def test_smart_patch_policy_only_escalates_irreversible_or_sensitive_boundaries(
     assert reentered_release_path.approval_required
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_read_uses_real_line_ranges_without_reading_only_a_prefix 精确标识本用例的具体条件。
 def test_read_uses_real_line_ranges_without_reading_only_a_prefix(tmp_path) -> None:
     (tmp_path / "long.txt").write_text("".join(f"line-{index}\n" for index in range(200)), encoding="utf-8")
     registry = create_default_registry(
@@ -163,6 +176,7 @@ def test_read_uses_real_line_ranges_without_reading_only_a_prefix(tmp_path) -> N
     assert result.metadata["truncated"] is True
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_rg_is_a_first_class_bounded_review_tool 精确标识本用例的具体条件。
 def test_rg_is_a_first_class_bounded_review_tool(tmp_path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "service.py").write_text(
@@ -184,6 +198,7 @@ def test_rg_is_a_first_class_bounded_review_tool(tmp_path) -> None:
     assert "src/service.py:1:def review_target" in result.content.replace("\\", "/")
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_validate_runs_in_sandboxed_cwd_and_persists_result 精确标识本用例的具体条件。
 def test_validate_runs_in_sandboxed_cwd_and_persists_result(tmp_path) -> None:
     (tmp_path / "backend").mkdir()
     registry = create_default_registry(
@@ -204,12 +219,14 @@ def test_validate_runs_in_sandboxed_cwd_and_persists_result(tmp_path) -> None:
     assert state["validations"][0]["exit_code"] == 0
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_validate_uses_frozen_docker_runtime_without_exposing_docker 精确标识本用例的具体条件。
 def test_validate_uses_frozen_docker_runtime_without_exposing_docker(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "backend").mkdir()
     captured: dict = {}
 
+    # 局部测试函数：fake_run_command 模拟该步骤的返回结果或异常。
     def fake_run_command(_sandbox, command, **kwargs) -> ToolResult:
         captured["command"] = command
         captured["kwargs"] = kwargs
@@ -254,11 +271,13 @@ def test_validate_uses_frozen_docker_runtime_without_exposing_docker(
     }
 
 
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_docker_validation_reports_cleanup_failure 精确标识本用例的具体条件。
 def test_docker_validation_reports_cleanup_failure(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = 0
 
+    # 局部测试函数：fake_run_command 模拟该步骤的返回结果或异常。
     def fake_run_command(_sandbox, _command, **_kwargs) -> ToolResult:
         nonlocal calls
         calls += 1
@@ -281,6 +300,7 @@ def test_docker_validation_reports_cleanup_failure(
     assert "Docker 容器清理失败" in result.content
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_change_after_validation_marks_the_evidence_stale 精确标识本用例的具体条件。
 def test_change_after_validation_marks_the_evidence_stale(tmp_path) -> None:
     (tmp_path / "value.txt").write_text("before\n", encoding="utf-8")
     registry = create_default_registry(
@@ -305,6 +325,7 @@ def test_change_after_validation_marks_the_evidence_stale(tmp_path) -> None:
     assert "Validation status: stale" in registry.workflow_prompt
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_coding_bash_detects_real_tracked_file_changes 精确标识本用例的具体条件。
 def test_coding_bash_detects_real_tracked_file_changes(tmp_path) -> None:
     source = tmp_path / "value.txt"
     source.write_text("before\n", encoding="utf-8")
@@ -337,6 +358,7 @@ def test_coding_bash_detects_real_tracked_file_changes(tmp_path) -> None:
     assert "Changed paths: value.txt" in registry.workflow_prompt
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_coding_bash_detects_existing_untracked_file_content_changes 精确标识本用例的具体条件。
 def test_coding_bash_detects_existing_untracked_file_content_changes(tmp_path) -> None:
     (tmp_path / "tracked.txt").write_text("baseline\n", encoding="utf-8")
     _init_git_repository(tmp_path)
@@ -372,6 +394,7 @@ def test_coding_bash_detects_existing_untracked_file_content_changes(tmp_path) -
     assert "Validation status: stale" in registry.workflow_prompt
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_coding_bash_reports_only_files_changed_by_this_command 精确标识本用例的具体条件。
 def test_coding_bash_reports_only_files_changed_by_this_command(tmp_path) -> None:
     user_file = tmp_path / "user.txt"
     agent_file = tmp_path / "agent.txt"
@@ -403,6 +426,7 @@ def test_coding_bash_reports_only_files_changed_by_this_command(tmp_path) -> Non
     ]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_coding_bash_detects_same_size_untracked_change_with_restored_mtime 精确标识本用例的具体条件。
 def test_coding_bash_detects_same_size_untracked_change_with_restored_mtime(tmp_path) -> None:
     (tmp_path / "tracked.txt").write_text("baseline\n", encoding="utf-8")
     _init_git_repository(tmp_path)
@@ -436,6 +460,7 @@ def test_coding_bash_detects_same_size_untracked_change_with_restored_mtime(tmp_
     ("file_name", "tracked", "operation"),
     [("代码.py", True, "update"), ("草稿.txt", False, "add")],
 )
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_coding_bash_reports_unicode_paths 精确标识本用例的具体条件。
 def test_coding_bash_reports_unicode_paths(
     tmp_path,
     file_name: str,
@@ -473,6 +498,7 @@ def test_coding_bash_reports_unicode_paths(
     ]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_validate_baseline_runs_in_isolated_head_worktree 精确标识本用例的具体条件。
 def test_validate_baseline_runs_in_isolated_head_worktree(tmp_path) -> None:
     source = tmp_path / "value.txt"
     source.write_text("baseline\n", encoding="utf-8")
@@ -512,6 +538,7 @@ def test_validate_baseline_runs_in_isolated_head_worktree(tmp_path) -> None:
     assert registry.runtime_state()["coding_state"]["validations"] == []
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_validate_baseline_unlocks_and_removes_worktree_after_command 精确标识本用例的具体条件。
 def test_validate_baseline_unlocks_and_removes_worktree_after_command(tmp_path) -> None:
     (tmp_path / "value.txt").write_text("baseline\n", encoding="utf-8")
     _init_git_repository(tmp_path)
@@ -539,6 +566,7 @@ def test_validate_baseline_unlocks_and_removes_worktree_after_command(tmp_path) 
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_validate_baseline_cancellation_stops_command_and_removes_worktree 精确标识本用例的具体条件。
 async def test_validate_baseline_cancellation_stops_command_and_removes_worktree(tmp_path) -> None:
     (tmp_path / "value.txt").write_text("baseline\n", encoding="utf-8")
     _init_git_repository(tmp_path)
@@ -570,6 +598,7 @@ async def test_validate_baseline_cancellation_stops_command_and_removes_worktree
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_validate_cancellation_stops_command 精确标识本用例的具体条件。
 async def test_validate_cancellation_stops_command(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -593,6 +622,7 @@ async def test_validate_cancellation_stops_command(tmp_path) -> None:
     assert result.error_code == "cancelled"
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_validate_baseline_does_not_prune_unrelated_missing_worktree 精确标识本用例的具体条件。
 def test_validate_baseline_does_not_prune_unrelated_missing_worktree(tmp_path) -> None:
     (tmp_path / "value.txt").write_text("baseline\n", encoding="utf-8")
     _init_git_repository(tmp_path)
@@ -633,6 +663,7 @@ def test_validate_baseline_does_not_prune_unrelated_missing_worktree(tmp_path) -
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_general_surface_activates_selected_low_frequency_tools 精确标识本用例的具体条件。
 async def test_general_surface_activates_selected_low_frequency_tools(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -662,6 +693,7 @@ async def test_general_surface_activates_selected_low_frequency_tools(tmp_path) 
     assert "validate" in resumed.model_visible_tool_names
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_coding_profile_does_not_defer_tools_when_tool_search_is_unavailable 精确标识本用例的具体条件。
 def test_coding_profile_does_not_defer_tools_when_tool_search_is_unavailable(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -674,6 +706,7 @@ def test_coding_profile_does_not_defer_tools_when_tool_search_is_unavailable(tmp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_canonical_surface_hides_legacy_aliases_but_keeps_them_executable 精确标识本用例的具体条件。
 async def test_canonical_surface_hides_legacy_aliases_but_keeps_them_executable(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -698,6 +731,7 @@ async def test_canonical_surface_hides_legacy_aliases_but_keeps_them_executable(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_explicit_review_profile_records_and_restores_structured_findings 精确标识本用例的具体条件。
 async def test_explicit_review_profile_records_and_restores_structured_findings(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -736,6 +770,7 @@ async def test_explicit_review_profile_records_and_restores_structured_findings(
     assert json.loads(search.content) == []
     assert search.metadata["activated_tools"] == []
 
+    # 辅助方法：external 实现测试替身在此调用阶段需要的最小行为。
     async def external(arguments: dict) -> ToolResult:
         return ToolResult("external", True, json.dumps(arguments))
 
@@ -778,6 +813,7 @@ async def test_explicit_review_profile_records_and_restores_structured_findings(
     assert resumed.runtime_state()["workflow_evidence_state"] == snapshot["workflow_evidence_state"]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_explicit_debug_profile_keeps_hypotheses_distinct_from_root_cause 精确标识本用例的具体条件。
 def test_explicit_debug_profile_keeps_hypotheses_distinct_from_root_cause(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -817,6 +853,7 @@ def test_explicit_debug_profile_keeps_hypotheses_distinct_from_root_cause(tmp_pa
     assert "Location: src/parser.py:18" in registry.workflow_prompt
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_workflow_profile_resolution_keeps_auto_general 精确标识本用例的具体条件。
 def test_workflow_profile_resolution_keeps_auto_general() -> None:
     assert resolve_workflow_profile("review", ["read"]).id == "review"
     assert resolve_workflow_profile("debug", ["read"]).id == "debug"

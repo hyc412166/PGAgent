@@ -4,6 +4,8 @@ Each module owns one public API area.  Re-exports preserve the original
 Python import surface for callers and tests while the HTTP wiring remains
 explicit below.
 """
+# 文件职责：负责HTTP 接口、数据契约与依赖装配中的 __init__ 子模块。
+# 逻辑关系：上层通过 api/routes/__init__.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from fastapi import APIRouter
 
@@ -47,6 +49,7 @@ from src.api.routes.sessions import (
 from src.api.routes.workspaces import create_workspace, delete_workspace, get_workspace, list_workspaces, update_workspace
 
 
+# 变量说明：router 表示当前步骤使用的 router 值。
 router = APIRouter()
 router.include_router(dashboard_routes.router)
 router.include_router(workspace_routes.router)

@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
+# 安装所需路径：项目根目录、固定 Conda 环境目录以及其 Python 可执行文件。
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $EnvironmentPath = 'E:\anaconda3\envs\agent_dock'
 $PythonPath = Join-Path $EnvironmentPath 'python.exe'
@@ -24,4 +25,3 @@ try {
 }
 
 Write-Host 'PGAgent is ready. Run start_pgagent.bat.' -ForegroundColor Green
-

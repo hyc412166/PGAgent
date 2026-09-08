@@ -1,3 +1,4 @@
+// 本文件实现 SkillsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { BookOpen, Check, ChevronRight, Download, LoaderCircle, RefreshCw, Search, Trash2, Upload } from 'lucide-react'
 import { Fragment, type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, api, describeError } from '../../api'
@@ -7,9 +8,12 @@ import { useApiData } from '../../shared/hooks/useApiData'
 import { formatDate } from '../../shared/lib/display'
 import type { FolderSelection, SkillCatalogItem, SkillInstallPreview, SkillMarketplaceBrowse, SkillMarketplaceCategory, SkillMarketplaceItem, SkillMarketplaceLeaderboards, SkillMarketplaceSearch, SkillMarketplaceView } from '../../types'
 
+// SkillsPage 同时管理已安装技能和远程市场，负责浏览、搜索、预览、安装、导入与删除链路。
 function SkillsPage() {
+  // installed 是本地权威目录；market 表示市场可用性，后续状态分别承载搜索和榜单数据。
   const installed = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
   const market = useApiData<SkillMarketplaceSearch>({}, () => api.get<SkillMarketplaceSearch>('/api/skills/market/status'), [])
+  // query/results 组成搜索状态，browse* 组成榜单状态，操作 ID 和 previews 负责逐卡片反馈。
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<SkillMarketplaceItem[]>([])
   const [searchedQuery, setSearchedQuery] = useState('')
@@ -25,6 +29,7 @@ function SkillsPage() {
   const [deletingSkillId, setDeletingSkillId] = useState('')
   const [previews, setPreviews] = useState<Record<string, SkillInstallPreview>>({})
   const [actionError, setActionError] = useState('')
+  // categoryBoards 及时间字段用于缓存分类榜，并按后端建议间隔执行后台刷新。
   const [categoryBoards, setCategoryBoards] = useState<SkillMarketplaceCategory[]>([])
   const [boardsLoading, setBoardsLoading] = useState(false)
   const [boardsRefreshing, setBoardsRefreshing] = useState(false)

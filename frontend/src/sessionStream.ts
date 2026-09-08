@@ -1,3 +1,5 @@
+// 本文件负责 sessionStream 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
+// RunStreamEvent 是后端 SSE 事件的宽松前端模型；索引签名保留不同事件携带的扩展字段。
 export interface RunStreamEvent {
   type: string
   delta?: string
@@ -10,6 +12,7 @@ export interface RunStreamEvent {
   [key: string]: unknown
 }
 
+// 三组集合分别定义终态事件、终态状态，以及“已停止但稍后可自动续跑”的等待原因。
 const terminalTypes = new Set(['run_completed', 'run_interrupted', 'run_stopped', 'model_failed', 'integration_failed', 'failed', 'completed', 'stopped'])
 const terminalStatuses = new Set(['completed', 'stopped', 'failed', 'cancelled'])
 const resumableWaitingReasons = new Set([
@@ -18,17 +21,21 @@ const resumableWaitingReasons = new Set([
   'delegated_child_awaiting_approval',
 ])
 
+// WaitingRunCandidate 只抽取判断后台等待所需字段，使该判断可复用于 Run 和 SSE 事件。
 type WaitingRunCandidate = { status?: string; stop_reason?: string; reason?: string }
 
+// 判断 stopped 是否只是持久化等待点；此类运行不能在 UI 中当作真正终止。
 export function isResumableWaitingRun(run: WaitingRunCandidate | undefined): boolean {
   if (!run || run.status !== 'stopped') return false
   return resumableWaitingReasons.has(String(run.stop_reason || run.reason || ''))
 }
 
+// 将等待原因映射为状态栏阶段文案。
 function waitingRunPhase(reason: string): string {
   return reason === 'waiting_background' ? '等待后台任务完成…' : '等待子 Agent 返回…'
 }
 
+// 解析 SSE data；assistant_delta 允许纯文本，以兼容无法包装成 JSON 的增量片段。
 export function parseRunStreamEvent(raw: string, fallbackType = ''): RunStreamEvent | null {
   try {
     const value = JSON.parse(raw) as Record<string, unknown>
@@ -40,6 +47,7 @@ export function parseRunStreamEvent(raw: string, fallbackType = ''): RunStreamEv
   }
 }
 
+// 把细粒度运行事件折叠成用户可理解的当前阶段。
 export function runStreamPhase(event: RunStreamEvent): string {
   switch (event.type) {
     case 'run_state': return isResumableWaitingRun({
@@ -94,6 +102,7 @@ export function runStreamPhase(event: RunStreamEvent): string {
   }
 }
 
+// 综合显式 terminal、事件类型和状态识别终态，同时排除可恢复等待点。
 export function isTerminalRunStreamEvent(event: RunStreamEvent): boolean {
   if (event.terminal === false) return false
   const inferredStatus = event.status || (event.type === 'run_stopped' || event.type === 'stopped' ? 'stopped' : '')
@@ -104,10 +113,12 @@ export function isTerminalRunStreamEvent(event: RunStreamEvent): boolean {
   return event.terminal === true || terminalTypes.has(event.type) || (event.type === 'run_state' && isTerminalRunStatus(event.status))
 }
 
+// 判断持久化 Run 状态是否已终止。
 export function isTerminalRunStatus(status?: string): boolean {
   return terminalStatuses.has(status || '')
 }
 
+// 在没有实时事件时，将轮询到的 Run 状态映射为阶段文案。
 export function runStatusPhase(status?: string): string {
   switch (status) {
     case 'received':
@@ -126,16 +137,16 @@ export function runStatusPhase(status?: string): string {
   }
 }
 
+// 合并回复增量；中断事件携带的 partial_output 是权威快照，可补回浏览器漏收的尾部片段。
 export function appendAssistantDelta(current: string, event: RunStreamEvent): string {
   if (event.type === 'assistant_delta' && typeof event.delta === 'string') return current + event.delta
-  // A stop response can arrive after the browser missed the last few SSE
-  // chunks. The backend includes the authoritative partial output on the
-  // terminal event so the interrupted draft remains editable in the UI.
+  // 停止响应可能晚于最后几段 SSE；后端在终态事件中附带权威草稿，确保中断内容仍可编辑。
   const partial = event.partial_output
   if (typeof partial === 'string' && partial.length > current.length) return partial
   return current
 }
 
+// 用事件 ID 去重重连后重复送达的 SSE；无 ID 的兼容事件默认接受。
 export function rememberRunStreamEvent(seenEventIds: Set<string>, event: RunStreamEvent, lastEventId = ''): boolean {
   const eventId = String(event.event_id || lastEventId || '')
   if (!eventId) return true
@@ -144,10 +155,12 @@ export function rememberRunStreamEvent(seenEventIds: Set<string>, event: RunStre
   return true
 }
 
+// 仅暴露属于当前会话的异步结果，防止切换会话时旧请求短暂串屏。
 export function visibleSessionItems<T>(ownerSessionId: string, activeSessionId: string, items: T[]): T[] {
   return ownerSessionId === activeSessionId ? items : []
 }
 
+// 根据历史锚定是否完成及用户是否贴底，决定能否自动滚动到最新消息。
 export function shouldStartHistoryScroll(
   anchoringHistory: boolean,
   historyReady: boolean,
@@ -156,6 +169,7 @@ export function shouldStartHistoryScroll(
   return anchoringHistory ? historyReady : stickToBottom
 }
 
+// 校验异步回调仍属于当前会话和运行，避免过期流修改新会话状态。
 export function isCurrentSessionRun(
   activeSessionId: string,
   activeRunId: string,
@@ -168,24 +182,27 @@ export function isCurrentSessionRun(
     && (activeRunId === expectedRunId || streamRunId === expectedRunId)
 }
 
+// 只有当前实时运行与审批运行一致时才展示“审批后恢复中”。
 export function shouldMarkApprovalResuming(status: string, liveRunId: string, approvalRunId: string): boolean {
   return status === 'awaiting_approval' && Boolean(approvalRunId) && liveRunId === approvalRunId
 }
 
+// 拒绝子任务会直接写入终态消息，因此拒绝后需要额外刷新会话消息。
 export function shouldRefreshConversationAfterApprovalDecision(decision: 'approve' | 'reject'): boolean {
-  // A rejected delegated child writes its terminal result directly into the
-  // current session.  Approval/runs alone are insufficient to render it.
   return decision === 'reject'
 }
 
+// 终止提示判断所需的最小 Run 字段。
 type StoppedRunNoticeCandidate = { id: string; status?: string; stop_reason?: string; error_message?: string }
 
+// 当终止运行尚无持久化助手回复时显示兜底提示；可恢复等待不属于失败提示。
 export function shouldShowStoppedRunNotice(run: StoppedRunNoticeCandidate | undefined, repliedRunIds: Set<string>, historyReady = true): boolean {
   if (!historyReady || !run || !['stopped', 'failed'].includes(String(run.status || '')) || repliedRunIds.has(run.id)) return false
   if (run.status === 'failed') return true
   return !isResumableWaitingRun(run)
 }
 
+// PersistedRunReplyCandidate 描述识别“运行已有落盘回复”所需的消息字段。
 type PersistedRunReplyCandidate = {
   role?: string
   turn_id?: string
@@ -193,6 +210,7 @@ type PersistedRunReplyCandidate = {
   metadata?: Record<string, unknown>
 }
 
+// 通过 run_id 或终态 turn_id 关联消息，避免终态同步时重复插入回复。
 export function hasPersistedRunReply(
   messages: PersistedRunReplyCandidate[],
   runId: string,

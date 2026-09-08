@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// https://vite.dev/config/
+// 前端构建与开发服务配置：启用 React，并把本地 /api 请求代理到 FastAPI 后端。
 export default defineConfig({
   plugins: [react()],
   server: {
@@ -9,9 +9,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        // Keep the dev proxy aligned with the documented local backend port.
-        // VITE_API_PROXY_TARGET can still override this for another local
-        // instance without changing the frontend source.
+        // 默认端口与后端启动脚本一致；VITE_API_PROXY_TARGET 可在不改源码时切换本地实例。
         target: process.env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:8765',
         changeOrigin: true,
       },

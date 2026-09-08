@@ -1,8 +1,10 @@
+// 本文件实现 DurableTaskCard 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { Check, LoaderCircle, Play, Workflow, X } from 'lucide-react'
 
 import { StatusBadge } from '../../../components/ui'
 import type { DurableTask } from '../../../types'
 
+// taskStatusLabels 将后台任务状态转换为卡片文案。
 const taskStatusLabels: Record<string, string> = {
   planning: '正在规划',
   running: '执行中',
@@ -10,6 +12,7 @@ const taskStatusLabels: Record<string, string> = {
   needs_recovery: '需要恢复核验',
   blocked: '等待处理',
 }
+// DurableTaskCard 展示持久任务进度、下一次检查时间和取消操作。
 export function DurableTaskCard({
   task,
   onResume,

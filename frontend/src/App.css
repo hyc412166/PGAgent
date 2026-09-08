@@ -1,3 +1,4 @@
+/* 本文件定义 App 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 236px minmax(0, 1fr); }
 .sidebar { position: fixed; z-index: 20; inset: 0 auto 0 0; box-sizing: border-box; width: 236px; min-width: 0; display: flex; flex-direction: column; overflow-x: hidden; padding: 20px 14px 16px; border-right: 1px solid var(--line); background: #f1eee8; transition: width .2s ease, transform .2s ease; }
 .brand { min-height: 50px; display: flex; align-items: center; gap: 10px; padding: 0 7px 16px; border-bottom: 1px solid var(--line); }

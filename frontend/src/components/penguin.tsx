@@ -1,5 +1,7 @@
+// 本文件提供可复用的 penguin 展示组件，供各功能页面组合使用并保持交互表现一致。
 import type { SVGProps } from 'react'
 
+// PenguinMarkProps 在标准 SVG 属性上增加便捷尺寸参数。
 type PenguinMarkProps = SVGProps<SVGSVGElement> & {
   size?: number
 }
@@ -8,6 +10,7 @@ type PenguinMarkProps = SVGProps<SVGSVGElement> & {
  * The small PGAgent mascot is deliberately inline SVG: it keeps the brand
  * available on first paint without adding a network request or a raster asset.
  */
+// PenguinMark 渲染品牌企鹅矢量标记，供侧栏和状态区复用。
 export function PenguinMark({ size = 24, ...props }: PenguinMarkProps) {
   return (
     <svg

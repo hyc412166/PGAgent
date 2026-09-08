@@ -1,7 +1,10 @@
+// 本测试文件验证 contextUsage 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
 import { buildContextUsageView } from './contextUsage'
 
+// 测试分组：上下文圆环显示。
 describe('上下文圆环显示', () => {
+  // 测试场景：按已用和总量计算百分比并格式化辅助说明。
   it('按已用和总量计算百分比并格式化辅助说明', () => {
     const view = buildContextUsageView({
       used_tokens: 89000,
@@ -16,6 +19,7 @@ describe('上下文圆环显示', () => {
     expect(view.tone).toBe('near-limit')
   })
 
+  // 测试场景：达到阈值后切换为自动压缩状态并钳制异常百分比。
   it('达到阈值后切换为自动压缩状态并钳制异常百分比', () => {
     const view = buildContextUsageView({
       used_tokens: 120000,

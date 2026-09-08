@@ -1,3 +1,9 @@
+"""验证网页工具的地址安全分类、逐跳重定向校验、正文提取、错误体限制和命令分发。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import json
@@ -8,9 +14,11 @@ from src.tools import builtins
 from src.tools.sandbox import WorkspaceSandbox
 
 
+# 辅助函数：_install_transport 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _install_transport(monkeypatch, handler) -> None:
     real_client = httpx.Client
 
+    # 辅助方法：client_factory 实现测试替身在此调用阶段需要的最小行为。
     def client_factory(**kwargs):
         kwargs["transport"] = httpx.MockTransport(handler)
         return real_client(**kwargs)
@@ -18,6 +26,7 @@ def _install_transport(monkeypatch, handler) -> None:
     monkeypatch.setattr(builtins.httpx, "Client", client_factory)
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_web_address_classifier_rejects_non_global_ranges 精确标识本用例的具体条件。
 def test_web_address_classifier_rejects_non_global_ranges() -> None:
     assert builtins._is_public_ip("8.8.8.8")
     assert not builtins._is_public_ip("127.0.0.1")
@@ -25,6 +34,7 @@ def test_web_address_classifier_rejects_non_global_ranges() -> None:
     assert not builtins._is_public_ip("169.254.1.1")
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_web_open_extracts_readable_structured_page_and_bounds_content 精确标识本用例的具体条件。
 def test_web_open_extracts_readable_structured_page_and_bounds_content(monkeypatch, tmp_path) -> None:
     markup = """
     <html><head><title>Example story</title>
@@ -53,13 +63,16 @@ def test_web_open_extracts_readable_structured_page_and_bounds_content(monkeypat
     assert result.metadata["next_offset"] == 2_000
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_web_open_follows_redirect_only_after_validating_each_hop 精确标识本用例的具体条件。
 def test_web_open_follows_redirect_only_after_validating_each_hop(monkeypatch, tmp_path) -> None:
     validated: list[str] = []
 
+    # 辅助方法：validate 实现测试替身在此调用阶段需要的最小行为。
     def validate(url: str) -> tuple[str, str]:
         validated.append(url)
         return url, "example.com"
 
+    # 辅助方法：handler 实现测试替身在此调用阶段需要的最小行为。
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/start":
             return httpx.Response(302, headers={"location": "/final"})
@@ -75,6 +88,7 @@ def test_web_open_follows_redirect_only_after_validating_each_hop(monkeypatch, t
     assert result.metadata["redirects"] == ["https://example.com/final"]
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_web_open_does_not_return_large_http_error_body 精确标识本用例的具体条件。
 def test_web_open_does_not_return_large_http_error_body(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(builtins, "_validate_public_http_url", lambda url: (url, "example.com"))
     _install_transport(
@@ -93,6 +107,7 @@ def test_web_open_does_not_return_large_http_error_body(monkeypatch, tmp_path) -
     assert len(result.content) < 100
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_web_run_dispatches_codex_command_families 精确标识本用例的具体条件。
 def test_web_run_dispatches_codex_command_families(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(builtins, "web_search", lambda *_args, **_kwargs: builtins.ToolResult(
         "websearch", True, "hit", metadata={"results": [{"ref_id": "search1", "url": "https://example.com"}]}

@@ -1,4 +1,5 @@
-/* Page rhythm and frosted heading */
+/* 本文件定义 page-layout 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
+/* 页面纵向节奏与毛玻璃标题区。 */
 
 .page {
   width: min(1180px, 100%);

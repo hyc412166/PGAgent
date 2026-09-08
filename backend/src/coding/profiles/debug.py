@@ -1,10 +1,13 @@
 """Debugging workflow policy."""
+# 文件职责：负责代码任务状态、补丁、工作树及验证中的 debug 子模块。
+# 逻辑关系：上层通过 coding/profiles/debug.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
 from .base import WorkflowProfile
 
 
+# 变量说明：DEBUG_PROFILE 表示当前步骤使用的 DEBUG_PROFILE 值。
 DEBUG_PROFILE = WorkflowProfile(
     id="debug",
     direct_tool_names=frozenset({

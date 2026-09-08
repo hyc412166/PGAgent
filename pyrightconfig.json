@@ -1,0 +1,16 @@
+{
+  // 后端源码以 backend 作为 Python 导入根目录，`src.*` 包从这里解析。
+  "include": [
+    "backend/src",
+    "backend/tests"
+  ],
+  "executionEnvironments": [
+    {
+      "root": "backend",
+      "extraPaths": [
+        "backend"
+      ]
+    }
+  ],
+  "pythonVersion": "3.12"
+}

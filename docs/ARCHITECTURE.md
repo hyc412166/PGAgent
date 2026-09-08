@@ -53,6 +53,12 @@ Review profile 额外形成只读工作流上限：即使 Agent 配置误选了�
 - `ask`：写入、命令、委派与联网均须批准；`smart`：低风险读取和受限公网读取自动执行，写入、命令和委派须批准；`full`：无需批准，但仍保留上述基础安全边界。
 - 事件流提供 `model_step_started`、`tool_started`、`tool_finished` 和终态事件，携带安全参数摘要和耗时；工具结果正文、写入正文、Token/API Key 不写入时间线事件。
 
+## 运行诊断与日志
+
+PGAgent 使用两层诊断记录。SQLite `run_events` 保存可恢复、可分页的运行时间线，每条记录带有同一 Run 内递增的 `sequence`，并通过 `trace_id/run_id/turn_id/step/tool_call_id` 关联一次用户请求、模型步骤和工具调用；这些记录不会自动删除。浏览器的历史接口与 SSE 只返回同一套安全投影，运行快照、完整参数、模型输入输出、工具结果、文件正文、stdout/stderr 和凭据不会进入公开响应。
+
+本地结构化日志写入 `data/logs/pgagent-*.jsonl`，用于保留运行边界和异常堆栈。文件按 UTC 日期及 20 MB 大小分片，默认保留 14 天；路径、保留期和单片大小可通过 `PGAGENT_LOG_DIR`、`PGAGENT_LOG_RETENTION_DAYS`、`PGAGENT_LOG_MAX_BYTES` 调整。日志写入失败会输出一条受限的 stderr 诊断，但不会重放模型或工具，也不会改变 Run 的真实结果。本地 JSONL 不通过 HTTP API 提供。
+
 ### MCP 工具运行时
 
 启用内置 `MCP` 能力后，`McpRuntimePool` 以 PGAgent Session 为统一清理边界，并以 `(session, runtime scope, resolved workspace root)` 区分连接集合。主 Agent 的 scope 是会话，使用 `eager` 策略；每个委派 SubAgent 以自己的 Run ID 持有独立 scope，使用 `lazy_when_cached`，不会与父 Agent 或其他 SubAgent 共享连接状态。stdio server 由 SDK 作为子进程启动，Streamable HTTP 使用同一异步 Client 接口且不跟随 HTTP 重定向。每个 server 独立完成协议协商和 `tools/list`；required server 在没有缓存且启动失败时阻止本次运行，可选 server 失败只记录状态。目录刷新失败时保留该连接最后一次成功发现的工具，并标记为 degraded。

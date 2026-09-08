@@ -1,3 +1,9 @@
+"""验证用量统计 API 的总计、分组、时间范围和孤立记录过滤。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -13,7 +19,9 @@ from src.persistence.database import Base, Run, Session as ChatSession, UsageRec
 
 
 @pytest.fixture()
+# 测试夹具：client 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def client(tmp_path: Path) -> TestClient:
+    # 临时数据库保存运行用量明细；test_client 通过统计路由验证汇总、分组和范围过滤。
     configure_database(f"sqlite:///{(tmp_path / 'usage.db').as_posix()}")
     init_db()
     app = FastAPI()
@@ -23,6 +31,7 @@ def client(tmp_path: Path) -> TestClient:
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_empty_usage_aggregates_are_zero 精确标识本用例的具体条件。
 def test_empty_usage_aggregates_are_zero(client: TestClient) -> None:
     summary = client.get("/api/usage/summary")
     assert summary.status_code == 200
@@ -40,6 +49,7 @@ def test_empty_usage_aggregates_are_zero(client: TestClient) -> None:
     assert client.get("/api/usage/runs/missing-run").json() is None
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_usage_summary_and_model_groups 精确标识本用例的具体条件。
 def test_usage_summary_and_model_groups(client: TestClient) -> None:
     with database.SessionLocal() as db:
         db.add_all([
@@ -81,6 +91,7 @@ def test_usage_summary_and_model_groups(client: TestClient) -> None:
     assert models[0]["cache_hit_rate"] == pytest.approx(130 / 300)
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_usage_range_filters_apply_to_summary_and_model_groups 精确标识本用例的具体条件。
 def test_usage_range_filters_apply_to_summary_and_model_groups(client: TestClient) -> None:
     earlier = datetime(2026, 1, 10, tzinfo=timezone.utc)
     later = earlier + timedelta(days=1)
@@ -117,6 +128,7 @@ def test_usage_range_filters_apply_to_summary_and_model_groups(client: TestClien
     }]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_usage_session_and_workspace_groups 精确标识本用例的具体条件。
 def test_usage_session_and_workspace_groups(client: TestClient) -> None:
     with database.SessionLocal() as db:
         workspace = Workspace(id="workspace-a", name="Alpha", root_path="C:/work/alpha")
@@ -187,6 +199,7 @@ def test_usage_session_and_workspace_groups(client: TestClient) -> None:
     }
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_usage_group_ranges_exclude_orphan_records 精确标识本用例的具体条件。
 def test_usage_group_ranges_exclude_orphan_records(client: TestClient) -> None:
     earlier = datetime(2026, 1, 10, tzinfo=timezone.utc)
     later = earlier + timedelta(days=1)
@@ -214,6 +227,7 @@ def test_usage_group_ranges_exclude_orphan_records(client: TestClient) -> None:
     assert workspaces.json() == []
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_orphan_placeholder_usage_is_excluded_from_every_user_facing_aggregate 精确标识本用例的具体条件。
 def test_orphan_placeholder_usage_is_excluded_from_every_user_facing_aggregate(client: TestClient) -> None:
     with database.SessionLocal() as db:
         workspace = Workspace(id="workspace-a", name="Alpha", root_path="C:/work/alpha")

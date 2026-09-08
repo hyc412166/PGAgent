@@ -1,3 +1,4 @@
+// 本文件实现 useRunTransport 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { useCallback } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { api, apiUrl } from '../../../api'
@@ -6,12 +7,14 @@ import type { RunStreamEvent } from '../../../sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, thinkingStatusForRun, updateThoughtTimeline } from '../../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../../thoughtTimeline'
 import type { Approval, Run, RunEvent } from '../../../types'
-import { emptyLiveRun, runStreamEventNames } from '../sessionState'
+import { emptyLiveRun, runStreamEventNames, runThinkingStartedAt } from '../sessionState'
 import type { LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns } from '../sessionState'
 
+// MutableRef 和 LoadState 描述该 Hook 接收的可变引用及 useApiData 状态形状。
 type MutableRef<T> = { current: T }
 type LoadState<T> = { data: T; loading: boolean; error: string }
 
+// RunTransportOptions 汇集运输层需要读取的引用、需要推进的状态，以及终态时触发的数据刷新函数。
 type RunTransportOptions = {
   activeIdRef: MutableRef<string>
   eventSourceRef: MutableRef<EventSource | null>
@@ -37,6 +40,7 @@ type RunTransportOptions = {
   refreshDurableTask: () => Promise<unknown>
 }
 
+// 管理单次运行的 SSE 生命周期，并在流不可用时回退为轮询；会话页只负责触发和展示。
 export function useRunTransport(options: RunTransportOptions) {
   const {
     activeIdRef, eventSourceRef, fallbackTimerRef, streamReconnectTimerRef, streamErrorCountRef,
@@ -46,6 +50,7 @@ export function useRunTransport(options: RunTransportOptions) {
     refreshTeammates, refreshDurableTask,
   } = options
 
+  // 关闭全部运输资源并清空重连计数，供切换会话、终态和组件卸载共同调用。
   const closeRunTransport = useCallback(() => {
     eventSourceRef.current?.close()
     eventSourceRef.current = null
@@ -61,6 +66,7 @@ export function useRunTransport(options: RunTransportOptions) {
     streamRunIdRef.current = ''
   }, [eventSourceRef, fallbackTimerRef, streamErrorCountRef, streamReconnectTimerRef, streamRunIdRef])
 
+  // 同步等待审批的运行与审批单，使两组状态在同一次刷新中保持一致。
   const refreshApprovalsForSession = useCallback(async (sessionId: string) => {
     if (!sessionId || activeIdRef.current !== sessionId) return undefined
     try {
@@ -74,9 +80,7 @@ export function useRunTransport(options: RunTransportOptions) {
       )))
       if (activeIdRef.current !== sessionId) return undefined
       const data = groups.flat()
-      // The approval rows and the run status must advance together.  Without
-      // this state update, visibleApprovals still filters against the previous
-      // run list until the user changes tabs.
+      // 审批行与运行状态必须同步推进，否则 visibleApprovals 会一直用旧运行列表过滤到切换页面为止。
       setRunsState({ data: { ownerSessionId: sessionId, items: latestRuns }, loading: false, error: '' })
       setApprovalsState({ data, loading: false, error: '' })
       return data
@@ -85,13 +89,12 @@ export function useRunTransport(options: RunTransportOptions) {
     }
   }, [activeIdRef, setApprovalsState, setRunsState])
 
+  // 在终态边界关闭流、补齐中断草稿、固化思考时间线，并刷新后端权威消息与运行状态。
   const syncTerminalRun = useCallback(async (runId: string, event?: RunStreamEvent, sessionId = activeIdRef.current) => {
     const syncVersion = ++terminalSyncVersionRef.current
     closeRunTransport()
     let resolvedEvent = event
-    // When SSE was unavailable, the polling fallback only knows the terminal
-    // Run status. Recover the persisted interruption payload so a stopped run
-    // still exposes its partial draft for the edit action.
+    // SSE 不可用时轮询只知道终态；需读取持久化中断事件，恢复可供“编辑”操作使用的部分草稿。
     if (event?.type === 'run_state' && event.status === 'stopped' && !event.partial_output) {
       try {
         const persistedEvents = await api.list<RunEvent>(`/api/runs/${encodeURIComponent(runId)}/events`, ['events'])
@@ -105,7 +108,7 @@ export function useRunTransport(options: RunTransportOptions) {
           resolvedEvent = { ...event, partial_output: payload.partial_output, partial_thought: payload.partial_thought }
         }
       } catch {
-        // The regular Run status/message refresh below remains authoritative.
+        // 读取失败时仍以后续常规运行/消息刷新为权威状态。
       }
     }
     const stoppedTerminal = resolvedEvent?.type === 'run_interrupted' || resolvedEvent?.type === 'run_stopped'
@@ -124,9 +127,7 @@ export function useRunTransport(options: RunTransportOptions) {
       ? updateThoughtTimeline(liveRunRef.current.thought, resolvedEvent)
       : liveRunRef.current.thought
     if (runId && hasVisibleCompletedThought(terminalThought)) {
-      // Commit the live timeline at the terminal boundary itself. This avoids
-      // depending on a later React effect that can be overtaken by the next
-      // turn or a session navigation.
+      // 在终态边界立即固化时间线，避免稍后的 React effect 被下一轮或会话切换抢先覆盖。
       setCompletedThoughtsByRun((current) => ({ ...current, [runId]: terminalThought }))
     }
     setLiveRun((previous) => ({
@@ -169,6 +170,7 @@ export function useRunTransport(options: RunTransportOptions) {
     terminalSyncVersionRef,
   ])
 
+  // 启动低频轮询兜底：SSE 中断后查询运行状态，直到终态或恢复等待点。
   const startRunFallback = useCallback((runId: string, sessionId = activeIdRef.current) => {
     eventSourceRef.current?.close()
     eventSourceRef.current = null
@@ -227,7 +229,8 @@ export function useRunTransport(options: RunTransportOptions) {
     setLiveRun, streamReconnectTimerRef, streamRunIdRef, syncTerminalRun,
   ])
 
-  const startRunStream = useCallback((runId: string, sessionId = activeIdRef.current) => {
+  // 建立指定运行的 EventSource，统一处理所有命名事件、去重、重连和终态同步。
+  const startRunStream = useCallback((runId: string, sessionId = activeIdRef.current, persistedStartedAt?: string) => {
     if (!runId || activeIdRef.current !== sessionId) return
     if (streamRunIdRef.current === runId && eventSourceRef.current) return
     eventSourceRef.current?.close()
@@ -251,7 +254,9 @@ export function useRunTransport(options: RunTransportOptions) {
       draft: previous.runId === runId ? previous.draft : '',
       status: 'connecting',
       error: '',
-      thought: previous.runId === runId ? previous.thought : { ...emptyThoughtTimeline, startedAt: Date.now() },
+      thought: previous.runId === runId
+        ? previous.thought
+        : { ...emptyThoughtTimeline, startedAt: runThinkingStartedAt(persistedStartedAt) },
       thinkingStatus: previous.thinkingStatus || thinkingStatusForRun(runId),
     }))
 
@@ -288,9 +293,7 @@ export function useRunTransport(options: RunTransportOptions) {
         ...previous,
         runId,
         phase: runStreamPhase(parsed),
-        // Text received before a tool call is model progress, not the final
-        // answer.  Move it to the safe thought summary and clear the live
-        // answer draft as soon as the tool turn actually starts.
+        // 工具调用前收到的文本属于模型进度而非最终回答；工具真正开始时将其移入安全思考摘要并清空回答草稿。
         draft: parsed.type === 'tool_started' || parsed.type === 'tool_call'
           ? ''
           : appendAssistantDelta(previous.draft, parsed),

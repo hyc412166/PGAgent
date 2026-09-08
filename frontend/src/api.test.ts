@@ -1,12 +1,15 @@
+// 本测试文件验证 api 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, api, describeError } from './api'
-import type { MemorySettings } from './types'
+import type { MemorySettings, RunEventFilters } from './types'
 
 afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+// 测试分组：API 客户端。
 describe('API 客户端', () => {
+  // 测试场景：可以从常见的命名字段中解包列表。
   it('可以从常见的命名字段中解包列表', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ workspaces: [{ id: 'ws-1', name: '示例工作区' }] }),
@@ -17,6 +20,7 @@ describe('API 客户端', () => {
     expect(result).toEqual([{ id: 'ws-1', name: '示例工作区' }])
   })
 
+  // 测试场景：后端不可连接时返回明确的本地服务错误。
   it('后端不可连接时返回明确的本地服务错误', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
 
@@ -27,6 +31,7 @@ describe('API 客户端', () => {
     })
   })
 
+  // 测试场景：保留后端返回的业务错误详情。
   it('保留后端返回的业务错误详情', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ detail: 'API Key 无效' }),
@@ -42,6 +47,7 @@ describe('API 客户端', () => {
     }
   })
 
+  // 测试场景：会话模型可以通过 PATCH 切换或恢复自动继承。
   it('会话模型可以通过 PATCH 切换或恢复自动继承', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ id: 'session-1', model_id: null }),
@@ -57,6 +63,7 @@ describe('API 客户端', () => {
     }))
   })
 
+  // 测试场景：可以读取和更新全局记忆开关。
   it('可以读取和更新全局记忆开关', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(
@@ -78,6 +85,7 @@ describe('API 客户端', () => {
     }))
   })
 
+  // 测试场景：可以通过 DELETE 永久删除一条会话。
   it('可以通过 DELETE 永久删除一条会话', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
     vi.stubGlobal('fetch', fetchMock)
@@ -89,6 +97,7 @@ describe('API 客户端', () => {
     }))
   })
 
+  // 测试场景：原生文件夹选择使用无路径参数的本地 POST 接口。
   it('原生文件夹选择使用无路径参数的本地 POST 接口', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ path: 'C:\\Projects\\PGAgent' }),
@@ -101,6 +110,7 @@ describe('API 客户端', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/system/select-folder', expect.objectContaining({ method: 'POST' }))
   })
 
+  // 测试场景：multipart 请求交给浏览器生成 Content-Type boundary。
   it('multipart 请求交给浏览器生成 Content-Type boundary', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ id: 'run-1' }),
@@ -118,6 +128,7 @@ describe('API 客户端', () => {
     expect(new Headers(options.headers).has('Content-Type')).toBe(false)
   })
 
+  // 测试场景：运行中的会话配置冲突会保留后端 409 提示。
   it('运行中的会话配置冲突会保留后端 409 提示', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ detail: '运行或审批期间不能更改模型配置' }),
@@ -128,5 +139,33 @@ describe('API 客户端', () => {
       status: 409,
       message: '运行或审批期间不能更改模型配置',
     })
+  })
+
+  // 测试场景：运行事件请求完整传递诊断筛选与游标，并保留分页响应。
+  it('运行事件请求完整传递诊断筛选与游标', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({
+        items: [{ id: 'event-42', run_id: 'run/42', event_type: 'model_retry', sequence: 42, step: 3, payload: {}, created_at: '2026-09-08T08:00:00Z' }],
+        next_before: 42,
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+    const filters = {
+      event_type: 'model_retry',
+      step: 3,
+      errors_only: true,
+      before: 64,
+      limit: 25,
+    } satisfies RunEventFilters
+
+    await expect(api.listRunEvents('run/42', filters)).resolves.toMatchObject({
+      items: [expect.objectContaining({ id: 'event-42', sequence: 42 })],
+      next_before: 42,
+    })
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/runs/run%2F42/events?event_type=model_retry&step=3&errors_only=true&before=64&limit=25',
+      expect.objectContaining({ headers: expect.any(Object) }),
+    )
   })
 })

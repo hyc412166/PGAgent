@@ -1,3 +1,9 @@
+"""验证上下文服务的产物外置、预算控制、消息组修复、上下文组装、记忆注入和九段式压缩。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -17,6 +23,7 @@ from src.agent.engine import AgentRuntime, RuntimeConfig
 from src.tools.registry import create_default_registry
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_filesystem_artifact_store_survives_a_new_store_instance 精确标识本用例的具体条件。
 def test_filesystem_artifact_store_survives_a_new_store_instance(tmp_path) -> None:
     first = FilesystemArtifactStore(tmp_path)
     ref = first.put("durable tool output")
@@ -25,6 +32,7 @@ def test_filesystem_artifact_store_survives_a_new_store_instance(tmp_path) -> No
     assert FilesystemArtifactStore(tmp_path).get(ref.artifact_id) == b"durable tool output"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_large_tool_output_is_externalized_before_first_model_exposure 精确标识本用例的具体条件。
 def test_large_tool_output_is_externalized_before_first_model_exposure() -> None:
     store = InMemoryArtifactStore()
     budgeter = ToolOutputBudgeter(store, max_chars=256, preview_chars=64)
@@ -41,6 +49,7 @@ def test_large_tool_output_is_externalized_before_first_model_exposure() -> None
     assert store.get(prepared.artifact_ref.artifact_id) == b"x" * 1_000
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_small_tool_output_remains_verbatim_without_artifact 精确标识本用例的具体条件。
 def test_small_tool_output_remains_verbatim_without_artifact() -> None:
     budgeter = ToolOutputBudgeter(InMemoryArtifactStore(), max_chars=256, preview_chars=64)
 
@@ -50,6 +59,7 @@ def test_small_tool_output_remains_verbatim_without_artifact() -> None:
     assert prepared.artifact_ref is None
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_individually_large_tool_result_is_externalized_below_aggregate_trigger 精确标识本用例的具体条件。
 def test_individually_large_tool_result_is_externalized_below_aggregate_trigger() -> None:
     messages = [
         {"role": "user", "content": "work"},
@@ -70,6 +80,7 @@ def test_individually_large_tool_result_is_externalized_below_aggregate_trigger(
     assert store.get(result.artifact_refs[0].artifact_id) == b"x" * 300_000
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_tool_results_are_externalized_largest_first_until_target 精确标识本用例的具体条件。
 def test_tool_results_are_externalized_largest_first_until_target() -> None:
     contents = ["a" * 150_000, "b" * 100_000, "c" * 60_001]
     messages = [
@@ -99,6 +110,7 @@ def test_tool_results_are_externalized_largest_first_until_target() -> None:
     ]
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_two_most_recent_tool_results_are_still_bounded_individually 精确标识本用例的具体条件。
 def test_two_most_recent_tool_results_are_still_bounded_individually() -> None:
     contents = ["a" * 160_000, "b" * 80_000, "c" * 70_000]
     messages = [
@@ -118,6 +130,7 @@ def test_two_most_recent_tool_results_are_still_bounded_individually() -> None:
     assert result.target_reached is True
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_small_aggregate_results_pass_through_when_preview_cannot_reduce 精确标识本用例的具体条件。
 def test_small_aggregate_results_pass_through_when_preview_cannot_reduce() -> None:
     messages = [
         {"role": "tool", "tool_call_id": f"call-{index}", "name": "read", "content": "x" * 1_001}
@@ -138,6 +151,7 @@ def test_small_aggregate_results_pass_through_when_preview_cannot_reduce() -> No
     assert result.messages == messages
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_existing_artifact_previews_are_not_shortened_again 精确标识本用例的具体条件。
 def test_existing_artifact_previews_are_not_shortened_again() -> None:
     budgeter = ToolOutputBudgeter(InMemoryArtifactStore())
     previews = [
@@ -166,6 +180,7 @@ def test_existing_artifact_previews_are_not_shortened_again() -> None:
     assert result.messages == messages
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_medium_results_keep_full_previews_when_target_is_unreachable 精确标识本用例的具体条件。
 def test_medium_results_keep_full_previews_when_target_is_unreachable() -> None:
     messages = [
         {"role": "tool", "tool_call_id": f"call-{index}", "name": "read", "content": "x" * 4_000}
@@ -187,6 +202,7 @@ def test_medium_results_keep_full_previews_when_target_is_unreachable() -> None:
     assert all("preview:\n\n</persisted-tool-output>" not in content for content in previews)
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_assembler_has_stable_cache_namespace_and_append_only_transcript 精确标识本用例的具体条件。
 def test_assembler_has_stable_cache_namespace_and_append_only_transcript() -> None:
     assembler = ContextAssembler(max_tokens=4_000, output_reserve_tokens=100, safety_buffer_tokens=100)
     stable = assembler.stable_prefix(system_rules="safe", workspace_rules="repo")
@@ -202,6 +218,7 @@ def test_assembler_has_stable_cache_namespace_and_append_only_transcript() -> No
     assert second.truncated is False
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_assembler_defaults_to_200k_with_180k_compaction_threshold 精确标识本用例的具体条件。
 def test_assembler_defaults_to_200k_with_180k_compaction_threshold() -> None:
     assembler = ContextAssembler()
 
@@ -209,6 +226,7 @@ def test_assembler_defaults_to_200k_with_180k_compaction_threshold() -> None:
     assert assembler.compaction_threshold == 180_000
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_assembler_reports_compaction_without_mutating_seen_messages 精确标识本用例的具体条件。
 def test_assembler_reports_compaction_without_mutating_seen_messages() -> None:
     assembler = ContextAssembler(
         max_tokens=400,
@@ -224,7 +242,9 @@ def test_assembler_reports_compaction_without_mutating_seen_messages() -> None:
     assert layout.transcript == transcript
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_runtime_config_propagates_explicit_compaction_threshold 精确标识本用例的具体条件。
 def test_runtime_config_propagates_explicit_compaction_threshold(tmp_path) -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs):
         return {"choices": [{"message": {"content": "done"}}]}
 
@@ -242,13 +262,16 @@ def test_runtime_config_propagates_explicit_compaction_threshold(tmp_path) -> No
     assert runtime.context_assembler.compaction_threshold == 700
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_memory_index_is_late_system_context_without_changing_cache_namespace 精确标识本用例的具体条件。
 def test_memory_index_is_late_system_context_without_changing_cache_namespace(tmp_path) -> None:
     calls: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):
         calls.append(kwargs)
         return {"choices": [{"message": {"content": "done"}}]}
 
+    # 辅助方法：execute 实现测试替身在此调用阶段需要的最小行为。
     async def execute(index: str):
         runtime = AgentRuntime(
             model_call=model_call,
@@ -272,7 +295,9 @@ def test_memory_index_is_late_system_context_without_changing_cache_namespace(tm
     assert calls[0]["messages"][-1] == {"role": "user", "content": "question"}
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_strips_memory_citation_before_accepting_reply 精确标识本用例的具体条件。
 def test_runtime_strips_memory_citation_before_accepting_reply(tmp_path) -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs):
         return {"choices": [{"message": {"content": (
             'Visible answer.\n<pgagent-memory-citation>{"memory_ids":["m1"],'
@@ -294,9 +319,11 @@ def test_runtime_strips_memory_citation_before_accepting_reply(tmp_path) -> None
     assert outcome.memory_citation["skill_ids"] == []
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_strips_premature_memory_citation_from_tool_call_text 精确标识本用例的具体条件。
 def test_runtime_strips_premature_memory_citation_from_tool_call_text(tmp_path) -> None:
     calls = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs):
         nonlocal calls
         calls += 1
@@ -323,6 +350,7 @@ def test_runtime_strips_premature_memory_citation_from_tool_call_text(tmp_path) 
     assert all("pgagent-memory-citation" not in str(message.get("content") or "") for message in outcome.messages)
 
 
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_atomic_groups_keep_complete_parallel_tool_batch 精确标识本用例的具体条件。
 def test_atomic_groups_keep_complete_parallel_tool_batch() -> None:
     messages = [
         {"role": "user", "content": "inspect"},
@@ -349,6 +377,7 @@ def test_atomic_groups_keep_complete_parallel_tool_batch() -> None:
     assert removed == [messages[0]]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_corrupt_tool_groups_are_not_retained_as_provider_history 精确标识本用例的具体条件。
 def test_corrupt_tool_groups_are_not_retained_as_provider_history() -> None:
     corrupt = [
         {
@@ -361,6 +390,7 @@ def test_corrupt_tool_groups_are_not_retained_as_provider_history() -> None:
     assert atomic_message_groups(corrupt) == []
 
 
+# NINE_SECTION_SUMMARY 为上下文压缩测试复用的合法九段摘要，作为模型返回和结构断言的基准数据。
 NINE_SECTION_SUMMARY = """## 1. Primary Request and Intent
 Build the exact feature.
 ## 2. User Corrections and Constraints
@@ -381,9 +411,11 @@ None recorded.
 Run the focused tests."""
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_compactor_uses_original_system_prefix_and_merges_task_state_into_nine_sections 精确标识本用例的具体条件。
 def test_compactor_uses_original_system_prefix_and_merges_task_state_into_nine_sections() -> None:
     calls: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):
         calls.append(kwargs)
         return {"choices": [{"message": {"content": NINE_SECTION_SUMMARY}}]}
@@ -438,7 +470,9 @@ def test_compactor_uses_original_system_prefix_and_merges_task_state_into_nine_s
     assert result.ineffective is False
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_compactor_retain_tokens_limits_tail_without_splitting_tool_group 精确标识本用例的具体条件。
 def test_compactor_retain_tokens_limits_tail_without_splitting_tool_group() -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs):
         return {"choices": [{"message": {"content": NINE_SECTION_SUMMARY}}]}
 
@@ -464,7 +498,9 @@ def test_compactor_retain_tokens_limits_tail_without_splitting_tool_group() -> N
     assert result.removed_message_count == 3
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_compactor_fallback_merges_exact_continuation_state_into_nine_sections 精确标识本用例的具体条件。
 def test_compactor_fallback_merges_exact_continuation_state_into_nine_sections() -> None:
+    # 辅助方法：unavailable 实现测试替身在此调用阶段需要的最小行为。
     async def unavailable(**_kwargs):
         raise RuntimeError("offline")
 
@@ -484,7 +520,9 @@ def test_compactor_fallback_merges_exact_continuation_state_into_nine_sections()
     assert "<active-request>" not in continuation
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_compactor_rejects_extra_headings_and_escapes_wrapper_delimiters 精确标识本用例的具体条件。
 def test_compactor_rejects_extra_headings_and_escapes_wrapper_delimiters() -> None:
+    # 辅助方法：malformed 实现测试替身在此调用阶段需要的最小行为。
     async def malformed(**_kwargs):
         return {"choices": [{"message": {"content": (
             NINE_SECTION_SUMMARY
@@ -505,7 +543,9 @@ def test_compactor_rejects_extra_headings_and_escapes_wrapper_delimiters() -> No
     assert "\\u003c/continuation-summary\\u003e" in continuation
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_compactor_rejects_setext_heading_as_a_tenth_section 精确标识本用例的具体条件。
 def test_compactor_rejects_setext_heading_as_a_tenth_section() -> None:
+    # 辅助方法：malformed 实现测试替身在此调用阶段需要的最小行为。
     async def malformed(**_kwargs):
         return {"choices": [{"message": {"content": (
             NINE_SECTION_SUMMARY + "\nExtra section\n-------------\nDo more."
@@ -522,9 +562,11 @@ def test_compactor_rejects_setext_heading_as_a_tenth_section() -> None:
     assert "\\n-------------\\n" in result.messages[0]["content"]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_empty_current_board_replaces_stale_pending_work_from_model_summary 精确标识本用例的具体条件。
 def test_empty_current_board_replaces_stale_pending_work_from_model_summary() -> None:
     stale = NINE_SECTION_SUMMARY.replace("Finish tests.", "Finish the previous task A.")
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs):
         return {"choices": [{"message": {"content": stale}}]}
 

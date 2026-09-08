@@ -1,3 +1,4 @@
+/* 本文件定义 mcp 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
 .mcp-page { display: grid; gap: 16px; }
 .mcp-page .page-header { margin-bottom: 2px; }
 

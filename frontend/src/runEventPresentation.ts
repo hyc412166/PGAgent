@@ -1,5 +1,7 @@
+// 本文件负责 runEventPresentation 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
 import type { ApiRecord, Run, RunEvent } from './types'
 
+// RunEventFact、Tone 和 Presentation 组成运行事件卡片的纯展示模型。
 export type RunEventFact = { label: string; value: string }
 export type RunEventTone = 'neutral' | 'active' | 'success' | 'warning' | 'danger'
 
@@ -10,6 +12,7 @@ export type RunEventPresentation = {
   tone: RunEventTone
 }
 
+// 事件标题只覆盖公开契约中的已知事件；未知类型统一使用中性描述。
 const eventTitles: Record<string, string> = {
   approval_rejected: '审批已拒绝',
   approval_requested: '等待工具审批',
@@ -52,65 +55,31 @@ const eventTitles: Record<string, string> = {
   user_question_requested: '等待用户补充信息',
 }
 
-const factLabels: Record<string, string> = {
-  accepted: '验收结果',
-  affected_call_count: '受影响调用',
-  after_tokens: '整理后上下文',
-  attempt: '尝试次数',
-  before_tokens: '整理前上下文',
-  changed: '产生变更',
-  code: '状态代码',
-  complete: '步骤完成',
+const diagnosticFactLabels: Record<string, string> = {
+  attempt: '重试次数',
+  retry_attempt: '重试次数',
+  retry_count: '重试次数',
   delay_seconds: '重试等待',
-  duration_ms: '本阶段耗时',
-  elapsed_ms: '运行到',
+  retry_delay_ms: '重试等待',
+  retryable: '可重试',
+  duration_ms: '耗时',
+  elapsed_ms: '耗时',
+  thought_duration_ms: '模型思考耗时',
+  code: '错误代码',
   error_code: '错误代码',
   error_kind: '错误类型',
   error_type: '错误类型',
-  estimated_tokens: '上下文',
-  failed_servers: '不可用服务',
-  has_output: '生成回复',
-  message_id: '消息 ID',
-  model: '模型',
-  ok: '调用成功',
-  omitted_messages: '省略历史消息',
-  output_chars: '回复长度',
-  pending_approval: '等待审批',
-  phase: '阶段',
-  question_chars: '问题长度',
-  reason: '原因',
-  remaining_call_count: '剩余调用',
-  source_count: '来源数量',
-  removed_messages: '移除历史消息',
-  requires_next_message: '需要下一条消息',
-  servers: 'MCP 服务',
-  source: '结果来源',
-  status: '状态',
-  step: '步骤',
-  thought_duration_ms: '模型思考耗时',
-  tool_call_id: '调用 ID',
-  tool_count: '可用工具',
-  trace_id: '追踪 ID',
-  turn_id: '对话轮次 ID',
+  child_run_id: '子运行 ID',
+  child_agent_id: '子 Agent ID',
+  delegation_id: '委派 ID',
+  task_id: '子任务 ID',
+  background_job_id: '后台任务 ID',
+  job_id: '后台任务 ID',
 }
 
-const argumentLabels: Record<string, string> = {
-  command: '命令',
-  depth: '快照深度',
-  element: '元素描述',
-  file_path: '文件',
-  path: '路径',
-  pattern: '匹配规则',
-  query: '查询内容',
-  recursive: '递归',
-  submit: '提交',
-  target: '目标',
-  task: '子任务',
-  text: '输入内容',
-  todos: '任务项',
-  url: '网址',
-}
+const diagnosticFactKeys = Object.keys(diagnosticFactLabels)
 
+// 以下窄化和格式化函数把不可信事件 payload 转成稳定、长度受控的展示文本。
 function record(value: unknown): ApiRecord | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as ApiRecord : undefined
 }
@@ -134,72 +103,18 @@ function formatDuration(milliseconds: number): string {
   return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} 秒`
 }
 
-function formatArgumentValue(key: string, value: unknown): string {
-  const structured = record(value)
-  if (key === 'command' && structured) {
-    const commandText = text(structured.text)
-    if (commandText) return commandText
-    const executable = text(structured.executable) || '已提供命令'
-    const count = number(structured.argument_count)
-    return count === undefined ? executable : `${executable} · ${count} 个参数`
-  }
-  if (structured) {
-    const textValue = text(structured.text)
-    if (textValue) return textValue
-    const chars = number(structured.chars)
-    if (chars !== undefined) return `${chars} 个字符`
-    const count = number(structured.count)
-    if (count !== undefined) return `${count} 项`
-    const argumentCount = number(structured.argument_count)
-    if (argumentCount !== undefined) return `${argumentCount} 个参数`
-    if (typeof structured.provided === 'boolean') return structured.provided ? '已提供' : '未提供'
-  }
-  if (typeof value === 'boolean') return value ? '是' : '否'
-  if (typeof value === 'number') return new Intl.NumberFormat('zh-CN').format(value)
-  if (typeof value === 'string') return truncate(value, 180)
-  return truncate(JSON.stringify(value), 180)
-}
-
+// 安全诊断字段只接受标量；对象和数组不会被序列化到界面。
 function formatFactValue(key: string, value: unknown): string {
   const numeric = number(value)
   if (key.endsWith('_ms') && numeric !== undefined) return formatDuration(numeric)
   if (key === 'delay_seconds' && numeric !== undefined) return `${numeric} 秒`
-  if (['estimated_tokens', 'before_tokens', 'after_tokens'].includes(key) && numeric !== undefined) {
-    return `${new Intl.NumberFormat('zh-CN').format(numeric)} Token`
-  }
-  if (['omitted_messages', 'removed_messages'].includes(key) && numeric !== undefined) return `${numeric} 条`
-  if (key === 'tool_count' && numeric !== undefined) return `${numeric} 个`
-  if (key === 'output_chars' && numeric !== undefined) return `${numeric} 个字符`
-  if (key === 'question_chars' && numeric !== undefined) return `${numeric} 个字符`
-  if (key === 'remaining_call_count' && numeric !== undefined) return `${numeric} 次`
-  if (key === 'affected_call_count' && numeric !== undefined) return `${numeric} 次`
-  if (key === 'step' && numeric !== undefined) return `第 ${numeric} 步`
-  if (typeof value === 'string') {
-    const controlledValues: Record<string, string> = {
-      cancelled: '已取消',
-      completed: '已完成',
-      failed: '失败',
-      model: '模型',
-      model_output: '模型输出',
-      running: '运行中',
-      stopped: '已停止',
-    }
-    if (controlledValues[value]) return controlledValues[value]
-  }
   if (typeof value === 'boolean') return value ? '是' : '否'
   if (numeric !== undefined) return new Intl.NumberFormat('zh-CN').format(numeric)
-  if (Array.isArray(value)) {
-    const rendered = value.map((item) => {
-      if (typeof item === 'string') return item
-      const itemRecord = record(item)
-      return itemRecord ? [text(itemRecord.name), text(itemRecord.error_code)].filter(Boolean).join('：') : ''
-    }).filter(Boolean)
-    return rendered.length ? rendered.join('、') : '无'
-  }
   if (typeof value === 'string') return truncate(value, 180)
-  return truncate(JSON.stringify(value), 180)
+  return ''
 }
 
+// 由事件类型和结果状态决定视觉语气。
 function toneFor(type: string, payload: ApiRecord): RunEventTone {
   if (type.includes('failed') || type === 'run_interrupted' || type === 'completion_verification_rejected') return 'danger'
   if (type === 'mcp_degraded' || type.includes('stopped') || type === 'approval_requested') return 'warning'
@@ -208,6 +123,7 @@ function toneFor(type: string, payload: ApiRecord): RunEventTone {
   return 'neutral'
 }
 
+// 提炼事件最重要的一行详情，供运行时间线快速扫描。
 function eventDetail(type: string, payload: ApiRecord): string {
   const message = text(payload.message_excerpt)
   if (type === 'context_prepared' || type === 'context_resumed') {
@@ -251,50 +167,41 @@ function eventDetail(type: string, payload: ApiRecord): string {
   return text(payload.summary) || text(payload.reason) || '运行状态已更新'
 }
 
+// 把后端 RunEvent 完整转换为事件标题、详情、事实列表和语气。
 export function presentRunEvent(event: RunEvent): RunEventPresentation {
   const type = text(event.type) || text(event.event_type) || 'runtime_event'
   const payload = record(event.payload) ?? {}
+  const knownEvent = type in eventTitles || ['tool_started', 'tool_call', 'tool_finished', 'tool_result'].includes(type)
+  if (!knownEvent) {
+    return { title: '运行事件', detail: '记录了一项运行状态变化', facts: [], tone: 'neutral' }
+  }
   const toolName = text(payload.tool_name) || '未知工具'
   const title = type === 'tool_started' || type === 'tool_call'
     ? `开始调用 ${toolName}`
     : type === 'tool_finished' || type === 'tool_result'
       ? payload.ok === false ? `${toolName} 调用失败` : `${toolName} 调用完成`
-      : eventTitles[type] || type.replaceAll('_', ' ')
+      : eventTitles[type]
   const detail = type === 'tool_started' || type === 'tool_call'
     ? '工具正在执行'
     : type === 'tool_finished' || type === 'tool_result'
       ? payload.ok === false ? '工具返回了失败结果' : '工具已经返回结果'
       : eventDetail(type, payload)
   const facts: RunEventFact[] = []
-  const argumentsRecord = record(payload.arguments)
-  if (argumentsRecord) {
-    for (const [key, value] of Object.entries(argumentsRecord)) {
-      facts.push({ label: argumentLabels[key] || key, value: formatArgumentValue(key, value) })
-    }
-  }
-  const request = record(payload.request)
-  if (request) {
-    const requestedTool = text(request.tool_name)
-    if (requestedTool) facts.push({ label: '工具', value: requestedTool })
-    const requestArguments = record(request.arguments)
-    if (requestArguments) {
-      for (const [key, value] of Object.entries(requestArguments)) {
-        facts.push({ label: argumentLabels[key] || key, value: formatArgumentValue(key, value) })
-      }
-    }
-  }
-  const excluded = new Set(['arguments', 'request', 'message_excerpt', 'summary', 'progress', 'status_text', 'activity', 'failure_reason', 'partial_output', 'partial_thought', 'tool_name'])
-  for (const [key, value] of Object.entries(payload)) {
-    if (excluded.has(key) || value === undefined || value === null) continue
-    facts.push({ label: factLabels[key] || key, value: formatFactValue(key, value) })
+  for (const key of diagnosticFactKeys) {
+    const value = payload[key]
+    if (value === undefined || value === null) continue
+    const rendered = formatFactValue(key, value)
+    if (rendered) facts.push({ label: diagnosticFactLabels[key], value: rendered })
   }
   return { title, detail, facts, tone: toneFor(type, payload) }
 }
 
+// 为运行记录生成优先使用目标、计划或 ID 的主标题。
 export function runDisplayTitle(run: Run): string {
   return run.session_title || run.title || run.agent_name || `运行 ${run.id.slice(0, 8)}`
 }
 
+// 生成运行列表次要说明，补充 Agent 或会话关联。
 export function runSecondaryLabel(run: Run): string {
   const kindLabels: Record<string, string> = {
     initial: '初始运行',
@@ -304,6 +211,7 @@ export function runSecondaryLabel(run: Run): string {
   return [kindLabels[run.run_kind || ''] || '运行', run.agent_name, run.id.slice(0, 8)].filter(Boolean).join(' · ')
 }
 
+// 将事件绝对时间转换为本地时分秒。
 export function formatRunEventTime(value?: string): string {
   if (!value) return '—'
   const date = new Date(value)
@@ -318,6 +226,7 @@ export function formatRunEventTime(value?: string): string {
   }).format(date)
 }
 
+// 计算事件相对运行开始时间，便于分析各阶段耗时。
 export function formatRunEventOffset(value: string | undefined, startedAt: string | undefined): string {
   if (!value || !startedAt) return ''
   const elapsed = new Date(value).getTime() - new Date(startedAt).getTime()

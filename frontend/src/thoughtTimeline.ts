@@ -1,5 +1,7 @@
+// 本文件负责 thoughtTimeline 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
 import type { RunStreamEvent } from './sessionStream'
 
+// ThoughtToolItem 表示思考时间线中一次工具调用的开始、结束和结果摘要。
 export interface ThoughtToolItem {
   id: string
   name: string
@@ -12,9 +14,11 @@ export interface ThoughtToolItem {
  * Only model-authored, user-visible progress is shown here. Provider
  * reasoning summaries remain outside the presentation timeline.
  */
+// ActivityKind/Icon 分别表达活动语义和对应的视觉图标类别。
 export type ThoughtActivityKind = 'thought' | 'tool' | 'context' | 'approval' | 'task' | 'event'
 export type ThoughtActivityIcon = 'think' | 'read' | 'write' | 'edit' | 'search' | 'shell' | 'task' | 'approval' | 'context' | 'generic'
 
+// ThoughtActivityItem 是用户可见的单条推理活动摘要。
 export interface ThoughtActivityItem {
   id: string
   kind: ThoughtActivityKind
@@ -24,6 +28,7 @@ export interface ThoughtActivityItem {
   status: 'running' | 'completed' | 'failed'
 }
 
+// ThoughtTimelineState 聚合当前运行的思考文本、活动、工具项和计时边界。
 export interface ThoughtTimelineState {
   startedAt: number | null
   elapsedMs: number
@@ -34,6 +39,7 @@ export interface ThoughtTimelineState {
   conclusion?: string
 }
 
+// emptyThoughtTimeline 是每轮运行开始时的不可变初始快照。
 export const emptyThoughtTimeline: ThoughtTimelineState = {
   startedAt: null,
   elapsedMs: 0,
@@ -43,6 +49,7 @@ export const emptyThoughtTimeline: ThoughtTimelineState = {
   activeItemId: undefined,
 }
 
+// thinkingPhrases/faces 为等待模型首个可见事件时提供稳定但友好的状态占位。
 const thinkingPhrases = [
   '翻抽屉找思路中…',
   '正在召唤灵感中…',
@@ -74,12 +81,14 @@ const thinkingFaces = [
   '(｡•́‿•̀｡)',
 ] as const
 
+// 使用可注入随机源选择状态，便于测试覆盖边界。
 export function pickThinkingStatus(random: () => number = Math.random): string {
   const phraseIndex = Math.min(thinkingPhrases.length - 1, Math.max(0, Math.floor(random() * thinkingPhrases.length)))
   const faceIndex = Math.min(thinkingFaces.length - 1, Math.max(0, Math.floor(random() * thinkingFaces.length)))
   return `${thinkingPhrases[phraseIndex]} ${thinkingFaces[faceIndex]}`
 }
 
+// 根据 runId 稳定选择短语，使同一运行重渲染时文案不跳变。
 export function thinkingStatusForRun(runId: string): string {
   let hash = 2166136261
   for (const character of runId || 'pending') hash = Math.imul(hash ^ character.charCodeAt(0), 16777619)
@@ -90,11 +99,13 @@ export function thinkingStatusForRun(runId: string): string {
   })
 }
 
+// 事件类型集合用于识别工具生命周期和整轮终态。
 const toolStartTypes = new Set(['tool_started', 'tool_call'])
 const toolFinishTypes = new Set(['tool_finished', 'tool_result'])
 const terminalTypes = new Set(['run_completed', 'completed', 'run_interrupted', 'run_stopped', 'stopped', 'model_failed', 'integration_failed', 'failed'])
 const terminalStatuses = new Set(['completed', 'stopped', 'failed', 'cancelled'])
 
+// 以下安全提取函数从不同版本事件结构中读取展示字段，并控制敏感或超长内容。
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
 }
@@ -103,6 +114,7 @@ function firstString(...values: unknown[]): string {
   return values.find((value) => typeof value === 'string' && value.trim())?.toString().trim() ?? ''
 }
 
+// 提取工具最有辨识度的目标（路径、查询、命令等）并限制长度。
 export function safeToolTarget(event: RunStreamEvent, maxLength = 72): string {
   const payload = record(event.payload)
   const args = record(event.arguments) ?? record(event.input) ?? record(payload?.arguments) ?? record(payload?.input)
@@ -129,7 +141,7 @@ export function safeToolTarget(event: RunStreamEvent, maxLength = 72): string {
       target = parsed.toString()
     }
   } catch {
-    // File paths are intentionally handled as plain text.
+    // 文件路径按普通文本处理，避免把本地路径误当作可执行链接或富文本。
   }
 
   if (target.length <= maxLength) return target
@@ -138,6 +150,7 @@ export function safeToolTarget(event: RunStreamEvent, maxLength = 72): string {
   return `${target.slice(0, head)}…${target.slice(-tail)}`
 }
 
+// 将内部工具名映射为用户可理解的动作名称。
 export function displayToolName(name: string): string {
   const normalized = name.trim().toLowerCase()
   const labels: Record<string, string> = {
@@ -167,6 +180,7 @@ export function displayToolName(name: string): string {
   return (labels[normalized] ?? name.trim()) || 'Tool'
 }
 
+// 根据工具语义选择读取、写入、搜索、终端或通用图标。
 export function thoughtIconForTool(name: string): ThoughtActivityIcon {
   const normalized = name.trim().toLowerCase()
   if (normalized === 'task' || normalized === 'update_plan' || normalized === 'todowrite' || normalized.includes('delegate')) return 'task'
@@ -298,6 +312,7 @@ function safeActivityDetail(event: RunStreamEvent, toolName = ''): string {
 const safeProgressTypes = new Set(['agent_progress', 'thought_summary', 'activity_update'])
 const contextActivityTypes = new Set(['context_prepared', 'context_resumed', 'context_compacted', 'context_compaction_started', 'context_compaction_finished', 'context_compaction_failed'])
 
+// 将上下文、审批、委派和进度等非工具事件转换为活动条目。
 function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): ThoughtActivityItem | null {
   const type = firstString(event.type, event.event_type).toLowerCase()
   const progress = safeProgressText(event)
@@ -360,9 +375,7 @@ function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): Tho
       kind: 'thought',
       icon: 'think',
       title: '思考',
-      // Keep the generic model-step marker available for the live phase, but
-      // do not make it count as expandable content unless the runtime emits
-      // an explicit safe progress summary.
+      // 保留通用模型步骤供实时阶段显示；只有运行时给出明确的安全进度摘要时才算可展开内容。
       detail: progress,
       status: 'running',
     }
@@ -405,6 +418,7 @@ function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): Tho
   return null
 }
 
+// 纯函数式吸收一个 SSE 事件，推进思考文本、工具状态、活动列表和终态时间。
 export function updateThoughtTimeline(
   state: ThoughtTimelineState,
   event: RunStreamEvent,
@@ -493,8 +507,7 @@ export function updateThoughtTimeline(
         detail: activity.detail || existing.detail,
       }
     } else {
-      // A new model step closes the previous progress marker while tool
-      // entries remain independently tracked below it.
+      // 新模型步骤结束上一条进度标记，工具条目则继续独立跟踪。
       if (activity.kind === 'thought') {
         for (let index = items.length - 1; index >= 0; index -= 1) {
           if (items[index].kind === 'thought' && items[index].status === 'running') {
@@ -536,6 +549,7 @@ export function updateThoughtTimeline(
   return start === state.startedAt ? state : { ...state, startedAt: start }
 }
 
+// 重放持久化事件恢复已完成运行的思考时间线。
 export function timelineFromRunEvents(events: RunStreamEvent[]): ThoughtTimelineState {
   let timeline = emptyThoughtTimeline
   for (const event of events) {
@@ -555,10 +569,12 @@ export function timelineFromRunEvents(events: RunStreamEvent[]): ThoughtTimeline
   return timeline
 }
 
+// 判断终态时间线是否含值得在历史消息上方展示的内容。
 export function hasVisibleCompletedThought(timeline: ThoughtTimelineState): boolean {
   return timeline.finished && (timeline.startedAt !== null || timeline.tools.length > 0 || (timeline.items || []).length > 0)
 }
 
+// 从完整思考内容生成折叠态的一行结论摘要。
 export function summarizeThoughtConclusion(content: string, maxLength = 72): string {
   const firstMeaningfulLine = content
     .replace(/```[\s\S]*?```/g, '代码内容已生成')
@@ -571,12 +587,14 @@ export function summarizeThoughtConclusion(content: string, maxLength = 72): str
   return `${firstMeaningfulLine.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…`
 }
 
+// 格式化已完成思考耗时。
 export function formatThoughtDuration(milliseconds: number): string {
   if (milliseconds < 1000) return `${Math.max(0, Math.round(milliseconds))}ms`
   const seconds = milliseconds / 1000
   return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`
 }
 
+// 格式化仍在进行中的思考耗时，保留实时感知需要的精度。
 export function formatLiveThinkingDuration(milliseconds: number): string {
-  return `${(Math.max(0, milliseconds) / 1000).toFixed(1)} 秒`
+  return `${Math.floor(Math.max(0, milliseconds) / 1000)} 秒`
 }

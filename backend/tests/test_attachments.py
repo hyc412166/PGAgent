@@ -1,3 +1,9 @@
+"""验证附件上传、会话私有存储、草稿原子创建以及 PDF 文本提取和页面渲染。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -35,10 +41,12 @@ from src.tools.registry import create_default_registry
 
 
 @pytest.fixture()
+# 测试夹具：attachment_client 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def attachment_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[TestClient, Path, list[str]]:
+    # data_dir 是附件与派生产物的私有根目录；scheduled 收集草稿是否真正进入运行调度器。
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     monkeypatch.setattr(
@@ -62,6 +70,7 @@ def attachment_client(
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 辅助函数：_session 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _session() -> str:
     with database.SessionLocal() as db:
         session = Session(
@@ -74,6 +83,7 @@ def _session() -> str:
         return session.id
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_text_attachment_turn_stays_in_private_session_storage 精确标识本用例的具体条件。
 def test_text_attachment_turn_stays_in_private_session_storage(
     attachment_client: tuple[TestClient, Path, list[str]],
 ) -> None:
@@ -123,6 +133,7 @@ def test_text_attachment_turn_stays_in_private_session_storage(
     assert result.content == "one\nline"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_image_attachment_history_keeps_reference_instead_of_base64 精确标识本用例的具体条件。
 def test_image_attachment_history_keeps_reference_instead_of_base64(
     attachment_client: tuple[TestClient, Path, list[str]],
 ) -> None:
@@ -147,6 +158,7 @@ def test_image_attachment_history_keeps_reference_instead_of_base64(
         assert "base64" not in json.dumps(content)
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_attachment_only_draft_is_created_atomically 精确标识本用例的具体条件。
 def test_attachment_only_draft_is_created_atomically(
     attachment_client: tuple[TestClient, Path, list[str]],
 ) -> None:
@@ -176,6 +188,7 @@ def test_attachment_only_draft_is_created_atomically(
         assert message.extra["attachments"][0]["name"] == "report.txt"
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_pdf_tools_extract_text_and_render_a_private_image 精确标识本用例的具体条件。
 def test_pdf_tools_extract_text_and_render_a_private_image(
     attachment_client: tuple[TestClient, Path, list[str]],
 ) -> None:
@@ -214,6 +227,7 @@ def test_pdf_tools_extract_text_and_render_a_private_image(
         assert Path(derivative.storage_path).is_relative_to(data_dir / "artifacts" / session_id)
 
 
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_pdf_render_is_read_only_for_approval_but_not_parallel 精确标识本用例的具体条件。
 def test_pdf_render_is_read_only_for_approval_but_not_parallel(
     attachment_client: tuple[TestClient, Path, list[str]],
 ) -> None:

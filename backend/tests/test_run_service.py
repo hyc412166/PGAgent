@@ -1,3 +1,9 @@
+"""验证运行协调器的启动恢复、结果持久化、压缩提交、审批等待、用量聚合、指令与记忆冻结以及终态一致性。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -36,6 +42,7 @@ from src.tools import create_default_registry
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_coordinator_start_and_shutdown_bind_the_active_event_loop 精确标识本用例的具体条件。
 async def test_coordinator_start_and_shutdown_bind_the_active_event_loop() -> None:
     coordinator = RunCoordinator()
 
@@ -51,6 +58,7 @@ async def test_coordinator_start_and_shutdown_bind_the_active_event_loop() -> No
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_resume_is_queued_until_the_original_run_task_finishes 精确标识本用例的具体条件。
 async def test_resume_is_queued_until_the_original_run_task_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -59,10 +67,12 @@ async def test_resume_is_queued_until_the_original_run_task_finishes(
     release_execute = asyncio.Event()
     resume_started = asyncio.Event()
 
+    # 局部测试函数：fake_execute 模拟该步骤的返回结果或异常。
     async def fake_execute(_run_id: str) -> None:
         execute_started.set()
         await release_execute.wait()
 
+    # 局部测试函数：fake_resume 模拟该步骤的返回结果或异常。
     async def fake_resume(_run_id: str) -> None:
         resume_started.set()
 
@@ -80,7 +90,9 @@ async def test_resume_is_queued_until_the_original_run_task_finishes(
 
 
 @pytest.fixture()
+# 测试夹具：seeded_run 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def seeded_run(tmp_path: Path) -> tuple[str, str]:
+    # 临时数据库中的 session/run 标识组成夹具返回值，供用例驱动协调器并核对消息与终态持久化。
     database.configure_database(f"sqlite:///{(tmp_path / 'run-service.db').as_posix()}")
     database.init_db()
     with database.SessionLocal() as db:
@@ -102,9 +114,11 @@ def seeded_run(tmp_path: Path) -> tuple[str, str]:
 
 
 @pytest.fixture()
+# 测试夹具：accepted_run 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def accepted_run(tmp_path: Path) -> tuple[str, str]:
     """A legacy-shaped accepted user turn without the new delivery linkage."""
 
+    # session_id 与 run_id 指向旧结构的已接收轮次，用于验证兼容修复不会依赖新的投递关联字段。
     database.configure_database(f"sqlite:///{(tmp_path / 'accepted-run.db').as_posix()}")
     database.init_db()
     with database.SessionLocal() as db:
@@ -126,6 +140,7 @@ def accepted_run(tmp_path: Path) -> tuple[str, str]:
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_completed_outcome_persists_snapshot_and_assistant_message 精确标识本用例的具体条件。
 def test_completed_outcome_persists_snapshot_and_assistant_message(seeded_run: tuple[str, str]) -> None:
     run_id, session_id = seeded_run
     outcome = RunOutcome(
@@ -165,6 +180,7 @@ def test_completed_outcome_persists_snapshot_and_assistant_message(seeded_run: t
         assert snapshot is not None and snapshot.payload["guard_snapshot"]["calls"] == 1
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_terminal_stop_without_model_output_still_persists_one_user_reply 精确标识本用例的具体条件。
 def test_terminal_stop_without_model_output_still_persists_one_user_reply(
     accepted_run: tuple[str, str],
 ) -> None:
@@ -196,6 +212,7 @@ def test_terminal_stop_without_model_output_still_persists_one_user_reply(
         assert "追踪号" in replies[0].content
 
 
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_completed_empty_output_is_failed_and_receives_deterministic_reply 精确标识本用例的具体条件。
 def test_completed_empty_output_is_failed_and_receives_deterministic_reply(
     accepted_run: tuple[str, str],
 ) -> None:
@@ -223,6 +240,7 @@ def test_completed_empty_output_is_failed_and_receives_deterministic_reply(
         assert "没有返回可用内容" in reply.content
 
 
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_integration_failure_reply_is_traceable_idempotent_and_sanitized 精确标识本用例的具体条件。
 def test_integration_failure_reply_is_traceable_idempotent_and_sanitized(
     accepted_run: tuple[str, str],
 ) -> None:
@@ -244,6 +262,7 @@ def test_integration_failure_reply_is_traceable_idempotent_and_sanitized(
         assert "追踪号" in replies[0].content
 
 
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_model_failure_status_code_is_preserved_for_classification 精确标识本用例的具体条件。
 def test_model_failure_status_code_is_preserved_for_classification(
     accepted_run: tuple[str, str],
 ) -> None:
@@ -278,6 +297,7 @@ def test_model_failure_status_code_is_preserved_for_classification(
         assert "private upstream response" not in reply.content
 
 
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_parent_failure_fallback_summarizes_mixed_delegated_results 精确标识本用例的具体条件。
 def test_parent_failure_fallback_summarizes_mixed_delegated_results(
     accepted_run: tuple[str, str],
 ) -> None:
@@ -320,6 +340,7 @@ def test_parent_failure_fallback_summarizes_mixed_delegated_results(
         assert turn is not None and turn.execution_status == "partial_failure"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_reconciler_repairs_legacy_terminal_run_without_reply 精确标识本用例的具体条件。
 def test_reconciler_repairs_legacy_terminal_run_without_reply(
     accepted_run: tuple[str, str],
 ) -> None:
@@ -348,6 +369,7 @@ def test_reconciler_repairs_legacy_terminal_run_without_reply(
         assert "模型服务响应超时" in replies[0].content
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_watchdog_settles_an_accepted_orphaned_root_run 精确标识本用例的具体条件。
 def test_watchdog_settles_an_accepted_orphaned_root_run(
     accepted_run: tuple[str, str],
 ) -> None:
@@ -367,6 +389,7 @@ def test_watchdog_settles_an_accepted_orphaned_root_run(
         assert reply is not None and "失去运行进程" in reply.content
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_restart_recovery_persists_exactly_one_terminal_reply 精确标识本用例的具体条件。
 def test_restart_recovery_persists_exactly_one_terminal_reply(
     accepted_run: tuple[str, str],
 ) -> None:
@@ -398,6 +421,7 @@ def test_restart_recovery_persists_exactly_one_terminal_reply(
         ("stopped", None, "user_interrupted"),
     ],
 )
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_every_terminal_root_turn_has_one_delivered_terminal_message 精确标识本用例的具体条件。
 def test_every_terminal_root_turn_has_one_delivered_terminal_message(
     accepted_run: tuple[str, str],
     status: str,
@@ -435,6 +459,7 @@ def test_every_terminal_root_turn_has_one_delivered_terminal_message(
         assert replies[0].turn_id == turn.id
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_main_agent_installs_deterministic_gate_without_model_or_task_anchor 精确标识本用例的具体条件。
 def test_main_agent_installs_deterministic_gate_without_model_or_task_anchor(tmp_path: Path) -> None:
     runtime = AgentRuntime(
         model_call=lambda **_kwargs: None,
@@ -444,6 +469,7 @@ def test_main_agent_installs_deterministic_gate_without_model_or_task_anchor(tmp
     assert runtime.completion_verifier is decide_deterministic_completion
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_rejected_candidates_are_not_persisted_as_chat_messages 精确标识本用例的具体条件。
 def test_rejected_candidates_are_not_persisted_as_chat_messages(seeded_run: tuple[str, str]) -> None:
     run_id, session_id = seeded_run
     outcome = RunOutcome(
@@ -478,6 +504,7 @@ def test_rejected_candidates_are_not_persisted_as_chat_messages(seeded_run: tupl
         assert "unsupported candidate" not in str(snapshot.payload)
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_single_compaction_is_persisted_and_transcript_tail_is_loaded 精确标识本用例的具体条件。
 def test_single_compaction_is_persisted_and_transcript_tail_is_loaded(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -537,6 +564,7 @@ def test_single_compaction_is_persisted_and_transcript_tail_is_loaded(
         ]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_legacy_compaction_row_still_reconstructs_provider_history 精确标识本用例的具体条件。
 def test_legacy_compaction_row_still_reconstructs_provider_history(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -563,6 +591,7 @@ def test_legacy_compaction_row_still_reconstructs_provider_history(
         ]
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_context_artifact_metadata_is_persisted 精确标识本用例的具体条件。
 def test_context_artifact_metadata_is_persisted(seeded_run: tuple[str, str], tmp_path: Path) -> None:
     run_id, session_id = seeded_run
     artifact_path = tmp_path / "artifact.txt"
@@ -591,6 +620,7 @@ def test_context_artifact_metadata_is_persisted(seeded_run: tuple[str, str], tmp
         assert artifact.metadata_json["runtime_artifact_id"] == "artifact-test"
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_compaction_is_rejected_when_transcript_changed_during_model_call 精确标识本用例的具体条件。
 def test_compaction_is_rejected_when_transcript_changed_during_model_call(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -629,6 +659,7 @@ def test_compaction_is_rejected_when_transcript_changed_during_model_call(
         assert db.query(RunEvent).filter_by(run_id=run_id, event_type="context_compaction_conflict").count() == 1
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_transcript_delta_is_persisted_when_provider_messages_were_compacted 精确标识本用例的具体条件。
 def test_transcript_delta_is_persisted_when_provider_messages_were_compacted(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -669,6 +700,7 @@ def test_transcript_delta_is_persisted_when_provider_messages_were_compacted(
         assert [row.sequence for row in rows] == [1, 2, 3]
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_responses_native_items_are_persisted_without_visible_content_deduplication 精确标识本用例的具体条件。
 def test_responses_native_items_are_persisted_without_visible_content_deduplication(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -717,6 +749,7 @@ def test_responses_native_items_are_persisted_without_visible_content_deduplicat
         assert [row.provider_payload["native"]["items"][0]["id"] for row in rows] == ["msg-1", "msg-2"]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_delegated_terminal_result_appends_revision_without_mutating_placeholder 精确标识本用例的具体条件。
 def test_delegated_terminal_result_appends_revision_without_mutating_placeholder(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -772,6 +805,7 @@ def test_delegated_terminal_result_appends_revision_without_mutating_placeholder
         assert [row.sequence for row in rows] == [1, 2, 3, 4]
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_older_compaction_cannot_overwrite_newer_replacement 精确标识本用例的具体条件。
 def test_older_compaction_cannot_overwrite_newer_replacement(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -817,6 +851,7 @@ def test_older_compaction_cannot_overwrite_newer_replacement(
         assert db.query(RunEvent).filter_by(run_id=run_id, event_type="context_compaction_conflict").count() == 1
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_awaiting_outcome_creates_exact_pending_approval 精确标识本用例的具体条件。
 def test_awaiting_outcome_creates_exact_pending_approval(seeded_run: tuple[str, str]) -> None:
     run_id, _session_id = seeded_run
     pending = {
@@ -852,6 +887,7 @@ def test_awaiting_outcome_creates_exact_pending_approval(seeded_run: tuple[str, 
         assert restored.runtime_binding == {"workspace_root": "C:/frozen", "model_id": "frozen-model"}
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_mismatched_pending_approval_is_superseded_not_reused 精确标识本用例的具体条件。
 def test_mismatched_pending_approval_is_superseded_not_reused(seeded_run: tuple[str, str]) -> None:
     run_id, _session_id = seeded_run
     with database.SessionLocal() as db:
@@ -886,6 +922,7 @@ def test_mismatched_pending_approval_is_superseded_not_reused(seeded_run: tuple[
         assert pending_rows[0].arguments == {"path": "current.txt"}
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_usage_is_upserted_as_absolute_run_aggregate 精确标识本用例的具体条件。
 def test_usage_is_upserted_as_absolute_run_aggregate(seeded_run: tuple[str, str]) -> None:
     run_id, _session_id = seeded_run
     with database.SessionLocal() as db:
@@ -961,6 +998,7 @@ def test_usage_is_upserted_as_absolute_run_aggregate(seeded_run: tuple[str, str]
         assert record.model_connection_id == connection_id
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_history_loader_never_compacts_or_drops_messages 精确标识本用例的具体条件。
 def test_history_loader_never_compacts_or_drops_messages(seeded_run: tuple[str, str]) -> None:
     _run_id, session_id = seeded_run
     with database.SessionLocal() as db:
@@ -987,6 +1025,7 @@ def test_history_loader_never_compacts_or_drops_messages(seeded_run: tuple[str, 
         assert db.query(ConversationCompaction).filter_by(session_id=session_id).count() == 0
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_history_loader_orders_same_timestamp_messages_without_splitting 精确标识本用例的具体条件。
 def test_history_loader_orders_same_timestamp_messages_without_splitting(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -1015,6 +1054,7 @@ def test_history_loader_orders_same_timestamp_messages_without_splitting(
         assert db.query(ConversationCompaction).filter_by(session_id=session_id).count() == 0
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_history_uses_sequence_when_tool_messages_share_a_timestamp 精确标识本用例的具体条件。
 def test_history_uses_sequence_when_tool_messages_share_a_timestamp(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -1051,6 +1091,7 @@ def test_history_uses_sequence_when_tool_messages_share_a_timestamp(
     assert history[1]["tool_call_id"] == "call-1"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settings 精确标识本用例的具体条件。
 def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settings(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -1144,6 +1185,7 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
         RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_freezes_global_and_chat_memory_preferences 精确标识本用例的具体条件。
 def test_runtime_freezes_global_and_chat_memory_preferences(
     seeded_run: tuple[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1167,6 +1209,7 @@ def test_runtime_freezes_global_and_chat_memory_preferences(
 
     calls: list[tuple[str | None, str | None]] = []
 
+    # 局部测试函数：fake_load_memory_index 模拟该步骤的返回结果或异常。
     def fake_load_memory_index(*, workspace_id, session_id=None):  # type: ignore[no-untyped-def]
         calls.append((workspace_id, session_id))
         return "MEMORY INDEX"
@@ -1228,6 +1271,7 @@ def test_runtime_freezes_global_and_chat_memory_preferences(
 
 
 @pytest.mark.parametrize("global_enabled, expected_jobs", [(False, 0), (True, 1)])
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_global_memory_preference_controls_extraction_but_chat_preference_does_not 精确标识本用例的具体条件。
 def test_global_memory_preference_controls_extraction_but_chat_preference_does_not(
     accepted_run: tuple[str, str], global_enabled: bool, expected_jobs: int
 ) -> None:
@@ -1256,6 +1300,7 @@ def test_global_memory_preference_controls_extraction_but_chat_preference_does_n
         assert db.query(MemoryJob).count() == expected_jobs
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_durable_todo_state_wins_over_conflicting_frozen_binding 精确标识本用例的具体条件。
 def test_durable_todo_state_wins_over_conflicting_frozen_binding(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -1284,6 +1329,7 @@ def test_durable_todo_state_wins_over_conflicting_frozen_binding(
     assert [item["id"] for item in resumed["todo_state"]] == ["canonical"]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_freezes_global_and_project_agents_instructions 精确标识本用例的具体条件。
 def test_runtime_freezes_global_and_project_agents_instructions(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -1328,6 +1374,7 @@ def test_runtime_freezes_global_and_project_agents_instructions(
     assert "version two" not in resumed["workspace_rules"]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_resolved_runtime_can_read_its_session_artifacts 精确标识本用例的具体条件。
 def test_resolved_runtime_can_read_its_session_artifacts(
     seeded_run: tuple[str, str],
 ) -> None:
@@ -1354,6 +1401,7 @@ def test_resolved_runtime_can_read_its_session_artifacts(
     assert result.ok and result.content == "full persisted output"
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_fallback_connection_does_not_reuse_model_from_disabled_connection 精确标识本用例的具体条件。
 def test_fallback_connection_does_not_reuse_model_from_disabled_connection(
     seeded_run: tuple[str, str],
 ) -> None:

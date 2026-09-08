@@ -1,3 +1,5 @@
+// 本文件提供可复用的 status 展示组件，供各功能页面组合使用并保持交互表现一致。
+// statusText 是所有页面共享的后端状态到中文标签映射，未知值由调用组件自行兜底。
 export const statusText: Record<string, string> = {
   completed: '已完成',
   complete: '已完成',

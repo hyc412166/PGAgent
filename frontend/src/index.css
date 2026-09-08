@@ -1,3 +1,4 @@
+/* 本文件定义 index 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
 :root {
   font-family: ui-rounded, "Arial Rounded MT Bold", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   color: #12324a;

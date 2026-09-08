@@ -1,4 +1,6 @@
 """Run a baseline check without replacing the candidate working tree."""
+# 文件职责：负责代码任务状态、补丁、工作树及验证中的 baseline_validation 子模块。
+# 逻辑关系：上层通过 coding/baseline_validation.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
@@ -16,6 +18,9 @@ from src.tools.types import ToolResult
 from .validation import VALIDATION_KINDS
 
 
+# 函数职责：执行 baseline_validation 对应的数据或流程。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；command 表示当前步骤使用的 command 值；kind 表示当前步骤使用的 kind 值；cwd 表示当前步骤使用的 cwd 值；timeout_seconds 表示当前流程使用的 timeout_seconds 集合；approved 表示当前步骤使用的 approved 值；_cancel_event 表示当前步骤使用的 _cancel_event 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def run_baseline_validation(
     sandbox: WorkspaceSandbox,
     command: str | list[str],
@@ -34,6 +39,7 @@ def run_baseline_validation(
     is interrupted. The temporary worktree makes that comparison isolated.
     """
 
+    # 变量说明：normalized_kind 表示当前步骤使用的 normalized_kind 值。
     normalized_kind = str(kind or "test").strip().lower()
     if normalized_kind not in VALIDATION_KINDS:
         return ToolResult(
@@ -42,6 +48,7 @@ def run_baseline_validation(
             f"unsupported validation kind: {kind}",
             error_code="invalid_arguments",
         )
+    # 变量说明：repository 表示当前步骤使用的 repository 值。
     repository = _git(sandbox.root, ["rev-parse", "--show-toplevel"])
     if repository.returncode != 0:
         return ToolResult(
@@ -51,6 +58,7 @@ def run_baseline_validation(
             error_code="not_git_repository",
         )
     try:
+        # 变量说明：top_level 表示当前步骤使用的 top_level 值。
         top_level = Path(repository.stdout.strip()).resolve()
     except OSError as exc:
         return ToolResult(
@@ -67,15 +75,23 @@ def run_baseline_validation(
             error_code="workspace_not_repository_root",
         )
 
+    # 变量说明：temporary_root 表示当前步骤使用的 temporary_root 值。
     temporary_root = Path(tempfile.mkdtemp(prefix="pgagent-baseline-"))
+    # 变量说明：baseline_root 表示当前步骤使用的 baseline_root 值。
     baseline_root = temporary_root / "worktree"
+    # 变量说明：added 表示当前步骤使用的 added 值。
     added = False
+    # 变量说明：started 表示当前步骤使用的 started 值。
     started = time.monotonic()
+    # 变量说明：normalized 表示当前步骤使用的 normalized 值。
     normalized: ToolResult | None = None
+    # 变量说明：cleanup_error 表示当前步骤使用的 cleanup_error 值。
     cleanup_error: str | None = None
     try:
+        # 变量说明：setup 表示当前步骤使用的 setup 值。
         setup = _git(sandbox.root, ["worktree", "add", "--detach", str(baseline_root), "HEAD"])
         if setup.returncode != 0:
+            # 变量说明：normalized 表示当前步骤使用的 normalized 值。
             normalized = ToolResult(
                 "validate_baseline",
                 False,
@@ -83,8 +99,11 @@ def run_baseline_validation(
                 error_code="baseline_setup_failed",
             )
         else:
+            # 变量说明：added 表示当前步骤使用的 added 值。
             added = True
+            # 变量说明：baseline_sandbox 表示当前步骤使用的 baseline_sandbox 值。
             baseline_sandbox = WorkspaceSandbox(baseline_root)
+            # 变量说明：result 表示本步骤产生的结果。
             result = builtins.run_command(
                 baseline_sandbox,
                 command,
@@ -93,7 +112,9 @@ def run_baseline_validation(
                 timeout_seconds=timeout_seconds,
                 _cancel_event=_cancel_event,
             )
+            # 变量说明：elapsed_ms 表示当前流程使用的 elapsed_ms 集合。
             elapsed_ms = round((time.monotonic() - started) * 1000)
+            # 变量说明：baseline_validation 表示当前步骤使用的 baseline_validation 值。
             baseline_validation = {
                 "kind": normalized_kind,
                 "status": "passed" if result.ok else "failed",
@@ -103,6 +124,7 @@ def run_baseline_validation(
                 "ref": "HEAD",
                 "isolated": True,
             }
+            # 变量说明：normalized 表示当前步骤使用的 normalized 值。
             normalized = ToolResult(
                 "validate_baseline",
                 result.ok,
@@ -116,6 +138,7 @@ def run_baseline_validation(
             )
     finally:
         if added:
+            # 变量说明：cleanup_error 表示当前步骤使用的 cleanup_error 值。
             cleanup_error = _remove_worktree(sandbox.root, baseline_root)
         shutil.rmtree(temporary_root, ignore_errors=True)
     assert normalized is not None
@@ -131,24 +154,31 @@ def run_baseline_validation(
     return normalized
 
 
+# 函数职责：移除 worktree 对应的数据或流程。
+# 参数关系：repository_root 表示当前步骤使用的 repository_root 值；baseline_root 表示当前步骤使用的 baseline_root 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _remove_worktree(repository_root: Path, baseline_root: Path) -> str | None:
     # A validation command can lock its own temporary worktree. Unlock first;
     # an "is not locked" error is harmless and removal remains authoritative.
     _git(repository_root, ["worktree", "unlock", str(baseline_root)])
+    # 变量说明：removed 表示当前步骤使用的 removed 值。
     removed = _git(
         repository_root,
         ["worktree", "remove", "--force", str(baseline_root)],
     )
     if removed.returncode != 0:
         shutil.rmtree(baseline_root, ignore_errors=True)
+    # 变量说明：listed 表示当前步骤使用的 listed 值。
     listed = _git(repository_root, ["worktree", "list", "--porcelain"])
     if listed.returncode != 0:
         return listed.stderr or "无法确认临时 worktree 是否已经移除"
+    # 变量说明：expected 表示当前步骤使用的 expected 值。
     expected = baseline_root.resolve()
     for line in listed.stdout.splitlines():
         if not line.startswith("worktree "):
             continue
         try:
+            # 变量说明：registered 表示当前步骤使用的 registered 值。
             registered = Path(line[len("worktree "):].strip()).resolve()
         except OSError:
             continue
@@ -157,6 +187,9 @@ def _remove_worktree(repository_root: Path, baseline_root: Path) -> str | None:
     return None
 
 
+# 函数职责：完成 git 对应的业务处理。
+# 参数关系：root 表示处理范围的根目录；arguments 表示当前流程使用的 arguments 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _git(root: Path, arguments: list[str]) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(

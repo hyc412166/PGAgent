@@ -1,4 +1,6 @@
 """Shared, complete deletion lifecycle for one or more conversations."""
+# 文件职责：负责会话交付与清理中的 deletion 子模块。
+# 逻辑关系：上层通过 sessions/deletion.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
@@ -24,16 +26,24 @@ from src.persistence.database import (
 from src.runs.service import STOPPABLE_STATUSES, coordinator
 
 
+# 类职责：定义 SessionDeletionConflict 在本领域中的数据与行为。
+# 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class SessionDeletionConflict(RuntimeError):
     """The conversation cannot be deleted while owned work is active."""
 
 
+# 类职责：定义 SessionDeletionEffects 在本领域中的数据与行为。
 @dataclass(frozen=True)
 class SessionDeletionEffects:
+    # 变量说明：session_ids 表示session 对象标识集合。
     session_ids: tuple[str, ...]
+    # 变量说明：artifact_directories 表示当前流程使用的 artifact_directories 集合。
     artifact_directories: tuple[Path, ...]
 
 
+# 函数职责：完成 stage_session_deletions 对应的业务处理。
+# 参数关系：db 表示当前数据库会话；conversations 表示当前流程使用的 conversations 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def stage_session_deletions(
     db: Session,
     conversations: list[ChatSession],
@@ -44,6 +54,7 @@ def stage_session_deletions(
         _ensure_deletable(db, conversation.id)
 
     for conversation in conversations:
+        # 变量说明：workspace 表示当前步骤使用的 workspace 值。
         workspace = db.get(Workspace, conversation.workspace_id)
         if workspace is None:
             continue
@@ -56,16 +67,22 @@ def stage_session_deletions(
 
     from src.api import routes as resources_api
 
+    # 变量说明：artifact_root 表示当前步骤使用的 artifact_root 值。
     artifact_root = (resources_api.settings.data_dir / "artifacts").resolve()
+    # 变量说明：artifact_directories 表示当前流程使用的 artifact_directories 集合。
     artifact_directories: list[Path] = []
+    # 变量说明：session_ids 表示session 对象标识集合。
     session_ids: list[str] = []
     for conversation in conversations:
+        # 变量说明：session_id 表示所属会话标识。
         session_id = conversation.id
         session_ids.append(session_id)
+        # 变量说明：artifact_directory 表示当前步骤使用的 artifact_directory 值。
         artifact_directory = (artifact_root / session_id).resolve()
         if artifact_directory.parent == artifact_root:
             artifact_directories.append(artifact_directory)
 
+        # 变量说明：run_ids 表示run 对象标识集合。
         run_ids = set(db.scalars(select(Run.id).where(Run.session_id == session_id)))
         run_ids.update(
             value
@@ -91,6 +108,9 @@ def stage_session_deletions(
     return SessionDeletionEffects(tuple(session_ids), tuple(artifact_directories))
 
 
+# 函数职责：完成 finalize_session_deletions 对应的业务处理。
+# 参数关系：effects 表示当前流程使用的 effects 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def finalize_session_deletions(effects: SessionDeletionEffects) -> None:
     """Release runtime state and stored payloads after the database commit."""
 
@@ -102,7 +122,11 @@ def finalize_session_deletions(effects: SessionDeletionEffects) -> None:
     refresh_memory_markdown_projection()
 
 
+# 函数职责：确保 deletable 对应的数据或流程。
+# 参数关系：db 表示当前数据库会话；session_id 表示所属会话标识。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _ensure_deletable(db: Session, session_id: str) -> None:
+    # 变量说明：active_background_jobs 表示当前流程使用的 active_background_jobs 集合。
     active_background_jobs = db.scalar(
         select(func.count(BackgroundJob.id)).where(
             BackgroundJob.session_id == session_id,
@@ -113,6 +137,7 @@ def _ensure_deletable(db: Session, session_id: str) -> None:
         raise SessionDeletionConflict(
             "Cannot delete a conversation while it has active background jobs"
         )
+    # 变量说明：active_runs 表示当前流程使用的 active_runs 集合。
     active_runs = db.scalar(
         select(func.count(Run.id)).where(
             Run.session_id == session_id,

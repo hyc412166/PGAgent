@@ -1,22 +1,32 @@
+"""验证数据库初始化、增量迁移、约束、级联关系以及核心资源 API。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select
 from sqlalchemy.exc import IntegrityError
 
 from src.api.routes import router as resources_router
 from src.api import routes as resources_api
 from src.api.routes.sessions import cancel_session_task
+from src.api.schemas import RunEventRead
 from src.config import settings
 from src.mcp.runtime import mcp_runtime_pool
+from src.observability import bind_observability_context
 from src.persistence import database
 from src.persistence.database import (
     Base,
@@ -39,11 +49,14 @@ from src.persistence.database import (
     configure_database,
     init_db,
 )
+from src.persistence.run_events import append_run_event
 from src.runs.service import coordinator
 
 
 @pytest.fixture()
+# 测试夹具：client 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def client(tmp_path: Path) -> TestClient:
+    # 临时 SQLite 数据库承载真实 ORM 与路由交互；test_client 负责触发资源 API，结束后删除全部表。
     configure_database(f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
     init_db()
     app = FastAPI()
@@ -53,6 +66,7 @@ def client(tmp_path: Path) -> TestClient:
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_init_creates_required_tables 精确标识本用例的具体条件。
 def test_init_creates_required_tables(tmp_path: Path) -> None:
     configure_database(f"sqlite:///{(tmp_path / 'schema.db').as_posix()}")
     init_db()
@@ -90,6 +104,7 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
     assert "context_checkpoints" not in tables
     assert "compaction_attempts" not in tables
 
+    # 辅助方法：unique_cover_count 实现测试替身在此调用阶段需要的最小行为。
     def unique_cover_count(table_name: str, column_name: str) -> int:
         constraints = sum(
             constraint.get("column_names") == [column_name]
@@ -113,6 +128,218 @@ def test_init_creates_required_tables(tmp_path: Path) -> None:
     assert "uq_memory_skill_workspace_name" in skill_indexes
 
 
+def test_init_migrates_legacy_run_events_in_stable_per_run_order(tmp_path: Path) -> None:
+    """旧事件在升级后必须按每个 Run 的稳定历史顺序获得序号。"""
+
+    database_path = tmp_path / "legacy-run-events.db"
+    configure_database(f"sqlite:///{database_path.as_posix()}")
+    tables_except_run_events = [
+        table for table in Base.metadata.sorted_tables if table.name != "run_events"
+    ]
+    Base.metadata.create_all(bind=database.engine, tables=tables_except_run_events)
+
+    with database.SessionLocal() as db:
+        first_run = Run(status="completed")
+        second_run = Run(status="completed")
+        db.add_all([first_run, second_run])
+        db.commit()
+        first_run_id = first_run.id
+        second_run_id = second_run.id
+
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE run_events (
+                id VARCHAR(36) PRIMARY KEY,
+                run_id VARCHAR(36) NOT NULL,
+                event_type VARCHAR(80) NOT NULL,
+                step INTEGER,
+                payload JSON NOT NULL,
+                created_at DATETIME NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
+            );
+            """
+        )
+        connection.executemany(
+            "INSERT INTO run_events (id, run_id, event_type, step, payload, created_at) "
+            "VALUES (?, ?, ?, NULL, '{}', ?)",
+            [
+                ("event-b", first_run_id, "second", "2026-01-01 00:00:01"),
+                ("event-c", first_run_id, "third", "2026-01-01 00:00:02"),
+                ("event-a", first_run_id, "first", "2026-01-01 00:00:01"),
+                ("event-d", second_run_id, "only", "2026-01-01 00:00:03"),
+            ],
+        )
+
+    init_db()
+
+    inspector = inspect(database.engine)
+    event_columns = {column["name"] for column in inspector.get_columns("run_events")}
+    event_indexes = {index["name"] for index in inspector.get_indexes("run_events")}
+    assert {"trace_id", "sequence"}.issubset(event_columns)
+    assert "ix_run_events_run_sequence" in event_indexes
+
+    with database.SessionLocal() as db:
+        first_events = list(db.scalars(
+            select(database.RunEvent)
+            .where(database.RunEvent.run_id == first_run_id)
+            .order_by(database.RunEvent.sequence.asc())
+        ))
+        second_event = db.scalar(
+            select(database.RunEvent).where(database.RunEvent.run_id == second_run_id)
+        )
+
+    assert [event.id for event in first_events] == ["event-a", "event-b", "event-c"]
+    assert [event.sequence for event in first_events] == [1, 2, 3]
+    assert second_event is not None
+    assert second_event.sequence == 1
+    assert second_event.trace_id is None
+    serialized = RunEventRead.model_validate(first_events[0]).model_dump()
+    assert serialized["sequence"] == 1
+    assert serialized["trace_id"] is None
+
+
+def test_append_run_event_inherits_trace_and_leaves_commit_to_caller(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{(tmp_path / 'append-transaction.db').as_posix()}")
+    init_db()
+    with database.SessionLocal() as setup_db:
+        run = Run(status="running")
+        setup_db.add(run)
+        setup_db.commit()
+        run_id = run.id
+
+    with database.SessionLocal() as writer:
+        with bind_observability_context(trace_id="trace-current"):
+            event = append_run_event(writer, run_id=run_id, event_type="model_step_started")
+        assert event.sequence == 1
+        assert event.trace_id == "trace-current"
+        with database.SessionLocal() as reader:
+            assert reader.query(database.RunEvent).filter_by(run_id=run_id).count() == 0
+        writer.rollback()
+
+    with database.SessionLocal() as writer:
+        event = append_run_event(
+            writer,
+            run_id=run_id,
+            event_type="model_step_started",
+            trace_id="trace-explicit",
+        )
+        writer.commit()
+        assert event.sequence == 1
+        assert event.trace_id == "trace-explicit"
+
+
+def test_create_run_event_assigns_monotonic_run_sequence(client: TestClient) -> None:
+    session = client.post("/api/sessions", json={}).json()
+    run = client.post("/api/runs", json={"session_id": session["id"]}).json()
+
+    first = client.post(
+        f"/api/runs/{run['id']}/events",
+        json={"event_type": "first", "payload": {}},
+    )
+    second = client.post(
+        f"/api/runs/{run['id']}/events",
+        json={"event_type": "second", "payload": {}},
+    )
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert first.json()["sequence"] == 1
+    assert second.json()["sequence"] == 2
+
+
+def test_append_run_event_allocates_unique_order_under_concurrent_commits(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{(tmp_path / 'append-concurrent.db').as_posix()}")
+    init_db()
+    with database.SessionLocal() as db:
+        first_run = Run(status="running")
+        second_run = Run(status="running")
+        db.add_all([first_run, second_run])
+        db.commit()
+        first_run_id = first_run.id
+        second_run_id = second_run.id
+
+    count = 8
+    ready = threading.Barrier(count)
+
+    def append_one(index: int) -> int:
+        with database.SessionLocal() as db:
+            ready.wait(timeout=5)
+            event = append_run_event(
+                db,
+                run_id=first_run_id,
+                event_type="concurrent",
+                payload={"index": index},
+            )
+            db.commit()
+            return event.sequence
+
+    with ThreadPoolExecutor(max_workers=count) as executor:
+        sequences = list(executor.map(append_one, range(count)))
+
+    with database.SessionLocal() as db:
+        persisted = list(db.scalars(
+            select(database.RunEvent)
+            .where(database.RunEvent.run_id == first_run_id)
+            .order_by(database.RunEvent.sequence.asc())
+        ))
+        second_event = append_run_event(db, run_id=second_run_id, event_type="first")
+        db.commit()
+
+    assert sorted(sequences) == list(range(1, count + 1))
+    assert [event.sequence for event in persisted] == list(range(1, count + 1))
+    assert second_event.sequence == 1
+
+
+def test_append_run_event_releases_transaction_locks_and_isolates_runs(tmp_path: Path) -> None:
+    configure_database(f"sqlite:///{(tmp_path / 'append-locks.db').as_posix()}")
+    init_db()
+    with database.SessionLocal() as db:
+        first_run = Run(status="running")
+        second_run = Run(status="running")
+        db.add_all([first_run, second_run])
+        db.commit()
+        first_run_id = first_run.id
+        second_run_id = second_run.id
+
+    def append_and_commit(run_id: str, started: threading.Event) -> int:
+        with database.SessionLocal() as db:
+            started.set()
+            event = append_run_event(db, run_id=run_id, event_type="worker")
+            db.commit()
+            return event.sequence
+
+    with database.SessionLocal() as holder, ThreadPoolExecutor(max_workers=2) as executor:
+        held = append_run_event(holder, run_id=first_run_id, event_type="rolled_back")
+        assert held.sequence == 1
+
+        same_run_started = threading.Event()
+        same_run = executor.submit(append_and_commit, first_run_id, same_run_started)
+        assert same_run_started.wait(timeout=2)
+        with pytest.raises(FutureTimeoutError):
+            same_run.result(timeout=0.2)
+
+        other_run_started = threading.Event()
+        other_run = executor.submit(append_and_commit, second_run_id, other_run_started)
+        assert other_run_started.wait(timeout=2)
+        assert other_run.result(timeout=2) == 1
+
+        holder.rollback()
+        assert same_run.result(timeout=2) == 1
+
+    with database.SessionLocal() as holder, ThreadPoolExecutor(max_workers=1) as executor:
+        committed = append_run_event(holder, run_id=first_run_id, event_type="committed")
+        assert committed.sequence == 2
+        started = threading.Event()
+        after_commit = executor.submit(append_and_commit, first_run_id, started)
+        assert started.wait(timeout=2)
+        with pytest.raises(FutureTimeoutError):
+            after_commit.result(timeout=0.2)
+        holder.commit()
+        assert after_commit.result(timeout=2) == 3
+
+
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_session_task_api_returns_ordered_durable_plan 精确标识本用例的具体条件。
 def test_session_task_api_returns_ordered_durable_plan(client: TestClient) -> None:
     session_id = client.post("/api/sessions", json={}).json()["id"]
     with database.SessionLocal() as db:
@@ -154,6 +381,7 @@ def test_session_task_api_returns_ordered_durable_plan(client: TestClient) -> No
     assert client.get(f"/api/sessions/{session_id}/active-task").json() is None
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_cancel_session_task_rejects_a_stale_task_card 精确标识本用例的具体条件。
 def test_cancel_session_task_rejects_a_stale_task_card(client: TestClient) -> None:
     session_id = client.post("/api/sessions", json={}).json()["id"]
     with database.SessionLocal() as db:
@@ -176,6 +404,7 @@ def test_cancel_session_task_rejects_a_stale_task_card(client: TestClient) -> No
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_cancel_session_task_cancels_live_run_on_the_owning_loop 精确标识本用例的具体条件。
 async def test_cancel_session_task_cancels_live_run_on_the_owning_loop(tmp_path: Path) -> None:
     configure_database(f"sqlite:///{(tmp_path / 'live-cancel.db').as_posix()}")
     init_db()
@@ -202,6 +431,7 @@ async def test_cancel_session_task_cancels_live_run_on_the_owning_loop(tmp_path:
             coordinator._tasks.pop(run_id, None)
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_turn_schema_enforces_one_terminal_reply_per_accepted_message 精确标识本用例的具体条件。
 def test_turn_schema_enforces_one_terminal_reply_per_accepted_message(tmp_path: Path) -> None:
     configure_database(f"sqlite:///{(tmp_path / 'turn-schema.db').as_posix()}")
     init_db()
@@ -249,6 +479,7 @@ def test_turn_schema_enforces_one_terminal_reply_per_accepted_message(tmp_path: 
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_init_removes_retired_team_collaboration_tables 精确标识本用例的具体条件。
 def test_init_removes_retired_team_collaboration_tables(tmp_path: Path) -> None:
     configure_database(f"sqlite:///{(tmp_path / 'retired-team.db').as_posix()}")
     with database.engine.begin() as connection:
@@ -273,6 +504,7 @@ def test_init_removes_retired_team_collaboration_tables(tmp_path: Path) -> None:
     assert "background_jobs" in tables
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_retired_team_collaboration_routes_are_absent 精确标识本用例的具体条件。
 def test_retired_team_collaboration_routes_are_absent(client: TestClient) -> None:
     assert client.get("/api/teams/tasks").status_code == 404
     assert client.post("/api/teams/tasks", json={"title": "retired"}).status_code == 404
@@ -281,6 +513,7 @@ def test_retired_team_collaboration_routes_are_absent(client: TestClient) -> Non
     assert not [path for path in paths if path.startswith("/api/teams")]
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_compaction_persistence_round_trip_and_cascade 精确标识本用例的具体条件。
 def test_compaction_persistence_round_trip_and_cascade(tmp_path: Path) -> None:
     """A single compacted replacement is durable and follows its session."""
 
@@ -327,6 +560,7 @@ def test_compaction_persistence_round_trip_and_cascade(tmp_path: Path) -> None:
         assert db.query(Artifact).count() == 0
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_init_incrementally_migrates_legacy_database_and_preserves_rows 精确标识本用例的具体条件。
 def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path: Path) -> None:
     database_path = tmp_path / "legacy.db"
     settings.mcp_config_file.write_text(json.dumps({
@@ -421,6 +655,7 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     assert response.status_code == 409
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_init_adds_background_waiter_column_to_the_owning_table 精确标识本用例的具体条件。
 def test_init_adds_background_waiter_column_to_the_owning_table(tmp_path: Path) -> None:
     database_path = tmp_path / "background-migration.db"
     with sqlite3.connect(database_path) as connection:
@@ -444,6 +679,7 @@ def test_init_adds_background_waiter_column_to_the_owning_table(tmp_path: Path) 
     assert "waiting_run_id" not in run_columns
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_core_resource_crud_and_dashboard 精确标识本用例的具体条件。
 def test_core_resource_crud_and_dashboard(client: TestClient, tmp_path: Path) -> None:
     workspace_response = client.post(
         "/api/workspaces",
@@ -528,6 +764,7 @@ def test_core_resource_crud_and_dashboard(client: TestClient, tmp_path: Path) ->
     assert dashboard["pending_approvals"] == 1
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_workspace_directory_only_is_named_and_deduplicated 精确标识本用例的具体条件。
 def test_workspace_directory_only_is_named_and_deduplicated(
     client: TestClient, tmp_path: Path
 ) -> None:
@@ -566,6 +803,7 @@ def test_workspace_directory_only_is_named_and_deduplicated(
     assert len(client.get("/api/workspaces").json()) == 2
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_workspace_filesystem_root_uses_project_fallback_name 精确标识本用例的具体条件。
 def test_workspace_filesystem_root_uses_project_fallback_name(client: TestClient, tmp_path: Path) -> None:
     root = Path(tmp_path.anchor)
     created = client.post("/api/workspaces", json={"root_path": str(root)})
@@ -573,6 +811,7 @@ def test_workspace_filesystem_root_uses_project_fallback_name(client: TestClient
     assert created.json()["name"] == "项目"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_run_listing_supports_stable_pagination 精确标识本用例的具体条件。
 def test_run_listing_supports_stable_pagination(client: TestClient) -> None:
     session_id = client.post("/api/sessions", json={}).json()["id"]
     run_ids = [
@@ -599,6 +838,7 @@ def test_run_listing_supports_stable_pagination(client: TestClient) -> None:
     assert set(listed) == set(run_ids)
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_delete_workspace_keeps_local_files_and_deletes_complete_session_history 精确标识本用例的具体条件。
 def test_delete_workspace_keeps_local_files_and_deletes_complete_session_history(
     client: TestClient, tmp_path: Path
 ) -> None:
@@ -646,6 +886,7 @@ def test_delete_workspace_keeps_local_files_and_deletes_complete_session_history
         ).count() == 0
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_delete_workspace_rejects_active_project_run 精确标识本用例的具体条件。
 def test_delete_workspace_rejects_active_project_run(client: TestClient, tmp_path: Path) -> None:
     root = tmp_path / "active-project"
     root.mkdir()
@@ -667,6 +908,7 @@ def test_delete_workspace_rejects_active_project_run(client: TestClient, tmp_pat
     assert client.get(f"/api/sessions/{session['id']}").status_code == 200
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_delete_session_purges_its_complete_conversation_history 精确标识本用例的具体条件。
 def test_delete_session_purges_its_complete_conversation_history(
     client: TestClient,
     tmp_path: Path,
@@ -721,6 +963,7 @@ def test_delete_session_purges_its_complete_conversation_history(
         assert db.query(database.Artifact).filter_by(session_id=session_id).count() == 0
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_defaults_are_seeded_protected_and_used_for_new_sessions 精确标识本用例的具体条件。
 def test_defaults_are_seeded_protected_and_used_for_new_sessions(client: TestClient) -> None:
     workspaces = client.get("/api/workspaces").json()
     agents = client.get("/api/agents").json()
@@ -775,6 +1018,7 @@ def test_defaults_are_seeded_protected_and_used_for_new_sessions(client: TestCli
     assert body["context_tokens"] == 0
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_init_migrates_saved_agent_tools_to_canonical_surface 精确标识本用例的具体条件。
 def test_init_migrates_saved_agent_tools_to_canonical_surface(client: TestClient) -> None:
     child = client.post("/api/agents", json={"name": "Legacy tools"}).json()
     with database.SessionLocal() as db:
@@ -802,6 +1046,7 @@ def test_init_migrates_saved_agent_tools_to_canonical_surface(client: TestClient
     ]
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_message_api_exposes_responses_web_search_citations 精确标识本用例的具体条件。
 def test_message_api_exposes_responses_web_search_citations(client: TestClient) -> None:
     session = client.post("/api/sessions", json={}).json()
     with database.SessionLocal() as db:
@@ -827,6 +1072,7 @@ def test_message_api_exposes_responses_web_search_citations(client: TestClient) 
     }]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_sessions_always_use_the_fixed_coordinator 精确标识本用例的具体条件。
 def test_sessions_always_use_the_fixed_coordinator(client: TestClient) -> None:
     child = client.post("/api/agents", json={"name": "Specialist child"}).json()
 
@@ -850,6 +1096,7 @@ def test_sessions_always_use_the_fixed_coordinator(client: TestClient) -> None:
     assert run.json()["agent_id"] == DEFAULT_AGENT_ID
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_seed_migrates_legacy_session_binding_without_losing_messages 精确标识本用例的具体条件。
 def test_seed_migrates_legacy_session_binding_without_losing_messages(client: TestClient) -> None:
     with database.SessionLocal() as db:
         child = database.Agent(name="Legacy child")
@@ -872,6 +1119,7 @@ def test_seed_migrates_legacy_session_binding_without_losing_messages(client: Te
         assert [message.content for message in messages] == ["keep this message"]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_session_model_overrides_can_be_patched 精确标识本用例的具体条件。
 def test_session_model_overrides_can_be_patched(client: TestClient) -> None:
     with database.SessionLocal() as db:
         connection = ModelConnection(
@@ -898,6 +1146,7 @@ def test_session_model_overrides_can_be_patched(client: TestClient) -> None:
     assert updated.json()["thinking_level"] == "high"
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_global_and_session_memory_preferences_persist 精确标识本用例的具体条件。
 def test_global_and_session_memory_preferences_persist(client: TestClient) -> None:
     initial = client.get("/api/memories/settings")
     assert initial.status_code == 200
@@ -918,12 +1167,14 @@ def test_global_and_session_memory_preferences_persist(client: TestClient) -> No
     assert updated.json()["use_memories"] is True
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_session_mcp_selection_persists_and_rejects_unavailable_servers 精确标识本用例的具体条件。
 def test_session_mcp_selection_persists_and_rejects_unavailable_servers(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     closed_sessions: list[str] = []
 
+    # 辅助方法：close_session 实现测试替身在此调用阶段需要的最小行为。
     async def close_session(session_id: str) -> None:
         closed_sessions.append(session_id)
 
@@ -955,6 +1206,7 @@ def test_session_mcp_selection_persists_and_rejects_unavailable_servers(
     ).status_code == 409
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_session_model_connection_must_exist_and_be_enabled 精确标识本用例的具体条件。
 def test_session_model_connection_must_exist_and_be_enabled(client: TestClient) -> None:
     with database.SessionLocal() as db:
         disabled = ModelConnection(
@@ -984,6 +1236,7 @@ def test_session_model_connection_must_exist_and_be_enabled(client: TestClient) 
     ).status_code == 409
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_agent_model_connection_must_exist_and_be_enabled 精确标识本用例的具体条件。
 def test_agent_model_connection_must_exist_and_be_enabled(client: TestClient) -> None:
     with database.SessionLocal() as db:
         enabled = ModelConnection(
@@ -1029,6 +1282,7 @@ def test_agent_model_connection_must_exist_and_be_enabled(client: TestClient) ->
     assert updated.json()["model_connection_id"] == enabled_id
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads 精确标识本用例的具体条件。
 def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(client: TestClient) -> None:
     session = client.post("/api/sessions", json={}).json()
     run = client.post("/api/runs", json={"session_id": session["id"]}).json()
@@ -1114,7 +1368,9 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
 
     response = client.get(f"/api/runs/{run['id']}/events")
     assert response.status_code == 200, response.text
-    events = response.json()
+    page = response.json()
+    assert page["next_before"] is None
+    events = page["items"]
     assert {event["event_type"] for event in events} == {
         "model_step_started", "mcp_connecting", "mcp_ready", "thought_summary", "tool_started", "tool_finished", "run_completed",
     }
@@ -1155,6 +1411,7 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
         assert private_value not in serialized
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_run_reads_include_the_real_session_and_agent_names 精确标识本用例的具体条件。
 def test_run_reads_include_the_real_session_and_agent_names(client: TestClient) -> None:
     session = client.post("/api/sessions", json={"title": "调用 Playwright 搜索科比"}).json()
     run = client.post("/api/runs", json={"session_id": session["id"]}).json()
@@ -1168,6 +1425,7 @@ def test_run_reads_include_the_real_session_and_agent_names(client: TestClient) 
     assert fetched["session_title"] == "调用 Playwright 搜索科比"
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_context_event_includes_a_bounded_user_message_excerpt 精确标识本用例的具体条件。
 def test_context_event_includes_a_bounded_user_message_excerpt(client: TestClient) -> None:
     session = client.post("/api/sessions", json={"title": "Long prompt"}).json()
     content = "请分析这个很长的任务：" + ("细节" * 120)
@@ -1194,7 +1452,7 @@ def test_context_event_includes_a_bounded_user_message_excerpt(client: TestClien
         db.commit()
         run_id = run.id
 
-    event = client.get(f"/api/runs/{run_id}/events").json()[0]
+    event = client.get(f"/api/runs/{run_id}/events").json()["items"][0]
     excerpt = event["payload"]["message_excerpt"]
 
     assert excerpt.startswith("请分析这个很长的任务：")
@@ -1203,7 +1461,129 @@ def test_context_event_includes_a_bounded_user_message_excerpt(client: TestClien
     assert event["payload"]["estimated_tokens"] == 321
 
 
+# 测试场景：验证运行事件筛选在游标分页前组合执行，并按 sequence 无重复、无遗漏地读取全部公开事件。
+def test_run_event_api_composes_filters_and_pages_by_sequence(client: TestClient) -> None:
+    run_id = client.post("/api/runs", json={}).json()["id"]
+    with database.SessionLocal() as db:
+        for event_type, step in (
+            ("model_step_started", 1),
+            ("model_retry", 1),
+            ("tool_started", 1),
+            ("runtime_snapshot", 1),
+            ("model_failed", 2),
+            ("model_retry", 2),
+            ("run_completed", 2),
+        ):
+            append_run_event(
+                db,
+                run_id=run_id,
+                event_type=event_type,
+                step=step,
+                payload={"attempt": step},
+            )
+        db.commit()
+
+    seen_sequences: list[int] = []
+    before: int | None = None
+    while True:
+        params: dict[str, int] = {"limit": 2}
+        if before is not None:
+            params["before"] = before
+        response = client.get(f"/api/runs/{run_id}/events", params=params)
+        assert response.status_code == 200, response.text
+        page = response.json()
+        page_sequences = [event["sequence"] for event in page["items"]]
+        assert page_sequences == sorted(page_sequences)
+        seen_sequences.extend(page_sequences)
+        before = page["next_before"]
+        if before is None:
+            break
+
+    assert seen_sequences == [6, 7, 3, 5, 1, 2]
+    assert len(seen_sequences) == len(set(seen_sequences))
+
+    filtered = client.get(
+        f"/api/runs/{run_id}/events",
+        params=[
+            ("event_type", "model_retry"),
+            ("event_type", "model_failed"),
+            ("step", "2"),
+            ("errors_only", "true"),
+            ("before", "7"),
+            ("limit", "2"),
+        ],
+    )
+    assert filtered.status_code == 200, filtered.text
+    assert [
+        (event["event_type"], event["step"], event["sequence"])
+        for event in filtered.json()["items"]
+    ] == [("model_failed", 2, 5), ("model_retry", 2, 6)]
+    assert filtered.json()["next_before"] is None
+
+
+# 测试场景：验证事件写入响应只返回安全投影，且恢复专用 snapshot/checkpoint 不能通过公共接口创建。
+def test_run_event_post_uses_safe_projection_and_rejects_private_events(client: TestClient) -> None:
+    sentinel = "SUPER_SECRET_SENTINEL"
+    run_id = client.post("/api/runs", json={}).json()["id"]
+
+    response = client.post(
+        f"/api/runs/{run_id}/events",
+        json={
+            "event_type": "tool_started",
+            "trace_id": "trace-public-post",
+            "step": 3,
+            "payload": {
+                "tool_name": "read",
+                "tool_call_id": "call-public-post",
+                "elapsed_ms": 12,
+                "arguments": {
+                    "path": "safe.txt",
+                    "content": sentinel,
+                    "authorization": f"Bearer {sentinel}",
+                },
+                "internal_error": sentinel,
+                "stdout": sentinel,
+                "messages": [{"content": sentinel}],
+            },
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert sentinel.encode() not in response.content
+    assert response.json() == {
+        "id": response.json()["id"],
+        "run_id": run_id,
+        "event_type": "tool_started",
+        "trace_id": "trace-public-post",
+        "sequence": 1,
+        "step": 3,
+        "payload": {
+            "elapsed_ms": 12,
+            "tool_name": "read",
+            "tool_call_id": "call-public-post",
+            "arguments": {"path": "safe.txt"},
+        },
+        "created_at": response.json()["created_at"],
+    }
+    with database.SessionLocal() as db:
+        persisted = db.scalar(select(database.RunEvent).where(database.RunEvent.run_id == run_id))
+        assert persisted is not None
+        assert persisted.payload["internal_error"] == sentinel
+
+    for event_type in ("runtime_snapshot", "checkpoint", "provider_checkpoint_created"):
+        rejected = client.post(
+            f"/api/runs/{run_id}/events",
+            json={"event_type": event_type, "payload": {"messages": [{"content": sentinel}]}},
+        )
+        assert rejected.status_code == 422, rejected.text
+        assert sentinel.encode() not in rejected.content
+
+    with database.SessionLocal() as db:
+        assert db.query(database.RunEvent).filter_by(run_id=run_id).count() == 1
+
+
 @pytest.mark.parametrize("run_status", ["received", "awaiting_approval"])
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_active_run_blocks_session_runtime_setting_changes 精确标识本用例的具体条件。
 def test_active_run_blocks_session_runtime_setting_changes(
     client: TestClient, run_status: str
 ) -> None:
@@ -1240,6 +1620,7 @@ def test_active_run_blocks_session_runtime_setting_changes(
     assert metadata_only.json()["title"] == "Rename while running"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_non_global_memory_requires_scope_id 精确标识本用例的具体条件。
 def test_non_global_memory_requires_scope_id(client: TestClient) -> None:
     response = client.post(
         "/api/memories", json={"scope": "workspace", "content": "Missing workspace id"}
@@ -1247,6 +1628,7 @@ def test_non_global_memory_requires_scope_id(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_memory_api_validates_scope_and_versions_updates 精确标识本用例的具体条件。
 def test_memory_api_validates_scope_and_versions_updates(client: TestClient, tmp_path: Path) -> None:
     workspace = client.post(
         "/api/workspaces", json={"name": "Memory project", "root_path": str(tmp_path / "memory-project")}
@@ -1308,6 +1690,7 @@ def test_memory_api_validates_scope_and_versions_updates(client: TestClient, tmp
     ).status_code == 409
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_deleting_session_cascades_messages 精确标识本用例的具体条件。
 def test_deleting_session_cascades_messages(client: TestClient) -> None:
     session = client.post("/api/sessions", json={"title": "Disposable"}).json()
     client.post(

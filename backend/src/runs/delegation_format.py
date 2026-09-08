@@ -1,4 +1,6 @@
 """Delegation catalog and structured result formatting."""
+# 文件职责：负责运行创建、恢复、流式传输和生命周期中的 delegation_format 子模块。
+# 逻辑关系：上层通过 runs/delegation_format.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
@@ -92,15 +94,24 @@ from src.sessions.delivery import (
 )
 
 
+# 变量说明：_DELEGATE_OUTPUT_LIMIT 表示当前步骤使用的 _DELEGATE_OUTPUT_LIMIT 值。
 _DELEGATE_OUTPUT_LIMIT = 16_000
+# 变量说明：_DELEGATE_MESSAGE_LIMIT 表示当前步骤使用的 _DELEGATE_MESSAGE_LIMIT 值。
 _DELEGATE_MESSAGE_LIMIT = 20_000
+# 变量说明：_DELEGATE_AGENT_CATALOG_LIMIT 表示当前步骤使用的 _DELEGATE_AGENT_CATALOG_LIMIT 值。
 _DELEGATE_AGENT_CATALOG_LIMIT = 40
+# 函数职责：完成 single_line 对应的业务处理。
+# 参数关系：value 表示当前字段或计算值；limit 表示当前步骤使用的 limit 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _single_line(value: object, *, limit: int) -> str:
     """Render user-configured metadata safely inside a system capability hint."""
 
     return " ".join(str(value or "").replace("\x00", "").split())[:limit]
 
 
+# 函数职责：完成 active_child_agents 对应的业务处理。
+# 参数关系：db 表示当前数据库会话。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _active_child_agents(db: Any) -> list[Agent]:
     """Return only explicitly user-created, currently enabled delegate targets."""
 
@@ -115,6 +126,9 @@ def _active_child_agents(db: Any) -> list[Agent]:
     ))
 
 
+# 函数职责：完成 delegate_catalog_prompt 对应的业务处理。
+# 参数关系：db 表示当前数据库会话；run 表示当前步骤使用的 run 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _delegate_catalog_prompt(db: Any, run: Run) -> str:
     """Make the main runtime's valid delegate IDs visible to the model.
 
@@ -124,25 +138,32 @@ def _delegate_catalog_prompt(db: Any, run: Run) -> str:
     credentials, workspaces, or capability internals.
     """
 
+    # 变量说明：children 表示当前步骤使用的 children 值。
     children = _active_child_agents(db)[:_DELEGATE_AGENT_CATALOG_LIMIT]
     if not children:
         return ""
+    # 变量说明：lines 表示当前流程使用的 lines 集合。
     lines = [
         "可委派的子 Agent（仅在任务确实较复杂、专业，或用户明确要求时使用 task 工具）：",
         "- 单个子任务使用 task + agent_id；批量任务使用 tasks 数组中的稳定 id/depends_on 声明依赖，无依赖节点会并行启动。",
         "- 每项任务都必须使用下列精确 agent_id；子 Agent 的实际权限和工具会由系统再次校验。",
     ]
     for child in children:
+        # 变量说明：name 表示当前对象名称。
         name = _single_line(child.name, limit=120) or "未命名子 Agent"
+        # 变量说明：description 表示当前步骤使用的 description 值。
         description = _single_line(child.description, limit=300)
+        # 变量说明：suffix 表示当前步骤使用的 suffix 值。
         suffix = f"：{description}" if description else ""
         lines.append(f"- {child.id} | {name}{suffix}")
     if len(children) >= _DELEGATE_AGENT_CATALOG_LIMIT:
         lines.append("- 列表已截断；如未找到匹配子 Agent，请直接完成可安全完成的部分或向用户说明。")
+    # 变量说明：team 表示当前步骤使用的 team 值。
     team = db.scalar(select(CollaborationTeam).where(
         CollaborationTeam.parent_run_id == run.id
     ))
     if team is None and run.task_id:
+        # 变量说明：team 表示当前步骤使用的 team 值。
         team = db.scalar(
             select(CollaborationTeam)
             .where(
@@ -152,8 +173,10 @@ def _delegate_catalog_prompt(db: Any, run: Run) -> str:
             .order_by(CollaborationTeam.updated_at.desc(), CollaborationTeam.id.desc())
         )
         if team is not None:
+            # 变量说明：parent_run_id 表示parent_run 对象的唯一标识。
             team.parent_run_id = run.id
     if team is not None:
+        # 变量说明：workers 表示当前流程使用的 workers 集合。
         workers = list(db.scalars(
             select(TeammateWorker)
             .where(TeammateWorker.team_id == team.id)
@@ -169,6 +192,9 @@ def _delegate_catalog_prompt(db: Any, run: Run) -> str:
     return "\n".join(lines)
 
 
+# 函数职责：完成 model_id_for_delegate 对应的业务处理。
+# 参数关系：connection 表示当前步骤使用的 connection 值；preferred 表示当前步骤使用的 preferred 值；inherited_model_id 表示inherited_model 对象的唯一标识；may_inherit_model 表示当前步骤使用的 may_inherit_model 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _model_id_for_delegate(
     connection: ModelConnection,
     *,
@@ -178,32 +204,43 @@ def _model_id_for_delegate(
 ) -> str | None:
     """Resolve a child model without accidentally crossing connections."""
 
+    # 变量说明：selected 表示当前步骤使用的 selected 值。
     selected = str(preferred or "").strip()
     if selected:
         return selected[:255]
+    # 变量说明：selected 表示当前步骤使用的 selected 值。
     selected = str(connection.default_model or "").strip()
     if selected:
         return selected[:255]
+    # 变量说明：candidates 表示当前流程使用的 candidates 集合。
     candidates = [*(connection.discovered_models or []), *(connection.manual_models or [])]
     for candidate in candidates:
+        # 变量说明：normalized 表示当前步骤使用的 normalized 值。
         normalized = str(candidate or "").strip()
         if normalized:
             return normalized[:255]
     if may_inherit_model:
+        # 变量说明：selected 表示当前步骤使用的 selected 值。
         selected = str(inherited_model_id or "").strip()
         if selected:
             return selected[:255]
     return None
 
 
+# 函数职责：完成 delegate_result_content 对应的业务处理。
+# 参数关系：payload 表示跨层传递的数据载荷。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _delegate_result_content(payload: dict[str, Any]) -> str:
     """Bound the child response before it becomes a parent tool observation."""
 
+    # 变量说明：encoded 表示当前步骤使用的 encoded 值。
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
     if len(encoded) <= _DELEGATE_MESSAGE_LIMIT:
         return encoded
     # Keep the structured envelope valid and signal truncation explicitly.
+    # 变量说明：compact 表示当前步骤使用的 compact 值。
     compact = dict(payload)
+    # 变量说明：output 表示当前步骤使用的 output 值。
     output = str(compact.get("output") or "")
     compact["output"] = output[: max(0, _DELEGATE_OUTPUT_LIMIT // 2)]
     compact["output_truncated"] = True
