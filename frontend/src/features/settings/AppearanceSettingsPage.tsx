@@ -1,6 +1,8 @@
+// 本文件实现 AppearanceSettingsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { Type } from 'lucide-react'
 import { PageHeader } from '../../components/ui'
 
+// AppearanceSettingsPage 编辑由 AppShell 持有的全局字号倍率，变更会即时作用到根元素。
 function AppearanceSettingsPage({ fontScale, onFontScaleChange }: { fontScale: number; onFontScaleChange: (value: number) => void }) {
   const percentage = Math.round(fontScale * 100)
   const presets = [90, 100, 110, 120]

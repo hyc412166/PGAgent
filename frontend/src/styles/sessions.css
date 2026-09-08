@@ -1,4 +1,5 @@
-/* Conversation workspace */
+/* 本文件定义 sessions 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
+/* 会话工作台整体布局。 */
 
 .page-chat {
   width: 100%;
@@ -532,7 +533,7 @@
 
 .composer textarea::placeholder { color: var(--muted-2); }
 
-/* Keep the context ring and add button stationary while settings are saved. */
+/* 保存设置时保持上下文环和添加按钮位置稳定。 */
 .composer-actions {
   flex: 0 0 auto;
 }

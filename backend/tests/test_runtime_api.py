@@ -1,3 +1,9 @@
+"""验证运行与草稿 API 的启动、停止、续接、审批、幂等物化和上下文查询。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -33,10 +39,13 @@ from src.persistence.database import (
 from src.runs.service import RunCoordinator, coordinator
 from src.runs.stream import run_stream_broker
 from src.tasks.state import sync_todos_for_run, transition_run_task
+from src.observability import current_observability_context
 
 
 @pytest.fixture()
+# 测试夹具：client 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, dict[str, list]]:
+    # 临时数据库承载草稿和运行状态；scheduled 捕获协调器调度，test_client 驱动运行与审批 API。
     configure_database(f"sqlite:///{(tmp_path / 'runtime-api.db').as_posix()}")
     init_db()
     launched: dict[str, list] = {"calls": []}
@@ -52,6 +61,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient,
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_waiting_stop_events_do_not_close_the_run_stream 精确标识本用例的具体条件。
 def test_waiting_stop_events_do_not_close_the_run_stream() -> None:
     assert not _stream_event_is_terminal({"type": "run_stopped", "reason": "waiting_background"})
     assert not _stream_event_is_terminal({"type": "run_stopped", "reason": "delegated_child_waiting_event"})
@@ -59,6 +69,7 @@ def test_waiting_stop_events_do_not_close_the_run_stream() -> None:
     assert _stream_event_is_terminal({"type": "run_completed"})
 
 
+# 辅助函数：_seed 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _seed() -> tuple[str, str, str]:
     with database.SessionLocal() as db:
         workspace = Workspace(name="Demo", root_path="C:/demo")
@@ -73,6 +84,65 @@ def _seed() -> tuple[str, str, str]:
         return workspace.id, agent.id, session.id
 
 
+def test_run_coordinator_binds_root_and_delegated_observability_context(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    _test_client, _launched = client
+    workspace_id, agent_id, session_id = _seed()
+    with database.SessionLocal() as db:
+        turn = ConversationTurn(session_id=session_id, trace_id="trace-observability")
+        db.add(turn)
+        db.flush()
+        parent = Run(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            turn_id=turn.id,
+        )
+        child = Run(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            run_kind="delegated",
+        )
+        db.add_all([parent, child])
+        db.flush()
+        db.add(
+            DelegatedTask(
+                parent_run_id=parent.id,
+                parent_session_id=session_id,
+                child_run_id=child.id,
+                child_agent_id=agent_id,
+                title="检查日志链路",
+                idempotency_key="observability-context",
+            )
+        )
+        db.commit()
+        parent_id = parent.id
+        child_id = child.id
+        turn_id = turn.id
+
+    local_coordinator = RunCoordinator()
+    with local_coordinator._observability_scope(parent_id):
+        assert current_observability_context() == {
+            "trace_id": "trace-observability",
+            "run_id": parent_id,
+            "turn_id": turn_id,
+        }
+
+    with local_coordinator._observability_scope(child_id):
+        assert current_observability_context() == {
+            "trace_id": "trace-observability",
+            "run_id": child_id,
+            "turn_id": turn_id,
+            "parent_run_id": parent_id,
+            "child_run_id": child_id,
+        }
+
+    assert current_observability_context() == {}
+
+
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_launch_session_run_persists_message_and_returns_immediately 精确标识本用例的具体条件。
 def test_launch_session_run_persists_message_and_returns_immediately(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -96,6 +166,7 @@ def test_launch_session_run_persists_message_and_returns_immediately(
         assert db.query(database.ChatMessage).filter_by(session_id=session_id).one().content == "读取文件"
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_continue_turn_binds_latest_interrupted_durable_task 精确标识本用例的具体条件。
 def test_continue_turn_binds_latest_interrupted_durable_task(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -137,6 +208,7 @@ def test_continue_turn_binds_latest_interrupted_durable_task(
     assert launched["calls"] == [(initial_run_id, False), (payload["id"], False)]
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_explicit_cancel_turn_terminates_the_durable_task_before_model_launch 精确标识本用例的具体条件。
 def test_explicit_cancel_turn_terminates_the_durable_task_before_model_launch(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -167,6 +239,7 @@ def test_explicit_cancel_turn_terminates_the_durable_task_before_model_launch(
     assert launched["calls"] == [(initial_run_id, False), (cancelled.json()["id"], False)]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_session_run_idempotency_reuses_the_same_accepted_turn 精确标识本用例的具体条件。
 def test_session_run_idempotency_reuses_the_same_accepted_turn(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -191,6 +264,7 @@ def test_session_run_idempotency_reuses_the_same_accepted_turn(
         assert db.query(ChatMessage).filter_by(session_id=session_id, role="user").count() == 1
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_second_active_run_is_rejected 精确标识本用例的具体条件。
 def test_second_active_run_is_rejected(client: tuple[TestClient, dict[str, list]]) -> None:
     test_client, _launched = client
     workspace_id, agent_id, session_id = _seed()
@@ -201,6 +275,7 @@ def test_second_active_run_is_rejected(client: tuple[TestClient, dict[str, list]
     assert response.status_code == 409
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_run_stream_sends_current_state_replay_and_terminal_with_stable_ids 精确标识本用例的具体条件。
 def test_run_stream_sends_current_state_replay_and_terminal_with_stable_ids(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -234,6 +309,47 @@ def test_run_stream_sends_current_state_replay_and_terminal_with_stable_ids(
     assert run_stream_broker.subscriber_count(run_id) == 0
 
 
+def test_run_stream_projects_durable_events_without_private_payloads(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, _launched = client
+    workspace_id, agent_id, session_id = _seed()
+    with database.SessionLocal() as db:
+        run = Run(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            status="completed",
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    run_stream_broker.publish(run_id, {
+        "type": "tool_started",
+        "tool_name": "read_file",
+        "tool_call_id": "call-secret-test",
+        "arguments": {
+            "path": "safe.txt",
+            "content": "private-file-body",
+            "api_key": "private-api-key",
+        },
+    })
+    run_stream_broker.publish(run_id, {
+        "type": "run_completed",
+        "output": "private-assistant-output",
+    })
+
+    response = test_client.get(f"/api/runs/{run_id}/stream")
+
+    assert response.status_code == 200
+    assert '"path":"safe.txt"' in response.text
+    assert "private-file-body" not in response.text
+    assert "private-api-key" not in response.text
+    assert "private-assistant-output" not in response.text
+
+
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_stop_run_is_idempotent_and_keeps_partial_stream_evidence 精确标识本用例的具体条件。
 def test_stop_run_is_idempotent_and_keeps_partial_stream_evidence(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -287,6 +403,7 @@ def test_stop_run_is_idempotent_and_keeps_partial_stream_evidence(
         assert not any(event.event_type == "tool_finished" for event in events)
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_stopping_an_accepted_turn_persists_exactly_one_terminal_reply 精确标识本用例的具体条件。
 def test_stopping_an_accepted_turn_persists_exactly_one_terminal_reply(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -315,19 +432,24 @@ def test_stopping_an_accepted_turn_persists_exactly_one_terminal_reply(
         assert "按你的要求停止" in replies[0].content
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_stop_run_cancels_in_process_task_and_does_not_rewrite_completed 精确标识本用例的具体条件。
 def test_stop_run_cancels_in_process_task_and_does_not_rewrite_completed(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
     test_client, _launched = client
     workspace_id, agent_id, session_id = _seed()
 
+    # 测试替身类：PendingTask 保存该局部场景的可控状态。
     class PendingTask:
+        # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
         def __init__(self) -> None:
             self.cancelled = False
 
+        # 辅助方法：done 实现测试替身在此调用阶段需要的最小行为。
         def done(self) -> bool:
             return False
 
+        # 辅助方法：cancel 实现测试替身在此调用阶段需要的最小行为。
         def cancel(self) -> bool:
             self.cancelled = True
             return True
@@ -366,6 +488,7 @@ def test_stop_run_cancels_in_process_task_and_does_not_rewrite_completed(
         ) is None
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_stop_waiting_approval_supersedes_pending_and_never_resumes 精确标识本用例的具体条件。
 def test_stop_waiting_approval_supersedes_pending_and_never_resumes(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -419,6 +542,7 @@ def test_stop_waiting_approval_supersedes_pending_and_never_resumes(
     assert rejected.status_code == 409
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_stopping_parent_settles_active_delegated_child 精确标识本用例的具体条件。
 def test_stopping_parent_settles_active_delegated_child(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -460,6 +584,7 @@ def test_stopping_parent_settles_active_delegated_child(
         ) is not None
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_stopping_delegated_child_settles_task_and_parent 精确标识本用例的具体条件。
 def test_stopping_delegated_child_settles_task_and_parent(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -514,6 +639,7 @@ def test_stopping_delegated_child_settles_task_and_parent(
         ) is not None
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_approval_decision_resumes_only_when_approved 精确标识本用例的具体条件。
 def test_approval_decision_resumes_only_when_approved(client: tuple[TestClient, dict[str, list]]) -> None:
     test_client, launched = client
     workspace_id, agent_id, session_id = _seed()
@@ -544,6 +670,7 @@ def test_approval_decision_resumes_only_when_approved(client: tuple[TestClient, 
     assert launched["calls"] == [(run_id, True)]
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_rejecting_root_approval_persists_exactly_one_terminal_reply 精确标识本用例的具体条件。
 def test_rejecting_root_approval_persists_exactly_one_terminal_reply(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -604,6 +731,7 @@ def test_rejecting_root_approval_persists_exactly_one_terminal_reply(
         assert "没有获得批准" in replies[0].content
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_approval_decision_is_restored_when_resume_cannot_be_scheduled 精确标识本用例的具体条件。
 def test_approval_decision_is_restored_when_resume_cannot_be_scheduled(
     client: tuple[TestClient, dict[str, list]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -650,6 +778,7 @@ def test_approval_decision_is_restored_when_resume_cannot_be_scheduled(
         assert restored_run is not None and restored_run.status == "awaiting_approval"
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_rejecting_delegated_child_approval_settles_its_delegation_and_parent_audit 精确标识本用例的具体条件。
 def test_rejecting_delegated_child_approval_settles_its_delegation_and_parent_audit(
     client: tuple[TestClient, dict[str, list]],
     monkeypatch: pytest.MonkeyPatch,
@@ -777,6 +906,7 @@ def test_rejecting_delegated_child_approval_settles_its_delegation_and_parent_au
         ]
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_approval_decision_rejects_run_not_awaiting_approval 精确标识本用例的具体条件。
 def test_approval_decision_rejects_run_not_awaiting_approval(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -798,6 +928,7 @@ def test_approval_decision_rejects_run_not_awaiting_approval(
         assert db.get(Approval, approval_id).status == "pending"
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_approval_decision_rejects_mismatch_with_latest_runtime_snapshot 精确标识本用例的具体条件。
 def test_approval_decision_rejects_mismatch_with_latest_runtime_snapshot(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -808,9 +939,11 @@ def test_approval_decision_rejects_mismatch_with_latest_runtime_snapshot(
         db.add(run)
         db.flush()
         approval = Approval(run_id=run.id, tool_name="write_file", arguments={"path": "approved.txt"})
-        snapshot = RunEvent(
+        latest_snapshot = RunEvent(
             run_id=run.id,
             event_type="runtime_snapshot",
+            sequence=2,
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
             payload={
                 "status": "awaiting_approval",
                 "pending_approval": {
@@ -820,7 +953,21 @@ def test_approval_decision_rejects_mismatch_with_latest_runtime_snapshot(
                 },
             },
         )
-        db.add_all([approval, snapshot])
+        misleading_newer_timestamp = RunEvent(
+            run_id=run.id,
+            event_type="runtime_snapshot",
+            sequence=1,
+            created_at=datetime.now(timezone.utc),
+            payload={
+                "status": "awaiting_approval",
+                "pending_approval": {
+                    "id": "call-old",
+                    "tool_name": "write_file",
+                    "arguments": {"path": "approved.txt"},
+                },
+            },
+        )
+        db.add_all([approval, latest_snapshot, misleading_newer_timestamp])
         db.commit()
         approval_id = approval.id
 
@@ -831,6 +978,7 @@ def test_approval_decision_rejects_mismatch_with_latest_runtime_snapshot(
         assert db.get(Approval, approval_id).status == "pending"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_launch_uses_fixed_defaults_when_session_has_no_bindings 精确标识本用例的具体条件。
 def test_launch_uses_fixed_defaults_when_session_has_no_bindings(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -851,6 +999,7 @@ def test_launch_uses_fixed_defaults_when_session_has_no_bindings(
         assert run.mode == "auto"
 
 
+# 辅助函数：_draft_payload 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _draft_payload(
     *,
     key: str,
@@ -872,6 +1021,7 @@ def _draft_payload(
     return payload
 
 
+# 辅助函数：_draft_resource_counts 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _draft_resource_counts() -> tuple[int, int, int, int]:
     with database.SessionLocal() as db:
         return (
@@ -882,6 +1032,7 @@ def _draft_resource_counts() -> tuple[int, int, int, int]:
         )
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_launch_draft_materializes_once_and_retries_without_rescheduling 精确标识本用例的具体条件。
 def test_launch_draft_materializes_once_and_retries_without_rescheduling(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -916,6 +1067,7 @@ def test_launch_draft_materializes_once_and_retries_without_rescheduling(
         assert db.query(DraftLaunch).count() == 1
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_launch_draft_rejects_reusing_key_for_different_request 精确标识本用例的具体条件。
 def test_launch_draft_rejects_reusing_key_for_different_request(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -935,6 +1087,7 @@ def test_launch_draft_rejects_reusing_key_for_different_request(
 
 
 @pytest.mark.parametrize("failure_mode", ["false", "exception"])
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_launch_draft_marks_persisted_run_failed_when_initial_scheduling_fails 精确标识本用例的具体条件。
 def test_launch_draft_marks_persisted_run_failed_when_initial_scheduling_fails(
     client: tuple[TestClient, dict[str, list]],
     monkeypatch: pytest.MonkeyPatch,
@@ -943,6 +1096,7 @@ def test_launch_draft_marks_persisted_run_failed_when_initial_scheduling_fails(
     test_client, launched = client
     attempts: list[tuple[str, bool]] = []
 
+    # 辅助方法：cannot_schedule 实现测试替身在此调用阶段需要的最小行为。
     def cannot_schedule(run_id: str, resume: bool = False) -> bool:
         attempts.append((run_id, resume))
         if failure_mode == "exception":
@@ -997,6 +1151,7 @@ def test_launch_draft_marks_persisted_run_failed_when_initial_scheduling_fails(
     assert launched["calls"] == []
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_launch_draft_reuses_project_for_distinct_keys_with_same_normalized_root 精确标识本用例的具体条件。
 def test_launch_draft_reuses_project_for_distinct_keys_with_same_normalized_root(
     client: tuple[TestClient, dict[str, list]], tmp_path: Path
 ) -> None:
@@ -1019,6 +1174,7 @@ def test_launch_draft_reuses_project_for_distinct_keys_with_same_normalized_root
         assert db.query(Workspace).count() == 2  # default one-off workspace + selected project
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_invalid_or_unavailable_draft_launch_leaves_no_rows 精确标识本用例的具体条件。
 def test_invalid_or_unavailable_draft_launch_leaves_no_rows(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -1041,6 +1197,7 @@ def test_invalid_or_unavailable_draft_launch_leaves_no_rows(
     assert launched["calls"] == []
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_session_context_recalculates_messages_when_cached_count_is_zero 精确标识本用例的具体条件。
 def test_session_context_recalculates_messages_when_cached_count_is_zero(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
@@ -1069,6 +1226,7 @@ def test_session_context_recalculates_messages_when_cached_count_is_zero(
         assert session is not None and session.context_tokens == body["used_tokens"]
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_session_context_get_reports_threshold_without_mutating_history 精确标识本用例的具体条件。
 def test_session_context_get_reports_threshold_without_mutating_history(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:

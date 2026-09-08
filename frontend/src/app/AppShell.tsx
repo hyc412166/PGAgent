@@ -1,3 +1,4 @@
+// 本文件负责 AppShell 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
 import { Bot, BookOpen, Cable, ChartNoAxesCombined, Database, History, LayoutDashboard, Menu, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Settings2, Sparkles, Sun, Type } from 'lucide-react'
 import { useEffect, useLayoutEffect, useState } from 'react'
 import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
@@ -17,6 +18,7 @@ import { UsagePage } from '../features/usage/UsagePage'
 import { useApiData } from '../shared/hooks/useApiData'
 import type { Health } from '../types'
 
+// navigation 是侧栏和路由展示共用的导航元数据；前七项属于工作台，其余属于系统设置。
 const navigation = [
   { path: '/dashboard', label: '总览', icon: LayoutDashboard },
   { path: '/agents', label: 'Agent 小队', icon: Bot },
@@ -31,9 +33,11 @@ const navigation = [
   { path: '/settings/appearance', label: '界面设置', icon: Type },
 ]
 
+// 字号缩放上下限保护页面布局，fontScale 的值会持久化到 localStorage。
 const fontScaleMin = 0.85
 const fontScaleMax = 1.25
 
+// 读取并夹紧已保存的字号倍率；浏览器禁用本地存储时回到默认倍率。
 function loadFontScale() {
   try {
     const stored = window.localStorage.getItem('pgagent-font-scale')
@@ -45,7 +49,9 @@ function loadFontScale() {
   }
 }
 
+// AppShell 是前端顶层布局，负责导航、主题、字号、健康状态和所有页面路由的装配。
 function AppShell() {
+  // mobileOpen/collapsed 控制两种侧栏形态；theme/fontScale 是跨页面的外观状态。
   const [mobileOpen, setMobileOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(false)
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -56,6 +62,7 @@ function AppShell() {
     }
   })
   const [fontScale, setFontScale] = useState(loadFontScale)
+  // location 用于路由变化后关闭移动导航；health 驱动侧栏底部的后端在线状态。
   const location = useLocation()
   const health = useApiData<Health | null>(null, () => api.get<Health>('/api/health'), [])
 
@@ -63,11 +70,11 @@ function AppShell() {
   useEffect(() => {
     document.documentElement.style.colorScheme = theme
     document.documentElement.dataset.theme = theme
-    try { window.localStorage.setItem('pgagent-theme', theme) } catch { /* local storage is optional */ }
+    try { window.localStorage.setItem('pgagent-theme', theme) } catch { /* 本地存储不可用时只保持当前页面状态。 */ }
   }, [theme])
   useLayoutEffect(() => {
     document.documentElement.style.fontSize = `${16 * fontScale}px`
-    try { window.localStorage.setItem('pgagent-font-scale', String(fontScale)) } catch { /* local storage is optional */ }
+    try { window.localStorage.setItem('pgagent-font-scale', String(fontScale)) } catch { /* 本地存储不可用时只保持当前页面状态。 */ }
   }, [fontScale])
 
   return (

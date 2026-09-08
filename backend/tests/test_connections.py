@@ -1,3 +1,9 @@
+"""验证模型连接的创建、模型发现、凭据保密、错误分类和推理等级更新。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,22 +20,28 @@ from src.api.connections import router as connections_router
 from src.persistence.database import Base, configure_database, init_db
 
 
+# 测试替身类：FakeHttpClient 模拟外部依赖的响应与调用记录，使连接或协议测试无需访问真实服务。
 class FakeHttpClient:
+    # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
     def __init__(self, response: httpx.Response, protocol_response: httpx.Response):
         self.response = response
         self.protocol_response = protocol_response
 
+    # 辅助方法：__enter__ 实现测试替身在此调用阶段需要的最小行为。
     def __enter__(self):  # type: ignore[no-untyped-def]
         return self
 
+    # 辅助方法：__exit__ 实现测试替身在此调用阶段需要的最小行为。
     def __exit__(self, *_args):  # type: ignore[no-untyped-def]
         return None
 
+    # 辅助方法：get 实现测试替身在此调用阶段需要的最小行为。
     def get(self, url: str, headers: dict[str, str]) -> httpx.Response:
         assert url.endswith("/models")
         assert headers["Authorization"].startswith("Bearer ")
         return self.response
 
+    # 辅助方法：post 实现测试替身在此调用阶段需要的最小行为。
     def post(self, url: str, headers: dict[str, str], json: dict) -> httpx.Response:  # type: ignore[no-untyped-def]
         assert url.endswith(("/responses", "/chat/completions"))
         assert headers["Authorization"].startswith("Bearer ")
@@ -38,16 +50,21 @@ class FakeHttpClient:
             assert json["max_output_tokens"] == 16
         return self.protocol_response
 
+    # 测试替身类：_Stream 保存该局部场景的可控状态。
     class _Stream:
+        # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
         def __init__(self, response: httpx.Response):
             self.response = response
 
+        # 辅助方法：__enter__ 实现测试替身在此调用阶段需要的最小行为。
         def __enter__(self):  # type: ignore[no-untyped-def]
             return self.response
 
+        # 辅助方法：__exit__ 实现测试替身在此调用阶段需要的最小行为。
         def __exit__(self, *_args):  # type: ignore[no-untyped-def]
             return None
 
+    # 辅助方法：stream 实现测试替身在此调用阶段需要的最小行为。
     def stream(self, method: str, url: str, headers: dict[str, str], json: dict) -> "FakeHttpClient._Stream":  # type: ignore[no-untyped-def]
         assert method == "POST"
         assert json["stream"] is True
@@ -55,7 +72,9 @@ class FakeHttpClient:
 
 
 @pytest.fixture()
+# 测试夹具：secret_backend 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def secret_backend(monkeypatch: pytest.MonkeyPatch) -> dict[tuple[str, str], str]:
+    # stored 以“服务名、连接标识”为键模拟系统密钥环，确保凭据不会落入业务数据库。
     stored: dict[tuple[str, str], str] = {}
     monkeypatch.setattr(
         secrets.keyring, "set_password", lambda service, ref, value: stored.__setitem__((service, ref), value)
@@ -66,7 +85,9 @@ def secret_backend(monkeypatch: pytest.MonkeyPatch) -> dict[tuple[str, str], str
 
 
 @pytest.fixture()
+# 测试夹具：client 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def client(tmp_path: Path, secret_backend: dict[tuple[str, str], str]) -> TestClient:
+    # 临时数据库保存连接元数据；secret_backend 单独保存密钥，test_client 用于调用连接管理 API。
     configure_database(f"sqlite:///{(tmp_path / 'connections.db').as_posix()}")
     init_db()
     app = FastAPI()
@@ -76,6 +97,7 @@ def client(tmp_path: Path, secret_backend: dict[tuple[str, str], str]) -> TestCl
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 辅助函数：mock_response 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def mock_response(
     monkeypatch: pytest.MonkeyPatch,
     status: int,
@@ -97,6 +119,7 @@ def mock_response(
     )
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_create_discovers_models_and_keeps_key_out_of_database_and_response 精确标识本用例的具体条件。
 def test_create_discovers_models_and_keeps_key_out_of_database_and_response(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -122,6 +145,7 @@ def test_create_discovers_models_and_keeps_key_out_of_database_and_response(
     assert test_response.json()["category"] == "ok"
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_manual_models_allow_missing_models_endpoint 精确标识本用例的具体条件。
 def test_manual_models_allow_missing_models_endpoint(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -144,6 +168,7 @@ def test_manual_models_allow_missing_models_endpoint(
     ("http_status", "category", "retryable"),
     [(401, "invalid_credentials", False), (403, "invalid_credentials", False), (429, "rate_limited", True), (503, "provider_error", True)],
 )
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_connection_errors_are_classified 精确标识本用例的具体条件。
 def test_connection_errors_are_classified(
     monkeypatch: pytest.MonkeyPatch,
     http_status: int,
@@ -158,6 +183,7 @@ def test_connection_errors_are_classified(
     assert result.http_status == http_status
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_create_rejects_discovery_failure_without_manual_models 精确标识本用例的具体条件。
 def test_create_rejects_discovery_failure_without_manual_models(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, secret_backend: dict[tuple[str, str], str]
 ) -> None:
@@ -171,6 +197,7 @@ def test_create_rejects_discovery_failure_without_manual_models(
     assert secret_backend == {}
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_manual_models_do_not_hide_invalid_credentials 精确标识本用例的具体条件。
 def test_manual_models_do_not_hide_invalid_credentials(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, secret_backend: dict[tuple[str, str], str]
 ) -> None:
@@ -189,6 +216,7 @@ def test_manual_models_do_not_hide_invalid_credentials(
     assert secret_backend == {}
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_connection_thinking_level_can_be_updated 精确标识本用例的具体条件。
 def test_connection_thinking_level_can_be_updated(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -210,6 +238,7 @@ def test_connection_thinking_level_can_be_updated(
     assert updated.json()["thinking_level"] == "high"
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_secret_headers_cannot_be_persisted 精确标识本用例的具体条件。
 def test_secret_headers_cannot_be_persisted(client: TestClient) -> None:
     response = client.post(
         "/api/connections",

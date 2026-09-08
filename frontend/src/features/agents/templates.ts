@@ -1,3 +1,5 @@
+// 本文件实现 templates 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
+// AgentTemplate 描述新建 Agent 时可选的角色起点及其推荐能力。
 export type AgentTemplate = {
   id: string
   name: string
@@ -9,7 +11,7 @@ export type AgentTemplate = {
   accent: 'violet' | 'blue' | 'green' | 'amber'
 }
 
-/** Curated starting points; every value remains editable before saving. */
+/** 精选配置仅作为起点，保存前每个字段仍可编辑。 */
 export const agentTemplates: AgentTemplate[] = [
   {
     id: 'coding-agent',

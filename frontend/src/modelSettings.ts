@@ -1,13 +1,17 @@
+// 本文件负责 modelSettings 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
 import type { AgentProfile, Connection, Session } from './types'
 
+// healthyStatuses 定义自动连接排序时视为健康的后端状态别名。
 const healthyStatuses = new Set(['connected', 'healthy', 'online'])
 
+// 将连接最后检查时间规范为可排序时间戳，无效时间排到末尾。
 function checkedAt(connection: Connection) {
   const value = connection.last_checked_at || connection.last_checked
   const timestamp = value ? new Date(value).getTime() : 0
   return Number.isNaN(timestamp) ? 0 : timestamp
 }
 
+// 自动选择优先级为：已启用、健康、最近检查；完全相同时保持原列表顺序。
 export function chooseAutomaticConnection(connections: Connection[]): Connection | undefined {
   return connections
     .map((connection, index) => ({ connection, index }))
@@ -20,6 +24,7 @@ export function chooseAutomaticConnection(connections: Connection[]): Connection
     })[0]?.connection
 }
 
+// 合并默认、发现和手动模型并去重，默认模型始终排在首位。
 export function availableConnectionModels(connection?: Connection): string[] {
   if (!connection) return []
   return Array.from(new Set([
@@ -30,6 +35,7 @@ export function availableConnectionModels(connection?: Connection): string[] {
   ]))
 }
 
+// 按“会话覆盖 > Agent 默认 > 自动连接”解析本轮实际连接和模型，并返回选择器所需值。
 export function resolveEffectiveModelSettings(
   connections: Connection[],
   session?: Session,

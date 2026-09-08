@@ -1,4 +1,6 @@
 """Frozen model, tool, skill, and workspace bindings for a run."""
+# 文件职责：负责运行创建、恢复、流式传输和生命周期中的 configuration 子模块。
+# 逻辑关系：上层通过 runs/configuration.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
@@ -93,18 +95,28 @@ from src.sessions.delivery import (
 )
 
 
+# 函数职责：完成 explicit_setting 对应的业务处理。
+# 参数关系：values 表示当前流程使用的 values 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _explicit_setting(*values: str | None) -> str | None:
     for value in values:
+        # 变量说明：normalized 表示当前步骤使用的 normalized 值。
         normalized = (value or "").strip()
         if normalized and normalized != "auto":
             return normalized
     return None
 
 
+# 函数职责：完成 fallback_connection 对应的业务处理。
+# 参数关系：db 表示当前数据库会话；provider 表示模型供应商。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _fallback_connection(db: Any, *, provider: str | None = None) -> ModelConnection | None:
+    # 变量说明：query 表示当前步骤使用的 query 值。
     query = select(ModelConnection).where(ModelConnection.enabled.is_(True))
     if provider:
+        # 变量说明：query 表示当前步骤使用的 query 值。
         query = query.where(ModelConnection.provider == provider)
+    # 变量说明：query 表示当前步骤使用的 query 值。
     query = query.order_by(
         case(
             (ModelConnection.status.in_(("connected", "healthy", "online")), 0),
@@ -117,21 +129,32 @@ def _fallback_connection(db: Any, *, provider: str | None = None) -> ModelConnec
     return db.scalar(query)
 
 
+# 函数职责：完成 effective_connection 对应的业务处理。
+# 参数关系：db 表示当前数据库会话；session 表示当前步骤使用的 session 值；agent 表示当前步骤使用的 agent 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _effective_connection(db: Any, session: Session | None, agent: Agent) -> ModelConnection | None:
+    # 变量说明：candidate_ids 表示candidate 对象标识集合。
     candidate_ids = [session.model_connection_id if session else None, agent.model_connection_id]
     for connection_id in dict.fromkeys(item for item in candidate_ids if item):
+        # 变量说明：connection 表示当前步骤使用的 connection 值。
         connection = db.get(ModelConnection, connection_id)
         if connection is not None and connection.enabled:
             return connection
     return _fallback_connection(db)
 
 
+# 函数职责：完成 allowed_runtime_tool_names 对应的业务处理。
+# 参数关系：tool_ids 表示tool 对象标识集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _allowed_runtime_tool_names(tool_ids: list[str]) -> list[str]:
     """Map persisted catalog IDs to only tools this runtime actually implements."""
 
+    # 变量说明：selected 表示当前步骤使用的 selected 值。
     selected: list[str] = []
+    # 变量说明：seen 表示当前步骤使用的 seen 值。
     seen: set[str] = set()
     for raw_id in tool_ids:
+        # 变量说明：tool_name 表示当前步骤使用的 tool_name 值。
         tool_name = str(raw_id or "").strip()
         if tool_name in TOOL_SCHEMAS and tool_name not in seen:
             selected.append(tool_name)
@@ -139,6 +162,9 @@ def _allowed_runtime_tool_names(tool_ids: list[str]) -> list[str]:
     return selected
 
 
+# 函数职责：完成 read_selected_skill_instructions 对应的业务处理。
+# 参数关系：db 表示当前数据库会话；skill_ids 表示skill 对象标识集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _read_selected_skill_instructions(db: Any, skill_ids: list[str]) -> list[dict[str, str]]:
     """Read only selected, PGAgent-managed ``SKILL.md`` text into a run binding.
 
@@ -147,24 +173,33 @@ def _read_selected_skill_instructions(db: Any, skill_ids: list[str]) -> list[dic
     filesystem exception to the model.
     """
 
+    # 变量说明：requested 表示当前步骤使用的 requested 值。
     requested = [str(item).strip() for item in skill_ids if str(item).strip()]
     if not requested:
         return []
+    # 变量说明：rows 表示当前流程使用的 rows 集合。
     rows = list(db.scalars(select(Skill).where(Skill.id.in_(requested), Skill.enabled.is_(True))))
+    # 变量说明：by_id 表示by 对象的唯一标识。
     by_id = {item.id: item for item in rows}
+    # 变量说明：managed_root 表示当前步骤使用的 managed_root 值。
     managed_root = (settings.data_dir / "skills").resolve()
+    # 变量说明：items 表示待处理的元素集合。
     items: list[dict[str, str]] = []
     for skill_id in requested:
+        # 变量说明：skill 表示当前步骤使用的 skill 值。
         skill = by_id.get(skill_id)
         if skill is None:
             continue
         try:
+            # 变量说明：root 表示处理范围的根目录。
             root = Path(skill.root_path).resolve(strict=True)
             root.relative_to(managed_root)
+            # 变量说明：skill_file 表示当前步骤使用的 skill_file 值。
             skill_file = (root / "SKILL.md").resolve(strict=True)
             skill_file.relative_to(root)
             if not skill_file.is_file() or skill_file.stat().st_size > 2_000_000:
                 continue
+            # 变量说明：content 表示待处理或返回的正文内容。
             content = skill_file.read_text(encoding="utf-8")[:40_000]
         except (OSError, UnicodeError, ValueError):
             continue

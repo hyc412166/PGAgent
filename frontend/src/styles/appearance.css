@@ -1,4 +1,5 @@
-/* Appearance settings */
+/* 本文件定义 appearance 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
+/* 外观设置：字号滑杆及预览区域。 */
 
 .appearance-settings-page { width: min(900px, 100%); }
 .appearance-settings-card { width: min(680px, 100%); padding: 18px; }

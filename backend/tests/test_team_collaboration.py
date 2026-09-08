@@ -1,3 +1,9 @@
+"""验证持久化协作者、数据库邮箱、Git 工作树创建、变更集成与会话清理。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import json
@@ -33,7 +39,9 @@ from src.tools import create_default_registry
 
 
 @pytest.fixture()
+# 测试夹具：team_db 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def team_db(tmp_path: Path):
+    # 临时数据库中的 child/session/run 标识组成协作上下文，供邮箱与工作树用例复用同一持久关系。
     database.configure_database(f"sqlite:///{(tmp_path / 'teams.db').as_posix()}")
     database.init_db()
     with database.SessionLocal() as db:
@@ -75,6 +83,7 @@ def team_db(tmp_path: Path):
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_persistent_teammate_reuse_and_database_mailbox 精确标识本用例的具体条件。
 def test_persistent_teammate_reuse_and_database_mailbox(team_db, tmp_path: Path) -> None:
     lead = TeamToolStore(
         run_id=team_db["run_id"],
@@ -178,6 +187,7 @@ def test_persistent_teammate_reuse_and_database_mailbox(team_db, tmp_path: Path)
         assert list_session_collaboration_events(team_db["session_id"], 200, db)
 
 
+# 辅助函数：_git 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(repo), *arguments],
@@ -189,11 +199,13 @@ def _git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_worktree_provisioning_does_not_hold_sqlite_writer_lock 精确标识本用例的具体条件。
 def test_worktree_provisioning_does_not_hold_sqlite_writer_lock(
     team_db, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     writes_during_git: list[str] = []
 
+    # 局部测试函数：fake_create 模拟该步骤的返回结果或异常。
     def fake_create(_workspace_root: str, worker_id: str, _worktree_root=None):  # type: ignore[no-untyped-def]
         with database.SessionLocal() as db:
             db.add(RunEvent(
@@ -226,6 +238,7 @@ def test_worktree_provisioning_does_not_hold_sqlite_writer_lock(
         assert db.query(RunEvent).filter_by(event_type="concurrent_write_during_worktree").count() == 1
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_worktree_teammate_changes_are_explicitly_integrated 精确标识本用例的具体条件。
 def test_worktree_teammate_changes_are_explicitly_integrated(team_db, tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
@@ -272,6 +285,7 @@ def test_worktree_teammate_changes_are_explicitly_integrated(team_db, tmp_path: 
     assert "parallel teammate result" in _git(repository, "log", "--oneline", "--all").stdout
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_session_delete_removes_teammate_worktree_and_branch 精确标识本用例的具体条件。
 def test_session_delete_removes_teammate_worktree_and_branch(team_db, tmp_path: Path) -> None:
     repository = tmp_path / "delete-repository"
     repository.mkdir()
@@ -317,6 +331,7 @@ def test_session_delete_removes_teammate_worktree_and_branch(team_db, tmp_path: 
     assert str(worktree.resolve()) not in _git(repository, "worktree", "list", "--porcelain").stdout
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_worktree_merge_timeout_aborts_merge 精确标识本用例的具体条件。
 def test_worktree_merge_timeout_aborts_merge(
     team_db, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -350,6 +365,7 @@ def test_worktree_merge_timeout_aborts_merge(
     original_run = team_service.subprocess.run
     abort_calls: list[list[str]] = []
 
+    # 辅助方法：timed_merge 实现测试替身在此调用阶段需要的最小行为。
     def timed_merge(arguments, *args, **kwargs):  # type: ignore[no-untyped-def]
         command = [str(item) for item in arguments]
         if "merge" in command and "--abort" not in command:

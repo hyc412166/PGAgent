@@ -1,3 +1,9 @@
+"""验证长期记忆提取流水线的候选生成、去重、合并、删除和运行结束触发。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import json
@@ -35,7 +41,9 @@ from src.runs.service import RunCoordinator
 
 
 @pytest.fixture()
+# 测试夹具：pipeline_db 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def pipeline_db(tmp_path: Path):
+    # 临时数据库串联运行、消息与记忆候选；夹具退出时清表，避免不同提取场景相互污染。
     database.configure_database(f"sqlite:///{(tmp_path / 'memory-pipeline.db').as_posix()}")
     database.init_db()
     with database.SessionLocal() as db:
@@ -57,6 +65,7 @@ def pipeline_db(tmp_path: Path):
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 辅助函数：_binding 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _binding(connection: ModelConnection) -> dict[str, str]:
     return {
         "model_connection_id": connection.id,
@@ -67,6 +76,7 @@ def _binding(connection: ModelConnection) -> dict[str, str]:
     }
 
 
+# 辅助函数：_phase1_response 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _phase1_response(content: str) -> dict:
     return {
         "choices": [{"message": {"content": json.dumps({
@@ -83,6 +93,7 @@ def _phase1_response(content: str) -> dict:
     }
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_memory_citation_protocol_is_hidden_and_machine_readable 精确标识本用例的具体条件。
 def test_memory_citation_protocol_is_hidden_and_machine_readable() -> None:
     visible, citation = split_memory_citation(
         'Use pytest.\n<pgagent-memory-citation>{"memory_ids":["m1"],'
@@ -99,6 +110,7 @@ def test_memory_citation_protocol_is_hidden_and_machine_readable() -> None:
     assert "backend testing" in message["content"]
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_phase1_redacts_quoted_json_credentials_from_inputs_and_outputs 精确标识本用例的具体条件。
 def test_phase1_redacts_quoted_json_credentials_from_inputs_and_outputs() -> None:
     raw = json.dumps({
         "api_key": "sk-abcdefghijklmnop",
@@ -139,6 +151,7 @@ def test_phase1_redacts_quoted_json_credentials_from_inputs_and_outputs() -> Non
     assert redacted.count("[REDACTED]") == 5
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_rollout_filter_keeps_public_request_terminal_reply_and_tool_evidence 精确标识本用例的具体条件。
 def test_rollout_filter_keeps_public_request_terminal_reply_and_tool_evidence(pipeline_db) -> None:
     _root, _workspace_id, session_id, _connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -154,6 +167,7 @@ def test_rollout_filter_keeps_public_request_terminal_reply_and_tool_evidence(pi
     assert [item["content"] for item in filtered] == ["request", "calling", "verified", "done"]
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_rollout_filter_bounds_messages_and_redacts_tool_call_secrets 精确标识本用例的具体条件。
 def test_rollout_filter_bounds_messages_and_redacts_tool_call_secrets(pipeline_db) -> None:
     _root, _workspace_id, session_id, _connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -175,6 +189,7 @@ def test_rollout_filter_bounds_messages_and_redacts_tool_call_secrets(pipeline_d
     assert "[REDACTED]" in serialized
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_deferred_extraction_activates_for_a_later_root_turn 精确标识本用例的具体条件。
 def test_deferred_extraction_activates_for_a_later_root_turn(pipeline_db) -> None:
     _root, workspace_id, session_id, _connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -210,6 +225,7 @@ def test_deferred_extraction_activates_for_a_later_root_turn(pipeline_db) -> Non
         assert db.get(MemoryJob, previous_id).status == "pending"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_global_disable_pauses_deferred_and_pending_memory_jobs 精确标识本用例的具体条件。
 def test_global_disable_pauses_deferred_and_pending_memory_jobs(pipeline_db) -> None:
     _tmp_path, workspace_id, session_id, _connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -234,6 +250,7 @@ def test_global_disable_pauses_deferred_and_pending_memory_jobs(pipeline_db) -> 
         assert db.get(MemoryJob, job_id).status == "deferred"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_memory_summary_indexes_every_active_memory 精确标识本用例的具体条件。
 def test_memory_summary_indexes_every_active_memory(pipeline_db) -> None:
     root, workspace_id, session_id, _connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -257,6 +274,7 @@ def test_memory_summary_indexes_every_active_memory(pipeline_db) -> None:
     assert "Search hint" in summary
 
 
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_run_memory_index_contains_all_visible_routes_but_not_other_workspace 精确标识本用例的具体条件。
 def test_run_memory_index_contains_all_visible_routes_but_not_other_workspace(pipeline_db) -> None:
     _root, workspace_id, session_id, _connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -274,6 +292,7 @@ def test_run_memory_index_contains_all_visible_routes_but_not_other_workspace(pi
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_extract_job_claim_allows_only_one_model_call 精确标识本用例的具体条件。
 async def test_extract_job_claim_allows_only_one_model_call(pipeline_db, monkeypatch: pytest.MonkeyPatch) -> None:
     _root, workspace_id, session_id, connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -286,6 +305,7 @@ async def test_extract_job_claim_allows_only_one_model_call(pipeline_db, monkeyp
         db.add(job); db.commit(); job_id = job.id
     calls = 0
 
+    # 局部测试函数：fake_call 模拟该步骤的返回结果或异常。
     async def fake_call(**_kwargs):
         nonlocal calls
         calls += 1
@@ -302,6 +322,7 @@ async def test_extract_job_claim_allows_only_one_model_call(pipeline_db, monkeyp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_malformed_extraction_is_retryable_instead_of_a_false_noop 精确标识本用例的具体条件。
 async def test_malformed_extraction_is_retryable_instead_of_a_false_noop(pipeline_db, monkeypatch: pytest.MonkeyPatch) -> None:
     _root, workspace_id, session_id, connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -313,6 +334,7 @@ async def test_malformed_extraction_is_retryable_instead_of_a_false_noop(pipelin
         )
         db.add(job); db.commit(); job_id = job.id
 
+    # 局部测试函数：fake_call 模拟该步骤的返回结果或异常。
     async def fake_call(**_kwargs):
         return {"choices": [{"message": {"content": "{truncated"}}]}
 
@@ -326,6 +348,7 @@ async def test_malformed_extraction_is_retryable_instead_of_a_false_noop(pipelin
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_legacy_extraction_payload_is_used_when_no_chat_rows_exist 精确标识本用例的具体条件。
 async def test_legacy_extraction_payload_is_used_when_no_chat_rows_exist(
     pipeline_db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -347,6 +370,7 @@ async def test_legacy_extraction_payload_is_used_when_no_chat_rows_exist(
         db.add(job); db.commit(); job_id = job.id
     observed: list[dict[str, str]] = []
 
+    # 局部测试函数：fake_call 模拟该步骤的返回结果或异常。
     async def fake_call(**kwargs):
         observed.extend(kwargs["messages"])
         return {"choices": [{"message": {"content": json.dumps({
@@ -366,6 +390,7 @@ async def test_legacy_extraction_payload_is_used_when_no_chat_rows_exist(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_multiple_legacy_payloads_in_one_session_are_not_deduplicated 精确标识本用例的具体条件。
 async def test_multiple_legacy_payloads_in_one_session_are_not_deduplicated(
     pipeline_db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -385,6 +410,7 @@ async def test_multiple_legacy_payloads_in_one_session_are_not_deduplicated(
         ) for request in ("remember alpha", "remember beta")]
         db.add_all(jobs); db.commit(); job_ids = [job.id for job in jobs]
 
+    # 局部测试函数：fake_call 模拟该步骤的返回结果或异常。
     async def fake_call(**kwargs):
         rendered = "\n".join(message["content"] for message in kwargs["messages"])
         content = "alpha durable value" if "remember alpha" in rendered else "beta durable value"
@@ -404,6 +430,7 @@ async def test_multiple_legacy_payloads_in_one_session_are_not_deduplicated(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_memory_job_error_redacts_provider_credentials 精确标识本用例的具体条件。
 async def test_memory_job_error_redacts_provider_credentials(pipeline_db, monkeypatch: pytest.MonkeyPatch) -> None:
     _root, workspace_id, session_id, connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -417,6 +444,7 @@ async def test_memory_job_error_redacts_provider_credentials(pipeline_db, monkey
         )
         db.add(job); db.commit(); job_id = job.id
 
+    # 局部测试函数：fake_call 模拟该步骤的返回结果或异常。
     async def fake_call(**_kwargs):
         raise RuntimeError("request failed: api_token=provider-secret-value")
 
@@ -431,6 +459,7 @@ async def test_memory_job_error_redacts_provider_credentials(pipeline_db, monkey
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_unavailable_connection_releases_consolidation_reservation 精确标识本用例的具体条件。
 async def test_unavailable_connection_releases_consolidation_reservation(pipeline_db) -> None:
     _root, workspace_id, session_id, _connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -474,6 +503,7 @@ async def test_unavailable_connection_releases_consolidation_reservation(pipelin
         assert rollout.consolidation_job_id is None
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_recovery_marks_exhausted_running_memory_job_failed 精确标识本用例的具体条件。
 def test_recovery_marks_exhausted_running_memory_job_failed(pipeline_db) -> None:
     _root, workspace_id, session_id, _connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -493,6 +523,7 @@ def test_recovery_marks_exhausted_running_memory_job_failed(pipeline_db) -> None
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_expired_worker_is_fenced_from_overwriting_new_attempt 精确标识本用例的具体条件。
 async def test_expired_worker_is_fenced_from_overwriting_new_attempt(pipeline_db, monkeypatch: pytest.MonkeyPatch) -> None:
     _root, workspace_id, session_id, connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -508,6 +539,7 @@ async def test_expired_worker_is_fenced_from_overwriting_new_attempt(pipeline_db
     release_first = asyncio.Event()
     calls = 0
 
+    # 局部测试函数：fake_call 模拟该步骤的返回结果或异常。
     async def fake_call(**_kwargs):
         nonlocal calls
         calls += 1
@@ -540,6 +572,7 @@ async def test_expired_worker_is_fenced_from_overwriting_new_attempt(pipeline_db
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_two_phase_pipeline_consolidates_and_citations_feed_usage 精确标识本用例的具体条件。
 async def test_two_phase_pipeline_consolidates_and_citations_feed_usage(pipeline_db, monkeypatch: pytest.MonkeyPatch) -> None:
     root, workspace_id, session_id, connection_id = pipeline_db
     with database.SessionLocal() as db:
@@ -593,6 +626,7 @@ async def test_two_phase_pipeline_consolidates_and_citations_feed_usage(pipeline
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
     }]
 
+    # 局部测试函数：fake_call 模拟该步骤的返回结果或异常。
     async def fake_call(**_kwargs):
         return responses.pop(0)
 

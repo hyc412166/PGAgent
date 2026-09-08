@@ -1,3 +1,4 @@
+// 本文件实现 SessionsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { AlertCircle, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
 import { Fragment, type FormEvent, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
@@ -28,7 +29,9 @@ import { activeRunStatuses, emptyDraftContext, emptyDraftSettings, emptyLiveRun,
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
 import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
+// SessionsPage 是会话工作台协调器：连接项目/会话导航、消息历史、实时运行、审批、子任务和编辑器设置。
 function SessionsPage() {
+  // 首组资源是页面级目录数据，提供会话归属、Agent 默认值以及可选择的模型与能力。
   const sessions = useApiData<Session[]>([], () => api.list<Session>('/api/sessions', ['sessions']), [])
   const agents = useApiData<AgentProfile[]>([], () => api.list<AgentProfile>('/api/agents', ['agents']), [])
   const workspaces = useApiData<Workspace[]>([], () => api.list<Workspace>('/api/workspaces', ['workspaces']), [])
@@ -36,6 +39,7 @@ function SessionsPage() {
   const skills = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
   const mcpServers = useApiData<McpServer[]>([], () => api.list<McpServer>('/api/mcp/servers', ['mcp-servers']), [])
   const memorySettings = useApiData<MemorySettings | null>(null, () => api.get<MemorySettings>('/api/memories/settings'), [])
+  // activeId 选择当前会话；编辑器、发送、中断和删除状态共同描述当前用户操作。
   const [activeId, setActiveId] = useState('')
   const [composerHasValue, setComposerHasValue] = useState(false)
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([])
@@ -45,6 +49,7 @@ function SessionsPage() {
   const [deletingSessionId, setDeletingSessionId] = useState('')
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState('')
   const [interruptedRunId, setInterruptedRunId] = useState('')
+  // 下列状态控制设置菜单及其子菜单；capabilitySaving 单独标记技能/MCP/权限写入。
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false)
   const [settingsSubmenu, setSettingsSubmenu] = useState<'model' | 'thinking' | null>(null)
@@ -53,17 +58,20 @@ function SessionsPage() {
   const [mcpSubmenuOpen, setMcpSubmenuOpen] = useState(false)
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false)
   const [capabilitySaving, setCapabilitySaving] = useState(false)
+  // 菜单 DOM 引用用于点击外部关闭和键盘焦点管理。
   const settingsMenuRef = useRef<HTMLDivElement>(null)
   const settingsTriggerRef = useRef<HTMLButtonElement>(null)
   const modelSubmenuRef = useRef<HTMLDivElement>(null)
   const thinkingSubmenuRef = useRef<HTMLDivElement>(null)
   const addMenuRef = useRef<HTMLDivElement>(null)
   const permissionMenuRef = useRef<HTMLDivElement>(null)
+  // actionError 汇集会话动作失败；draft* 表示尚未持久化的新会话及其项目/设置。
   const [decidingApproval, setDecidingApproval] = useState('')
   const [actionError, setActionError] = useState('')
   const [draftActive, setDraftActive] = useState(false)
   const [draftRootPath, setDraftRootPath] = useState('')
   const [draftSettings, setDraftSettings] = useState<DraftSessionSettings>(emptyDraftSettings)
+  // 项目树展开、文件夹选择、悬浮卡片，以及完成思考/子 Agent 面板属于展示层状态。
   const [expandedWorkspaceIds, setExpandedWorkspaceIds] = useState<Set<string>>(() => new Set())
   const [addingProject, setAddingProject] = useState(false)
   const [pickingDraftProject, setPickingDraftProject] = useState(false)
@@ -72,6 +80,7 @@ function SessionsPage() {
   const [completedThoughtsByRun, setCompletedThoughtsByRun] = useState<Record<string, ThoughtTimelineState>>({})
   const [childPanelOpen, setChildPanelOpen] = useState(false)
   const [selectedChildTaskId, setSelectedChildTaskId] = useState('')
+  // 运输层 refs 跨渲染保存 EventSource、计时器、事件去重集合和当前运行 ID，交给 useRunTransport 管理。
   const childPanelAutoOpenedRef = useRef(false)
   const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRun)
   const eventSourceRef = useRef<EventSource | null>(null)
@@ -80,6 +89,7 @@ function SessionsPage() {
   const streamErrorCountRef = useRef(0)
   const streamRunIdRef = useRef('')
   const seenStreamEventsRef = useRef<{ runId: string; eventIds: Set<string> }>({ runId: '', eventIds: new Set() })
+  // DOM/提交 refs 保存滚动位置、输入组件、待上传文件与幂等键，避免异步回调捕获旧状态。
   const messagesRef = useRef<HTMLDivElement>(null)
   const composerInputRef = useRef<ComposerTextAreaHandle>(null)
   const attachmentInputRef = useRef<HTMLInputElement>(null)
@@ -88,13 +98,14 @@ function SessionsPage() {
   const stickToBottomRef = useRef(true)
   const historyScrollSessionRef = useRef('')
   const terminalSyncVersionRef = useRef(0)
-  const pendingDraftRunRef = useRef<{ sessionId: string; runId: string } | null>(null)
+  const pendingDraftRunRef = useRef<{ sessionId: string; runId: string; startedAt?: string } | null>(null)
   const draftIdempotencyKeyRef = useRef('')
   const pendingSessionSendRef = useRef<{ sessionId: string; content: string; attachmentSignature: string; key: string } | null>(null)
   const draftVersionRef = useRef(0)
   const sendingRef = useRef(false)
   const lastSubmittedContentRef = useRef('')
   const thoughtHydrationRegistryRef = useRef(new ThoughtHydrationRegistry())
+  // 历史水合状态区分“数据已到达”和“滚动锚定已完成”，防止首次打开跳动。
   const [historyHydration, setHistoryHydration] = useState({ sessionId: '', complete: false })
   const [historyOpenVersion, setHistoryOpenVersion] = useState(0)
   activeIdRef.current = activeId
@@ -165,6 +176,7 @@ function SessionsPage() {
     setSelectedChildTaskId('')
   }, [activeId])
 
+  // 会话关联资源均携带 ownerSessionId；异步结果返回后只有 owner 与 activeId 一致才会展示。
   const messages = useApiData<OwnedSessionMessages>(
     { ownerSessionId: '', items: [] },
     async () => activeId
@@ -194,17 +206,17 @@ function SessionsPage() {
     : Promise.resolve(null), [activeId])
   const refreshDurableTask = durableTask.refresh
   const context = useApiData<SessionContext | null>(null, () => activeId ? api.get<SessionContext>(`/api/sessions/${activeId}/context`) : Promise.resolve(null), [activeId])
+  // 以下派生值把原始资源收敛为当前会话、当前运行、可见消息及可操作状态。
   const activeSession = sessions.data.find((item) => stringId(item.id) === activeId)
   const activeAgent = agents.data.find((item) => item.id === activeSession?.agent_id)
   const sessionRuns = visibleSessionItems(runs.data.ownerSessionId, activeId, runs.data.items)
     .filter((item) => !item.session_id || item.session_id === activeId)
+  // awaitingApprovalRunIds 驱动审批查询；只关注当前会话中仍等待决策的运行。
   const awaitingApprovalRunIds = sessionRuns
     .filter((item) => item.status === 'awaiting_approval')
     .map((item) => item.id)
   const approvalRunIdsKey = awaitingApprovalRunIds.join(',')
-  // A child awaiting approval takes precedence over its parent so the card is
-  // actionable in this very conversation instead of hidden behind a parent
-  // run that has already stopped for the child.
+  // 等待审批的子运行优先于父运行，确保审批卡直接出现在当前会话，而不被已为子任务停止的父运行遮挡。
   const activeRun = sessionRuns.find((item) => item.status === 'awaiting_approval')
     ?? sessionRuns.find((item) => isResumableWaitingRun(item))
     ?? sessionRuns.find((item) => activeRunStatuses.has(item.status || ''))
@@ -214,9 +226,7 @@ function SessionsPage() {
     activeRunStatuses.has(activeRun.status || '') || isResumableWaitingRun(activeRun)
   ))
   // `sending` only covers the initial launch request. Once the request has
-  // returned, the run is still active while its SSE stream/fallback polling
-  // is working. Keep the composer action bound to that run so users can
-  // interrupt the model at any point instead of seeing a disabled send icon.
+  // 子任务返回后，只要 SSE 或兜底轮询仍工作，运行就仍活跃；编辑器继续绑定该运行以允许随时中断。
   const liveRunIsActive = Boolean(
     liveRun.runId
       && (
@@ -237,13 +247,11 @@ function SessionsPage() {
       && liveRun.status === 'terminal'
       && lastSubmittedContentRef.current.trim(),
   )
-  // Legacy versions wrote raw child responses into the chat transcript. Hide
-  // those rows too; the source of truth is now the child side panel.
+  // 旧版本曾把子任务原始响应写入聊天记录；这些行也隐藏，当前权威展示位于子 Agent 侧栏。
+  // visibleMessages 与 repliedRunIds 用于渲染历史，并判定终止运行是否已有权威回复。
   const visibleMessages = visibleSessionItems(messages.data.ownerSessionId, activeId, messages.data.items)
     .filter((message) => message.metadata?.delegated_child !== true)
-    // Runtime tool turns and delegated terminal observations are durable
-    // provider/checkpoint transcript, not user-facing chat bubbles.  They are
-    // rendered through the activity timeline and child-agent side panel.
+    // 工具轮次和委派终态观察属于持久化执行记录，并非聊天气泡；它们由活动时间线和子 Agent 侧栏展示。
     .filter((message) => message.role !== 'tool')
     .filter((message) => message.metadata?.runtime_run_id == null)
     .filter((message) => message.metadata?.delegated_result_revision !== true)
@@ -268,6 +276,7 @@ function SessionsPage() {
   const completedThoughtLayoutVersion = Object.entries(completedThoughtsByRun)
     .map(([runId, timeline]) => `${runId}:${timeline.elapsedMs}:${timeline.tools.length}:${timeline.items?.length ?? 0}`)
     .join('|')
+  // 子任务、队友和选中子任务运行共同驱动右侧 ChildAgentPanel。
   const visibleChildTasks = childTasks.data.ownerSessionId === activeId ? childTasks.data.items : noDelegatedTasks
   const visibleTeammates = activeId ? teammates.data : noTeammates
   const sessionNavigation = buildSessionNavigation(workspaces.data, sessions.data)
@@ -277,6 +286,7 @@ function SessionsPage() {
   const childTaskEvents = useApiData<RunEvent[]>([], () => childTaskRunId
     ? api.list<RunEvent>(`/api/runs/${encodeURIComponent(childTaskRunId)}/events`, ['events'])
     : Promise.resolve([]), [childTaskRunId])
+  // 审批必须按当前等待运行逐组读取，再合并为页面可见列表。
   const approvals = useApiData<Approval[]>([], async () => {
     const runIds = approvalRunIdsKey ? approvalRunIdsKey.split(',').filter(Boolean) : []
     if (!runIds.length) return []
@@ -290,6 +300,7 @@ function SessionsPage() {
     awaitingApprovalRunIds.includes(stringId(approval.run_id))
       || (liveRun.status === 'awaiting_approval' && stringId(approval.run_id) === liveRun.runId)
   ))
+  // 为运输 Hook 提供稳定命名的刷新/状态写入函数，使终态同步不依赖页面实现细节。
   const refreshMessages = messages.refresh
   const refreshRuns = runs.refresh
   const refreshChildTasks = childTasks.refresh
@@ -319,9 +330,7 @@ function SessionsPage() {
       setSelectedChildTaskId('')
       return
     }
-    // Opening a history entry with delegated work should reveal its side
-    // panel once.  A later manual close is respected until the session has no
-    // child tasks (or the user switches sessions).
+    // 打开含委派任务的历史会话时自动展示一次侧栏；之后尊重手动关闭，直到子任务清空或切换会话。
     if (!childPanelAutoOpenedRef.current) {
       childPanelAutoOpenedRef.current = true
       setChildPanelOpen(true)
@@ -339,9 +348,7 @@ function SessionsPage() {
         .filter((run) => (!run.session_id || run.session_id === activeId) && isTerminalRunStatus(run.status))
         .map((run) => run.id),
     )
-    // Messages are the authoritative history index. `/api/runs` is bounded,
-    // so relying only on that list would lose thought timelines in long
-    // sessions once the run count exceeds its page limit.
+    // 消息是历史索引的权威来源；`/api/runs` 有分页上限，长会话不能只靠运行列表恢复思考时间线。
     for (const runId of historyMessageRunIds.split('|')) if (runId) finishedRunIds.add(runId)
     const registry = thoughtHydrationRegistryRef.current
     const runsToHydrate = [...finishedRunIds].filter((runId) => registry.shouldLoad(runId))
@@ -393,6 +400,7 @@ function SessionsPage() {
     setExpandedWorkspaceIds(isProject ? new Set([workspaceId]) : new Set())
   }, [activeSession?.workspace_id, draftActive, workspaces.data])
 
+  // 清除待上传附件及对应 input 值，保证再次选择同名文件仍会触发 change。
   function clearPendingAttachments() {
     pendingAttachmentsRef.current.forEach((item) => {
       if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
@@ -402,6 +410,7 @@ function SessionsPage() {
     if (attachmentInputRef.current) attachmentInputRef.current.value = ''
   }
 
+  // 校验新选择文件并与现有队列合并，同时为列表生成稳定本地 ID。
   function queueAttachments(files: FileList | null) {
     const selected = Array.from(files || [])
     if (!selected.length) return
@@ -424,6 +433,7 @@ function SessionsPage() {
     if (attachmentInputRef.current) attachmentInputRef.current.value = ''
   }
 
+  // 从状态和同步 ref 中同时移除附件，确保紧接着提交时读取到最新队列。
   function removePendingAttachment(id: string) {
     const target = pendingAttachmentsRef.current.find((item) => item.id === id)
     if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl)
@@ -432,6 +442,7 @@ function SessionsPage() {
     setPendingAttachments(next)
   }
 
+  // 将尚未创建的新会话恢复为初始草稿，并废弃此前异步操作版本。
   function clearDraftState() {
     draftVersionRef.current += 1
     clearPendingAttachments()
@@ -442,6 +453,7 @@ function SessionsPage() {
     draftIdempotencyKeyRef.current = ''
   }
 
+  // 进入新会话模式，关闭现有会话运输和菜单，并准备默认能力设置。
   function beginDraft() {
     if (sendingRef.current) return
     clearPendingAttachments()
@@ -458,6 +470,7 @@ function SessionsPage() {
     setDraftActive(true)
   }
 
+  // 切换至持久化会话；后续 useApiData 依赖 activeId 自动加载关联资源。
   function openExistingSession(sessionId: string) {
     if (draftActive && sendingRef.current) return
     if (draftActive) {
@@ -471,6 +484,7 @@ function SessionsPage() {
     setActiveId(sessionId)
   }
 
+  // 在不可变 Set 中切换项目树展开状态。
   function toggleProject(workspaceId: string) {
     setExpandedWorkspaceIds((current) => {
       const next = new Set(current)
@@ -480,6 +494,7 @@ function SessionsPage() {
     })
   }
 
+  // 根据触发元素位置计算项目悬浮卡片坐标，并限制在视口内。
   function showProjectHoverCard(
     event: React.MouseEvent<HTMLButtonElement> | React.FocusEvent<HTMLButtonElement>,
     workspace: Workspace,
@@ -499,6 +514,7 @@ function SessionsPage() {
     })
   }
 
+  // 调用系统文件夹选择器创建工作区，并刷新项目树。
   async function addProjectFromFolder() {
     if (addingProject) return
     setAddingProject(true); setProjectError('')
@@ -513,6 +529,7 @@ function SessionsPage() {
     } finally { setAddingProject(false) }
   }
 
+  // 确认并删除项目；若项目内存在活动运行则阻止删除以免丢失进行中工作。
   async function deleteProject(workspace: Workspace, projectSessions: Session[]) {
     const workspaceId = stringId(workspace.id)
     const deletedSessionIds = new Set(projectSessions.map((session) => stringId(session.id)))
@@ -545,6 +562,7 @@ function SessionsPage() {
     }
   }
 
+  // 为新会话选择或创建工作区，但暂不创建会话本身。
   async function selectDraftProject() {
     if (pickingDraftProject) return
     setPickingDraftProject(true); setActionError('')
@@ -557,6 +575,7 @@ function SessionsPage() {
     } catch (error) { setActionError(describeError(error)) } finally { setPickingDraftProject(false) }
   }
 
+  // 只解除草稿与项目的关联，保留草稿输入和其他设置。
   function clearDraftProject() {
     draftVersionRef.current += 1
     setDraftRootPath('')
@@ -608,7 +627,7 @@ function SessionsPage() {
     const pending = pendingDraftRunRef.current
     if (!pending || pending.sessionId !== activeId) return
     pendingDraftRunRef.current = null
-    startRunStream(pending.runId, pending.sessionId)
+    startRunStream(pending.runId, pending.sessionId, pending.startedAt)
     void refreshMessages()
     void refreshRuns()
     void refreshContext()
@@ -617,12 +636,10 @@ function SessionsPage() {
   useEffect(() => {
     if (!activeId || messages.loading || !activeRun?.id || !activeRunCanStream || liveRun.status === 'terminal') return
     if (streamRunIdRef.current === activeRun.id) return
-    startRunStream(activeRun.id, activeId)
+    startRunStream(activeRun.id, activeId, activeRun.started_at)
   }, [activeId, activeRun?.id, activeRun?.status, activeRun?.stop_reason, activeRunCanStream, liveRun.status, messages.loading, startRunStream, visibleMessages])
 
-  // A newly opened history stays pinned until both messages and persisted
-  // thought/tool timelines have hydrated. Programmatic layout scroll events
-  // must not cancel that initial anchor.
+  // 新打开的历史在消息和持久化思考/工具时间线均水合前保持锚定；程序布局滚动不能取消首次锚点。
   useEffect(() => {
     const anchoringHistory = Boolean(activeId) && historyScrollSessionRef.current === activeId
     const historyReady = historyHydration.sessionId === activeId
@@ -649,15 +666,13 @@ function SessionsPage() {
     const scrollToLatest = () => {
       const element = messagesRef.current
       if (!element) return
-      // Jump once after hydration instead of animating through a long history.
-      // This keeps opening and switching conversations immediately responsive.
+      // 水合完成后一次跳到底部，不在长历史中播放滚动动画，以保持会话切换即时响应。
       observedElement = element
       element.addEventListener('scrollend', finishHistoryAnchor)
       element.scrollTo({ top: element.scrollHeight })
       settleFrame = window.requestAnimationFrame(finishHistoryAnchor)
     }
-    // Wait for two browser layout passes after React has committed the fully
-    // hydrated history so the final scroll height is stable.
+    // React 提交完整历史后再等待两个浏览器布局周期，确保最终滚动高度稳定。
     prepareFrame = window.requestAnimationFrame(() => {
       frame = window.requestAnimationFrame(scrollToLatest)
     })
@@ -669,6 +684,7 @@ function SessionsPage() {
     }
   }, [activeId, childPanelOpen, completedThoughtLayoutVersion, historyHydration.complete, historyHydration.sessionId, historyOpenVersion, messages.data.ownerSessionId, messages.loading, liveRun.draft, liveRun.phase, runs.data.ownerSessionId, runs.loading, visibleApprovals.length, visibleMessages.length])
 
+  // 统一处理首轮建会话和已有会话续写，复用幂等键防止网络重试造成重复运行。
   async function submitMessage(content: string, files: File[], consumeComposer: boolean) {
     if (sendingRef.current || (!activeId && !draftActive) || (!content && !files.length) || settingsSaving || capabilitySaving || settingsLocked) return
     sendingRef.current = true
@@ -696,7 +712,7 @@ function SessionsPage() {
         const runId = stringId(launched.run?.id)
         if (!sessionId || !runId) throw new Error('草稿启动响应缺少会话或运行标识。')
         setInterruptedRunId('')
-        pendingDraftRunRef.current = { sessionId, runId }
+        pendingDraftRunRef.current = { sessionId, runId, startedAt: launched.run.started_at }
         if (consumeComposer) composerInputRef.current?.clear()
         clearDraftState()
         setActiveId(sessionId)
@@ -729,13 +745,12 @@ function SessionsPage() {
       void runs.refresh()
       void context.refresh()
       void durableTask.refresh()
-      startRunStream(launched.id, targetSessionId)
+      startRunStream(launched.id, targetSessionId, launched.started_at)
     } catch (error) {
       setLiveRun(emptyLiveRun())
       setActionError(describeError(error))
       if (!draftActive && activeId) {
-        // The request may have committed before the transport failed. Reload
-        // durable state so an accepted turn never remains a bare user bubble.
+        // 运输失败前请求可能已经提交；重新加载持久状态，避免已接收轮次只留下用户气泡。
         void Promise.all([messages.refresh(), runs.refresh(), context.refresh(), durableTask.refresh()])
       }
     } finally {
@@ -744,6 +759,7 @@ function SessionsPage() {
     }
   }
 
+  // 表单入口从非受控编辑器读取最新文本和附件快照，再交给 submitMessage。
   function sendMessage(event: FormEvent) {
     event.preventDefault()
     void submitMessage(
@@ -753,6 +769,7 @@ function SessionsPage() {
     )
   }
 
+  // 请求后端中断当前运行；实际草稿和终态随后由运输层事件同步。
   async function stopActiveRun() {
     const runId = interruptibleRunId || streamRunIdRef.current
     if (!runId || stoppingRunId) return
@@ -766,9 +783,7 @@ function SessionsPage() {
     ))
     try {
       await api.post(`/api/runs/${encodeURIComponent(runId)}/stop`, { reason: 'user_interrupted' })
-      // The server publishes `run_stopped` on the existing stream. Keep the
-      // transport open so the partial assistant draft and terminal timeline
-      // can be reconciled by the normal sync path.
+      // 服务端会在现有流发布 `run_stopped`；保持运输开启，让部分回复和终态时间线走常规同步路径。
       void refreshRuns()
     } catch (error) {
       setInterruptedRunId('')
@@ -783,6 +798,7 @@ function SessionsPage() {
     }
   }
 
+  // 取消持久任务并刷新卡片，避免仅在前端隐藏仍在执行的后台工作。
   async function cancelDurableTask(taskId: string) {
     const sessionId = activeIdRef.current
     if (!sessionId || !taskId || cancellingTaskId) return
@@ -801,6 +817,7 @@ function SessionsPage() {
     }
   }
 
+  // 把用户中断后的最后一次提交恢复进编辑器，供修改后重新发送。
   function editInterruptedPrompt() {
     const content = lastSubmittedContentRef.current.trim()
     if (!content || !canEditInterrupted) return
@@ -811,6 +828,7 @@ function SessionsPage() {
     window.requestAnimationFrame(() => composerInputRef.current?.focus?.())
   }
 
+  // 提交审批决策并同步运行、消息、上下文和子任务；批准时继续监听原运行。
   async function decideApproval(id: string, decision: 'approve' | 'reject', approvalRunId: string) {
     const approvalSessionId = activeIdRef.current
     if (!approvalSessionId || !approvalRunId || !sessionRuns.some((run) => run.id === approvalRunId)) return
@@ -841,6 +859,7 @@ function SessionsPage() {
     } finally { setDecidingApproval('') }
   }
 
+  // 更新模型、思考等级或单会话记忆开关；草稿模式仅更新本地设置。
   async function updateSessionSettings(payload: { model_connection_id?: string | null; model_id?: string | null; thinking_level?: ThinkingLevel | null; use_memories?: boolean }) {
     if (settingsLocked || sending) return
     if (draftActive) {
@@ -859,6 +878,7 @@ function SessionsPage() {
     catch (error) { setActionError(describeError(error)) } finally { setSettingsSaving(false) }
   }
 
+  // 更新技能、MCP 和权限能力；草稿在首轮创建时随 launch payload 一并提交。
   async function updateSessionCapabilities(payload: { skill_ids?: string[]; mcp_server_names?: string[]; permission_mode?: PermissionMode }) {
     if (settingsLocked || sending || capabilitySaving) return
     if (draftActive) {
@@ -876,6 +896,7 @@ function SessionsPage() {
     catch (error) { setActionError(describeError(error)) } finally { setCapabilitySaving(false) }
   }
 
+  // 删除单个会话并选择剩余最近会话；进行中会话由调用处禁用删除入口。
   async function deleteConversation(session: Session) {
     const sessionId = stringId(session.id)
     if (!sessionId || deletingSessionId || (sessionId === activeId && sendingRef.current)) return
@@ -900,6 +921,7 @@ function SessionsPage() {
     }
   }
 
+  // 生成项目树内复用的会话行，并把选择与删除动作绑定到对应 session.id。
   function renderSessionTreeItem(session: Session, extraClass = '') {
     const sessionId = stringId(session.id)
     const deleting = deletingSessionId === sessionId
@@ -916,14 +938,17 @@ function SessionsPage() {
   const selectedUseMemories = draftActive ? draftSettings.use_memories : activeSession?.use_memories ?? true
   const globalMemoriesDisabled = memorySettings.data?.enabled === false
 
+  // 切换当前会话或草稿的技能 ID。
   function toggleSessionSkill(skillId: string) {
     void updateSessionCapabilities({ skill_ids: toggleSelectedId(selectedSessionSkillIds, skillId) })
   }
 
+  // 切换当前会话或草稿按名称启用的 MCP 服务。
   function toggleSessionMcp(serverName: string) {
     void updateSessionCapabilities({ mcp_server_names: toggleSelectedId(selectedSessionMcpNames, serverName) })
   }
 
+  // 保存权限模式并关闭对应弹出菜单。
   function selectPermissionMode(mode: PermissionMode) {
     setPermissionMenuOpen(false)
     void updateSessionCapabilities({ permission_mode: mode })
@@ -952,22 +977,27 @@ function SessionsPage() {
     { value: 'high', label: '高' },
     { value: 'xhigh', label: '极高', hint: '更快消耗使用额度' },
   ]
+  // 同时关闭设置主菜单和二级菜单，防止残留不可见焦点。
   function closeSettingsMenu() {
     setSettingsMenuOpen(false)
     setSettingsSubmenu(null)
   }
+  // 将组合选择值转换成连接/模型字段后保存。
   function selectModel(value: string) {
     closeSettingsMenu()
     void updateSessionSettings(modelSelectionPayload(value))
   }
+  // 保存显式思考等级；auto 仍由有效设置解析函数结合默认值决定。
   function selectThinking(value: ThinkingLevel) {
     closeSettingsMenu()
     void updateSessionSettings({ thinking_level: value })
   }
+  // 切换单会话记忆召回；全局关闭时 UI 会禁用该入口。
   function toggleSessionMemories() {
     closeSettingsMenu()
     void updateSessionSettings({ use_memories: !selectedUseMemories })
   }
+  // 打开模型或思考二级菜单，并可在键盘导航时聚焦首个选项。
   function openSettingsSubmenu(kind: 'model' | 'thinking', focusFirst = false) {
     setSettingsSubmenu(kind)
     if (focusFirst) {

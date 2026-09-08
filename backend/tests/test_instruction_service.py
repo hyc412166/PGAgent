@@ -1,3 +1,9 @@
+"""验证全局与项目级 AGENTS.md 指令发现、合并、缓存失效和路径边界。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,13 +15,16 @@ from src.context import instructions as instruction_service
 
 
 @pytest.fixture()
+# 测试夹具：instruction_home 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def instruction_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    # data_dir 模拟全局个人指令目录；workspace_root 模拟项目目录，用于验证两级 AGENTS.md 的发现与合并。
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     monkeypatch.setattr(instruction_service, "settings", SimpleNamespace(data_dir=data_dir))
     return data_dir
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_personalization_round_trips_through_global_agents_md 精确标识本用例的具体条件。
 def test_personalization_round_trips_through_global_agents_md(instruction_home: Path) -> None:
     path = instruction_service.write_personal_instructions("Prefer Chinese replies.\r\nRun tests.")
 
@@ -28,6 +37,7 @@ def test_personalization_round_trips_through_global_agents_md(instruction_home: 
     assert not override_active
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_global_and_project_override_precedence_matches_codex 精确标识本用例的具体条件。
 def test_global_and_project_override_precedence_matches_codex(
     instruction_home: Path,
     tmp_path: Path,
@@ -50,6 +60,7 @@ def test_global_and_project_override_precedence_matches_codex(
     ]
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_empty_override_falls_back_and_workspace_rules_keep_instruction_order 精确标识本用例的具体条件。
 def test_empty_override_falls_back_and_workspace_rules_keep_instruction_order(
     instruction_home: Path,
     tmp_path: Path,
@@ -67,6 +78,7 @@ def test_empty_override_falls_back_and_workspace_rules_keep_instruction_order(
     assert rules.index("project rule") < rules.index("Only access the selected workspace")
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_personal_instruction_limit_is_enforced 精确标识本用例的具体条件。
 def test_personal_instruction_limit_is_enforced(instruction_home: Path) -> None:
     with pytest.raises(ValueError, match="exceed"):
         instruction_service.write_personal_instructions(
@@ -74,6 +86,7 @@ def test_personal_instruction_limit_is_enforced(instruction_home: Path) -> None:
         )
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_manually_created_instruction_files_are_bounded 精确标识本用例的具体条件。
 def test_manually_created_instruction_files_are_bounded(
     instruction_home: Path,
     tmp_path: Path,
@@ -98,6 +111,7 @@ def test_manually_created_instruction_files_are_bounded(
     assert len(project.content.encode("utf-8")) == instruction_service.MAX_PROJECT_INSTRUCTION_BYTES
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_project_instruction_symlink_cannot_escape_workspace 精确标识本用例的具体条件。
 def test_project_instruction_symlink_cannot_escape_workspace(
     instruction_home: Path,
     tmp_path: Path,
@@ -117,6 +131,7 @@ def test_project_instruction_symlink_cannot_escape_workspace(
     assert str(outside.resolve()) not in paths
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_resolved_file_outside_boundary_is_rejected 精确标识本用例的具体条件。
 def test_resolved_file_outside_boundary_is_rejected(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

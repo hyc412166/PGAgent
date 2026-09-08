@@ -36,7 +36,8 @@ backend/                              # 完整后端核心，对应 codex-rs/cor
 │   ├── mcp/                          # MCP Client 配置、会话连接与工具适配
 │   ├── model/                        # 模型网关与凭据适配
 │   ├── native/                       # Windows 原生系统集成
-│   ├── persistence/                  # ORM、数据库生命周期和默认数据
+│   ├── observability/                # 关联上下文、脱敏与本地 JSONL 日志
+│   ├── persistence/                  # ORM、数据库生命周期、默认数据与有序 RunEvent 写入
 │   ├── runs/                         # Run 配置、生命周期、委派和事件流
 │   ├── sessions/                     # 会话交付语义
 │   ├── skills/                       # Skill 注册、导入和选择
@@ -53,6 +54,7 @@ backend/                              # 完整后端核心，对应 codex-rs/cor
 - `context/` 负责送入模型的内容；`memory/` 负责跨会话的长期信息。
 - `coding/` 是共享 `AgentRuntime` 上的工程工作流层；Coding、Review、Debug 只定义 profile 和证据语义，不各自拥有运行时、审批或沙箱实现。
 - `persistence/models.py` 只声明关系实体；引擎、迁移、初始化和数据库会话归 `persistence/database.py`。
+- `observability/` 只负责诊断关联、脱敏和本地文件输出；`persistence/run_events.py` 负责事务内的 RunEvent 顺序分配，HTTP/SSE 的安全投影归 `api/`。
 - `main.py` 只装配各模块与进程生命周期，不新增业务实现。
 - 不再保留 `app/`、`services/`、`runtime/` 等旧实现路径；新增代码必须进入拥有该行为的领域目录。
 

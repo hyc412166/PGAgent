@@ -1,3 +1,9 @@
+"""验证持久化任务依赖图的建图、并发领取、分波调度、失败传播和委派步骤复用。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -19,13 +25,16 @@ from src.tools.types import ToolResult
 
 
 @pytest.fixture()
+# 测试夹具：graph_db 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def graph_db(tmp_path: Path):
+    # 临时数据库保存任务及依赖步骤，确保并发领取、状态传播和委派映射均经过真实事务。
     database.configure_database(f"sqlite:///{(tmp_path / 'task-graph.db').as_posix()}")
     database.init_db()
     yield
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 辅助函数：_create_run 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _create_run() -> str:
     with database.SessionLocal() as db:
         session = Session(
@@ -48,6 +57,7 @@ def _create_run() -> str:
         return run.id
 
 
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_dependency_graph_unlocks_parallel_steps_in_waves 精确标识本用例的具体条件。
 def test_dependency_graph_unlocks_parallel_steps_in_waves(graph_db) -> None:
     run_id = _create_run()
     sync_todos_for_run(run_id, [
@@ -104,6 +114,7 @@ def test_dependency_graph_unlocks_parallel_steps_in_waves(graph_db) -> None:
         assert task is not None and task.status == "completed"
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_atomic_claim_allows_only_one_worker 精确标识本用例的具体条件。
 def test_atomic_claim_allows_only_one_worker(graph_db) -> None:
     run_id = _create_run()
     sync_todos_for_run(run_id, [
@@ -118,6 +129,7 @@ def test_atomic_claim_allows_only_one_worker(graph_db) -> None:
     assert sorted(outcomes) == [False, True]
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_cycle_is_rejected_before_plan_is_persisted 精确标识本用例的具体条件。
 def test_cycle_is_rejected_before_plan_is_persisted(graph_db) -> None:
     run_id = _create_run()
     with pytest.raises(ValueError, match="cycle"):
@@ -130,6 +142,7 @@ def test_cycle_is_rejected_before_plan_is_persisted(graph_db) -> None:
         assert run is not None and run.task_id is None
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_compatibility_task_tools_share_the_canonical_sqlite_graph 精确标识本用例的具体条件。
 def test_compatibility_task_tools_share_the_canonical_sqlite_graph(graph_db, tmp_path: Path) -> None:
     run_id = _create_run()
     store = TaskGraphToolStore(run_id=run_id)
@@ -167,8 +180,11 @@ def test_compatibility_task_tools_share_the_canonical_sqlite_graph(graph_db, tmp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_delegate_batch_runs_ready_nodes_concurrently_then_dependency 精确标识本用例的具体条件。
 async def test_delegate_batch_runs_ready_nodes_concurrently_then_dependency(graph_db, tmp_path: Path) -> None:
+    # 测试替身类：Delegate 保存该局部场景的可控状态。
     class Delegate:
+        # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
         def __init__(self) -> None:
             self.active = 0
             self.max_active = 0
@@ -179,10 +195,12 @@ async def test_delegate_batch_runs_ready_nodes_concurrently_then_dependency(grap
             self.graph_call_ids: dict[str, str | None] = {}
             self.prepared_call_id: str | None = None
 
+        # 辅助方法：prepare_graph 实现测试替身在此调用阶段需要的最小行为。
         def prepare_graph(self, specs, *, call_id=None):  # type: ignore[no-untyped-def]
             self.prepared = [dict(item) for item in specs]
             self.prepared_call_id = call_id
 
+        # 辅助方法：__call__ 实现测试替身在此调用阶段需要的最小行为。
         async def __call__(
             self,
             task: str,
@@ -236,13 +254,17 @@ async def test_delegate_batch_runs_ready_nodes_concurrently_then_dependency(grap
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_delegate_without_step_id_requests_existing_plan_link 精确标识本用例的具体条件。
 async def test_delegate_without_step_id_requests_existing_plan_link(graph_db, tmp_path: Path) -> None:
+    # 测试替身类：Delegate 保存该局部场景的可控状态。
     class Delegate:
         prepared: list[dict[str, object]] = []
 
+        # 辅助方法：prepare_graph 实现测试替身在此调用阶段需要的最小行为。
         def prepare_graph(self, specs, *, call_id=None):  # type: ignore[no-untyped-def]
             self.prepared = [dict(item) for item in specs]
 
+        # 辅助方法：__call__ 实现测试替身在此调用阶段需要的最小行为。
         async def __call__(self, _task: str, **_kwargs) -> ToolResult:  # type: ignore[no-untyped-def]
             return ToolResult("task", True, json.dumps({"status": "completed"}))
 
@@ -267,19 +289,25 @@ async def test_delegate_without_step_id_requests_existing_plan_link(graph_db, tm
 
 
 @pytest.mark.asyncio
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_delegate_preflight_failure_settles_failed_and_downstream_steps 精确标识本用例的具体条件。
 async def test_delegate_preflight_failure_settles_failed_and_downstream_steps(
     graph_db, tmp_path: Path
 ) -> None:
+    # 测试替身类：Delegate 保存该局部场景的可控状态。
     class Delegate:
+        # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
         def __init__(self) -> None:
             self.blocked: dict[str, str] = {}
 
+        # 辅助方法：prepare_graph 实现测试替身在此调用阶段需要的最小行为。
         def prepare_graph(self, _specs):  # type: ignore[no-untyped-def]
             return None
 
+        # 辅助方法：block_step 实现测试替身在此调用阶段需要的最小行为。
         def block_step(self, external_id: str, reason: str) -> None:
             self.blocked[external_id] = reason
 
+        # 辅助方法：__call__ 实现测试替身在此调用阶段需要的最小行为。
         async def __call__(self, task: str, **_kwargs) -> ToolResult:  # type: ignore[no-untyped-def]
             return ToolResult("task", False, f"cannot start {task}", error_code="delegate_configuration_invalid")
 
@@ -301,18 +329,24 @@ async def test_delegate_preflight_failure_settles_failed_and_downstream_steps(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_waiting_prerequisite_pauses_downstream_without_failing_it 精确标识本用例的具体条件。
 async def test_waiting_prerequisite_pauses_downstream_without_failing_it(graph_db, tmp_path: Path) -> None:
+    # 测试替身类：Delegate 保存该局部场景的可控状态。
     class Delegate:
+        # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
         def __init__(self) -> None:
             self.called: list[str] = []
             self.blocked: list[str] = []
 
+        # 辅助方法：prepare_graph 实现测试替身在此调用阶段需要的最小行为。
         def prepare_graph(self, _specs, *, call_id=None):  # type: ignore[no-untyped-def]
             return None
 
+        # 辅助方法：block_step 实现测试替身在此调用阶段需要的最小行为。
         def block_step(self, external_id: str, _reason: str, *, graph_call_id=None) -> None:
             self.blocked.append(external_id)
 
+        # 辅助方法：__call__ 实现测试替身在此调用阶段需要的最小行为。
         async def __call__(self, _task: str, *, plan_step_external_id: str, **_kwargs) -> ToolResult:
             self.called.append(plan_step_external_id)
             return ToolResult(
@@ -344,6 +378,7 @@ async def test_waiting_prerequisite_pauses_downstream_without_failing_it(graph_d
     assert delegate.blocked == []
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_replaying_completed_delegated_graph_keeps_task_completed 精确标识本用例的具体条件。
 def test_replaying_completed_delegated_graph_keeps_task_completed(graph_db) -> None:
     run_id = _create_run()
     specs = [{"id": "done", "task": "Already done", "agent_id": DEFAULT_AGENT_ID}]
@@ -361,6 +396,7 @@ def test_replaying_completed_delegated_graph_keeps_task_completed(graph_db) -> N
         assert task.active_step_id is None
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_generated_delegation_links_unique_ready_subagent_plan_step 精确标识本用例的具体条件。
 def test_generated_delegation_links_unique_ready_subagent_plan_step(graph_db) -> None:
     run_id = _create_run()
     sync_todos_for_run(run_id, [
@@ -403,6 +439,7 @@ def test_generated_delegation_links_unique_ready_subagent_plan_step(graph_db) ->
         }
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_explicit_delegation_step_id_reuses_planned_step 精确标识本用例的具体条件。
 def test_explicit_delegation_step_id_reuses_planned_step(graph_db) -> None:
     run_id = _create_run()
     sync_todos_for_run(run_id, [{
@@ -431,6 +468,7 @@ def test_explicit_delegation_step_id_reuses_planned_step(graph_db) -> None:
         assert steps[0].external_id == "inspect"
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_explicit_delegation_reuses_blocked_batch_steps_and_keeps_dependencies 精确标识本用例的具体条件。
 def test_explicit_delegation_reuses_blocked_batch_steps_and_keeps_dependencies(graph_db) -> None:
     run_id = _create_run()
     sync_todos_for_run(run_id, [

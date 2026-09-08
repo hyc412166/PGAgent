@@ -1,4 +1,6 @@
 """Durable, model-independent delivery for accepted conversation turns."""
+# 文件职责：负责会话交付与清理中的 delivery 子模块。
+# 逻辑关系：上层通过 sessions/delivery.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
@@ -16,9 +18,12 @@ from src.persistence.database import (
     RunEvent,
     next_chat_message_sequence,
 )
+from src.persistence.run_events import append_run_event
 
 
+# 变量说明：TERMINAL_RUN_STATUSES 表示当前流程使用的 TERMINAL_RUN_STATUSES 集合。
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "stopped"})
+# 变量说明：NON_TERMINAL_STOP_REASONS 表示当前流程使用的 NON_TERMINAL_STOP_REASONS 集合。
 NON_TERMINAL_STOP_REASONS = frozenset({
     "delegated_child_awaiting_approval",
     "delegated_child_waiting_event",
@@ -26,21 +31,33 @@ NON_TERMINAL_STOP_REASONS = frozenset({
 })
 
 
+# 函数职责：完成 utcnow 对应的业务处理。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# 函数职责：完成 request_fingerprint 对应的业务处理。
+# 参数关系：content 表示待处理或返回的正文内容。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def request_fingerprint(content: str) -> str:
+    # 变量说明：normalized 表示当前步骤使用的 normalized 值。
     normalized = content.strip().encode("utf-8")
     return hashlib.sha256(normalized).hexdigest()
 
 
+# 函数职责：完成 is_terminal_delivery 对应的业务处理。
+# 参数关系：status 表示当前对象或运行的状态；stop_reason 表示当前步骤使用的 stop_reason 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def is_terminal_delivery(status: str, stop_reason: str | None = None) -> bool:
     return status in TERMINAL_RUN_STATUSES and not (
         status == "stopped" and stop_reason in NON_TERMINAL_STOP_REASONS
     )
 
 
+# 函数职责：查找 turn_by_client_message 对应的数据或流程。
+# 参数关系：db 表示当前数据库会话；session_id 表示所属会话标识；client_message_id 表示client_message 对象的唯一标识。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def find_turn_by_client_message(
     db: Any,
     *,
@@ -55,10 +72,16 @@ def find_turn_by_client_message(
     ))
 
 
+# 函数职责：执行 for_turn 对应的数据或流程。
+# 参数关系：db 表示当前数据库会话；turn_id 表示turn 对象的唯一标识。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def run_for_turn(db: Any, turn_id: str) -> Run | None:
     return db.scalar(select(Run).where(Run.turn_id == turn_id))
 
 
+# 函数职责：完成 stage_user_turn 对应的业务处理。
+# 参数关系：db 表示当前数据库会话；session_id 表示所属会话标识；workspace_id 表示工作区标识；agent_id 表示智能体标识；content 表示待处理或返回的正文内容；mode 表示当前步骤使用的 mode 值；client_message_id 表示client_message 对象的唯一标识；fingerprint 表示当前步骤使用的 fingerprint 值；其余参数沿用调用方提供的扩展选项。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def stage_user_turn(
     db: Any,
     *,
@@ -73,7 +96,9 @@ def stage_user_turn(
 ) -> tuple[ConversationTurn, ChatMessage, Run]:
     """Stage the receipt, user message and root run in one transaction."""
 
+    # 变量说明：normalized_content 表示当前步骤使用的 normalized_content 值。
     normalized_content = content.strip()
+    # 变量说明：turn 表示当前步骤使用的 turn 值。
     turn = ConversationTurn(
         session_id=session_id,
         client_message_id=client_message_id,
@@ -83,6 +108,7 @@ def stage_user_turn(
     )
     db.add(turn)
     db.flush()
+    # 变量说明：message 表示当前消息。
     message = ChatMessage(
         session_id=session_id,
         role="user",
@@ -96,6 +122,7 @@ def stage_user_turn(
             "trace_id": turn.trace_id,
         },
     )
+    # 变量说明：run 表示当前步骤使用的 run 值。
     run = Run(
         session_id=session_id,
         workspace_id=workspace_id,
@@ -106,10 +133,14 @@ def stage_user_turn(
     )
     db.add_all([message, run])
     db.flush()
+    # 变量说明：user_message_id 表示user_message 对象的唯一标识。
     turn.user_message_id = message.id
     return turn, message, run
 
 
+# 函数职责：确保 run_turn 对应的数据或流程。
+# 参数关系：db 表示当前数据库会话；run 表示当前步骤使用的 run 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def ensure_run_turn(db: Any, run: Run) -> ConversationTurn | None:
     """Return a run's receipt, conservatively adopting legacy accepted runs."""
 
@@ -122,6 +153,7 @@ def ensure_run_turn(db: Any, run: Run) -> ConversationTurn | None:
 
     # A root Run created through generic resource APIs is not necessarily a
     # user turn. Only adopt it when an unclaimed user message proves acceptance.
+    # 变量说明：user_message 表示当前步骤使用的 user_message 值。
     user_message = db.scalar(
         select(ChatMessage)
         .where(
@@ -135,6 +167,7 @@ def ensure_run_turn(db: Any, run: Run) -> ConversationTurn | None:
     if user_message is None:
         return None
 
+    # 变量说明：turn 表示当前步骤使用的 turn 值。
     turn = ConversationTurn(
         session_id=run.session_id,
         request_fingerprint=request_fingerprint(user_message.content),
@@ -145,9 +178,13 @@ def ensure_run_turn(db: Any, run: Run) -> ConversationTurn | None:
     )
     db.add(turn)
     db.flush()
+    # 变量说明：turn_id 表示turn 对象的唯一标识。
     run.turn_id = turn.id
+    # 变量说明：turn_id 表示turn 对象的唯一标识。
     user_message.turn_id = turn.id
+    # 变量说明：message_kind 表示当前步骤使用的 message_kind 值。
     user_message.message_kind = "user_request"
+    # 变量说明：extra 表示当前步骤使用的 extra 值。
     user_message.extra = {
         **dict(user_message.extra or {}),
         "turn_id": turn.id,
@@ -155,11 +192,13 @@ def ensure_run_turn(db: Any, run: Run) -> ConversationTurn | None:
         "legacy_turn_adopted": True,
     }
 
+    # 变量说明：existing_replies 表示当前流程使用的 existing_replies 集合。
     existing_replies = list(db.scalars(
         select(ChatMessage)
         .where(ChatMessage.session_id == run.session_id, ChatMessage.role == "assistant")
         .order_by(ChatMessage.sequence.desc(), ChatMessage.created_at.desc(), ChatMessage.id.desc())
     ))
+    # 变量说明：existing_reply 表示当前步骤使用的 existing_reply 值。
     existing_reply = next(
         (
             message for message in existing_replies
@@ -169,29 +208,45 @@ def ensure_run_turn(db: Any, run: Run) -> ConversationTurn | None:
         None,
     )
     if existing_reply is not None:
+        # 变量说明：turn_id 表示turn 对象的唯一标识。
         existing_reply.turn_id = turn.id
+        # 变量说明：message_kind 表示当前步骤使用的 message_kind 值。
         existing_reply.message_kind = "terminal"
+        # 变量说明：terminal_for_turn_id 表示terminal_for_turn 对象的唯一标识。
         existing_reply.terminal_for_turn_id = turn.id
+        # 变量说明：extra 表示当前步骤使用的 extra 值。
         existing_reply.extra = {
             **dict(existing_reply.extra or {}),
             "turn_id": turn.id,
             "trace_id": turn.trace_id,
         }
+        # 变量说明：terminal_message_id 表示terminal_message 对象的唯一标识。
         turn.terminal_message_id = existing_reply.id
+        # 变量说明：reply_status 表示当前流程使用的 reply_status 集合。
         turn.reply_status = "delivered"
+        # 变量说明：finished_at 表示finished_at 对应的时间信息。
         turn.finished_at = run.finished_at or utcnow()
     return turn
 
 
+# 函数职责：完成 sync_turn_progress 对应的业务处理。
+# 参数关系：db 表示当前数据库会话；run 表示当前步骤使用的 run 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def sync_turn_progress(db: Any, run: Run) -> ConversationTurn | None:
+    # 变量说明：turn 表示当前步骤使用的 turn 值。
     turn = ensure_run_turn(db, run)
     if turn is None:
         return None
+    # 变量说明：execution_status 表示当前流程使用的 execution_status 集合。
     turn.execution_status = str(run.status or turn.execution_status)
+    # 变量说明：heartbeat_at 表示heartbeat_at 对应的时间信息。
     turn.heartbeat_at = utcnow()
     return turn
 
 
+# 函数职责：完成 classify_error_details 对应的业务处理。
+# 参数关系：error_type 表示当前步骤使用的 error_type 值；message 表示当前消息；status_code 表示当前步骤使用的 status_code 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def classify_error_details(
     error_type: str | None,
     message: str | None,
@@ -200,11 +255,15 @@ def classify_error_details(
 ) -> str:
     """Normalize provider/integration details without exposing their text."""
 
+    # 变量说明：name 表示当前对象名称。
     name = str(error_type or "").casefold()
+    # 变量说明：normalized_message 表示当前步骤使用的 normalized_message 值。
     normalized_message = str(message or "").casefold()
     try:
+        # 变量说明：status_number 表示当前步骤使用的 status_number 值。
         status_number = int(status_code) if status_code is not None else None
     except (TypeError, ValueError):
+        # 变量说明：status_number 表示当前步骤使用的 status_number 值。
         status_number = None
     if "partialmodelstream" in name:
         return "model_stream_interrupted"
@@ -237,6 +296,9 @@ def classify_error_details(
     return "integration_error"
 
 
+# 函数职责：完成 classify_exception 对应的业务处理。
+# 参数关系：error 表示当前捕获或准备上报的错误。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def classify_exception(error: BaseException) -> str:
     from src.agent.errors import status_code_from_error
 
@@ -247,6 +309,7 @@ def classify_exception(error: BaseException) -> str:
     )
 
 
+# 变量说明：_PUBLIC_REASONS 表示当前流程使用的 _PUBLIC_REASONS 集合。
 _PUBLIC_REASONS = {
     "acceptance_failed": "结果没有通过确定性验收，系统已停止继续尝试。",
     "approval_rejected": "所需操作没有获得批准，任务已停止。",
@@ -274,7 +337,11 @@ _PUBLIC_REASONS = {
 }
 
 
+# 函数职责：完成 public_error_message 对应的业务处理。
+# 参数关系：error_code 表示当前步骤使用的 error_code 值；status 表示当前对象或运行的状态。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def public_error_message(error_code: str | None, status: str = "failed") -> str:
+    # 变量说明：code 表示当前步骤使用的 code 值。
     code = str(error_code or "").strip()
     if code in _PUBLIC_REASONS:
         return _PUBLIC_REASONS[code]
@@ -283,6 +350,9 @@ def public_error_message(error_code: str | None, status: str = "failed") -> str:
     return "本次任务没有完成。"
 
 
+# 函数职责：完成 terminal_error_code 对应的业务处理。
+# 参数关系：status 表示当前对象或运行的状态；stop_reason 表示当前步骤使用的 stop_reason 值；error_code 表示当前步骤使用的 error_code 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def terminal_error_code(
     *,
     status: str,
@@ -296,16 +366,25 @@ def terminal_error_code(
     return str(error_code or "run_failed")
 
 
+# 函数职责：完成 delegated_summary 对应的业务处理。
+# 参数关系：db 表示当前数据库会话；run_id 表示当前运行标识。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _delegated_summary(db: Any, run_id: str) -> tuple[list[str], bool, bool]:
+    # 变量说明：tasks 表示当前流程使用的 tasks 集合。
     tasks = list(db.scalars(
         select(DelegatedTask)
         .where(DelegatedTask.parent_run_id == run_id)
         .order_by(DelegatedTask.created_at.asc(), DelegatedTask.id.asc())
     ))
+    # 变量说明：lines 表示当前流程使用的 lines 集合。
     lines: list[str] = []
+    # 变量说明：completed 表示当前步骤使用的 completed 值。
     completed = False
+    # 变量说明：incomplete 表示当前步骤使用的 incomplete 值。
     incomplete = False
+    # 变量说明：changed 表示当前步骤使用的 changed 值。
     changed = False
+    # 变量说明：labels 表示当前流程使用的 labels 集合。
     labels = {
         "completed": "已完成",
         "failed": "未完成",
@@ -315,27 +394,43 @@ def _delegated_summary(db: Any, run_id: str) -> tuple[list[str], bool, bool]:
         "in_progress": "未完成",
     }
     for index, task in enumerate(tasks, start=1):
+        # 变量说明：result 表示本步骤产生的结果。
         result = dict(task.result or {})
+        # 变量说明：status 表示当前对象或运行的状态。
         status = str(result.get("status") or task.status or "in_progress")
+        # 变量说明：label 表示当前步骤使用的 label 值。
         label = labels.get(status, "未完成")
+        # 变量说明：title 表示当前步骤使用的 title 值。
         title = " ".join(str(task.title or f"子任务 {index}").split())[:160]
+        # 变量说明：error_code 表示当前步骤使用的 error_code 值。
         error_code = str(result.get("error_code") or "").strip()
+        # 变量说明：suffix 表示当前步骤使用的 suffix 值。
         suffix = f"（错误代码：{error_code[:100]}）" if error_code and status != "completed" else ""
         lines.append(f"{index}. {title}：{label}{suffix}")
+        # 变量说明：completed 表示当前步骤使用的 completed 值。
         completed = completed or status == "completed"
+        # 变量说明：incomplete 表示当前步骤使用的 incomplete 值。
         incomplete = incomplete or status != "completed"
+        # 变量说明：changed 表示当前步骤使用的 changed 值。
         changed = changed or bool(result.get("workspace_changed"))
     return lines, completed and incomplete, changed
 
 
+# 函数职责：执行 has_recorded_change 对应的数据或流程。
+# 参数关系：db 表示当前数据库会话；run_id 表示当前运行标识。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _run_has_recorded_change(db: Any, run_id: str) -> bool:
     for event in db.scalars(select(RunEvent).where(RunEvent.run_id == run_id)):
+        # 变量说明：payload 表示跨层传递的数据载荷。
         payload = event.payload if isinstance(event.payload, dict) else {}
         if bool(payload.get("changed")):
             return True
     return False
 
 
+# 函数职责：完成 terminal_content 对应的业务处理。
+# 参数关系：db 表示当前数据库会话；run 表示当前步骤使用的 run 值；turn 表示当前步骤使用的 turn 值；output 表示当前步骤使用的 output 值；error_code 表示当前步骤使用的 error_code 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _terminal_content(
     db: Any,
     *,
@@ -344,11 +439,14 @@ def _terminal_content(
     output: str | None,
     error_code: str | None,
 ) -> tuple[str, str]:
+    # 变量说明：accepted_output 表示当前步骤使用的 accepted_output 值。
     accepted_output = str(output or "").strip()
     if accepted_output:
         return accepted_output, "model_output"
 
+    # 变量说明：lines 表示当前流程使用的 lines 集合；partial_failure 表示当前步骤使用的 partial_failure 值；delegated_changed 表示当前步骤使用的 delegated_changed 值。
     lines, partial_failure, delegated_changed = _delegated_summary(db, run.id)
+    # 变量说明：parts 表示当前流程使用的 parts 集合。
     parts = [public_error_message(error_code, str(run.status or "failed"))]
     if lines:
         parts.append("子任务结果：\n" + "\n".join(lines))
@@ -358,6 +456,9 @@ def _terminal_content(
     return "\n\n".join(parts), "deterministic_fallback"
 
 
+# 函数职责：完成 persist_terminal_response 对应的业务处理。
+# 参数关系：db 表示当前数据库会话；run 表示当前步骤使用的 run 值；output 表示当前步骤使用的 output 值；error_code 表示当前步骤使用的 error_code 值；error_message 表示当前步骤使用的 error_message 值；provider_payload 表示当前步骤使用的 provider_payload 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def persist_terminal_response(
     db: Any,
     run: Run,
@@ -372,13 +473,18 @@ def persist_terminal_response(
     if not is_terminal_delivery(str(run.status or ""), run.stop_reason):
         sync_turn_progress(db, run)
         return None
+    # 变量说明：turn 表示当前步骤使用的 turn 值。
     turn = ensure_run_turn(db, run)
     if turn is None or not run.session_id:
         return None
 
+    # 变量说明：existing 表示当前步骤使用的 existing 值。
     existing = db.scalar(select(ChatMessage).where(ChatMessage.terminal_for_turn_id == turn.id))
+    # 变量说明：_delegated_lines 表示当前流程使用的 _delegated_lines 集合；delegated_partial_failure 表示当前步骤使用的 delegated_partial_failure 值；_delegated_changed 表示当前步骤使用的 _delegated_changed 值。
     _delegated_lines, delegated_partial_failure, _delegated_changed = _delegated_summary(db, run.id)
+    # 变量说明：execution_status 表示当前流程使用的 execution_status 集合。
     execution_status = "partial_failure" if delegated_partial_failure else str(run.status or "failed")
+    # 变量说明：normalized_code 表示当前步骤使用的 normalized_code 值。
     normalized_code = terminal_error_code(
         status=str(run.status or "failed"),
         stop_reason=run.stop_reason,
@@ -386,16 +492,25 @@ def persist_terminal_response(
     )
     if existing is not None:
         if provider_payload:
+            # 变量说明：provider_payload 表示当前步骤使用的 provider_payload 值。
             existing.provider_payload = dict(provider_payload)
+        # 变量说明：terminal_message_id 表示terminal_message 对象的唯一标识。
         turn.terminal_message_id = existing.id
+        # 变量说明：reply_status 表示当前流程使用的 reply_status 集合。
         turn.reply_status = "delivered"
+        # 变量说明：execution_status 表示当前流程使用的 execution_status 集合。
         turn.execution_status = execution_status
+        # 变量说明：error_code 表示当前步骤使用的 error_code 值。
         turn.error_code = normalized_code
+        # 变量说明：error_message 表示当前步骤使用的 error_message 值。
         turn.error_message = error_message or run.error_message
+        # 变量说明：heartbeat_at 表示heartbeat_at 对应的时间信息。
         turn.heartbeat_at = utcnow()
+        # 变量说明：finished_at 表示finished_at 对应的时间信息。
         turn.finished_at = run.finished_at or utcnow()
         return existing
 
+    # 变量说明：content 表示待处理或返回的正文内容；source 表示当前步骤使用的 source 值。
     content, source = _terminal_content(
         db,
         run=run,
@@ -403,6 +518,7 @@ def persist_terminal_response(
         output=output,
         error_code=normalized_code,
     )
+    # 变量说明：message 表示当前消息。
     message = ChatMessage(
         session_id=run.session_id,
         role="assistant",
@@ -424,14 +540,22 @@ def persist_terminal_response(
     )
     db.add(message)
     db.flush()
+    # 变量说明：terminal_message_id 表示terminal_message 对象的唯一标识。
     turn.terminal_message_id = message.id
+    # 变量说明：reply_status 表示当前流程使用的 reply_status 集合。
     turn.reply_status = "delivered"
+    # 变量说明：execution_status 表示当前流程使用的 execution_status 集合。
     turn.execution_status = execution_status
+    # 变量说明：error_code 表示当前步骤使用的 error_code 值。
     turn.error_code = normalized_code
+    # 变量说明：error_message 表示当前步骤使用的 error_message 值。
     turn.error_message = error_message or run.error_message
+    # 变量说明：heartbeat_at 表示heartbeat_at 对应的时间信息。
     turn.heartbeat_at = utcnow()
+    # 变量说明：finished_at 表示finished_at 对应的时间信息。
     turn.finished_at = run.finished_at or utcnow()
-    db.add(RunEvent(
+    append_run_event(
+        db,
         run_id=run.id,
         event_type="terminal_response_persisted",
         payload={
@@ -442,5 +566,5 @@ def persist_terminal_response(
             "error_code": normalized_code,
             "source": source,
         },
-    ))
+    )
     return message

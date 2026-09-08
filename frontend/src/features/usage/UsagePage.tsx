@@ -1,3 +1,4 @@
+// 本文件实现 UsagePage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { ArrowRight, CalendarDays, ChartNoAxesCombined, CheckCircle2, Database, LoaderCircle, RefreshCw, Sparkles } from 'lucide-react'
 import { useState } from 'react'
 import { api } from '../../api'
@@ -8,14 +9,17 @@ import { usageDateKey, usageDateOptions, usageDatePresetBounds, usageDateRange, 
 import type { QuickUsageDatePreset, UsageDatePreset } from '../../usageDateRange'
 import type { ModelUsage, UsageBreakdownItem, UsageSession, UsageSummary, UsageWorkspace } from '../../types'
 
+// UsagePage 根据统一日期范围并行读取总量、模型、会话和项目四个维度的用量。
 function UsagePage() {
   const emptySummary: UsageSummary = { total_requests: 0, input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, total_tokens: 0, total_cost_usd: 0, cache_hit_rate: 0 }
   const today = usageDateKey(new Date())
+  // start/end 是实际查询边界，datePreset/rangeAnchor 保存快捷范围语义及其计算基准。
   const [startDate, setStartDate] = useState(today)
   const [endDate, setEndDate] = useState(today)
   const [datePreset, setDatePreset] = useState<UsageDatePreset>('today')
   const [rangeAnchor, setRangeAnchor] = useState(() => new Date())
   const range = usageDateRange(startDate, endDate, datePreset, rangeAnchor)
+  // 四个资源共享 range，因此日期变化后会同步重新加载，避免维度间时间窗口不一致。
   const summary = useApiData<UsageSummary>(emptySummary, () => api.get<UsageSummary>(`/api/usage/summary${range}`), [range])
   const models = useApiData<ModelUsage[]>([], () => api.list<ModelUsage>(`/api/usage/models${range}`), [range])
   const sessions = useApiData<UsageSession[]>([], () => api.list<UsageSession>(`/api/usage/sessions${range}`), [range])
@@ -88,10 +92,12 @@ function UsagePage() {
   )
 }
 
+// UsageRefreshBadge 为后台更新状态提供一致的轻量视觉标记。
 function UsageRefreshBadge() {
   return <span className="usage-refresh-badge" role="status"><LoaderCircle className="spin" size={12} />更新中</span>
 }
 
+// UsageBreakdown 复用模型/会话/项目排行结构，并统一处理首次加载、刷新、错误和空数据。
 function UsageBreakdown({ title, eyebrow, emptyDescription, data, initialLoading, refreshing, error, onRetry }: { title: string; eyebrow: string; emptyDescription: string; data: UsageBreakdownItem[]; initialLoading: boolean; refreshing: boolean; error: string; onRetry: () => void }) {
   return <section className="usage-models card">
     <div className="card-heading"><div><p className="eyebrow">{eyebrow}</p><h2>{title}</h2></div>{refreshing && <UsageRefreshBadge />}</div>

@@ -3,27 +3,40 @@
 The names intentionally retain the casing used by the reference projects so
 persisted tool calls and model-generated calls can be replayed verbatim.
 """
+# 文件职责：负责工具定义、授权、注册、调度与执行中的 advanced_contract 子模块。
+# 逻辑关系：上层通过 tools/advanced_contract.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
 from typing import Any
 
 
+# 函数职责：完成 schema 对应的业务处理。
+# 参数关系：description 表示当前步骤使用的 description 值；properties 表示当前流程使用的 properties 集合；required 表示当前步骤使用的 required 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _schema(description: str, properties: dict[str, Any] | None = None, required: tuple[str, ...] = ()) -> dict[str, Any]:
+    # 变量说明：parameters 表示当前流程使用的 parameters 集合。
     parameters: dict[str, Any] = {"type": "object", "properties": properties or {}}
     if required:
         parameters["required"] = list(required)
     return {"description": description, "parameters": parameters}
 
 
+# 变量说明：_STRING 表示当前步骤使用的 _STRING 值。
 _STRING = {"type": "string"}
+# 变量说明：_BOOL 表示当前步骤使用的 _BOOL 值。
 _BOOL = {"type": "boolean"}
+# 变量说明：_INTEGER 表示当前步骤使用的 _INTEGER 值。
 _INTEGER = {"type": "integer"}
+# 变量说明：_NUMBER 表示当前步骤使用的 _NUMBER 值。
 _NUMBER = {"type": "number"}
+# 变量说明：_STRINGS 表示当前流程使用的 _STRINGS 集合。
 _STRINGS = {"type": "array", "items": _STRING}
+# 变量说明：_OBJECT 表示当前步骤使用的 _OBJECT 值。
 _OBJECT = {"type": "object", "additionalProperties": True}
 
 
+# 变量说明：ADVANCED_TOOL_SCHEMAS 表示当前流程使用的 ADVANCED_TOOL_SCHEMAS 集合。
 ADVANCED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     # Claw Code contracts.
     "edit_file": _schema("Replace exact text in a workspace file.", {"path": _STRING, "old_string": _STRING, "new_string": _STRING, "replace_all": _BOOL}, ("path", "old_string", "new_string")),
@@ -106,6 +119,7 @@ ADVANCED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 
+# 变量说明：CLAW_TOOL_NAMES 表示当前流程使用的 CLAW_TOOL_NAMES 集合。
 CLAW_TOOL_NAMES: tuple[str, ...] = (
     "edit_file", "glob_search", "grep_search", "WebFetch", "WebSearch", "TodoWrite", "Skill", "Agent",
     "ToolSearch", "NotebookEdit", "Sleep", "SendUserMessage", "Config", "EnterPlanMode", "ExitPlanMode",
@@ -117,6 +131,7 @@ CLAW_TOOL_NAMES: tuple[str, ...] = (
     "GitStatus", "GitDiff", "GitLog", "GitShow", "GitBlame", "MemoryWrite", "MemoryRead", "MemoryList", "MemorySearch",
 )
 
+# 变量说明：LEARN_TOOL_NAMES 表示当前流程使用的 LEARN_TOOL_NAMES 集合。
 LEARN_TOOL_NAMES: tuple[str, ...] = (
     "load_skill", "compress", "background_run", "check_background", "write_stdin", "task_create", "task_get", "task_update",
     "task_list", "spawn_teammate", "list_teammates", "send_message", "read_inbox", "broadcast",

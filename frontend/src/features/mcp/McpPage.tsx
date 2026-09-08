@@ -1,3 +1,4 @@
+// 本文件实现 McpPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { AlertCircle, Cable, CirclePlus, Command, LoaderCircle, Pencil, Plus, Search, ServerCog, Trash2, X } from 'lucide-react'
 import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { api, describeError } from '../../api'
@@ -6,11 +7,15 @@ import { filterMcpServers, mcpStatusLabel } from '../../mcpPresentation'
 import { useApiData } from '../../shared/hooks/useApiData'
 import type { McpServer } from '../../types'
 
+// ServerPayload 是创建或更新 MCP 服务时允许提交的最小字段集合。
 type ServerPayload = Pick<McpServer, 'name' | 'command' | 'args' | 'enabled'>
 
+// McpPage 管理本地 MCP 服务配置、连接状态检查、启停和删除操作。
 function McpPage() {
+  // servers 是后端权威列表；query 只影响当前页过滤。
   const servers = useApiData<McpServer[]>([], () => api.list<McpServer>('/api/mcp/servers'), [])
   const [query, setQuery] = useState('')
+  // 表单状态描述编辑目标、命令参数和启用值；busyNames/rowErrors 按服务隔离行级操作反馈。
   const [panelOpen, setPanelOpen] = useState(false)
   const [editing, setEditing] = useState<McpServer | null>(null)
   const [args, setArgs] = useState<string[]>([])

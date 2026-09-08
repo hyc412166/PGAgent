@@ -1,9 +1,12 @@
+// 本测试文件验证 messageAttachments 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
 import { MessageBubble } from './features/sessions/presentation'
 
+// 测试分组：message image presentation。
 describe('message image presentation', () => {
+  // 测试场景：places a clean image preview above the user text bubble。
   it('places a clean image preview above the user text bubble', () => {
     const markup = renderToStaticMarkup(<MessageBubble message={{
       id: 'message-1',
@@ -26,6 +29,7 @@ describe('message image presentation', () => {
     expect(markup).not.toContain('image/png ·')
   })
 
+  // 测试场景：renders Responses web search citations as user-visible source links。
   it('renders Responses web search citations as user-visible source links', () => {
     const markup = renderToStaticMarkup(<MessageBubble message={{
       id: 'message-2',

@@ -1,5 +1,7 @@
+// 本文件负责 mcpPresentation 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
 import type { McpServer } from './types'
 
+// 将 MCP 启用及连接状态映射为卡片标签。
 export function mcpStatusLabel(server: McpServer) {
   if (!server.enabled) return '已停用'
   if (server.runtime_status === 'dormant') return '缓存就绪，等待调用'
@@ -9,6 +11,7 @@ export function mcpStatusLabel(server: McpServer) {
   return '等待会话连接'
 }
 
+// 按名称、命令和参数执行不区分大小写的本地过滤。
 export function filterMcpServers(servers: McpServer[], query: string) {
   const normalized = query.trim().toLocaleLowerCase()
   if (!normalized) return servers

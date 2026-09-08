@@ -1,3 +1,4 @@
+/* 本文件定义 theme-refinements 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
 /* 2026 visual refinement: a calmer deep-sea interaction system. The red scarf
    remains a brand and destructive signal instead of competing with the ice UI. */
 :root {
@@ -221,7 +222,7 @@ select:focus-visible {
 .font-scale-control input[type='range'] { accent-color: var(--action); }
 .context-compacting .context-ring-value { stroke: var(--yellow); }
 
-/* Four compact cards fill a desktop row; narrower workspaces step down cleanly. */
+/* 桌面端每行四张紧凑卡片，较窄空间按断点平滑降列。 */
 .entity-grid.agent-grid,
 .skill-card-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -299,7 +300,7 @@ select:focus-visible {
 
 .connection-card-actions .status { margin-right: 2px; }
 
-/* Agent create/edit: readable capability rows with stable scrolling and cheap paint. */
+/* Agent 新建/编辑：能力行保持可读、滚动稳定并降低重绘开销。 */
 .capability-select {
   border-color: var(--line);
   background: rgb(255 255 255 / 64%);
@@ -395,7 +396,7 @@ select:focus-visible {
   transform: scale(1);
 }
 
-/* Panels keep spatial continuity without holding a permanent compositor layer. */
+/* 面板保留空间连续感，同时不长期占用合成层。 */
 .motion-panel {
   background: rgb(5 35 51 / 0%);
   transition: background-color 140ms ease-out;
@@ -419,7 +420,7 @@ select:focus-visible {
   box-shadow: 0 0 0 3px var(--action-ring);
 }
 
-/* Opaque popovers remove the expensive nested blur that made level 2/3 menus stutter. */
+/* 不透明弹层避免昂贵的嵌套模糊，防止二、三级菜单卡顿。 */
 .project-hover-card,
 .capability-popover,
 .session-settings-popover,
@@ -516,7 +517,7 @@ select:focus-visible {
   outline-offset: 2px;
 }
 
-/* Error color is a precise semantic accent, not a full competing surface. */
+/* 错误色只作为精确语义强调，不扩展为抢占视觉的整块表面。 */
 .error-state {
   color: var(--ink);
   border-color: transparent;

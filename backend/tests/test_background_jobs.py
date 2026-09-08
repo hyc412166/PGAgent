@@ -1,3 +1,9 @@
+"""验证后台进程作业的持久化、输入输出、等待、恢复、终止通知及其与运行协调器和任务图的联动。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +26,7 @@ from src.tasks.state import sync_todos_for_run
 from src.tools import create_default_registry
 
 
+# 辅助函数：_wait_for_job_status 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _wait_for_job_status(
     job_id: str,
     statuses: set[str],
@@ -39,7 +46,9 @@ def _wait_for_job_status(
 
 
 @pytest.fixture()
+# 测试夹具：background_store 创建本组用例共享的隔离资源，并在测试结束后恢复数据库、配置或进程状态。
 def background_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # 临时数据库保存作业、运行和协作事件；workspace_root 隔离子进程文件，store/manager 分别负责查询与进程生命周期。
     database.configure_database(f"sqlite:///{(tmp_path / 'background.db').as_posix()}")
     database.init_db()
     workspace_root = tmp_path / "workspace"
@@ -77,6 +86,7 @@ def background_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     Base.metadata.drop_all(bind=database.engine)
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_background_job_is_persisted_and_wait_returns_terminal_output 精确标识本用例的具体条件。
 def test_background_job_is_persisted_and_wait_returns_terminal_output(background_store) -> None:
     store, _manager = background_store
     started = store.start(
@@ -103,6 +113,7 @@ def test_background_job_is_persisted_and_wait_returns_terminal_output(background
         assert not (Path(store.workspace_root) / ".pgagent").exists()
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_write_stdin_sends_input_to_running_background_job 精确标识本用例的具体条件。
 def test_write_stdin_sends_input_to_running_background_job(background_store) -> None:
     store, _manager = background_store
     started = store.start(
@@ -120,6 +131,7 @@ def test_write_stdin_sends_input_to_running_background_job(background_store) -> 
     assert "stdin:hello" in sent.content
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_background_wait_timeout_yields_without_stopping_process 精确标识本用例的具体条件。
 def test_background_wait_timeout_yields_without_stopping_process(background_store) -> None:
     store, _manager = background_store
     started = store.start(
@@ -142,6 +154,7 @@ def test_background_wait_timeout_yields_without_stopping_process(background_stor
     assert _manager.cancel(job_id) is True
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_background_output_offsets_return_only_new_bytes 精确标识本用例的具体条件。
 def test_background_output_offsets_return_only_new_bytes(background_store) -> None:
     store, _manager = background_store
     started = store.start(
@@ -175,6 +188,7 @@ def test_background_output_offsets_return_only_new_bytes(background_store) -> No
     assert "first" not in terminal_payload["output"]
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_bash_yields_a_durable_session_without_starting_a_second_process 精确标识本用例的具体条件。
 def test_bash_yields_a_durable_session_without_starting_a_second_process(background_store) -> None:
     store, _manager = background_store
     registry = create_default_registry(
@@ -206,6 +220,7 @@ def test_bash_yields_a_durable_session_without_starting_a_second_process(backgro
         assert running.pid is not None
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_bash_returns_terminal_output_when_command_finishes_inside_yield_window 精确标识本用例的具体条件。
 def test_bash_returns_terminal_output_when_command_finishes_inside_yield_window(background_store) -> None:
     store, _manager = background_store
     registry = create_default_registry(
@@ -226,6 +241,7 @@ def test_bash_returns_terminal_output_when_command_finishes_inside_yield_window(
     assert "fast" in result.content
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_recover_relaunches_queued_job_and_settles_stale_running_job 精确标识本用例的具体条件。
 def test_recover_relaunches_queued_job_and_settles_stale_running_job(background_store) -> None:
     store, manager = background_store
     with database.SessionLocal() as db:
@@ -266,6 +282,7 @@ def test_recover_relaunches_queued_job_and_settles_stale_running_job(background_
         assert "restarted" in str(stale.error)
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_shutdown_marks_started_job_failed_instead_of_replaying_it 精确标识本用例的具体条件。
 def test_shutdown_marks_started_job_failed_instead_of_replaying_it(background_store) -> None:
     store, manager = background_store
     sync_todos_for_run(store.run_id, [{
@@ -296,19 +313,24 @@ def test_shutdown_marks_started_job_failed_instead_of_replaying_it(background_st
         assert db.query(CollaborationEvent).filter_by(source_id=job_id).count() == 1
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_completion_verifier_rejects_unobserved_background_job 精确标识本用例的具体条件。
 def test_completion_verifier_rejects_unobserved_background_job(tmp_path: Path) -> None:
+    # 测试替身类：Store 保存该局部场景的可控状态。
     class Store:
         active = [{"id": "job-1", "status": "running"}]
         terminal = []
         registered = False
 
+        # 辅助方法：active_jobs 实现测试替身在此调用阶段需要的最小行为。
         def active_jobs(self):
             return list(self.active)
 
+        # 辅助方法：register_waiter 实现测试替身在此调用阶段需要的最小行为。
         def register_waiter(self):
             self.registered = True
             return ["job-1"]
 
+        # 辅助方法：observe_terminal_results 实现测试替身在此调用阶段需要的最小行为。
         def observe_terminal_results(self):
             results = list(self.terminal)
             self.terminal = []
@@ -340,14 +362,19 @@ def test_completion_verifier_rejects_unobserved_background_job(tmp_path: Path) -
     assert runtime.completion_verifier(candidate).accepted is True
 
 
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_completion_verifier_consumes_terminal_race_instead_of_dead_waiting 精确标识本用例的具体条件。
 def test_completion_verifier_consumes_terminal_race_instead_of_dead_waiting(tmp_path: Path) -> None:
+    # 测试替身类：Store 保存该局部场景的可控状态。
     class Store:
+        # 辅助方法：active_jobs 实现测试替身在此调用阶段需要的最小行为。
         def active_jobs(self):
             return [{"id": "job-race", "status": "running"}]
 
+        # 辅助方法：register_waiter 实现测试替身在此调用阶段需要的最小行为。
         def register_waiter(self):
             return []
 
+        # 辅助方法：observe_terminal_results 实现测试替身在此调用阶段需要的最小行为。
         def observe_terminal_results(self):
             return [{"id": "job-race", "status": "completed", "output_preview": "ready"}]
 
@@ -371,6 +398,7 @@ def test_completion_verifier_consumes_terminal_race_instead_of_dead_waiting(tmp_
     assert decision.report["background_jobs"] == [{"id": "job-race", "status": "completed"}]
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_terminal_job_writes_durable_collaboration_event 精确标识本用例的具体条件。
 def test_terminal_job_writes_durable_collaboration_event(background_store) -> None:
     store, _manager = background_store
     started = store.start(command="Write-Output event-result", shell="powershell", timeout=30)
@@ -386,6 +414,7 @@ def test_terminal_job_writes_durable_collaboration_event(background_store) -> No
         assert "event-result" in event.payload["output"]
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_terminal_event_is_acknowledged_only_with_persisted_model_outcome 精确标识本用例的具体条件。
 def test_terminal_event_is_acknowledged_only_with_persisted_model_outcome(background_store) -> None:
     store, _manager = background_store
     with database.SessionLocal() as db:
@@ -449,6 +478,7 @@ def test_terminal_event_is_acknowledged_only_with_persisted_model_outcome(backgr
         assert event.consumed_at is not None and event.consumer_run_id == store.run_id
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_background_job_claims_and_settles_a_task_graph_step 精确标识本用例的具体条件。
 def test_background_job_claims_and_settles_a_task_graph_step(background_store) -> None:
     store, _manager = background_store
     sync_todos_for_run(store.run_id, [{
@@ -478,6 +508,7 @@ def test_background_job_claims_and_settles_a_task_graph_step(background_store) -
         assert "model-ready" in step.result
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_session_background_job_api_reads_durable_state 精确标识本用例的具体条件。
 def test_session_background_job_api_reads_durable_state(background_store) -> None:
     store, _manager = background_store
     started = store.start(command="Write-Output api-result", shell="powershell", timeout=30)
@@ -492,6 +523,7 @@ def test_session_background_job_api_reads_durable_state(background_store) -> Non
     assert "api-result" in rows[0].output_preview
 
 
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_new_run_in_same_session_can_observe_recovered_job 精确标识本用例的具体条件。
 def test_new_run_in_same_session_can_observe_recovered_job(background_store) -> None:
     original_store, _manager = background_store
     started = original_store.start(command="Write-Output inherited", shell="powershell", timeout=30)
@@ -525,6 +557,7 @@ def test_new_run_in_same_session_can_observe_recovered_job(background_store) -> 
         assert job.observed_by_run_id == resumed_run_id
 
 
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_concurrent_terminal_notifications_queue_only_one_resume 精确标识本用例的具体条件。
 def test_concurrent_terminal_notifications_queue_only_one_resume(background_store, monkeypatch) -> None:
     store, _manager = background_store
     with database.SessionLocal() as db:
@@ -568,6 +601,7 @@ def test_concurrent_terminal_notifications_queue_only_one_resume(background_stor
         ).count() == 1
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_user_can_stop_a_run_while_it_waits_for_background_work 精确标识本用例的具体条件。
 def test_user_can_stop_a_run_while_it_waits_for_background_work(background_store) -> None:
     store, _manager = background_store
     started = store.start(
@@ -593,6 +627,7 @@ def test_user_can_stop_a_run_while_it_waits_for_background_work(background_store
     assert cancelled.pid is None
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_session_delete_rejects_active_background_job 精确标识本用例的具体条件。
 def test_session_delete_rejects_active_background_job(background_store) -> None:
     store, _manager = background_store
     with database.SessionLocal() as db:
@@ -619,6 +654,7 @@ def test_session_delete_rejects_active_background_job(background_store) -> None:
         assert "background" in str(error.value.detail).lower()
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_sibling_child_completion_only_sees_its_own_background_jobs 精确标识本用例的具体条件。
 def test_sibling_child_completion_only_sees_its_own_background_jobs(background_store) -> None:
     first_store, _manager = background_store
     with database.SessionLocal() as db:
@@ -654,6 +690,7 @@ def test_sibling_child_completion_only_sees_its_own_background_jobs(background_s
     assert [item["id"] for item in recovery_store.unresolved_jobs()] == [sibling_job.id]
 
 
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_background_wait_is_not_part_of_generic_parallel_read_batch 精确标识本用例的具体条件。
 def test_background_wait_is_not_part_of_generic_parallel_read_batch(tmp_path: Path) -> None:
     registry = create_default_registry(
         str(tmp_path),

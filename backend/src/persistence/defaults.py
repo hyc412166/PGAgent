@@ -1,15 +1,26 @@
 """Built-in workspace and primary-agent defaults."""
+# 文件职责：负责数据库模型、默认数据与事务访问中的 defaults 子模块。
+# 逻辑关系：上层通过 persistence/defaults.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from src.config import PROJECT_ROOT
 
+# 变量说明：DEFAULT_DATABASE_PATH 表示DEFAULT_DATABASE_PATH 对应的文件系统位置。
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "pgagent.db"
+# 变量说明：DEFAULT_DATABASE_URL 表示DEFAULT_DATABASE 的访问地址。
 DEFAULT_DATABASE_URL = f"sqlite:///{DEFAULT_DATABASE_PATH.as_posix()}"
+# 变量说明：DEFAULT_WORKSPACE_ID 表示DEFAULT_WORKSPACE 对象的唯一标识。
 DEFAULT_WORKSPACE_ID = "00000000-0000-0000-0000-000000000001"
+# 变量说明：DEFAULT_AGENT_ID 表示DEFAULT_AGENT 对象的唯一标识。
 DEFAULT_AGENT_ID = "00000000-0000-0000-0000-000000000002"
+# 变量说明：DEFAULT_WORKSPACE_NAME 表示当前步骤使用的 DEFAULT_WORKSPACE_NAME 值。
 DEFAULT_WORKSPACE_NAME = "一次性任务"
+# 变量说明：DEFAULT_WORKSPACE_DESCRIPTION 表示当前步骤使用的 DEFAULT_WORKSPACE_DESCRIPTION 值。
 DEFAULT_WORKSPACE_DESCRIPTION = "未选择项目目录的单次任务会话归属。"
+# 变量说明：DEFAULT_AGENT_NAME 表示当前步骤使用的 DEFAULT_AGENT_NAME 值。
 DEFAULT_AGENT_NAME = "PGAgent 主控"
+# 变量说明：DEFAULT_AGENT_DESCRIPTION 表示当前步骤使用的 DEFAULT_AGENT_DESCRIPTION 值。
 DEFAULT_AGENT_DESCRIPTION = "固定主控：理解意图、分析编排、汇总结果并决定继续执行或输出。"
+# 变量说明：DEFAULT_AGENT_SYSTEM_PROMPT 表示当前步骤使用的 DEFAULT_AGENT_SYSTEM_PROMPT 值。
 DEFAULT_AGENT_SYSTEM_PROMPT = """你是 PGAgent 主控，负责整个会话的协调与交付。
 
 你的职责是：理解用户意图与约束，判断任务难度，必要时形成清晰计划，汇总已经获得的证据与结果，并决定应继续推进还是直接给出结果。简单、明确且可安全完成的任务可以由你直接完成。

@@ -1,4 +1,5 @@
-/* Frosted panels and form controls */
+/* 本文件定义 forms 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
+/* 毛玻璃面板与表单控件。 */
 
 .overlay {
   background: rgb(5 35 51 / 28%);

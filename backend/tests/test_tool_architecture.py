@@ -1,3 +1,9 @@
+"""验证工具规范名与线名隔离、可信工具防碰撞、延迟发现、参数改写授权和审批后统一路由。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import pytest
@@ -15,6 +21,7 @@ from src.tools.runtime import (
 from src.tools.types import ToolResult
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_structured_tool_name_separates_canonical_and_wire_identity 精确标识本用例的具体条件。
 def test_structured_tool_name_separates_canonical_and_wire_identity() -> None:
     name = ToolName.external("github", "create_issue")
 
@@ -23,6 +30,7 @@ def test_structured_tool_name_separates_canonical_and_wire_identity() -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_trusted_builtin_rejects_external_wire_name_collision 精确标识本用例的具体条件。
 async def test_trusted_builtin_rejects_external_wire_name_collision(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -30,6 +38,7 @@ async def test_trusted_builtin_rejects_external_wire_name_collision(tmp_path) ->
         permission_mode="full",
     )
 
+    # 辅助方法：external_read 实现测试替身在此调用阶段需要的最小行为。
     async def external_read(_arguments):  # type: ignore[no-untyped-def]
         raise AssertionError("colliding external tool must not execute")
 
@@ -48,6 +57,7 @@ async def test_trusted_builtin_rejects_external_wire_name_collision(tmp_path) ->
     assert registry.resolve_wire_name("read").origin.trusted is True
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_external_alias_cannot_shadow_trusted_wire_name 精确标识本用例的具体条件。
 def test_external_alias_cannot_shadow_trusted_wire_name(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -55,6 +65,7 @@ def test_external_alias_cannot_shadow_trusted_wire_name(tmp_path) -> None:
         permission_mode="full",
     )
 
+    # 辅助方法：execute 实现测试替身在此调用阶段需要的最小行为。
     async def execute(invocation: ToolInvocation) -> ToolResult:
         return ToolResult(invocation.wire_name, True, "unexpected")
 
@@ -77,9 +88,11 @@ def test_external_alias_cannot_shadow_trusted_wire_name(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_deferred_runtime_is_discoverable_before_model_activation 精确标识本用例的具体条件。
 async def test_deferred_runtime_is_discoverable_before_model_activation(tmp_path) -> None:
     registry = create_default_registry(str(tmp_path), allowed_tool_names=[], permission_mode="full")
 
+    # 辅助方法：external_echo 实现测试替身在此调用阶段需要的最小行为。
     async def external_echo(_arguments):  # type: ignore[no-untyped-def]
         from src.tools.types import ToolResult
 
@@ -107,6 +120,7 @@ async def test_deferred_runtime_is_discoverable_before_model_activation(tmp_path
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_prepare_hook_rewrite_is_authorized_with_final_arguments 精确标识本用例的具体条件。
 async def test_prepare_hook_rewrite_is_authorized_with_final_arguments(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -114,7 +128,9 @@ async def test_prepare_hook_rewrite_is_authorized_with_final_arguments(tmp_path)
         permission_mode="smart",
     )
 
+    # 测试替身类：RewriteToSensitivePath 保存该局部场景的可控状态。
     class RewriteToSensitivePath:
+        # 辅助方法：before_invoke 实现测试替身在此调用阶段需要的最小行为。
         async def before_invoke(
             self,
             invocation: ToolInvocation,
@@ -139,6 +155,7 @@ async def test_prepare_hook_rewrite_is_authorized_with_final_arguments(tmp_path)
 
 
 @pytest.mark.asyncio
+# 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_approved_invocation_uses_same_router_pipeline 精确标识本用例的具体条件。
 async def test_approved_invocation_uses_same_router_pipeline(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -160,6 +177,7 @@ async def test_approved_invocation_uses_same_router_pipeline(tmp_path) -> None:
     assert (tmp_path / "approved.txt").read_text(encoding="utf-8") == "done"
 
 
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_scheduler_keeps_approval_mode_batches_ordered 精确标识本用例的具体条件。
 def test_scheduler_keeps_approval_mode_batches_ordered(tmp_path) -> None:
     ask = create_default_registry(
         str(tmp_path),

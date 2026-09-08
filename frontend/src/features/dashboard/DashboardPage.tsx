@@ -1,3 +1,4 @@
+// 本文件实现 DashboardPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { Activity, ArrowRight, Bot, CheckCircle2, ChevronRight, Folder, Play, ShieldCheck, SquareTerminal, Workflow } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../../api'
@@ -7,8 +8,10 @@ import { useApiData } from '../../shared/hooks/useApiData'
 import { formatDate } from '../../shared/lib/display'
 import type { Approval, DashboardData, Run } from '../../types'
 
+// DashboardPage 汇总概览指标、最近运行和待审批项，作为进入各功能域的只读入口。
 function DashboardPage() {
   const navigate = useNavigate()
+  // dashboard 提供聚合计数，recentRuns/approvals 补充需要关注的具体记录。
   const dashboard = useApiData<DashboardData>({}, () => api.get<DashboardData>('/api/dashboard'), [])
   const recentRuns = useApiData<Run[]>([], () => api.list<Run>('/api/runs?limit=5', ['runs']), [])
   const approvals = useApiData<Approval[]>([], () => api.list<Approval>('/api/approvals?status=pending', ['approvals']), [])

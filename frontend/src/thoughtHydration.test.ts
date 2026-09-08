@@ -1,7 +1,10 @@
+// 本测试文件验证 thoughtHydration 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
 import { ThoughtHydrationRegistry } from './thoughtHydration'
 
+// 测试分组：历史思考加载登记。
 describe('历史思考加载登记', () => {
+  // 测试场景：取消的旧请求不会冒充已加载，也不能清除同一 Run 的新请求。
   it('取消的旧请求不会冒充已加载，也不能清除同一 Run 的新请求', () => {
     const registry = new ThoughtHydrationRegistry()
     const first = registry.begin('run-1')
@@ -18,6 +21,7 @@ describe('历史思考加载登记', () => {
     expect(registry.isLoaded('run-1')).toBe(true)
   })
 
+  // 测试场景：只有当前令牌对应的成功请求才能提交，reset 后允许会话重新加载。
   it('只有当前令牌对应的成功请求才能提交，reset 后允许会话重新加载', () => {
     const registry = new ThoughtHydrationRegistry()
     const token = registry.begin('run-2')!

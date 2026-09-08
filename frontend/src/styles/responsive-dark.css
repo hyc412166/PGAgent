@@ -1,4 +1,5 @@
-/* Dark surface corrections */
+/* 本文件定义 responsive-dark 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
+/* 深色主题表面颜色修正。 */
 
 :root[data-theme='dark'] body::before { opacity: .12; }
 .theme-dark .page-mascot { color: var(--penguin); background: linear-gradient(145deg, #f9fdff, var(--ice)); }
@@ -50,7 +51,7 @@
     linear-gradient(155deg, rgb(20 61 81 / 99%), rgb(9 39 56 / 98%));
 }
 
-/* Responsive */
+/* 响应式布局覆盖。 */
 
 @media (min-width: 861px) {
   .app-shell.sidebar-collapsed { grid-template-columns: 72px minmax(0, 1fr); }

@@ -1,3 +1,4 @@
+// 本文件实现 presentation 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import {
   Brain,
   Bot,
@@ -26,7 +27,9 @@ import type { Approval, DelegatedTask, Message, Run, RunEvent, Teammate } from '
 import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../components/ui'
 import { statusText } from '../../components/status'
 import { PenguinMark } from '../../components/penguin'
+import { presentRunEvent } from '../../runEventPresentation'
 
+// LiveRunView 是运输状态到实时回复组件之间的最小只读接口。
 export type LiveRunView = {
   runId: string
   phase: string
@@ -37,6 +40,7 @@ export type LiveRunView = {
   thinkingStatus: string
 }
 
+// 将后端时间转换为当前语言环境下的短日期时间。
 function formatUiDate(value?: string) {
   if (!value) return '—'
   const date = new Date(value)
@@ -49,23 +53,24 @@ function formatUiDate(value?: string) {
   }).format(date)
 }
 
+// 从宽松结果对象中安全读取数值字段。
 function numberFromRecord(record: Record<string, unknown> | undefined, key: string) {
   const value = record?.[key]
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
+// 将子任务内部状态转换为面板标签。
 function childTaskStatusLabel(status?: string) {
   return statusText[(status || '').toLowerCase()] ?? status ?? '处理中'
 }
 
+// 按优先级提取子任务最终输出、错误或当前阶段说明。
 function childTaskOutput(task?: DelegatedTask) {
-  const output = task?.result?.output
-  if (typeof output === 'string' && output.trim()) return output
-  const error = task?.result?.error
-  if (typeof error === 'string' && error.trim()) return error
+  // 子任务原始结果可能包含文件正文、命令输出或 provider 错误；仅使用 RunEvent 的安全摘要。
   return ''
 }
 
+// ChildAgentPanel 展示协作树、选中子任务详情及其运行事件，memo 避免流式文本更新带来无关重绘。
 export const ChildAgentPanel = memo(function ChildAgentPanel({
   open,
   tasks,
@@ -118,12 +123,13 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
         <dl className="child-task-stats"><div><dt>步骤</dt><dd>{numberFromRecord(selectedTask.result, 'steps') ?? run?.step_count ?? run?.current_step ?? 0}</dd></div><div><dt>工具</dt><dd>{numberFromRecord(selectedTask.result, 'tool_calls') ?? run?.tool_calls ?? 0}</dd></div></dl>
         {selectedTask.description && <section className="child-detail-block"><strong>任务</strong><p>{selectedTask.description}</p></section>}
         {output && <section className="child-detail-block"><strong>{selectedTask.status === 'completed' ? '结果' : '状态说明'}</strong><pre>{output}</pre></section>}
-        <section className="child-detail-block child-events"><strong>工作过程</strong>{eventsError ? <p className="inline-error">{eventsError}</p> : eventsLoading ? <p>正在读取运行事件…</p> : toolEvents.length ? <ol>{toolEvents.map((event, index) => <li key={event.id || index}><span>{event.type || event.event_type}</span><small>{formatUiDate(event.created_at)}</small></li>)}</ol> : <p>暂未记录工具调用。</p>}</section>
+        <section className="child-detail-block child-events"><strong>工作过程</strong>{eventsError ? <p className="inline-error">{eventsError}</p> : eventsLoading ? <p>正在读取运行事件…</p> : toolEvents.length ? <ol>{toolEvents.map((event, index) => <li key={event.id || index}><span>{presentRunEvent(event).title}</span><small>{formatUiDate(event.created_at)}</small></li>)}</ol> : <p>暂未记录工具调用。</p>}</section>
       </section>}
     </>}
   </aside>
 })
 
+// MessageBubble 根据角色渲染正文、附件和复制动作，是持久消息的统一展示入口。
 export const MessageBubble = memo(function MessageBubble({ message }: { message: Message }) {
   const [copied, setCopied] = useState(false)
   const attachments = messageAttachments(message.metadata?.attachments)
@@ -197,6 +203,7 @@ export const MessageBubble = memo(function MessageBubble({ message }: { message:
   )
 })
 
+// ThoughtActivityIcon 将时间线语义图标映射为具体 Lucide 图形。
 function ThoughtActivityIcon({ icon }: { icon: ThoughtActivityIcon }) {
   if (icon === 'task') return <span className="thought-activity-icon is-task"><PenguinMark size={13} /></span>
   if (icon === 'search') return <span className="thought-activity-icon is-search"><Search size={13} /></span>
@@ -209,6 +216,7 @@ function ThoughtActivityIcon({ icon }: { icon: ThoughtActivityIcon }) {
   return <span className="thought-activity-icon is-generic"><Wrench size={13} /></span>
 }
 
+// 旧运行缺少结构化活动时，从思考文本和工具列表生成兼容展示条目。
 function fallbackThoughtItems(timeline: ThoughtTimelineState): ThoughtActivityItem[] {
   if (timeline.items?.length) return timeline.items
   return timeline.tools.map((tool) => ({
@@ -221,13 +229,13 @@ function fallbackThoughtItems(timeline: ThoughtTimelineState): ThoughtActivityIt
   }))
 }
 
+// 判断活动列表是否包含需要展开查看的详情。
 function hasActivityDetails(items: ThoughtActivityItem[]) {
-  // A generic model-step marker is useful for the live phase/timer, but it
-  // is not expandable content by itself.  Show the disclosure only when a
-  // real safe progress summary or tool/context activity exists.
+  // 通用模型步骤标记只用于实时阶段和计时；仅在存在安全进度摘要或工具/上下文活动时才允许展开。
   return items.some((item) => Boolean(item.detail.trim()) || item.kind !== 'thought')
 }
 
+// ThoughtActivityList 统一渲染实时与历史活动，并突出当前活动。
 function ThoughtActivityList({ items, live = false, activeItemId }: { items: ThoughtActivityItem[]; live?: boolean; activeItemId?: string }) {
   const visibleItems = items.filter((item) => item.kind !== 'thought' || Boolean(item.detail.trim()))
   if (!visibleItems.length) return null
@@ -239,6 +247,7 @@ function ThoughtActivityList({ items, live = false, activeItemId }: { items: Tho
   </div>
 }
 
+// CompletedThoughtTimeline 在助手历史消息上方展示可折叠的已完成思考过程。
 export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({ runId, timeline }: { runId: string; timeline: ThoughtTimelineState }) {
   const [expanded, setExpanded] = useState(false)
   const duration = formatThoughtDuration(timeline.elapsedMs)
@@ -254,6 +263,7 @@ export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({
   </article>
 })
 
+// LiveAssistantMessage 合并阶段、实时耗时、活动时间线和逐字回复草稿。
 export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunView }) {
   const [now, setNow] = useState(() => Date.now())
   const [expanded, setExpanded] = useState(true)
@@ -294,12 +304,14 @@ export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun
   )
 })
 
+// ApprovalCard 展示待执行动作及风险信息，并将批准/拒绝决策回传会话协调器。
 export const ApprovalCard = memo(function ApprovalCard({ approval, deciding, onDecision }: { approval: Approval; deciding: boolean; onDecision: (id: string, decision: 'approve' | 'reject', runId: string) => void }) {
   const runId = typeof approval.run_id === 'string' || typeof approval.run_id === 'number' ? String(approval.run_id) : ''
+  const argumentCount = approval.arguments && typeof approval.arguments === 'object' ? Object.keys(approval.arguments).length : 0
   return (
     <article className="approval-card">
       <header><span><ShieldCheck size={17} /></span><div><strong>需要你的批准</strong><p>Agent 请求执行有副作用的工具</p></div><StatusBadge status={approval.status || 'pending'} /></header>
-      <div className="approval-command"><span>{approval.tool_name || 'unknown_tool'}</span><pre>{JSON.stringify(approval.arguments ?? {}, null, 2)}</pre></div>
+      <div className="approval-command"><span>{approval.tool_name || 'unknown_tool'}</span><p>{argumentCount ? `已准备 ${argumentCount} 项参数` : '本次调用不含可展示参数'}</p></div>
       {approval.reason && <p className="approval-reason">理由：{approval.reason}</p>}
       <footer><button className="button button-danger" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'reject', runId)}><XCircle size={15} />拒绝</button><button className="button button-primary" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'approve', runId)}>{deciding ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}允许本次</button></footer>
     </article>

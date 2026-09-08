@@ -1,7 +1,10 @@
+// 本测试文件验证 thoughtTimeline 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
 import { displayToolName, emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, safeToolTarget, summarizeThoughtConclusion, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from './thoughtTimeline'
 
+// 测试分组：实时 Thought 时间线。
 describe('实时 Thought 时间线', () => {
+  // 测试场景：展示规范工具名并兼容旧会话别名。
   it('展示规范工具名并兼容旧会话别名', () => {
     expect(displayToolName('shell')).toBe('Shell')
     expect(displayToolName('bash')).toBe('Shell')
@@ -12,6 +15,7 @@ describe('实时 Thought 时间线', () => {
     expect(displayToolName('tool_search')).toBe('Tool Search')
   })
 
+  // 测试场景：累计思考耗时并跟踪工具的开始与完成。
   it('累计思考耗时并跟踪工具的开始与完成', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started' }, 1_000)
     const reading = updateThoughtTimeline(started, { type: 'tool_started', tool_name: 'read_file', tool_call_id: 'call-1', arguments: { path: '.gitignore', content: '不可展示' } }, 1_250)
@@ -24,6 +28,7 @@ describe('实时 Thought 时间线', () => {
     expect(formatThoughtDuration(completed.elapsedMs)).toBe('858ms')
   })
 
+  // 测试场景：只提取路径或去掉查询参数的 URL，不显示其它工具参数。
   it('只提取路径或去掉查询参数的 URL，不显示其它工具参数', () => {
     const event = { type: 'tool_call', arguments: { url: 'https://example.com/docs/long?token=secret#private', api_key: 'never-show', content: 'never-show' } }
     expect(safeToolTarget(event)).toBe('https://example.com/docs/long')
@@ -31,12 +36,14 @@ describe('实时 Thought 时间线', () => {
     expect(formatThoughtDuration(2_450)).toBe('2.5s')
   })
 
+  // 测试场景：为一次运行稳定选择幽默状态，并用秒显示实时耗时。
   it('为一次运行稳定选择幽默状态，并用秒显示实时耗时', () => {
     expect(pickThinkingStatus(() => 0)).toBe('翻抽屉找思路中… (•̀ᴗ•́)و')
     expect(thinkingStatusForRun('run-42')).toBe(thinkingStatusForRun('run-42'))
-    expect(formatLiveThinkingDuration(2_345)).toBe('2.3 秒')
+    expect(formatLiveThinkingDuration(2_345)).toBe('2 秒')
   })
 
+  // 测试场景：可以从持久化 RunEvent 重建刷新后仍可见的终态时间线。
   it('可以从持久化 RunEvent 重建刷新后仍可见的终态时间线', () => {
     const timeline = timelineFromRunEvents([
       { type: '', event_type: 'model_step_started', created_at: '2026-08-11T00:00:00.000Z', payload: {} },
@@ -53,6 +60,7 @@ describe('实时 Thought 时间线', () => {
     ]))
   })
 
+  // 测试场景：只展示模型主动输出的安全进度，不展示后端固定 progress。
   it('只展示模型主动输出的安全进度，不展示后端固定 progress', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, {
       type: 'model_step_started',
@@ -73,6 +81,7 @@ describe('实时 Thought 时间线', () => {
     expect(JSON.stringify(activity.items)).not.toContain('隐藏思维链')
   })
 
+  // 测试场景：隐藏 provider reasoning，只保留模型可见阶段进度。
   it('隐藏 provider reasoning，只保留模型可见阶段进度', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
     const first = updateThoughtTimeline(started, { type: 'thought_delta', step: 1, delta: '先检查' }, 1_050)
@@ -86,6 +95,7 @@ describe('实时 Thought 时间线', () => {
     expect(visible.activeItemId).toBe('thought-step-1')
   })
 
+  // 测试场景：只把当前正在运行的步骤标记为呼吸灯目标。
   it('只把当前正在运行的步骤标记为呼吸灯目标', () => {
     const thinking = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
     expect(thinking.activeItemId).toBe('thought-step-1')
@@ -100,6 +110,7 @@ describe('实时 Thought 时间线', () => {
     expect(verifying.activeItemId).toBe('verify-1')
   })
 
+  // 测试场景：分别展示 MCP 目录准备和按需连接进度。
   it('分别展示 MCP 目录准备和按需连接进度', () => {
     const loading = updateThoughtTimeline(emptyThoughtTimeline, {
       type: 'mcp_catalog_loading',
@@ -148,6 +159,7 @@ describe('实时 Thought 时间线', () => {
     expect(connected.activeItemId).toBeUndefined()
   })
 
+  // 测试场景：中断后不显示服务端保存的 provider reasoning 片段。
   it('中断后不显示服务端保存的 provider reasoning 片段', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 2 }, 1_000)
     const partial = updateThoughtTimeline(started, { type: 'thought_delta', step: 2, delta: '正在分析' }, 1_100)
@@ -156,6 +168,20 @@ describe('实时 Thought 时间线', () => {
     expect(stopped.items[0]).toMatchObject({ title: '思考', detail: '', status: 'completed' })
   })
 
+  // 测试场景：重放未知持久事件时不把任意 payload 变成可见时间线内容。
+  it('忽略未知持久事件中的任意 payload', () => {
+    const timeline = timelineFromRunEvents([{
+      type: '',
+      event_type: 'provider_internal_packet',
+      created_at: '2026-09-08T08:00:00Z',
+      payload: { summary: 'secret-summary', reason: 'secret-reason', raw: { token: 'secret-token' } },
+    }])
+
+    expect(timeline).toEqual(emptyThoughtTimeline)
+    expect(JSON.stringify(timeline)).not.toContain('secret')
+  })
+
+  // 测试场景：后续模型重试覆盖当前重试行。
   it('后续模型重试覆盖当前重试行', () => {
     const first = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_retry', attempt: 1, event_id: 'retry-1' }, 1_000)
     const second = updateThoughtTimeline(first, { type: 'model_retry', attempt: 2, event_id: 'retry-2' }, 1_100)
@@ -165,6 +191,7 @@ describe('实时 Thought 时间线', () => {
     ])
   })
 
+  // 测试场景：为默认收起的处理摘要提取安全、简短的结论首行。
   it('为默认收起的处理摘要提取安全、简短的结论首行', () => {
     expect(summarizeThoughtConclusion('## 最终结论\n\n已经完成配置。')).toBe('最终结论')
     expect(summarizeThoughtConclusion('')).toBe('任务已完成')

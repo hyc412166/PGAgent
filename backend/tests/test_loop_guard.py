@@ -1,3 +1,9 @@
+"""验证代理循环守卫对重复工具调用、停滞、预算、完成条件和恢复策略的判定。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,29 +21,37 @@ from src.tools import create_default_registry
 from src.tools.types import ToolResult
 
 
+# 测试替身类：StatusError 模拟外部依赖的响应与调用记录，使连接或协议测试无需访问真实服务。
 class StatusError(RuntimeError):
+    # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
     def __init__(self, status_code: int) -> None:
         super().__init__(f"HTTP {status_code}")
         self.status_code = status_code
 
 
+# 测试替身类：ManualClock 模拟外部依赖的响应与调用记录，使连接或协议测试无需访问真实服务。
 class ManualClock:
+    # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
     def __init__(self) -> None:
         self.value = 0.0
 
+    # 辅助方法：__call__ 实现测试替身在此调用阶段需要的最小行为。
     def __call__(self) -> float:
         return self.value
 
+    # 辅助方法：advance 实现测试替身在此调用阶段需要的最小行为。
     def advance(self, seconds: float) -> None:
         self.value += seconds
 
 
+# 辅助函数：write_call 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def write_call(call_id: str, path: str, content: str) -> ModelToolCall:
     return ModelToolCall(call_id, "apply_patch", {
         "patch": f"*** Begin Patch\n*** Add File: {path}\n+{content}\n*** End Patch",
     })
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_usage_merge_rejects_model_identity_drift 精确标识本用例的具体条件。
 def test_usage_merge_rejects_model_identity_drift() -> None:
     with pytest.raises(ValueError, match="模型身份发生变化"):
         merge_usage(
@@ -46,6 +60,7 @@ def test_usage_merge_rejects_model_identity_drift() -> None:
         )
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_normalize_responses_usage_splits_cached_input_without_double_counting 精确标识本用例的具体条件。
 def test_normalize_responses_usage_splits_cached_input_without_double_counting() -> None:
     raw = {
         "input_tokens": 100,
@@ -70,6 +85,7 @@ def test_normalize_responses_usage_splits_cached_input_without_double_counting()
     assert normalize_usage(normalized) == normalized
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_normalize_responses_usage_accepts_missing_cache_write_detail 精确标识本用例的具体条件。
 def test_normalize_responses_usage_accepts_missing_cache_write_detail() -> None:
     normalized = normalize_usage({
         "input_tokens": 80,
@@ -83,6 +99,7 @@ def test_normalize_responses_usage_accepts_missing_cache_write_detail() -> None:
     assert normalized["total_tokens"] == 85
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_identical_call_is_stopped_on_third_occurrence 精确标识本用例的具体条件。
 def test_identical_call_is_stopped_on_third_occurrence() -> None:
     guard = LoopGuard(identical_limit=3)
     assert not guard.record_tool_call("read_file", {"path": "a", "line": 1}).stop
@@ -93,6 +110,7 @@ def test_identical_call_is_stopped_on_third_occurrence() -> None:
     assert decision.code == "repeated_tool_call"
 
 
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_no_progress_is_stopped_after_four_steps 精确标识本用例的具体条件。
 def test_no_progress_is_stopped_after_four_steps() -> None:
     guard = LoopGuard(no_progress_limit=4)
     for _ in range(3):
@@ -103,6 +121,7 @@ def test_no_progress_is_stopped_after_four_steps() -> None:
     assert guard.no_progress_count == 4
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_real_progress_resets_no_progress_counter 精确标识本用例的具体条件。
 def test_real_progress_resets_no_progress_counter() -> None:
     guard = LoopGuard(no_progress_limit=2)
     guard.record_progress(False)
@@ -110,6 +129,7 @@ def test_real_progress_resets_no_progress_counter() -> None:
     assert not guard.record_progress(False).stop
 
 
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_zero_hard_limits_allow_large_runs_but_keep_anti_loop_guards 精确标识本用例的具体条件。
 def test_zero_hard_limits_allow_large_runs_but_keep_anti_loop_guards() -> None:
     guard = LoopGuard(max_steps=0, max_calls=0, identical_limit=3, no_progress_limit=4)
     for index in range(250):
@@ -121,9 +141,11 @@ def test_zero_hard_limits_allow_large_runs_but_keep_anti_loop_guards() -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_production_context_is_stable_prefix_plus_transcript 精确标识本用例的具体条件。
 async def test_production_context_is_stable_prefix_plus_transcript(tmp_path) -> None:
     observed: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         observed.extend(kwargs["messages"])
         return ModelTurn(content="done")
@@ -145,9 +167,11 @@ async def test_production_context_is_stable_prefix_plus_transcript(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_production_context_is_an_append_only_provider_prefix_across_user_turns 精确标识本用例的具体条件。
 async def test_production_context_is_an_append_only_provider_prefix_across_user_turns(tmp_path) -> None:
     observed: list[list[dict]] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         observed.append([dict(item) for item in kwargs["messages"]])
         return ModelTurn(content="done")
@@ -173,9 +197,11 @@ async def test_production_context_is_an_append_only_provider_prefix_across_user_
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_provider_boundary_repairs_corrupt_historical_tool_groups 精确标识本用例的具体条件。
 async def test_provider_boundary_repairs_corrupt_historical_tool_groups(tmp_path) -> None:
     observed: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         observed.extend(dict(item) for item in kwargs["messages"])
         return ModelTurn(content="recovered")
@@ -209,9 +235,11 @@ async def test_provider_boundary_repairs_corrupt_historical_tool_groups(tmp_path
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_production_prepare_audits_corrupt_historical_tool_groups 精确标识本用例的具体条件。
 async def test_production_prepare_audits_corrupt_historical_tool_groups(tmp_path) -> None:
     observed: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         observed.extend(dict(item) for item in kwargs["messages"])
         return ModelTurn(content="recovered")
@@ -242,6 +270,7 @@ async def test_production_prepare_audits_corrupt_historical_tool_groups(tmp_path
 
 
 @pytest.mark.asyncio
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_multiple_task_calls_are_dispatched_concurrently 精确标识本用例的具体条件。
 async def test_multiple_task_calls_are_dispatched_concurrently(tmp_path) -> None:
     started = asyncio.Event()
     active = 0
@@ -249,6 +278,7 @@ async def test_multiple_task_calls_are_dispatched_concurrently(tmp_path) -> None
     start_count = 0
     model_turns = 0
 
+    # 辅助方法：delegate 实现测试替身在此调用阶段需要的最小行为。
     async def delegate(task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
         nonlocal active, max_active, start_count
         active += 1
@@ -260,6 +290,7 @@ async def test_multiple_task_calls_are_dispatched_concurrently(tmp_path) -> None
         active -= 1
         return ToolResult("task", True, f"{agent_id}: {task}")
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal model_turns
         model_turns += 1
@@ -287,14 +318,17 @@ async def test_multiple_task_calls_are_dispatched_concurrently(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_parallel_task_turn_rejects_total_fanout_above_limit 精确标识本用例的具体条件。
 async def test_parallel_task_turn_rejects_total_fanout_above_limit(tmp_path) -> None:
     invoked: list[str] = []
     model_turns = 0
 
+    # 辅助方法：delegate 实现测试替身在此调用阶段需要的最小行为。
     async def delegate(task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
         invoked.append(agent_id)
         return ToolResult("task", True, task)
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal model_turns
         model_turns += 1
@@ -332,14 +366,17 @@ async def test_parallel_task_turn_rejects_total_fanout_above_limit(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_mixed_tool_turn_cannot_bypass_total_delegate_limit 精确标识本用例的具体条件。
 async def test_mixed_tool_turn_cannot_bypass_total_delegate_limit(tmp_path) -> None:
     invoked: list[str] = []
     model_turns = 0
 
+    # 辅助方法：delegate 实现测试替身在此调用阶段需要的最小行为。
     async def delegate(task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
         invoked.append(agent_id)
         return ToolResult("task", True, task)
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal model_turns
         model_turns += 1
@@ -381,11 +418,13 @@ async def test_mixed_tool_turn_cannot_bypass_total_delegate_limit(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_parallel_child_approval_keeps_sibling_results_and_resumes_all 精确标识本用例的具体条件。
 async def test_parallel_child_approval_keeps_sibling_results_and_resumes_all(tmp_path) -> None:
     child_a_completed = False
     calls: list[str] = []
     model_turns = 0
 
+    # 辅助方法：delegate 实现测试替身在此调用阶段需要的最小行为。
     async def delegate(task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
         calls.append(str(call_id))
         if call_id == "task-a" and not child_a_completed:
@@ -402,6 +441,7 @@ async def test_parallel_child_approval_keeps_sibling_results_and_resumes_all(tmp
             )
         return ToolResult("task", True, f"{agent_id}: {task} completed")
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal model_turns
         model_turns += 1
@@ -444,9 +484,11 @@ async def test_parallel_child_approval_keeps_sibling_results_and_resumes_all(tmp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_active_runtime_fuse_stops_without_restoring_step_or_tool_limits 精确标识本用例的具体条件。
 async def test_active_runtime_fuse_stops_without_restoring_step_or_tool_limits(tmp_path) -> None:
     clock = ManualClock()
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         clock.advance(2.0)
         return ModelTurn(content="late answer")
@@ -464,10 +506,12 @@ async def test_active_runtime_fuse_stops_without_restoring_step_or_tool_limits(t
 
 
 @pytest.mark.asyncio
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_active_runtime_accumulates_across_approval_pause 精确标识本用例的具体条件。
 async def test_active_runtime_accumulates_across_approval_pause(tmp_path) -> None:
     clock = ManualClock()
     turns = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal turns
         turns += 1
@@ -500,11 +544,14 @@ async def test_active_runtime_accumulates_across_approval_pause(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_background_wait_does_not_consume_active_runtime_budget 精确标识本用例的具体条件。
 async def test_background_wait_does_not_consume_active_runtime_budget(tmp_path) -> None:
     clock = ManualClock()
     turns = 0
 
+    # 测试替身类：BackgroundStore 保存该局部场景的可控状态。
     class BackgroundStore:
+        # 辅助方法：check 实现测试替身在此调用阶段需要的最小行为。
         def check(self, **_kwargs) -> ToolResult:
             clock.advance(10.0)
             return ToolResult(
@@ -514,6 +561,7 @@ async def test_background_wait_does_not_consume_active_runtime_budget(tmp_path) 
                 metadata={"background_wait_seconds": 10.0},
             )
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal turns
         turns += 1
@@ -542,10 +590,12 @@ async def test_background_wait_does_not_consume_active_runtime_budget(tmp_path) 
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_provider_timeout_is_not_misclassified_as_run_fuse 精确标识本用例的具体条件。
 async def test_provider_timeout_is_not_misclassified_as_run_fuse(tmp_path) -> None:
     clock = ManualClock()
     attempts = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal attempts
         attempts += 1
@@ -564,6 +614,7 @@ async def test_provider_timeout_is_not_misclassified_as_run_fuse(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_observation_history_is_not_truncated_to_200_before_approval 精确标识本用例的具体条件。
 async def test_observation_history_is_not_truncated_to_200_before_approval(tmp_path) -> None:
     calls = [
         ModelToolCall(f"missing-{index}", f"missing-{index}", {})
@@ -573,6 +624,7 @@ async def test_observation_history_is_not_truncated_to_200_before_approval(tmp_p
         "patch": "*** Begin Patch\n*** Add File: x.txt\n+x\n*** End Patch",
     }))
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(tool_calls=calls)
 
@@ -587,9 +639,11 @@ async def test_observation_history_is_not_truncated_to_200_before_approval(tmp_p
 
 
 @pytest.mark.asyncio
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_auth_failure_is_not_retried 精确标识本用例的具体条件。
 async def test_auth_failure_is_not_retried() -> None:
     attempts = 0
 
+    # 辅助方法：operation 实现测试替身在此调用阶段需要的最小行为。
     async def operation() -> None:
         nonlocal attempts
         attempts += 1
@@ -602,10 +656,12 @@ async def test_auth_failure_is_not_retried() -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_rate_limit_retries_at_most_three_total_attempts 精确标识本用例的具体条件。
 async def test_rate_limit_retries_at_most_three_total_attempts() -> None:
     attempts = 0
     delays: list[float] = []
 
+    # 辅助方法：operation 实现测试替身在此调用阶段需要的最小行为。
     async def operation() -> str:
         nonlocal attempts
         attempts += 1
@@ -613,6 +669,7 @@ async def test_rate_limit_retries_at_most_three_total_attempts() -> None:
             raise StatusError(429)
         return "ok"
 
+    # 局部测试函数：fake_sleep 模拟该步骤的返回结果或异常。
     async def fake_sleep(delay: float) -> None:
         delays.append(delay)
 
@@ -629,9 +686,11 @@ async def test_rate_limit_retries_at_most_three_total_attempts() -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_provider_managed_retry_is_persisted_before_terminal_failure 精确标识本用例的具体条件。
 async def test_provider_managed_retry_is_persisted_before_terminal_failure(tmp_path) -> None:
     published: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(*, on_retry=None, **_kwargs) -> ModelTurn:
         await on_retry("request", 1, 0)
         raise StatusError(502)
@@ -663,7 +722,9 @@ async def test_provider_managed_retry_is_persisted_before_terminal_failure(tmp_p
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_runtime_stops_repeated_model_tool_call 精确标识本用例的具体条件。
 async def test_runtime_stops_repeated_model_tool_call(tmp_path) -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(tool_calls=[ModelToolCall("same", "glob", {"path": "."})])
 
@@ -679,7 +740,9 @@ async def test_runtime_stops_repeated_model_tool_call(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_pauses_before_side_effect 精确标识本用例的具体条件。
 async def test_runtime_pauses_before_side_effect(tmp_path) -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(
             tool_calls=[write_call("write-1", "x.txt", "hello")]
@@ -697,9 +760,11 @@ async def test_runtime_pauses_before_side_effect(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_runtime_stops_after_four_failed_no_progress_steps 精确标识本用例的具体条件。
 async def test_runtime_stops_after_four_failed_no_progress_steps(tmp_path) -> None:
     turn = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal turn
         turn += 1
@@ -717,10 +782,12 @@ async def test_runtime_stops_after_four_failed_no_progress_steps(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_coding_runtime_gets_one_recovery_turn_before_no_progress_stop 精确标识本用例的具体条件。
 async def test_coding_runtime_gets_one_recovery_turn_before_no_progress_stop(tmp_path) -> None:
     model_messages: list[list[dict]] = []
     turn = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         nonlocal turn
         turn += 1
@@ -763,10 +830,12 @@ async def test_coding_runtime_gets_one_recovery_turn_before_no_progress_stop(tmp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_coding_runtime_recovers_once_from_tool_errors_before_any_edit 精确标识本用例的具体条件。
 async def test_coding_runtime_recovers_once_from_tool_errors_before_any_edit(tmp_path) -> None:
     turns = 0
     recovery_messages: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         nonlocal turns, recovery_messages
         turns += 1
@@ -799,7 +868,9 @@ async def test_coding_runtime_recovers_once_from_tool_errors_before_any_edit(tmp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_stream_activity_resets_model_idle_timeout 精确标识本用例的具体条件。
 async def test_stream_activity_resets_model_idle_timeout(tmp_path) -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(*, on_delta, **_kwargs) -> ModelTurn:
         await asyncio.sleep(0.3)
         await on_delta("still working")
@@ -819,10 +890,12 @@ async def test_stream_activity_resets_model_idle_timeout(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_stream_idle_after_activity_is_not_retried 精确标识本用例的具体条件。
 async def test_stream_idle_after_activity_is_not_retried(tmp_path) -> None:
     calls = 0
     cancelled = asyncio.Event()
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(*, on_delta, **_kwargs) -> ModelTurn:
         nonlocal calls
         calls += 1
@@ -852,9 +925,11 @@ async def test_stream_idle_after_activity_is_not_retried(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_resumes_by_executing_exact_approved_call 精确标识本用例的具体条件。
 async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> None:
     turns = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         nonlocal turns
         turns += 1
@@ -881,10 +956,12 @@ async def test_runtime_resumes_by_executing_exact_approved_call(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_production_context_path_keeps_original_task_after_approval_resume 精确标识本用例的具体条件。
 async def test_production_context_path_keeps_original_task_after_approval_resume(tmp_path) -> None:
     task = "Write the approved file and keep this goal after resume."
     turns = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         nonlocal turns
         turns += 1
@@ -911,10 +988,12 @@ async def test_production_context_path_keeps_original_task_after_approval_resume
 
 
 @pytest.mark.asyncio
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_full_compaction_keeps_current_request_through_approval_resume 精确标识本用例的具体条件。
 async def test_full_compaction_keeps_current_request_through_approval_resume(tmp_path) -> None:
     task = "Create the approved report and do not lose this task after context compaction."
     calls = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         nonlocal calls
         calls += 1
@@ -985,10 +1064,12 @@ async def test_full_compaction_keeps_current_request_through_approval_resume(tmp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_approval_resume_completes_entire_multi_tool_batch 精确标识本用例的具体条件。
 async def test_approval_resume_completes_entire_multi_tool_batch(tmp_path) -> None:
     (tmp_path / "before.txt").write_text("before", encoding="utf-8")
     turns = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:
         nonlocal turns
         turns += 1
@@ -1013,9 +1094,11 @@ async def test_approval_resume_completes_entire_multi_tool_batch(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_multi_side_effect_batch_pauses_for_each_approval 精确标识本用例的具体条件。
 async def test_multi_side_effect_batch_pauses_for_each_approval(tmp_path) -> None:
     turns = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal turns
         turns += 1
@@ -1040,9 +1123,11 @@ async def test_multi_side_effect_batch_pauses_for_each_approval(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_model_attempt_timeout_is_retried_and_bounded 精确标识本用例的具体条件。
 async def test_model_attempt_timeout_is_retried_and_bounded(tmp_path) -> None:
     attempts = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal attempts
         attempts += 1
@@ -1060,9 +1145,11 @@ async def test_model_attempt_timeout_is_retried_and_bounded(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_synchronous_model_timeout_is_not_retried 精确标识本用例的具体条件。
 async def test_synchronous_model_timeout_is_not_retried(tmp_path) -> None:
     attempts = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     def model_call(**_kwargs) -> ModelTurn:
         nonlocal attempts
         attempts += 1
@@ -1083,9 +1170,11 @@ async def test_synchronous_model_timeout_is_not_retried(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_resume_guard_stop_is_published_to_event_sink 精确标识本用例的具体条件。
 async def test_resume_guard_stop_is_published_to_event_sink(tmp_path) -> None:
     published: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(tool_calls=[
             write_call("write", "x.txt", "x"),
@@ -1106,9 +1195,11 @@ async def test_resume_guard_stop_is_published_to_event_sink(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_aggregates_usage_across_all_model_turns 精确标识本用例的具体条件。
 async def test_runtime_aggregates_usage_across_all_model_turns(tmp_path) -> None:
     turn = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal turn
         turn += 1
@@ -1148,9 +1239,11 @@ async def test_runtime_aggregates_usage_across_all_model_turns(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_explicit_token_budget_stops_before_executing_another_tool 精确标识本用例的具体条件。
 async def test_explicit_token_budget_stops_before_executing_another_tool(tmp_path) -> None:
     calls = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal calls
         calls += 1
@@ -1180,9 +1273,11 @@ async def test_explicit_token_budget_stops_before_executing_another_tool(tmp_pat
 
 
 @pytest.mark.asyncio
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_approval_resume_carries_usage_forward_without_double_counting 精确标识本用例的具体条件。
 async def test_approval_resume_carries_usage_forward_without_double_counting(tmp_path) -> None:
     turns = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal turns
         turns += 1
@@ -1210,10 +1305,12 @@ async def test_approval_resume_carries_usage_forward_without_double_counting(tmp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_approval_resume_preserves_seen_observations_for_no_progress_guard 精确标识本用例的具体条件。
 async def test_approval_resume_preserves_seen_observations_for_no_progress_guard(tmp_path) -> None:
     (tmp_path / "stable.txt").write_text("unchanged", encoding="utf-8")
     turns = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal turns
         turns += 1
@@ -1240,10 +1337,13 @@ async def test_approval_resume_preserves_seen_observations_for_no_progress_guard
 
 
 @pytest.mark.asyncio
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_event_sink_failure_is_reported_without_stranding_run 精确标识本用例的具体条件。
 async def test_event_sink_failure_is_reported_without_stranding_run(tmp_path) -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(content="ok")
 
+    # 辅助方法：broken_sink 实现测试替身在此调用阶段需要的最小行为。
     def broken_sink(_event) -> None:
         raise OSError("database unavailable")
 
@@ -1258,10 +1358,13 @@ async def test_event_sink_failure_is_reported_without_stranding_run(tmp_path) ->
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_event_sink_timeout_is_reported_without_stranding_run 精确标识本用例的具体条件。
 async def test_event_sink_timeout_is_reported_without_stranding_run(tmp_path) -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(content="ok")
 
+    # 辅助方法：stuck_sink 实现测试替身在此调用阶段需要的最小行为。
     async def stuck_sink(_event) -> None:
         await asyncio.Event().wait()
 
@@ -1280,10 +1383,12 @@ async def test_event_sink_timeout_is_reported_without_stranding_run(tmp_path) ->
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_assistant_deltas_use_only_transient_stream_sink 精确标识本用例的具体条件。
 async def test_assistant_deltas_use_only_transient_stream_sink(tmp_path) -> None:
     durable_events: list[dict] = []
     transient_events: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:  # type: ignore[no-untyped-def]
         await kwargs["on_delta"]("one ")
         await kwargs["on_delta"]("two")
@@ -1306,10 +1411,12 @@ async def test_assistant_deltas_use_only_transient_stream_sink(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_provider_reasoning_is_not_published_to_the_user_timeline 精确标识本用例的具体条件。
 async def test_provider_reasoning_is_not_published_to_the_user_timeline(tmp_path) -> None:
     durable_events: list[dict] = []
     transient_events: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:  # type: ignore[no-untyped-def]
         assert "on_thought_delta" not in kwargs
         await kwargs["on_delta"]("今天晴。")
@@ -1330,9 +1437,11 @@ async def test_provider_reasoning_is_not_published_to_the_user_timeline(tmp_path
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_provider_web_search_is_visible_without_local_dispatch 精确标识本用例的具体条件。
 async def test_provider_web_search_is_visible_without_local_dispatch(tmp_path) -> None:
     durable_events: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         return ModelTurn(
             content="检索完成。",
@@ -1370,10 +1479,12 @@ async def test_provider_web_search_is_visible_without_local_dispatch(tmp_path) -
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_tool_step_thought_summary_hides_memory_citation 精确标识本用例的具体条件。
 async def test_tool_step_thought_summary_hides_memory_citation(tmp_path) -> None:
     durable_events: list[dict] = []
     calls = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal calls
         calls += 1
@@ -1403,10 +1514,12 @@ async def test_tool_step_thought_summary_hides_memory_citation(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_tool_step_has_no_fixed_progress_fallback_without_model_status 精确标识本用例的具体条件。
 async def test_tool_step_has_no_fixed_progress_fallback_without_model_status(tmp_path) -> None:
     durable_events: list[dict] = []
     calls = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs) -> ModelTurn:
         nonlocal calls
         calls += 1
@@ -1431,7 +1544,9 @@ async def test_tool_step_has_no_fixed_progress_fallback_without_model_status(tmp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_keeps_legacy_model_callable_without_delta_keyword_compatible 精确标识本用例的具体条件。
 async def test_runtime_keeps_legacy_model_callable_without_delta_keyword_compatible(tmp_path) -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(messages, tools, mode) -> ModelTurn:  # type: ignore[no-untyped-def]
         assert isinstance(messages, list)
         assert isinstance(tools, list)
@@ -1447,5 +1562,6 @@ async def test_runtime_keeps_legacy_model_callable_without_delta_keyword_compati
     assert outcome.output == "compatible"
 
 
+# 辅助函数：_completed 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 async def _completed() -> None:
     return None

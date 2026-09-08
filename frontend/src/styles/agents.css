@@ -1,4 +1,5 @@
-/* Agent team: compact templates and small profile cards */
+/* 本文件定义 agents 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
+/* Agent 小队：紧凑模板区和小型配置卡片。 */
 
 .agent-starter-strip {
   display: grid;

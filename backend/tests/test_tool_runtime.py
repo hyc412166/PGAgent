@@ -1,3 +1,9 @@
+"""验证工具运行时的权限模式、审批、参数解析、时间线脱敏、上下文压缩和真实工具执行边界。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import json
@@ -11,6 +17,7 @@ from src.tools import create_default_registry
 from src.tools.policy import assess_tool_call
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_registry_exposes_only_selected_tools_and_enforces_permission_modes 精确标识本用例的具体条件。
 def test_registry_exposes_only_selected_tools_and_enforces_permission_modes(tmp_path) -> None:
     ask_registry = create_default_registry(
         str(tmp_path),
@@ -55,9 +62,11 @@ def test_registry_exposes_only_selected_tools_and_enforces_permission_modes(tmp_
 
 
 @pytest.mark.asyncio
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_frozen_legacy_run_can_call_another_legacy_tool_after_approval 精确标识本用例的具体条件。
 async def test_frozen_legacy_run_can_call_another_legacy_tool_after_approval(tmp_path) -> None:
     turns = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal turns
         turns += 1
@@ -88,6 +97,7 @@ async def test_frozen_legacy_run_can_call_another_legacy_tool_after_approval(tmp
     assert (tmp_path / "two.txt").read_text(encoding="utf-8") == "2"
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_timeline_redacts_patch_and_stdin_payloads 精确标识本用例的具体条件。
 def test_timeline_redacts_patch_and_stdin_payloads() -> None:
     summary = safe_tool_argument_summary(
         "apply_patch",
@@ -97,6 +107,7 @@ def test_timeline_redacts_patch_and_stdin_payloads() -> None:
     assert summary == {"arguments": {"patch": "[redacted]", "input": "[redacted]"}}
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_smart_mode_allows_routine_code_edits_but_escalates_sensitive_or_broad_writes 精确标识本用例的具体条件。
 def test_smart_mode_allows_routine_code_edits_but_escalates_sensitive_or_broad_writes(tmp_path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "src.py").write_text("print('before')\n", encoding="utf-8")
@@ -139,6 +150,7 @@ def test_smart_mode_allows_routine_code_edits_but_escalates_sensitive_or_broad_w
     assert "显著缩小" in destructive.content
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_smart_mode_classifies_commands_by_exact_arguments 精确标识本用例的具体条件。
 def test_smart_mode_classifies_commands_by_exact_arguments(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -171,6 +183,7 @@ def test_smart_mode_classifies_commands_by_exact_arguments(tmp_path) -> None:
         assert clue in pending.content
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_permission_modes_keep_their_distinct_boundaries_for_the_same_write 精确标识本用例的具体条件。
 def test_permission_modes_keep_their_distinct_boundaries_for_the_same_write(tmp_path) -> None:
     arguments = {"path": "src/src.py", "content": "print('ok')\n"}
 
@@ -184,6 +197,7 @@ def test_permission_modes_keep_their_distinct_boundaries_for_the_same_write(tmp_
     assert full.execute("write", {"path": ".env", "content": "API_KEY=demo"}).ok
 
 
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_legacy_delete_is_hidden_but_still_requires_approval 精确标识本用例的具体条件。
 def test_legacy_delete_is_hidden_but_still_requires_approval(tmp_path) -> None:
     target = tmp_path / "obsolete.txt"
     target.write_text("old", encoding="utf-8")
@@ -204,6 +218,7 @@ def test_legacy_delete_is_hidden_but_still_requires_approval(tmp_path) -> None:
     assert not target.exists()
 
 
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_malformed_provider_tool_arguments_are_rejected_without_execution 精确标识本用例的具体条件。
 def test_malformed_provider_tool_arguments_are_rejected_without_execution(tmp_path) -> None:
     turn = ModelTurn.from_response({
         "tool_calls": [{
@@ -224,6 +239,7 @@ def test_malformed_provider_tool_arguments_are_rejected_without_execution(tmp_pa
     assert "content" not in result.content
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_model_turn_preserves_provider_reasoning_for_followup_requests 精确标识本用例的具体条件。
 def test_model_turn_preserves_provider_reasoning_for_followup_requests() -> None:
     turn = ModelTurn.from_response({
         "choices": [{"message": {
@@ -240,10 +256,12 @@ def test_model_turn_preserves_provider_reasoning_for_followup_requests() -> None
 
 
 @pytest.mark.asyncio
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_runtime_never_persists_raw_malformed_tool_arguments 精确标识本用例的具体条件。
 async def test_runtime_never_persists_raw_malformed_tool_arguments(tmp_path) -> None:
     calls = 0
     malformed = '{"path":"x.txt","content":"DO_NOT_PERSIST"'
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal calls
         calls += 1
@@ -275,6 +293,7 @@ async def test_runtime_never_persists_raw_malformed_tool_arguments(tmp_path) -> 
     assert "_raw" not in serialized
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_edit_glob_and_grep_are_real_sandboxed_tools 精确标识本用例的具体条件。
 def test_edit_glob_and_grep_are_real_sandboxed_tools(tmp_path) -> None:
     (tmp_path / "notes").mkdir()
     target = tmp_path / "notes" / "sample.txt"
@@ -305,6 +324,7 @@ def test_edit_glob_and_grep_are_real_sandboxed_tools(tmp_path) -> None:
     assert "notes/sample.txt:1" in searched.content
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_todo_skill_and_task_behavior_is_honest 精确标识本用例的具体条件。
 def test_todo_skill_and_task_behavior_is_honest(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -344,9 +364,11 @@ def test_todo_skill_and_task_behavior_is_honest(tmp_path) -> None:
     assert task.error_code == "delegated_task_unavailable"
 
 @pytest.mark.asyncio
+# 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_task_delegate_is_not_started_until_parent_approval 精确标识本用例的具体条件。
 async def test_task_delegate_is_not_started_until_parent_approval(tmp_path) -> None:
     invoked: list[tuple[str, str, str | None]] = []
 
+    # 辅助方法：delegate 实现测试替身在此调用阶段需要的最小行为。
     async def delegate(task: str, *, agent_id: str, call_id: str | None = None):  # type: ignore[no-untyped-def]
         invoked.append((task, agent_id, call_id))
         from src.tools.types import ToolResult
@@ -386,6 +408,7 @@ async def test_task_delegate_is_not_started_until_parent_approval(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_async_command_approval_does_not_persist_private_cancel_signal 精确标识本用例的具体条件。
 async def test_async_command_approval_does_not_persist_private_cancel_signal(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
@@ -400,7 +423,9 @@ async def test_async_command_approval_does_not_persist_private_cancel_signal(tmp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_question_stops_for_input_without_claiming_completion 精确标识本用例的具体条件。
 async def test_question_stops_for_input_without_claiming_completion(tmp_path) -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs):
         return ModelTurn(tool_calls=[ModelToolCall("question-1", "question", {"question": "目标文件是哪一个？"})])
 
@@ -419,19 +444,25 @@ async def test_question_stops_for_input_without_claiming_completion(tmp_path) ->
         "run_stopped",
     ]
     started = next(event for event in outcome.events if event["type"] == "model_step_started")
+    finished = next(event for event in outcome.events if event["type"] == "model_step_finished")
     tool_started = next(event for event in outcome.events if event["type"] == "tool_started")
     assert isinstance(started["monotonic_ms"], int)
+    assert finished["step"] == started["step"]
+    assert isinstance(finished["duration_ms"], int)
     assert tool_started["tool_name"] == "question"
     assert "thought_duration_ms" in tool_started
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_provider_context_overflow_compacts_once_and_retries_without_loop 精确标识本用例的具体条件。
 async def test_provider_context_overflow_compacts_once_and_retries_without_loop(tmp_path) -> None:
+    # 测试替身类：ContextOverflow 保存该局部场景的可控状态。
     class ContextOverflow(RuntimeError):
         status_code = 400
 
     calls: list[str] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         calls.append(str(kwargs.get("mode")))
         if kwargs.get("mode") == "auto" and calls.count("auto") == 1:
@@ -480,10 +511,12 @@ async def test_provider_context_overflow_compacts_once_and_retries_without_loop(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_threshold_full_compaction_builds_exact_continuation 精确标识本用例的具体条件。
 async def test_threshold_full_compaction_builds_exact_continuation(tmp_path) -> None:
     calls: list[str] = []
     model_messages: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         mode = str(kwargs.get("mode") or "auto")
         calls.append(mode)
@@ -535,12 +568,14 @@ async def test_threshold_full_compaction_builds_exact_continuation(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_threshold_compaction_is_not_limited_to_two_per_run 精确标识本用例的具体条件。
 async def test_threshold_compaction_is_not_limited_to_two_per_run(tmp_path) -> None:
     (tmp_path / "large-1.txt").write_text("a" * 10_000, encoding="utf-8")
     (tmp_path / "large-2.txt").write_text("b" * 10_000, encoding="utf-8")
     modes: list[str] = []
     auto_calls = 0
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal auto_calls
         mode = str(kwargs.get("mode") or "auto")
@@ -599,10 +634,12 @@ async def test_threshold_compaction_is_not_limited_to_two_per_run(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_aggregate_tool_results_are_budgeted_before_nine_section_compaction 精确标识本用例的具体条件。
 async def test_aggregate_tool_results_are_budgeted_before_nine_section_compaction(tmp_path) -> None:
     calls: list[str] = []
     provider_messages: list[dict] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         calls.append(str(kwargs.get("mode") or "auto"))
         if kwargs.get("mode") == "auto":
@@ -662,9 +699,11 @@ async def test_aggregate_tool_results_are_budgeted_before_nine_section_compactio
 
 
 @pytest.mark.asyncio
+# 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_exhausted_tool_result_budget_passes_to_normal_threshold_logic 精确标识本用例的具体条件。
 async def test_exhausted_tool_result_budget_passes_to_normal_threshold_logic(tmp_path) -> None:
     calls: list[str] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         mode = str(kwargs.get("mode") or "auto")
         calls.append(mode)
@@ -712,13 +751,16 @@ async def test_exhausted_tool_result_budget_passes_to_normal_threshold_logic(tmp
 
 
 @pytest.mark.asyncio
+# 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_task_checkpoint_failure_keeps_original_messages_instead_of_degraded_compaction 精确标识本用例的具体条件。
 async def test_task_checkpoint_failure_keeps_original_messages_instead_of_degraded_compaction(tmp_path) -> None:
     modes: list[str] = []
 
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs):  # type: ignore[no-untyped-def]
         modes.append(str(kwargs.get("mode") or "auto"))
         return ModelTurn(content="answer from original context")
 
+    # 辅助方法：unavailable_checkpoint 实现测试替身在此调用阶段需要的最小行为。
     def unavailable_checkpoint():
         raise RuntimeError("database temporarily unavailable")
 
@@ -746,7 +788,9 @@ async def test_task_checkpoint_failure_keeps_original_messages_instead_of_degrad
 
 
 @pytest.mark.asyncio
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_timeline_never_persists_write_content_or_api_key 精确标识本用例的具体条件。
 async def test_timeline_never_persists_write_content_or_api_key(tmp_path) -> None:
+    # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**_kwargs):
         return ModelTurn(
             tool_calls=[

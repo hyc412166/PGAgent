@@ -1,4 +1,5 @@
-/* App shell */
+/* 本文件定义 app-shell 相关界面的布局、视觉状态与响应式样式，由对应 React 页面或全局样式入口加载。 */
+/* 应用外壳：侧栏、品牌区、主内容区和导航状态。 */
 
 .app-shell {
   position: relative;

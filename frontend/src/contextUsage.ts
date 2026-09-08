@@ -1,7 +1,10 @@
+// 本文件负责 contextUsage 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
 import type { SessionContext } from './types'
 
+// ContextTone 驱动上下文环的普通、临界和压缩中视觉状态。
 export type ContextTone = 'normal' | 'near-limit' | 'compacting'
 
+// ContextUsageView 是由原始 token 数据派生的纯展示模型。
 export interface ContextUsageView {
   percent: number
   roundedPercent: number
@@ -12,6 +15,7 @@ export interface ContextUsageView {
   compressionHint: string
 }
 
+// 规范化上限、阈值和百分比，并生成环形进度所需角度与提示文案。
 export function buildContextUsageView(context: SessionContext): ContextUsageView {
   const percent = context.limit_tokens > 0
     ? Math.min(100, Math.max(0, (context.used_tokens / context.limit_tokens) * 100))

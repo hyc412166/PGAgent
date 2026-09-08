@@ -1,4 +1,6 @@
 """Local-first tools exposed to PGAgent's model loop."""
+# 文件职责：负责工具定义、授权、注册、调度与执行中的 builtins 子模块。
+# 逻辑关系：上层通过 tools/builtins.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ import httpx
 from .sandbox import SandboxViolation, WorkspaceSandbox
 from .types import ApprovalRequest, ToolResult
 
+# 变量说明：DEFAULT_COMMAND_ALLOWLIST 表示当前步骤使用的 DEFAULT_COMMAND_ALLOWLIST 值。
 DEFAULT_COMMAND_ALLOWLIST = frozenset(
     {
         "python",
@@ -50,79 +53,121 @@ DEFAULT_COMMAND_ALLOWLIST = frozenset(
     }
 )
 
+# 变量说明：_DANGEROUS_SHELL_TOKENS 表示当前流程使用的 _DANGEROUS_SHELL_TOKENS 集合。
 _DANGEROUS_SHELL_TOKENS = ("&&", "||", ";", "|", ">", "<", "`", "$(")
+# 变量说明：_WINDOWS_BATCH_CONTROL_TOKENS 表示当前流程使用的 _WINDOWS_BATCH_CONTROL_TOKENS 集合。
 _WINDOWS_BATCH_CONTROL_TOKENS = ("&", "|", ">", "<", "^", "\r", "\n")
 
 # A coordinator must be able to fan out, but a malformed model response must
 # not be able to create an unbounded number of child runs in one turn.
+# 变量说明：MAX_PARALLEL_DELEGATED_TASKS 表示当前流程使用的 MAX_PARALLEL_DELEGATED_TASKS 集合。
 MAX_PARALLEL_DELEGATED_TASKS = 8
+# 变量说明：MAX_WEB_RESPONSE_BYTES 表示当前流程使用的 MAX_WEB_RESPONSE_BYTES 集合。
 MAX_WEB_RESPONSE_BYTES = 1_000_000
+# 变量说明：DEFAULT_WEB_PAGE_CHARS 表示当前流程使用的 DEFAULT_WEB_PAGE_CHARS 集合。
 DEFAULT_WEB_PAGE_CHARS = 12_000
+# 变量说明：MAX_WEB_PAGE_CHARS 表示当前流程使用的 MAX_WEB_PAGE_CHARS 集合。
 MAX_WEB_PAGE_CHARS = 20_000
+# 变量说明：MAX_WEB_REDIRECTS 表示当前流程使用的 MAX_WEB_REDIRECTS 集合。
 MAX_WEB_REDIRECTS = 5
+# 变量说明：MAX_SKILL_INSTRUCTION_CHARS 表示当前流程使用的 MAX_SKILL_INSTRUCTION_CHARS 集合。
 MAX_SKILL_INSTRUCTION_CHARS = 40_000
+# 变量说明：MAX_TODOS 表示当前流程使用的 MAX_TODOS 集合。
 MAX_TODOS = 100
 
 
+# 类职责：表示 UnsafeWebUrlError 场景的领域异常。
+# 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class UnsafeWebUrlError(ValueError):
     """A URL violates the webfetch SSRF boundary."""
 
 
+# 类职责：表示 WebHostResolutionError 场景的领域异常。
+# 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class WebHostResolutionError(RuntimeError):
     """The URL is syntactically safe but its public host could not resolve."""
 
 
+# 类职责：定义 _ReadableHtmlParser 在本领域中的数据与行为。
+# 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class _ReadableHtmlParser(HTMLParser):
     """Extract document metadata and readable text without retaining markup."""
 
+    # 变量说明：_SKIPPED 表示当前步骤使用的 _SKIPPED 值。
     _SKIPPED = frozenset({"script", "style", "noscript", "svg", "canvas", "template"})
+    # 变量说明：_BLOCKS 表示当前流程使用的 _BLOCKS 集合。
     _BLOCKS = frozenset({
         "article", "aside", "blockquote", "br", "div", "footer", "h1", "h2", "h3",
         "h4", "h5", "h6", "header", "li", "main", "nav", "ol", "p", "pre", "section",
         "table", "td", "th", "tr", "ul",
     })
 
+    # 函数职责：初始化实例依赖与初始状态。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
+        # 变量说明：parts 表示当前流程使用的 parts 集合。
         self.parts: list[str] = []
+        # 变量说明：title_parts 表示当前流程使用的 title_parts 集合。
         self.title_parts: list[str] = []
+        # 变量说明：metadata 表示当前步骤使用的 metadata 值。
         self.metadata: dict[str, str] = {}
+        # 变量说明：_skip_depth 表示当前步骤使用的 _skip_depth 值。
         self._skip_depth = 0
+        # 变量说明：_in_title 表示当前步骤使用的 _in_title 值。
         self._in_title = False
 
+    # 函数职责：处理 starttag 对应的数据或流程。
+    # 参数关系：tag 表示当前步骤使用的 tag 值；attrs 表示当前流程使用的 attrs 集合。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        # 变量说明：name 表示当前对象名称。
         name = tag.lower()
         if name in self._SKIPPED:
             self._skip_depth += 1
             return
         if self._skip_depth:
             return
+        # 变量说明：attributes 表示当前流程使用的 attributes 集合。
         attributes = {str(key).lower(): str(value or "") for key, value in attrs}
         if name == "title":
+            # 变量说明：_in_title 表示当前步骤使用的 _in_title 值。
             self._in_title = True
         elif name == "meta":
+            # 变量说明：key 表示用于查找或映射的键。
             key = (attributes.get("property") or attributes.get("name") or "").lower()
+            # 变量说明：value 表示当前字段或计算值。
             value = attributes.get("content", "").strip()
             if key and value:
                 self.metadata.setdefault(key, value)
         if name in self._BLOCKS:
             self.parts.append("\n")
 
+    # 函数职责：处理 endtag 对应的数据或流程。
+    # 参数关系：tag 表示当前步骤使用的 tag 值。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def handle_endtag(self, tag: str) -> None:
+        # 变量说明：name 表示当前对象名称。
         name = tag.lower()
         if name in self._SKIPPED:
+            # 变量说明：_skip_depth 表示当前步骤使用的 _skip_depth 值。
             self._skip_depth = max(0, self._skip_depth - 1)
             return
         if self._skip_depth:
             return
         if name == "title":
+            # 变量说明：_in_title 表示当前步骤使用的 _in_title 值。
             self._in_title = False
         if name in self._BLOCKS:
             self.parts.append("\n")
 
+    # 函数职责：处理 data 对应的数据或流程。
+    # 参数关系：data 表示当前处理的数据。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def handle_data(self, data: str) -> None:
         if self._skip_depth:
             return
+        # 变量说明：value 表示当前字段或计算值。
         value = data.strip()
         if not value:
             return
@@ -130,16 +175,24 @@ class _ReadableHtmlParser(HTMLParser):
             self.title_parts.append(value)
         self.parts.append(value)
 
+    # 函数职责：完成 readable_text 对应的业务处理。
+    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def readable_text(self) -> str:
+        # 变量说明：lines 表示当前流程使用的 lines 集合。
         lines = []
         for line in " ".join(self.parts).splitlines():
+            # 变量说明：normalized 表示当前步骤使用的 normalized 值。
             normalized = " ".join(line.split())
             if normalized and (not lines or lines[-1] != normalized):
                 lines.append(normalized)
         return "\n".join(lines)
 
 
+# 函数职责：完成 approval 对应的业务处理。
+# 参数关系：tool_name 表示当前步骤使用的 tool_name 值；arguments 表示当前流程使用的 arguments 集合；reason 表示当前步骤使用的 reason 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _approval(tool_name: str, arguments: dict[str, Any], reason: str) -> ToolResult:
+    # 变量说明：request 表示调用方传入的请求数据。
     request = ApprovalRequest(tool_name=tool_name, arguments=arguments, reason=reason)
     return ToolResult(
         tool_name=tool_name,
@@ -151,6 +204,9 @@ def _approval(tool_name: str, arguments: dict[str, Any], reason: str) -> ToolRes
     )
 
 
+# 函数职责：完成 safe_walk 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；root 表示处理范围的根目录；recursive 表示当前步骤使用的 recursive 值；max_entries 表示当前流程使用的 max_entries 集合；stats 表示当前流程使用的 stats 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _safe_walk(
     sandbox: WorkspaceSandbox,
     root: Path,
@@ -161,27 +217,37 @@ def _safe_walk(
 ) -> Iterator[tuple[Path, Path]]:
     """Walk without ever entering an unresolved symlink or Windows junction."""
 
+    # 变量说明：pending_directories 表示当前流程使用的 pending_directories 集合。
     pending_directories = [root]
+    # 变量说明：yielded 表示当前步骤使用的 yielded 值。
     yielded = 0
     while pending_directories and yielded < max_entries:
+        # 变量说明：current 表示当前步骤使用的 current 值。
         current = pending_directories.pop()
         try:
+            # 变量说明：children 表示当前步骤使用的 children 值。
             children = sorted(current.iterdir(), key=lambda item: item.as_posix().lower())
         except OSError:
             if stats is not None:
+                # 变量说明：stats 的索引项 表示该语句创建或更新的目标数据。
                 stats["skipped"] = stats.get("skipped", 0) + 1
             continue
+        # 变量说明：directories_to_visit 表示当前步骤使用的 directories_to_visit 值。
         directories_to_visit: list[Path] = []
         for child in children:
             try:
+                # 变量说明：lexical_relative 表示当前步骤使用的 lexical_relative 值。
                 lexical_relative = child.absolute().relative_to(sandbox.root)
+                # 变量说明：safe_child 表示当前步骤使用的 safe_child 值。
                 safe_child = sandbox.resolve(lexical_relative, must_exist=True)
             except (SandboxViolation, FileNotFoundError, OSError, ValueError):
                 if stats is not None:
+                    # 变量说明：stats 的索引项 表示该语句创建或更新的目标数据。
                     stats["skipped"] = stats.get("skipped", 0) + 1
                 continue
             yielded += 1
             if stats is not None:
+                # 变量说明：stats 的索引项 表示该语句创建或更新的目标数据。
                 stats["visited"] = yielded
             yield child, safe_child
             if yielded >= max_entries:
@@ -189,6 +255,7 @@ def _safe_walk(
                     # Conservatively report truncation even when the boundary is
                     # exactly equal to tree size; never claim a complete search
                     # after stopping because of the scan cap.
+                    # 变量说明：stats 的索引项 表示该语句创建或更新的目标数据。
                     stats["scan_limit_reached"] = 1
                 break
             if recursive and safe_child.is_dir():
@@ -198,6 +265,9 @@ def _safe_walk(
             break
 
 
+# 函数职责：列出 files 对应的数据或流程。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；path 表示当前文件或目录路径；recursive 表示当前步骤使用的 recursive 值；limit 表示当前步骤使用的 limit 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def list_files(
     sandbox: WorkspaceSandbox,
     path: str = ".",
@@ -206,10 +276,13 @@ def list_files(
     limit: int = 200,
 ) -> ToolResult:
     try:
+        # 变量说明：directory 表示当前步骤使用的 directory 值。
         directory = sandbox.resolve(path, must_exist=True)
         if not directory.is_dir():
             return ToolResult("list_files", False, "目标不是目录", error_code="not_directory")
+        # 变量说明：entry_limit 表示当前步骤使用的 entry_limit 值。
         entry_limit = max(1, limit)
+        # 变量说明：entries 表示当前流程使用的 entries 集合。
         entries = [
             lexical
             for lexical, _safe in _safe_walk(
@@ -219,6 +292,7 @@ def list_files(
                 max_entries=entry_limit,
             )
         ]
+        # 变量说明：lines 表示当前流程使用的 lines 集合。
         lines = [
             f"{'dir' if item.is_dir() else 'file'}\t{sandbox.relative(item)}"
             for item in entries
@@ -233,6 +307,9 @@ def list_files(
         return ToolResult("list_files", False, str(exc), error_code="path_error")
 
 
+# 函数职责：完成 read_file 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；path 表示当前文件或目录路径；offset 表示当前步骤使用的 offset 值；limit 表示当前步骤使用的 limit 值；max_chars 表示当前流程使用的 max_chars 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def read_file(
     sandbox: WorkspaceSandbox,
     path: str,
@@ -242,39 +319,53 @@ def read_file(
     max_chars: int = 100_000,
 ) -> ToolResult:
     try:
+        # 变量说明：target 表示当前步骤使用的 target 值。
         target = sandbox.resolve(path, must_exist=True)
         if not target.is_file():
             return ToolResult("read_file", False, "目标不是文件", error_code="not_file")
+        # 变量说明：size_bytes 表示当前流程使用的 size_bytes 集合。
         size_bytes = target.stat().st_size
         with target.open("rb") as binary_stream:
+            # 变量说明：prefix 表示当前步骤使用的 prefix 值。
             prefix = binary_stream.read(8192)
         if b"\x00" in prefix:
             return ToolResult("read_file", False, "暂不支持读取二进制文件", error_code="binary_file")
+        # 变量说明：line_offset 表示当前步骤使用的 line_offset 值。
         line_offset = max(0, int(offset))
+        # 变量说明：line_limit 表示当前步骤使用的 line_limit 值。
         line_limit = None if limit is None else max(1, int(limit))
+        # 变量说明：max_chars 表示当前流程使用的 max_chars 集合。
         max_chars = min(max(int(max_chars), 1), 1_000_000)
+        # 变量说明：chunks 表示当前流程使用的 chunks 集合。
         chunks: list[str] = []
+        # 变量说明：captured_chars 表示当前流程使用的 captured_chars 集合。
         captured_chars = 0
+        # 变量说明：returned_lines 表示当前流程使用的 returned_lines 集合。
         returned_lines = 0
+        # 变量说明：truncated 表示当前步骤使用的 truncated 值。
         truncated = False
         with target.open("r", encoding="utf-8", errors="replace") as text_stream:
             for line_index, line in enumerate(text_stream):
                 if line_index < line_offset:
                     continue
                 if line_limit is not None and returned_lines >= line_limit:
+                    # 变量说明：truncated 表示当前步骤使用的 truncated 值。
                     truncated = True
                     break
+                # 变量说明：remaining 表示当前步骤使用的 remaining 值。
                 remaining = max_chars - captured_chars
                 if len(line) > remaining:
                     chunks.append(line[:remaining])
                     captured_chars += remaining
                     if remaining:
                         returned_lines += 1
+                    # 变量说明：truncated 表示当前步骤使用的 truncated 值。
                     truncated = True
                     break
                 chunks.append(line)
                 captured_chars += len(line)
                 returned_lines += 1
+        # 变量说明：text 表示当前步骤使用的 text 值。
         text = "".join(chunks)
         return ToolResult(
             "read_file",
@@ -292,6 +383,9 @@ def read_file(
         return ToolResult("read_file", False, str(exc), error_code="path_error")
 
 
+# 函数职责：完成 search_files 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；query 表示当前步骤使用的 query 值；path 表示当前文件或目录路径；pattern 表示当前步骤使用的 pattern 值；case_sensitive 表示当前步骤使用的 case_sensitive 值；limit 表示当前步骤使用的 limit 值；max_entries 表示当前流程使用的 max_entries 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def search_files(
     sandbox: WorkspaceSandbox,
     query: str,
@@ -303,13 +397,19 @@ def search_files(
     max_entries: int = 10_000,
 ) -> ToolResult:
     try:
+        # 变量说明：root 表示处理范围的根目录。
         root = sandbox.resolve(path, must_exist=True)
         if not root.is_dir():
             return ToolResult("search_files", False, "目标不是目录", error_code="not_directory")
+        # 变量说明：flags 表示当前流程使用的 flags 集合。
         flags = 0 if case_sensitive else re.IGNORECASE
+        # 变量说明：matcher 表示当前步骤使用的 matcher 值。
         matcher = re.compile(re.escape(query), flags)
+        # 变量说明：matches 表示当前流程使用的 matches 集合。
         matches: list[str] = []
+        # 变量说明：skipped 表示当前步骤使用的 skipped 值。
         skipped = 0
+        # 变量说明：stats 表示当前流程使用的 stats 集合。
         stats = {"skipped": 0, "visited": 0, "scan_limit_reached": 0}
         for file_path, safe_path in _safe_walk(
             sandbox,
@@ -324,6 +424,7 @@ def search_files(
                 if safe_path.stat().st_size > 2_000_000:
                     skipped += 1
                     continue
+                # 变量说明：text 表示当前步骤使用的 text 值。
                 text = safe_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 skipped += 1
@@ -350,6 +451,9 @@ def search_files(
         return ToolResult("search_files", False, str(exc), error_code="search_error")
 
 
+# 函数职责：完成 glob_files 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；pattern 表示当前步骤使用的 pattern 值；path 表示当前文件或目录路径；limit 表示当前步骤使用的 limit 值；max_entries 表示当前流程使用的 max_entries 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def glob_files(
     sandbox: WorkspaceSandbox,
     pattern: str,
@@ -366,18 +470,24 @@ def glob_files(
     """
 
     try:
+        # 变量说明：normalized_pattern 表示当前步骤使用的 normalized_pattern 值。
         normalized_pattern = str(pattern or "").strip().replace("\\", "/")
         if not normalized_pattern:
             return ToolResult("glob", False, "pattern 不能为空", error_code="invalid_pattern")
         if len(normalized_pattern) > 512 or Path(normalized_pattern).is_absolute():
             return ToolResult("glob", False, "glob pattern 无效", error_code="invalid_pattern")
+        # 变量说明：root 表示处理范围的根目录。
         root = sandbox.resolve(path, must_exist=True)
         if not root.is_dir():
             return ToolResult("glob", False, "目标不是目录", error_code="not_directory")
 
+        # 变量说明：entry_limit 表示当前步骤使用的 entry_limit 值。
         entry_limit = min(max(int(max_entries), 1), 100_000)
+        # 变量说明：result_limit 表示当前步骤使用的 result_limit 值。
         result_limit = min(max(int(limit), 1), 2_000)
+        # 变量说明：stats 表示当前流程使用的 stats 集合。
         stats = {"skipped": 0, "visited": 0, "scan_limit_reached": 0}
+        # 变量说明：matches 表示当前流程使用的 matches 集合。
         matches: list[str] = []
         for lexical_path, safe_path in _safe_walk(
             sandbox,
@@ -387,6 +497,7 @@ def glob_files(
             stats=stats,
         ):
             try:
+                # 变量说明：relative_to_root 表示当前步骤使用的 relative_to_root 值。
                 relative_to_root = safe_path.relative_to(root).as_posix()
             except ValueError:
                 # Defensive: _safe_walk already resolves inside the sandbox.
@@ -414,6 +525,9 @@ def glob_files(
         return ToolResult("glob", False, str(exc), error_code="glob_error")
 
 
+# 函数职责：完成 unsafe_regular_expression 对应的业务处理。
+# 参数关系：pattern 表示当前步骤使用的 pattern 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _unsafe_regular_expression(pattern: str) -> bool:
     """Reject the common catastrophic-backtracking shapes before scanning files."""
 
@@ -423,6 +537,9 @@ def _unsafe_regular_expression(pattern: str) -> bool:
     return bool(re.search(r"\((?:[^()]|\([^()]*\))*[+*][^)]*\)[+*{]", pattern))
 
 
+# 函数职责：完成 grep_files 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；pattern 表示当前步骤使用的 pattern 值；path 表示当前文件或目录路径；file_pattern 表示当前步骤使用的 file_pattern 值；case_sensitive 表示当前步骤使用的 case_sensitive 值；limit 表示当前步骤使用的 limit 值；max_entries 表示当前流程使用的 max_entries 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def grep_files(
     sandbox: WorkspaceSandbox,
     pattern: str,
@@ -436,19 +553,27 @@ def grep_files(
     """Search text files with a bounded regular expression scan."""
 
     try:
+        # 变量说明：query 表示当前步骤使用的 query 值。
         query = str(pattern or "")
         if not query:
             return ToolResult("grep", False, "pattern 不能为空", error_code="invalid_pattern")
         if len(query) > 512 or _unsafe_regular_expression(query):
             return ToolResult("grep", False, "正则表达式过长或可能造成过度回溯", error_code="unsafe_pattern")
+        # 变量说明：root 表示处理范围的根目录。
         root = sandbox.resolve(path, must_exist=True)
         if not root.is_dir():
             return ToolResult("grep", False, "目标不是目录", error_code="not_directory")
+        # 变量说明：matcher 表示当前步骤使用的 matcher 值。
         matcher = re.compile(query, 0 if case_sensitive else re.IGNORECASE)
+        # 变量说明：entry_limit 表示当前步骤使用的 entry_limit 值。
         entry_limit = min(max(int(max_entries), 1), 100_000)
+        # 变量说明：result_limit 表示当前步骤使用的 result_limit 值。
         result_limit = min(max(int(limit), 1), 2_000)
+        # 变量说明：stats 表示当前流程使用的 stats 集合。
         stats = {"skipped": 0, "visited": 0, "scan_limit_reached": 0}
+        # 变量说明：skipped 表示当前步骤使用的 skipped 值。
         skipped = 0
+        # 变量说明：matches 表示当前流程使用的 matches 集合。
         matches: list[str] = []
         for lexical_path, safe_path in _safe_walk(
             sandbox,
@@ -459,6 +584,7 @@ def grep_files(
         ):
             if not safe_path.is_file():
                 continue
+            # 变量说明：relative_path 表示relative_path 对应的文件系统位置。
             relative_path = sandbox.relative(lexical_path)
             if not fnmatch.fnmatchcase(relative_path, file_pattern):
                 continue
@@ -470,6 +596,7 @@ def grep_files(
                     for line_number, line in enumerate(stream, start=1):
                         # Bound the candidate text too, preventing a single
                         # generated line from monopolizing the model loop.
+                        # 变量说明：preview 表示当前步骤使用的 preview 值。
                         preview = line[:10_000]
                         if matcher.search(preview):
                             matches.append(f"{relative_path}:{line_number}: {preview.rstrip()[:500]}")
@@ -494,6 +621,9 @@ def grep_files(
         return ToolResult("grep", False, str(exc), error_code="grep_error")
 
 
+# 函数职责：完成 ripgrep_search 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；pattern 表示当前步骤使用的 pattern 值；path 表示当前文件或目录路径；glob 表示当前步骤使用的 glob 值；case_sensitive 表示当前步骤使用的 case_sensitive 值；fixed_strings 表示当前流程使用的 fixed_strings 集合；context 表示当前步骤使用的 context 值；limit 表示当前步骤使用的 limit 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def ripgrep_search(
     sandbox: WorkspaceSandbox,
     pattern: str,
@@ -507,13 +637,18 @@ def ripgrep_search(
 ) -> ToolResult:
     """Run ripgrep without a shell and keep traversal inside the workspace."""
 
+    # 变量说明：executable 表示当前步骤使用的 executable 值。
     executable = shutil.which("rg")
     if executable is None:
         return ToolResult("rg", False, "ripgrep executable is unavailable", error_code="tool_unavailable")
     try:
+        # 变量说明：target 表示当前步骤使用的 target 值。
         target = sandbox.resolve(path, must_exist=True)
+        # 变量说明：relative_target 表示当前步骤使用的 relative_target 值。
         relative_target = sandbox.relative(target)
+        # 变量说明：result_limit 表示当前步骤使用的 result_limit 值。
         result_limit = min(max(int(limit), 1), 2_000)
+        # 变量说明：args 表示当前流程使用的 args 集合。
         args = [
             executable,
             "--line-number",
@@ -531,12 +666,14 @@ def ripgrep_search(
             args.append("--ignore-case")
         if fixed_strings:
             args.append("--fixed-strings")
+        # 变量说明：context_lines 表示当前流程使用的 context_lines 集合。
         context_lines = min(max(int(context), 0), 20)
         if context_lines:
             args.extend(["--context", str(context_lines)])
         if glob:
             args.extend(["--glob", str(glob)])
         args.extend(["--", str(pattern), relative_target])
+        # 变量说明：process 表示当前流程使用的 process 集合。
         process = subprocess.Popen(
             args,
             cwd=sandbox.root,
@@ -547,20 +684,25 @@ def ripgrep_search(
             errors="replace",
             shell=False,
         )
+        # 变量说明：lines 表示当前流程使用的 lines 集合。
         lines: list[str] = []
+        # 变量说明：truncated 表示当前步骤使用的 truncated 值。
         truncated = False
         assert process.stdout is not None
         for line in process.stdout:
             if len(lines) >= result_limit:
+                # 变量说明：truncated 表示当前步骤使用的 truncated 值。
                 truncated = True
                 process.terminate()
                 break
             lines.append(line[:2_000])
         process.stdout.close()
         try:
+            # 变量说明：exit_code 表示当前步骤使用的 exit_code 值。
             exit_code = process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
+            # 变量说明：exit_code 表示当前步骤使用的 exit_code 值。
             exit_code = process.wait(timeout=5)
         if not truncated and exit_code not in {0, 1}:
             return ToolResult("rg", False, "".join(lines), error_code="rg_error", metadata={"exit_code": exit_code})
@@ -579,6 +721,9 @@ def ripgrep_search(
         return ToolResult("rg", False, str(exc), error_code="rg_error")
 
 
+# 函数职责：完成 edit_file 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；path 表示当前文件或目录路径；old_string 表示当前步骤使用的 old_string 值；new_string 表示当前步骤使用的 new_string 值；replace_all 表示当前步骤使用的 replace_all 值；approved 表示当前步骤使用的 approved 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def edit_file(
     sandbox: WorkspaceSandbox,
     path: str,
@@ -590,6 +735,7 @@ def edit_file(
 ) -> ToolResult:
     """Apply an exact text replacement to one sandboxed UTF-8 text file."""
 
+    # 变量说明：arguments 表示当前流程使用的 arguments 集合。
     arguments = {
         "path": path,
         "old_string": old_string,
@@ -601,6 +747,7 @@ def edit_file(
     if not old_string:
         return ToolResult("edit", False, "old_string 不能为空", error_code="invalid_edit")
     try:
+        # 变量说明：target 表示当前步骤使用的 target 值。
         target = sandbox.resolve(path, must_exist=True)
         if not target.is_file():
             return ToolResult("edit", False, "目标不是文件", error_code="not_file")
@@ -609,7 +756,9 @@ def edit_file(
                 return ToolResult("edit", False, "暂不支持编辑二进制文件", error_code="binary_file")
         # Keep CRLF/LF exactly as stored except for the requested replacement.
         with target.open("r", encoding="utf-8", errors="replace", newline="") as stream:
+            # 变量说明：original 表示当前步骤使用的 original 值。
             original = stream.read()
+        # 变量说明：matches 表示当前流程使用的 matches 集合。
         matches = original.count(old_string)
         if not matches:
             return ToolResult("edit", False, "未找到 old_string，未修改文件", error_code="edit_not_found")
@@ -621,9 +770,11 @@ def edit_file(
                 error_code="edit_not_unique",
                 metadata={"matches": matches},
             )
+        # 变量说明：updated 表示当前步骤使用的 updated 值。
         updated = original.replace(old_string, new_string, -1 if replace_all else 1)
         with target.open("w", encoding="utf-8", newline="") as stream:
             stream.write(updated)
+        # 变量说明：replacements 表示当前流程使用的 replacements 集合。
         replacements = matches if replace_all else 1
         return ToolResult(
             "edit",
@@ -636,14 +787,21 @@ def edit_file(
         return ToolResult("edit", False, str(exc), error_code="edit_error")
 
 
+# 函数职责：完成 is_public_ip 对应的业务处理。
+# 参数关系：address 表示当前流程使用的 address 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _is_public_ip(address: str) -> bool:
     try:
+        # 变量说明：candidate 表示当前步骤使用的 candidate 值。
         candidate = ipaddress.ip_address(address)
     except ValueError:
         return False
     return candidate.is_global
 
 
+# 函数职责：校验 public_http_url 对应的数据或流程。
+# 参数关系：url 表示当前步骤使用的 url 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _validate_public_http_url(url: str) -> tuple[str, str]:
     """Validate scheme and DNS answers before a web request.
 
@@ -653,9 +811,11 @@ def _validate_public_http_url(url: str) -> tuple[str, str]:
     turns arbitrary network access into a filesystem sandbox.
     """
 
+    # 变量说明：candidate 表示当前步骤使用的 candidate 值。
     candidate = str(url or "").strip()
     if not candidate or len(candidate) > 4_096:
         raise UnsafeWebUrlError("URL 不能为空或过长")
+    # 变量说明：parsed 表示当前步骤使用的 parsed 值。
     parsed = urlsplit(candidate)
     if parsed.scheme.lower() not in {"http", "https"}:
         raise UnsafeWebUrlError("仅允许 http 或 https URL")
@@ -663,34 +823,44 @@ def _validate_public_http_url(url: str) -> tuple[str, str]:
         raise UnsafeWebUrlError("URL 缺少主机名")
     if parsed.username or parsed.password:
         raise UnsafeWebUrlError("URL 不允许包含用户名或密码")
+    # 变量说明：host 表示当前步骤使用的 host 值。
     host = parsed.hostname.rstrip(".").lower()
     if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
         raise UnsafeWebUrlError("不允许访问本机或本地网络地址")
     try:
+        # 变量说明：port 表示当前步骤使用的 port 值。
         port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
     except ValueError as exc:
         raise UnsafeWebUrlError("URL 端口无效") from exc
     try:
+        # 变量说明：answers 表示当前流程使用的 answers 集合。
         answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
         raise WebHostResolutionError("无法解析目标主机") from exc
+    # 变量说明：addresses 表示当前流程使用的 addresses 集合。
     addresses = {str(answer[4][0]) for answer in answers if answer[4]}
     if not addresses or any(not _is_public_ip(address) for address in addresses):
         raise UnsafeWebUrlError("不允许访问私有、回环或保留网络地址")
     # Canonicalizing the hostname avoids a host spelling changing after the
     # validation decision, while preserving the query and fragment semantics.
+    # 变量说明：safe_url 表示safe 的访问地址。
     safe_url = urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path or "/", parsed.query, ""))
     return safe_url, host
 
 
+# 函数职责：完成 response_peer_is_public 对应的业务处理。
+# 参数关系：response 表示下游返回的响应。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _response_peer_is_public(response: httpx.Response) -> bool:
     """Best-effort second SSRF check against the actual connected peer."""
 
+    # 变量说明：stream 表示当前步骤使用的 stream 值。
     stream = response.extensions.get("network_stream")
     if stream is None or not hasattr(stream, "get_extra_info"):
         # Some mock/custom transports do not expose peer information.  The
         # preflight DNS guard remains in effect and keeps tests transport-agnostic.
         return True
+    # 变量说明：peer 表示当前步骤使用的 peer 值。
     peer = stream.get_extra_info("server_addr")
     if not peer:
         return True
@@ -700,6 +870,9 @@ def _response_peer_is_public(response: httpx.Response) -> bool:
         return False
 
 
+# 函数职责：完成 web_fetch 对应的业务处理。
+# 参数关系：_sandbox 表示当前步骤使用的 _sandbox 值；url 表示当前步骤使用的 url 值；timeout_seconds 表示当前流程使用的 timeout_seconds 集合；max_bytes 表示当前流程使用的 max_bytes 集合；offset 表示当前步骤使用的 offset 值；max_chars 表示当前流程使用的 max_chars 集合；_tool_name 表示当前步骤使用的 _tool_name 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def web_fetch(
     _sandbox: WorkspaceSandbox,
     url: str,
@@ -713,16 +886,24 @@ def web_fetch(
     """Open a public page as bounded structured text, validating every redirect."""
 
     try:
+        # 变量说明：timeout 表示当前步骤使用的 timeout 值。
         timeout = min(max(float(timeout_seconds), 1.0), 30.0)
+        # 变量说明：byte_limit 表示当前步骤使用的 byte_limit 值。
         byte_limit = min(max(int(max_bytes), 1_024), MAX_WEB_RESPONSE_BYTES)
+        # 变量说明：page_offset 表示当前步骤使用的 page_offset 值。
         page_offset = max(int(offset), 0)
+        # 变量说明：page_limit 表示当前步骤使用的 page_limit 值。
         page_limit = min(max(int(max_chars), 1_000), MAX_WEB_PAGE_CHARS)
+        # 变量说明：headers 表示当前流程使用的 headers 集合。
         headers = {
             "User-Agent": "PGAgent/0.1 (+local safe web open)",
             "Accept": "text/plain,text/html,application/json,application/xml,text/xml;q=0.9,*/*;q=0.1",
         }
+        # 变量说明：requested_url 表示requested 的访问地址。
         requested_url = str(url or "").strip()
+        # 变量说明：current_url 表示current 的访问地址。
         current_url = requested_url
+        # 变量说明：redirects 表示当前流程使用的 redirects 集合。
         redirects: list[str] = []
         with httpx.Client(
             follow_redirects=False,
@@ -731,36 +912,46 @@ def web_fetch(
             headers=headers,
         ) as client:
             for redirect_count in range(MAX_WEB_REDIRECTS + 1):
+                # 变量说明：safe_url 表示safe 的访问地址；host 表示当前步骤使用的 host 值。
                 safe_url, host = _validate_public_http_url(current_url)
+                # 变量说明：body 表示当前步骤使用的 body 值。
                 body = bytearray()
                 with client.stream("GET", safe_url) as response:
                     if not _response_peer_is_public(response):
                         return ToolResult(_tool_name, False, "连接目标不是公共网络地址", error_code="unsafe_url")
                     if 300 <= response.status_code < 400:
+                        # 变量说明：location 表示当前步骤使用的 location 值。
                         location = response.headers.get("location", "").strip()
                         if not location:
                             return ToolResult(_tool_name, False, "服务器返回了缺少目标地址的重定向", error_code="http_error")
                         if redirect_count >= MAX_WEB_REDIRECTS:
                             return ToolResult(_tool_name, False, "网页重定向次数过多", error_code="too_many_redirects")
+                        # 变量说明：current_url 表示current 的访问地址。
                         current_url = urljoin(safe_url, location)
                         # Validation occurs at the start of the next loop before any request.
                         redirects.append(current_url)
                         continue
                     for chunk in response.iter_bytes():
+                        # 变量说明：remaining 表示当前步骤使用的 remaining 值。
                         remaining = byte_limit - len(body)
                         if remaining <= 0:
                             break
                         body.extend(chunk[:remaining])
                         if len(chunk) > remaining:
                             break
+                    # 变量说明：status_code 表示当前步骤使用的 status_code 值。
                     status_code = response.status_code
+                    # 变量说明：content_type 表示当前步骤使用的 content_type 值。
                     content_type = response.headers.get("content-type", "").lower()
+                    # 变量说明：encoding 表示当前步骤使用的 encoding 值。
                     encoding = response.encoding or "utf-8"
                     break
             else:  # pragma: no cover - bounded loop always returns or breaks
                 raise RuntimeError("redirect loop ended unexpectedly")
 
+        # 变量说明：truncated_bytes 表示当前流程使用的 truncated_bytes 集合。
         truncated_bytes = len(body) >= byte_limit
+        # 变量说明：metadata 表示当前步骤使用的 metadata 值。
         metadata = {
             "url": safe_url,
             "requested_url": requested_url,
@@ -786,21 +977,30 @@ def web_fetch(
                 metadata={**metadata, "truncated": truncated_bytes},
             )
 
+        # 变量说明：decoded 表示当前步骤使用的 decoded 值。
         decoded = bytes(body).decode(encoding, errors="replace")
+        # 变量说明：title 表示当前步骤使用的 title 值。
         title = ""
+        # 变量说明：description 表示当前步骤使用的 description 值。
         description = ""
+        # 变量说明：published_at 表示published_at 对应的时间信息。
         published_at = ""
         if "html" in content_type or re.search(r"<html\b", decoded[:2_000], re.IGNORECASE):
+            # 变量说明：parser 表示当前步骤使用的 parser 值。
             parser = _ReadableHtmlParser()
             parser.feed(decoded)
+            # 变量说明：readable 表示当前步骤使用的 readable 值。
             readable = parser.readable_text()
+            # 变量说明：title 表示当前步骤使用的 title 值。
             title = " ".join(parser.title_parts).strip()
+            # 变量说明：description 表示当前步骤使用的 description 值。
             description = (
                 parser.metadata.get("description")
                 or parser.metadata.get("og:description")
                 or parser.metadata.get("twitter:description")
                 or ""
             )
+            # 变量说明：published_at 表示published_at 对应的时间信息。
             published_at = (
                 parser.metadata.get("article:published_time")
                 or parser.metadata.get("date")
@@ -809,15 +1009,22 @@ def web_fetch(
             )
         elif "json" in content_type:
             try:
+                # 变量说明：readable 表示当前步骤使用的 readable 值。
                 readable = json.dumps(json.loads(decoded), ensure_ascii=False, indent=2)
             except json.JSONDecodeError:
+                # 变量说明：readable 表示当前步骤使用的 readable 值。
                 readable = decoded
         else:
+            # 变量说明：readable 表示当前步骤使用的 readable 值。
             readable = _clean_html_text(decoded) if "xml" in content_type else decoded
 
+        # 变量说明：readable 表示当前步骤使用的 readable 值。
         readable = readable.strip()
+        # 变量说明：page 表示当前步骤使用的 page 值。
         page = readable[page_offset:page_offset + page_limit]
+        # 变量说明：next_offset 表示当前步骤使用的 next_offset 值。
         next_offset = page_offset + len(page) if page_offset + len(page) < len(readable) else None
+        # 变量说明：payload 表示跨层传递的数据载荷。
         payload = {
             "title": title[:500] or None,
             "url": safe_url,
@@ -845,6 +1052,9 @@ def web_fetch(
         return ToolResult(_tool_name, False, f"网络请求失败: {type(exc).__name__}", error_code="network_error")
 
 
+# 函数职责：完成 web_open 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；url 表示当前步骤使用的 url 值；timeout_seconds 表示当前流程使用的 timeout_seconds 集合；offset 表示当前步骤使用的 offset 值；max_chars 表示当前流程使用的 max_chars 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def web_open(
     sandbox: WorkspaceSandbox,
     url: str,
@@ -865,34 +1075,52 @@ def web_open(
     )
 
 
+# 函数职责：完成 clean_html_text 对应的业务处理。
+# 参数关系：value 表示当前字段或计算值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _clean_html_text(value: str) -> str:
+    # 变量说明：without_tags 表示当前流程使用的 without_tags 集合。
     without_tags = re.sub(r"<[^>]+>", " ", value)
     return " ".join(html.unescape(without_tags).split())
 
 
+# 函数职责：完成 unwrap_duckduckgo_url 对应的业务处理。
+# 参数关系：value 表示当前字段或计算值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _unwrap_duckduckgo_url(value: str) -> str:
+    # 变量说明：candidate 表示当前步骤使用的 candidate 值。
     candidate = html.unescape(value)
     if candidate.startswith("//"):
+        # 变量说明：candidate 表示当前步骤使用的 candidate 值。
         candidate = f"https:{candidate}"
+    # 变量说明：parsed 表示当前步骤使用的 parsed 值。
     parsed = urlsplit(candidate)
     if parsed.netloc.endswith("duckduckgo.com"):
+        # 变量说明：redirect_target 表示当前步骤使用的 redirect_target 值。
         redirect_target = parse_qs(parsed.query).get("uddg", [""])[0]
         if redirect_target:
             return redirect_target
     return candidate
 
 
+# 函数职责：完成 duckduckgo_results 对应的业务处理。
+# 参数关系：markup 表示当前步骤使用的 markup 值；limit 表示当前步骤使用的 limit 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _duckduckgo_results(markup: str, limit: int) -> list[tuple[str, str]]:
     """Extract result links from the public HTML endpoint without a new parser dep."""
 
+    # 变量说明：result_re 表示当前步骤使用的 result_re 值。
     result_re = re.compile(
         r"<a\b(?=[^>]*\bclass=[\"'][^\"']*\bresult__a\b[^\"']*[\"'])"
         r"(?=[^>]*\bhref=[\"'](?P<href>[^\"']+)[\"'])[^>]*>(?P<title>.*?)</a>",
         re.IGNORECASE | re.DOTALL,
     )
+    # 变量说明：results 表示批量处理结果集合。
     results: list[tuple[str, str]] = []
     for match in result_re.finditer(markup):
+        # 变量说明：title 表示当前步骤使用的 title 值。
         title = _clean_html_text(match.group("title"))
+        # 变量说明：destination 表示当前步骤使用的 destination 值。
         destination = _unwrap_duckduckgo_url(match.group("href"))
         if not title or not destination:
             continue
@@ -902,6 +1130,9 @@ def _duckduckgo_results(markup: str, limit: int) -> list[tuple[str, str]]:
     return results
 
 
+# 函数职责：完成 web_search 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；query 表示当前步骤使用的 query 值；limit 表示当前步骤使用的 limit 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def web_search(
     sandbox: WorkspaceSandbox,
     query: str,
@@ -910,11 +1141,14 @@ def web_search(
 ) -> ToolResult:
     """Perform a provider-free DuckDuckGo HTML search, or return an honest error."""
 
+    # 变量说明：search_query 表示当前步骤使用的 search_query 值。
     search_query = str(query or "").strip()
     if not search_query or len(search_query) > 500:
         return ToolResult("websearch", False, "query 不能为空或过长", error_code="invalid_query")
+    # 变量说明：result_limit 表示当前步骤使用的 result_limit 值。
     result_limit = min(max(int(limit), 1), 10)
     try:
+        # 变量说明：search_url 表示search 的访问地址；_host 表示当前步骤使用的 _host 值。
         search_url, _host = _validate_public_http_url(
             f"https://html.duckduckgo.com/html/?q={quote_plus(search_query)}"
         )
@@ -924,20 +1158,25 @@ def web_search(
             trust_env=False,
             headers={"User-Agent": "PGAgent/0.1 (+local search)"},
         ) as client:
+            # 变量说明：body 表示当前步骤使用的 body 值。
             body = bytearray()
             with client.stream("GET", search_url) as response:
                 if not _response_peer_is_public(response):
                     return ToolResult("websearch", False, "连接目标不是公共网络地址", error_code="unsafe_url")
                 response.raise_for_status()
                 for chunk in response.iter_bytes():
+                    # 变量说明：remaining 表示当前步骤使用的 remaining 值。
                     remaining = MAX_WEB_RESPONSE_BYTES - len(body)
                     if remaining <= 0:
                         break
                     body.extend(chunk[:remaining])
                     if len(chunk) > remaining:
                         break
+                # 变量说明：encoding 表示当前步骤使用的 encoding 值。
                 encoding = response.encoding or "utf-8"
+                # 变量说明：status_code 表示当前步骤使用的 status_code 值。
                 status_code = response.status_code
+        # 变量说明：markup 表示当前步骤使用的 markup 值。
         markup = bytes(body).decode(encoding, errors="replace")
     except (UnsafeWebUrlError, WebHostResolutionError, httpx.HTTPError):
         return ToolResult(
@@ -947,6 +1186,7 @@ def web_search(
             error_code="search_provider_unavailable",
             metadata={"provider": "duckduckgo_html"},
         )
+    # 变量说明：results 表示批量处理结果集合。
     results = _duckduckgo_results(markup, result_limit)
     if not results:
         return ToolResult(
@@ -956,6 +1196,7 @@ def web_search(
             error_code="search_provider_unavailable",
             metadata={"provider": "duckduckgo_html", "source_status": status_code},
         )
+    # 变量说明：lines 表示当前流程使用的 lines 集合。
     lines = [f"{index}. {title}\n   {url}" for index, (title, url) in enumerate(results, start=1)]
     return ToolResult(
         "websearch",
@@ -973,14 +1214,20 @@ def web_search(
     )
 
 
+# 函数职责：完成 public_json 对应的业务处理。
+# 参数关系：url 表示当前步骤使用的 url 值；params 表示当前流程使用的 params 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _public_json(url: str, *, params: Mapping[str, Any] | None = None) -> tuple[dict[str, Any] | list[Any] | None, str | None]:
     try:
+        # 变量说明：safe_url 表示safe 的访问地址；_ 表示当前步骤使用的 _ 值。
         safe_url, _ = _validate_public_http_url(url)
         with httpx.Client(timeout=httpx.Timeout(15), trust_env=False, headers={"User-Agent": "PGAgent/0.1"}) as client:
+            # 变量说明：response 表示下游返回的响应。
             response = client.get(safe_url, params=dict(params or {}))
             if not _response_peer_is_public(response):
                 return None, "unsafe_url"
             response.raise_for_status()
+            # 变量说明：payload 表示跨层传递的数据载荷。
             payload = response.json()
         return payload, None
     except (UnsafeWebUrlError, WebHostResolutionError):
@@ -989,59 +1236,86 @@ def _public_json(url: str, *, params: Mapping[str, Any] | None = None) -> tuple[
         return None, "network_error"
 
 
+# 函数职责：完成 web_weather 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；location 表示当前步骤使用的 location 值；days 表示当前流程使用的 days 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def web_weather(sandbox: WorkspaceSandbox, *, location: str, days: int = 3) -> ToolResult:
     del sandbox
+    # 变量说明：place 表示当前步骤使用的 place 值。
     place = str(location or "").strip()
     if not place or len(place) > 200:
         return ToolResult("web.run", False, "location 不能为空且不能超过 200 个字符", error_code="invalid_arguments")
+    # 变量说明：geo 表示当前步骤使用的 geo 值；error 表示当前捕获或准备上报的错误。
     geo, error = _public_json("https://geocoding-api.open-meteo.com/v1/search", params={"name": place, "count": 1, "language": "zh", "format": "json"})
     if error or not isinstance(geo, Mapping) or not geo.get("results"):
         return ToolResult("web.run", False, "无法找到天气地点", error_code=error or "not_found")
+    # 变量说明：hit 表示当前步骤使用的 hit 值。
     hit = geo["results"][0]
+    # 变量说明：forecast 表示当前步骤使用的 forecast 值；error 表示当前捕获或准备上报的错误。
     forecast, error = _public_json("https://api.open-meteo.com/v1/forecast", params={"latitude": hit["latitude"], "longitude": hit["longitude"], "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m", "daily": "temperature_2m_max,temperature_2m_min,weather_code", "forecast_days": min(max(int(days), 1), 7), "timezone": "auto"})
     if error or not isinstance(forecast, Mapping):
         return ToolResult("web.run", False, "天气服务当前不可用", error_code=error or "network_error")
     return ToolResult("web.run", True, json.dumps({"location": hit, "forecast": forecast}, ensure_ascii=False), metadata={"provider": "open-meteo"})
 
 
+# 函数职责：完成 web_finance 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；ticker 表示当前步骤使用的 ticker 值；type 表示当前步骤使用的 type 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def web_finance(sandbox: WorkspaceSandbox, *, ticker: str, type: str = "equity") -> ToolResult:
     del sandbox
+    # 变量说明：symbol 表示当前步骤使用的 symbol 值。
     symbol = str(ticker or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9.\-^=]{1,20}", symbol):
         return ToolResult("web.run", False, "ticker 格式无效", error_code="invalid_arguments")
+    # 变量说明：payload 表示跨层传递的数据载荷；error 表示当前捕获或准备上报的错误。
     payload, error = _public_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(symbol)}", params={"range": "1d", "interval": "5m"})
     if error or not isinstance(payload, Mapping):
         return ToolResult("web.run", False, "行情服务当前不可用", error_code=error or "network_error")
+    # 变量说明：result 表示本步骤产生的结果。
     result = ((payload.get("chart") or {}).get("result") or [None])[0]
     if not isinstance(result, Mapping):
         return ToolResult("web.run", False, "未找到行情数据", error_code="not_found")
+    # 变量说明：meta 表示当前步骤使用的 meta 值。
     meta = result.get("meta") or {}
     return ToolResult("web.run", True, json.dumps({"ticker": symbol, "asset_type": type, "quote": meta}, ensure_ascii=False), metadata={"provider": "yahoo-finance"})
 
 
+# 函数职责：完成 web_sports 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；league 表示当前步骤使用的 league 值；date 表示当前步骤使用的 date 值；team 表示当前步骤使用的 team 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def web_sports(sandbox: WorkspaceSandbox, *, league: str, date: str | None = None, team: str | None = None) -> ToolResult:
     del sandbox
+    # 变量说明：competition 表示当前步骤使用的 competition 值。
     competition = str(league or "").strip().lower()
     if not re.fullmatch(r"[a-z0-9._-]{2,20}", competition):
         return ToolResult("web.run", False, "league 格式无效", error_code="invalid_arguments")
+    # 变量说明：params 表示当前流程使用的 params 集合。
     params = {"dates": date} if date else {}
     if team:
         params["limit"] = 100
+    # 变量说明：payload 表示跨层传递的数据载荷；error 表示当前捕获或准备上报的错误。
     payload, error = _public_json(f"https://site.api.espn.com/apis/site/v2/sports/{competition}/scoreboard", params=params)
     if error or not isinstance(payload, Mapping):
         return ToolResult("web.run", False, "体育数据服务当前不可用", error_code=error or "network_error")
     return ToolResult("web.run", True, json.dumps({"league": competition, "events": payload.get("events", [])}, ensure_ascii=False)[:40_000], metadata={"provider": "espn"})
 
 
+# 函数职责：完成 web_screenshot 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；url 表示当前步骤使用的 url 值；full_page 表示当前步骤使用的 full_page 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def web_screenshot(sandbox: WorkspaceSandbox, *, url: str, full_page: bool = False) -> ToolResult:
     del sandbox
     try:
+        # 变量说明：safe_url 表示safe 的访问地址；_ 表示当前步骤使用的 _ 值。
         safe_url, _ = _validate_public_http_url(url)
         from playwright.sync_api import sync_playwright
         with sync_playwright() as playwright:
+            # 变量说明：browser 表示当前步骤使用的 browser 值。
             browser = playwright.chromium.launch(headless=True)
+            # 变量说明：page 表示当前步骤使用的 page 值。
             page = browser.new_page()
             page.goto(safe_url, wait_until="domcontentloaded", timeout=20_000)
+            # 变量说明：data 表示当前处理的数据。
             data = page.screenshot(type="png", full_page=bool(full_page))
             browser.close()
         return ToolResult("web.run", True, "网页截图已生成", metadata={"mime_type": "image/png", "data_base64": base64.b64encode(data).decode("ascii"), "url": safe_url})
@@ -1049,6 +1323,9 @@ def web_screenshot(sandbox: WorkspaceSandbox, *, url: str, full_page: bool = Fal
         return ToolResult("web.run", False, f"网页截图不可用: {type(exc).__name__}", error_code="tool_unavailable")
 
 
+# 函数职责：完成 web_run 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；search_query 表示当前步骤使用的 search_query 值；open 表示当前步骤使用的 open 值；click 表示当前步骤使用的 click 值；find 表示当前步骤使用的 find 值；screenshot 表示当前步骤使用的 screenshot 值；finance 表示当前步骤使用的 finance 值；weather 表示当前步骤使用的 weather 值；其余参数沿用调用方提供的扩展选项。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def web_run(
     sandbox: WorkspaceSandbox,
     *,
@@ -1065,18 +1342,27 @@ def web_run(
 ) -> ToolResult:
     """Execute the public Codex web.run command shape using PGAgent primitives."""
 
+    # 变量说明：stored_pages 表示当前流程使用的 stored_pages 集合。
     stored_pages = dict(pages or {})
+    # 变量说明：output 表示当前步骤使用的 output 值。
     output: list[dict[str, Any]] = []
     for item in search_query or []:
+        # 变量说明：query 表示当前步骤使用的 query 值。
         query = str(item.get("q") or item.get("query") or "").strip()
+        # 变量说明：result 表示本步骤产生的结果。
         result = web_search(sandbox, query, limit=int(item.get("limit") or 5))
         output.append({"type": "search_query", "query": query, "ok": result.ok, "content": result.content})
         for hit in result.metadata.get("results", []) if isinstance(result.metadata, Mapping) else []:
+            # 变量说明：stored_pages 的索引项 表示该语句创建或更新的目标数据。
             stored_pages[str(hit.get("ref_id"))] = hit
     for item in open or []:
+        # 变量说明：ref_id 表示ref 对象的唯一标识。
         ref_id = str(item.get("ref_id") or item.get("url") or "").strip()
+        # 变量说明：target 表示当前步骤使用的 target 值。
         target = stored_pages.get(ref_id, {})
+        # 变量说明：url 表示当前步骤使用的 url 值。
         url = str(target.get("url") if isinstance(target, Mapping) else target or ref_id)
+        # 变量说明：result 表示本步骤产生的结果。
         result = web_open(
             sandbox,
             url,
@@ -1085,36 +1371,51 @@ def web_run(
         )
         output.append({"type": "open", "ref_id": ref_id, "url": url, "ok": result.ok, "content": result.content})
         if result.ok:
+            # 变量说明：stored_pages 的索引项 表示该语句创建或更新的目标数据。
             stored_pages[ref_id] = {"url": url, "content": result.content}
     for item in click or []:
+        # 变量说明：ref_id 表示ref 对象的唯一标识。
         ref_id = str(item.get("ref_id") or "").strip()
+        # 变量说明：links 表示当前流程使用的 links 集合。
         links = stored_pages.get(ref_id, {}).get("links", []) if isinstance(stored_pages.get(ref_id), Mapping) else []
+        # 变量说明：link_id 表示link 对象的唯一标识。
         link_id = str(item.get("id") or item.get("link_id") or "")
+        # 变量说明：target_url 表示target 的访问地址。
         target_url = next((str(link.get("url")) for link in links if str(link.get("id")) == link_id), "")
         if not target_url:
             output.append({"type": "click", "ref_id": ref_id, "id": link_id, "ok": False, "error": "link_not_found"})
             continue
+        # 变量说明：result 表示本步骤产生的结果。
         result = web_open(sandbox, target_url)
         output.append({"type": "click", "ref_id": ref_id, "id": link_id, "ok": result.ok, "content": result.content})
     for item in find or []:
+        # 变量说明：ref_id 表示ref 对象的唯一标识。
         ref_id = str(item.get("ref_id") or "").strip()
+        # 变量说明：pattern 表示当前步骤使用的 pattern 值。
         pattern = str(item.get("pattern") or "")
+        # 变量说明：content 表示待处理或返回的正文内容。
         content = str(stored_pages.get(ref_id, {}).get("content") or "")
+        # 变量说明：index 表示当前元素的位置索引。
         index = content.casefold().find(pattern.casefold()) if pattern else -1
         output.append({"type": "find", "ref_id": ref_id, "pattern": pattern, "ok": index >= 0, "index": index})
     for item in screenshot or []:
+        # 变量说明：result 表示本步骤产生的结果。
         result = web_screenshot(sandbox, url=str(item.get("url") or item.get("ref_id") or ""), full_page=bool(item.get("full_page")))
         output.append({"type": "screenshot", "ok": result.ok, "content": result.content, "metadata": result.metadata})
     for item in finance or []:
+        # 变量说明：result 表示本步骤产生的结果。
         result = web_finance(sandbox, ticker=str(item.get("ticker") or item.get("symbol") or ""), type=str(item.get("type") or "equity"))
         output.append({"type": "finance", "ok": result.ok, "content": result.content, "error_code": result.error_code})
     for item in weather or []:
+        # 变量说明：result 表示本步骤产生的结果。
         result = web_weather(sandbox, location=str(item.get("location") or item.get("city") or ""), days=int(item.get("days") or 3))
         output.append({"type": "weather", "ok": result.ok, "content": result.content, "error_code": result.error_code})
     for item in sports or []:
+        # 变量说明：result 表示本步骤产生的结果。
         result = web_sports(sandbox, league=str(item.get("league") or ""), date=item.get("date"), team=item.get("team"))
         output.append({"type": "sports", "ok": result.ok, "content": result.content, "error_code": result.error_code})
     for item in time or []:
+        # 变量说明：result 表示本步骤产生的结果。
         result = get_current_time(timezone_name=str(item.get("timezone") or item.get("timezone_name") or "") or None)
         output.append({"type": "time", "ok": result.ok, "content": result.content, "error_code": result.error_code})
     if not output:
@@ -1122,52 +1423,72 @@ def web_run(
     return ToolResult("web.run", True, json.dumps(output, ensure_ascii=False)[:40_000], metadata={"commands": output, "pages": stored_pages})
 
 
+# 函数职责：规范化 todos 对应的数据或流程。
+# 参数关系：value 表示当前字段或计算值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _normalize_todos(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("todos 必须是列表")
     if len(value) > MAX_TODOS:
         raise ValueError(f"todos 最多 {MAX_TODOS} 项")
+    # 变量说明：normalized 表示当前步骤使用的 normalized 值。
     normalized: list[dict[str, Any]] = []
+    # 变量说明：allowed_statuses 表示当前流程使用的 allowed_statuses 集合。
     allowed_statuses = {"pending", "in_progress", "completed", "cancelled"}
+    # 变量说明：seen_ids 表示seen 对象标识集合。
     seen_ids: set[str] = set()
     for index, raw in enumerate(value, start=1):
         if not isinstance(raw, Mapping):
             raise ValueError(f"第 {index} 项 todo 必须是对象")
+        # 变量说明：content 表示待处理或返回的正文内容。
         content = str(raw.get("content") or "").strip()
         if not content or len(content) > 1_000:
             raise ValueError(f"第 {index} 项 todo 的 content 不能为空且最多 1000 字符")
+        # 变量说明：todo_id 表示todo 对象的唯一标识。
         todo_id = str(raw.get("id") or "").strip()
         if not todo_id or len(todo_id) > 120 or todo_id in seen_ids:
             raise ValueError(f"第 {index} 项 todo 必须提供稳定且不重复的 id")
         seen_ids.add(todo_id)
+        # 变量说明：status 表示当前对象或运行的状态。
         status = str(raw.get("status") or "pending").strip().lower()
         if status not in allowed_statuses:
             raise ValueError(f"第 {index} 项 todo 的 status 无效")
+        # 变量说明：item 表示当前步骤使用的 item 值。
         item = {"id": todo_id, "content": content, "status": status}
         if raw.get("active_form"):
             item["active_form"] = str(raw["active_form"])[:1_000]
+        # 变量说明：dependencies 表示当前流程使用的 dependencies 集合。
         dependencies = raw.get("depends_on", raw.get("blockedBy", []))
         if dependencies is None:
+            # 变量说明：dependencies 表示当前流程使用的 dependencies 集合。
             dependencies = []
         if not isinstance(dependencies, (list, tuple)):
             raise ValueError(f"第 {index} 项 todo 的 depends_on 必须是数组")
+        # 变量说明：item 的索引项 表示该语句创建或更新的目标数据。
         item["depends_on"] = list(dict.fromkeys(
             str(value).strip() for value in dependencies if str(value).strip()
         ))
+        # 变量说明：executor_kind 表示当前步骤使用的 executor_kind 值。
         executor_kind = str(raw.get("executor_kind") or raw.get("executor") or "main").strip().lower()
         if executor_kind not in {"main", "subagent", "background"}:
             raise ValueError(f"第 {index} 项 todo 的 executor_kind 无效")
+        # 变量说明：item 的索引项 表示该语句创建或更新的目标数据。
         item["executor_kind"] = executor_kind
+        # 变量说明：assigned_agent_id 表示assigned_agent 对象的唯一标识。
         assigned_agent_id = str(raw.get("agent_id") or raw.get("assigned_agent_id") or "").strip()
         if executor_kind == "subagent" and not assigned_agent_id:
             raise ValueError(f"第 {index} 项 subagent todo 必须提供 agent_id")
         if assigned_agent_id:
+            # 变量说明：item 的索引项 表示该语句创建或更新的目标数据。
             item["agent_id"] = assigned_agent_id
+        # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
         workspace_mode = str(raw.get("workspace_mode") or "shared").strip().lower()
         if workspace_mode not in {"shared", "worktree"}:
             raise ValueError(f"第 {index} 项 todo 的 workspace_mode 无效")
+        # 变量说明：item 的索引项 表示该语句创建或更新的目标数据。
         item["workspace_mode"] = workspace_mode
         normalized.append(item)
+    # 变量说明：known_ids 表示known 对象标识集合。
     known_ids = {item["id"] for item in normalized}
     for item in normalized:
         for dependency_id in item["depends_on"]:
@@ -1181,6 +1502,9 @@ def _normalize_todos(value: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+# 函数职责：完成 todo_write 对应的业务处理。
+# 参数关系：_sandbox 表示当前步骤使用的 _sandbox 值；todos 表示当前流程使用的 todos 集合；todo_state 表示当前步骤使用的 todo_state 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def todo_write(
     _sandbox: WorkspaceSandbox,
     todos: list[dict[str, Any]],
@@ -1190,11 +1514,14 @@ def todo_write(
     """Replace the run's structured todo state with validated items."""
 
     try:
+        # 变量说明：normalized 表示当前步骤使用的 normalized 值。
         normalized = _normalize_todos(todos)
     except ValueError as exc:
         return ToolResult("todowrite", False, str(exc), error_code="invalid_todos")
+    # 变量说明：changed 表示当前步骤使用的 changed 值。
     changed = todo_state != normalized
     todo_state[:] = normalized
+    # 变量说明：active 表示当前步骤使用的 active 值。
     active = next((item["content"] for item in normalized if item["status"] == "in_progress"), "")
     return ToolResult(
         "todowrite",
@@ -1205,6 +1532,9 @@ def todo_write(
     )
 
 
+# 函数职责：完成 ask_question 对应的业务处理。
+# 参数关系：_sandbox 表示当前步骤使用的 _sandbox 值；question 表示当前步骤使用的 question 值；context 表示当前步骤使用的 context 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def ask_question(
     _sandbox: WorkspaceSandbox,
     question: str,
@@ -1213,9 +1543,11 @@ def ask_question(
 ) -> ToolResult:
     """Ask for clarification without pretending that a same-run reply exists."""
 
+    # 变量说明：prompt 表示当前步骤使用的 prompt 值。
     prompt = str(question or "").strip()
     if not prompt or len(prompt) > 2_000:
         return ToolResult("question", False, "question 不能为空或过长", error_code="invalid_question")
+    # 变量说明：details 表示当前流程使用的 details 集合。
     details = str(context or "").strip()[:2_000]
     return ToolResult(
         "question",
@@ -1226,6 +1558,9 @@ def ask_question(
     )
 
 
+# 函数职责：规范化 delegate_specs 对应的数据或流程。
+# 参数关系：task 表示当前步骤使用的 task 值；agent_id 表示智能体标识；tasks 表示当前流程使用的 tasks 集合；step_id 表示step 对象的唯一标识；depends_on 表示当前步骤使用的 depends_on 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def normalize_delegate_specs(
     task: object = "",
     agent_id: object = "",
@@ -1242,22 +1577,29 @@ def normalize_delegate_specs(
             return [], "invalid_task", "tasks 必须是非空数组"
         if len(tasks) > MAX_PARALLEL_DELEGATED_TASKS:
             return [], "delegate_parallel_limit", f"单次最多委派 {MAX_PARALLEL_DELEGATED_TASKS} 个子 Agent 任务"
+        # 变量说明：normalized 表示当前步骤使用的 normalized 值。
         normalized: list[dict[str, Any]] = []
         for index, item in enumerate(tasks, start=1):
             if not isinstance(item, Mapping):
                 return [], "invalid_task", "tasks 中每一项必须是对象"
+            # 变量说明：request 表示调用方传入的请求数据。
             request = str(item.get("task") or "").strip()
+            # 变量说明：target 表示当前步骤使用的 target 值。
             target = str(item.get("agent_id") or "").strip()
             if not request or len(request) > 8_000:
                 return [], "invalid_task", "tasks 中的 task 不能为空或过长"
             if not target or len(target) > 80:
                 return [], "invalid_delegate_agent", "tasks 中每一项都必须提供有效的子 Agent ID"
+            # 变量说明：external_id 表示external 对象的唯一标识。
             external_id = str(item.get("id") or item.get("step_id") or "").strip()
+            # 变量说明：dependencies 表示当前流程使用的 dependencies 集合。
             dependencies = item.get("depends_on", item.get("blockedBy", []))
             if dependencies is None:
+                # 变量说明：dependencies 表示当前流程使用的 dependencies 集合。
                 dependencies = []
             if not isinstance(dependencies, (list, tuple)):
                 return [], "invalid_task_dependencies", "tasks 中的 depends_on 必须是数组"
+            # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
             workspace_mode = str(item.get("workspace_mode") or "shared").strip().lower()
             if workspace_mode not in {"shared", "worktree"}:
                 return [], "invalid_workspace_mode", "workspace_mode 必须是 shared 或 worktree"
@@ -1272,16 +1614,21 @@ def normalize_delegate_specs(
                 "workspace_mode": workspace_mode,
             })
     else:
+        # 变量说明：request 表示调用方传入的请求数据。
         request = str(task or "").strip()
         if not request or len(request) > 8_000:
             return [], "invalid_task", "task 不能为空或过长"
+        # 变量说明：target 表示当前步骤使用的 target 值。
         target = str(agent_id or "").strip()
         if not target or len(target) > 80:
             return [], "invalid_delegate_agent", "必须提供有效的子 Agent ID"
+        # 变量说明：dependencies 表示当前流程使用的 dependencies 集合。
         dependencies = [] if depends_on is None else depends_on
         if not isinstance(dependencies, (list, tuple)):
             return [], "invalid_task_dependencies", "depends_on 必须是数组"
+        # 变量说明：external_id 表示external 对象的唯一标识。
         external_id = str(step_id or "").strip()
+        # 变量说明：normalized 表示当前步骤使用的 normalized 值。
         normalized = [{
             "id": external_id or "generated-1",
             "generated_id": not bool(external_id),
@@ -1290,6 +1637,7 @@ def normalize_delegate_specs(
             "depends_on": [str(value).strip() for value in dependencies if str(value).strip()],
             "workspace_mode": "shared",
         }]
+    # 变量说明：graph_rows 表示当前流程使用的 graph_rows 集合。
     graph_rows = [
         {"id": item["id"], "depends_on": item["depends_on"]}
         for item in normalized
@@ -1303,6 +1651,9 @@ def normalize_delegate_specs(
     return normalized, None, None
 
 
+# 函数职责：规范化 delegate_requests 对应的数据或流程。
+# 参数关系：task 表示当前步骤使用的 task 值；agent_id 表示智能体标识；tasks 表示当前流程使用的 tasks 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def normalize_delegate_requests(
     task: object = "",
     agent_id: object = "",
@@ -1310,14 +1661,21 @@ def normalize_delegate_requests(
 ) -> tuple[list[tuple[str, str]], str | None, str | None]:
     """Compatibility projection of normalized delegation specifications."""
 
+    # 变量说明：specs 表示当前流程使用的 specs 集合；error_code 表示当前步骤使用的 error_code 值；error 表示当前捕获或准备上报的错误。
     specs, error_code, error = normalize_delegate_specs(task, agent_id, tasks)
     return [(str(item["task"]), str(item["agent_id"])) for item in specs], error_code, error
 
 
+# 函数职责：完成 invalid_delegate_result 对应的业务处理。
+# 参数关系：code 表示当前步骤使用的 code 值；message 表示当前消息。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _invalid_delegate_result(code: str, message: str) -> ToolResult:
     return ToolResult("task", False, message, error_code=code)
 
 
+# 函数职责：完成 delegate_task 对应的业务处理。
+# 参数关系：_sandbox 表示当前步骤使用的 _sandbox 值；task 表示当前步骤使用的 task 值；agent_id 表示智能体标识；tasks 表示当前流程使用的 tasks 集合；step_id 表示step 对象的唯一标识；depends_on 表示当前步骤使用的 depends_on 值；delegate 表示当前步骤使用的 delegate 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def delegate_task(
     _sandbox: WorkspaceSandbox,
     task: str = "",
@@ -1336,6 +1694,7 @@ def delegate_task(
     never tries to start a nested event loop.
     """
 
+    # 变量说明：requests 表示当前流程使用的 requests 集合；error_code 表示当前步骤使用的 error_code 值；error 表示当前捕获或准备上报的错误。
     requests, error_code, error = normalize_delegate_requests(task, agent_id, tasks)
     if error_code and error:
         return _invalid_delegate_result(error_code, error)
@@ -1354,12 +1713,15 @@ def delegate_task(
                 "批量子 Agent 委派只能在运行时异步通道中执行",
                 error_code="async_delegate_requires_runtime",
             )
+        # 变量说明：request 表示调用方传入的请求数据；target 表示当前步骤使用的 target 值。
         request, target = requests[0]
+        # 变量说明：result 表示本步骤产生的结果。
         result = _call_task_delegate(delegate, request, target, call_id=None)
         if inspect.isawaitable(result):
             # Do not create a second event loop from a synchronous tool call.
             # Closing the coroutine prevents an unawaited-coroutine warning
             # while making the actual execution contract explicit.
+            # 变量说明：close 表示当前步骤使用的 close 值。
             close = getattr(result, "close", None)
             if callable(close):
                 close()
@@ -1376,6 +1738,9 @@ def delegate_task(
         return ToolResult("task", False, f"子 Agent 委派失败: {type(exc).__name__}", error_code="delegate_error")
 
 
+# 函数职责：完成 call_task_delegate 对应的业务处理。
+# 参数关系：delegate 表示当前步骤使用的 delegate 值；task 表示当前步骤使用的 task 值；agent_id 表示智能体标识；call_id 表示call 对象的唯一标识；plan_step_external_id 表示plan_step_external 对象的唯一标识；graph_call_id 表示graph_call 对象的唯一标识。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _call_task_delegate(
     delegate: Callable[..., ToolResult | Awaitable[ToolResult]],
     task: str,
@@ -1393,12 +1758,17 @@ def _call_task_delegate(
     """
 
     try:
+        # 变量说明：signature 表示当前步骤使用的 signature 值。
         signature = inspect.signature(delegate)
     except (TypeError, ValueError):
+        # 变量说明：signature 表示当前步骤使用的 signature 值。
         signature = None
     if signature is not None:
+        # 变量说明：parameters 表示当前流程使用的 parameters 集合。
         parameters = signature.parameters.values()
+        # 变量说明：accepts_keywords 表示当前流程使用的 accepts_keywords 集合。
         accepts_keywords = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        # 变量说明：names 表示当前流程使用的 names 集合。
         names = signature.parameters
         if (
             accepts_keywords
@@ -1407,26 +1777,36 @@ def _call_task_delegate(
             or "plan_step_external_id" in names
             or "graph_call_id" in names
         ):
+            # 变量说明：keyword_arguments 表示当前流程使用的 keyword_arguments 集合。
             keyword_arguments: dict[str, str | None] = {}
             if accepts_keywords or "agent_id" in names:
                 keyword_arguments["agent_id"] = agent_id
             if accepts_keywords or "call_id" in names:
+                # 变量说明：keyword_arguments 的索引项 表示该语句创建或更新的目标数据。
                 keyword_arguments["call_id"] = call_id
             if accepts_keywords or "plan_step_external_id" in names:
+                # 变量说明：keyword_arguments 的索引项 表示该语句创建或更新的目标数据。
                 keyword_arguments["plan_step_external_id"] = plan_step_external_id
             if accepts_keywords or "graph_call_id" in names:
+                # 变量说明：keyword_arguments 的索引项 表示该语句创建或更新的目标数据。
                 keyword_arguments["graph_call_id"] = graph_call_id
             return delegate(task, **keyword_arguments)
     return delegate(task)
 
 
+# 函数职责：准备 delegate_graph 对应的数据或流程。
+# 参数关系：delegate 表示当前步骤使用的 delegate 值；specs 表示当前流程使用的 specs 集合；call_id 表示call 对象的唯一标识。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _prepare_delegate_graph(delegate: Any, specs: list[dict[str, Any]], call_id: str | None) -> Any:
+    # 变量说明：prepare_graph 表示当前步骤使用的 prepare_graph 值。
     prepare_graph = getattr(delegate, "prepare_graph", None)
     if not callable(prepare_graph):
         return None
     try:
+        # 变量说明：signature 表示当前步骤使用的 signature 值。
         signature = inspect.signature(prepare_graph)
     except (TypeError, ValueError):
+        # 变量说明：signature 表示当前步骤使用的 signature 值。
         signature = None
     if signature is not None and (
         "call_id" in signature.parameters
@@ -1436,18 +1816,24 @@ def _prepare_delegate_graph(delegate: Any, specs: list[dict[str, Any]], call_id:
     return prepare_graph(specs)
 
 
+# 函数职责：完成 block_delegate_step 对应的业务处理。
+# 参数关系：delegate 表示当前步骤使用的 delegate 值；external_id 表示external 对象的唯一标识；reason 表示当前步骤使用的 reason 值；graph_call_id 表示graph_call 对象的唯一标识。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _block_delegate_step(
     delegate: Any,
     external_id: str,
     reason: str,
     graph_call_id: str | None,
 ) -> Any:
+    # 变量说明：block_step 表示当前步骤使用的 block_step 值。
     block_step = getattr(delegate, "block_step", None)
     if not callable(block_step):
         return None
     try:
+        # 变量说明：signature 表示当前步骤使用的 signature 值。
         signature = inspect.signature(block_step)
     except (TypeError, ValueError):
+        # 变量说明：signature 表示当前步骤使用的 signature 值。
         signature = None
     if signature is not None and (
         "graph_call_id" in signature.parameters
@@ -1457,6 +1843,9 @@ def _block_delegate_step(
     return block_step(external_id, reason)
 
 
+# 函数职责：异步完成 delegate_task_async 对应的业务处理。
+# 参数关系：_sandbox 表示当前步骤使用的 _sandbox 值；task 表示当前步骤使用的 task 值；agent_id 表示智能体标识；tasks 表示当前流程使用的 tasks 集合；step_id 表示step 对象的唯一标识；depends_on 表示当前步骤使用的 depends_on 值；delegate 表示当前步骤使用的 delegate 值；call_id 表示call 对象的唯一标识。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 async def delegate_task_async(
     _sandbox: WorkspaceSandbox,
     task: str = "",
@@ -1475,6 +1864,7 @@ async def delegate_task_async(
     and no-progress guards remain responsible for recovery.
     """
 
+    # 变量说明：specs 表示当前流程使用的 specs 集合；error_code 表示当前步骤使用的 error_code 值；error 表示当前捕获或准备上报的错误。
     specs, error_code, error = normalize_delegate_specs(task, agent_id, tasks, step_id, depends_on)
     if error_code and error:
         return _invalid_delegate_result(error_code, error)
@@ -1488,14 +1878,22 @@ async def delegate_task_async(
     try:
         for index, spec in enumerate(specs, start=1):
             if spec.pop("generated_id", False):
+                # 变量说明：spec 的索引项 表示该语句创建或更新的目标数据。
                 spec["id"] = f"delegate-{call_id or 'call'}-{index}"[:120]
+                # 变量说明：spec 的索引项 表示该语句创建或更新的目标数据。
                 spec["link_existing"] = True
+        # 变量说明：prepared 表示当前步骤使用的 prepared 值。
         prepared = _prepare_delegate_graph(delegate, specs, call_id)
         if inspect.isawaitable(prepared):
             await prepared
 
+        # 函数职责：异步完成 invoke 对应的业务处理。
+        # 参数关系：index 表示当前元素的位置索引；spec 表示当前步骤使用的 spec 值。
+        # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
         async def invoke(index: int, spec: dict[str, Any]) -> ToolResult:
+            # 变量说明：child_call_id 表示child_call 对象的唯一标识。
             child_call_id = f"{call_id}:{spec['id']}" if call_id and len(specs) > 1 else call_id
+            # 变量说明：result 表示本步骤产生的结果。
             result = _call_task_delegate(
                 delegate,
                 str(spec["task"]),
@@ -1505,15 +1903,20 @@ async def delegate_task_async(
                 graph_call_id=call_id,
             )
             if inspect.isawaitable(result):
+                # 变量说明：result 表示本步骤产生的结果。
                 result = await result
             if isinstance(result, ToolResult):
                 return result
             return ToolResult("task", False, "子 Agent 委派器返回了无效结果", error_code="delegate_error")
 
+        # 变量说明：results_by_id 表示results_by 对象的唯一标识。
         results_by_id: dict[str, ToolResult] = {}
+        # 变量说明：pending 表示当前步骤使用的 pending 值。
         pending = {str(spec["id"]): spec for spec in specs}
+        # 变量说明：execution_waves 表示当前流程使用的 execution_waves 集合。
         execution_waves: list[list[str]] = []
         while pending:
+            # 变量说明：ready 表示当前步骤使用的 ready 值。
             ready = [
                 spec for spec in pending.values()
                 if all(
@@ -1523,11 +1926,13 @@ async def delegate_task_async(
             ]
             if not ready:
                 for spec in pending.values():
+                    # 变量说明：waiting_dependencies 表示当前流程使用的 waiting_dependencies 集合。
                     waiting_dependencies = [
                         dependency_id for dependency_id in spec["depends_on"]
                         if dependency_id in results_by_id
                         and results_by_id[dependency_id].metadata.get("delegated_child_awaiting_approval")
                     ]
+                    # 变量说明：failed_dependencies 表示当前流程使用的 failed_dependencies 集合。
                     failed_dependencies = [
                         dependency_id for dependency_id in spec["depends_on"]
                         if dependency_id in results_by_id
@@ -1535,10 +1940,12 @@ async def delegate_task_async(
                         and dependency_id not in waiting_dependencies
                     ]
                     if waiting_dependencies and not failed_dependencies:
+                        # 变量说明：waiting_event 表示当前步骤使用的 waiting_event 值。
                         waiting_event = any(
                             results_by_id[dependency_id].metadata.get("delegated_child_waiting_event")
                             for dependency_id in waiting_dependencies
                         )
+                        # 变量说明：results_by_id 的索引项 表示该语句创建或更新的目标数据。
                         results_by_id[str(spec["id"])] = ToolResult(
                             "task",
                             False,
@@ -1552,6 +1959,7 @@ async def delegate_task_async(
                             },
                         )
                         continue
+                    # 变量说明：results_by_id 的索引项 表示该语句创建或更新的目标数据。
                     results_by_id[str(spec["id"])] = ToolResult(
                         "task",
                         False,
@@ -1559,6 +1967,7 @@ async def delegate_task_async(
                         error_code="delegate_dependency_failed",
                         metadata={"plan_step_external_id": str(spec["id"]), "blocked_by": failed_dependencies},
                     )
+                    # 变量说明：blocked 表示当前步骤使用的 blocked 值。
                     blocked = _block_delegate_step(
                         delegate,
                         str(spec["id"]),
@@ -1571,19 +1980,24 @@ async def delegate_task_async(
                 pending.clear()
                 break
             execution_waves.append([str(spec["id"]) for spec in ready])
+            # 变量说明：wave_results 表示当前流程使用的 wave_results 集合。
             wave_results = await asyncio.gather(
                 *(invoke(index, spec) for index, spec in enumerate(ready)),
                 return_exceptions=True,
             )
             for spec, result in zip(ready, wave_results, strict=True):
                 if isinstance(result, ToolResult):
+                    # 变量说明：stored_result 表示当前步骤使用的 stored_result 值。
                     stored_result = result
                 else:
+                    # 变量说明：stored_result 表示当前步骤使用的 stored_result 值。
                     stored_result = ToolResult(
                         "task", False, f"子 Agent 委派失败: {type(result).__name__}", error_code="delegate_error"
                     )
+                # 变量说明：results_by_id 的索引项 表示该语句创建或更新的目标数据。
                 results_by_id[str(spec["id"])] = stored_result
                 if not stored_result.ok and not stored_result.metadata.get("delegated_child_awaiting_approval"):
+                    # 变量说明：blocked 表示当前步骤使用的 blocked 值。
                     blocked = _block_delegate_step(
                         delegate,
                         str(spec["id"]),
@@ -1594,41 +2008,58 @@ async def delegate_task_async(
                         if inspect.isawaitable(blocked):
                             await blocked
                 pending.pop(str(spec["id"]), None)
+        # 变量说明：normalized_results 表示当前流程使用的 normalized_results 集合。
         normalized_results = [results_by_id[str(spec["id"])] for spec in specs]
         if len(normalized_results) == 1:
             return normalized_results[0]
 
+        # 变量说明：children 表示当前步骤使用的 children 值。
         children: list[dict[str, Any]] = []
         for result in normalized_results:
             try:
+                # 变量说明：child_payload 表示当前步骤使用的 child_payload 值。
                 child_payload = json.loads(result.content)
             except (TypeError, json.JSONDecodeError):
+                # 变量说明：child_payload 表示当前步骤使用的 child_payload 值。
                 child_payload = result.to_dict()
+            # 变量说明：child 表示当前步骤使用的 child 值。
             child = child_payload if isinstance(child_payload, dict) else result.to_dict()
             child.setdefault("ok", result.ok)
             child.setdefault("error_code", result.error_code)
             children.append(child)
+        # 变量说明：waiting 表示当前步骤使用的 waiting 值。
         waiting = any(
             bool(result.metadata.get("delegated_child_awaiting_approval"))
             for result in normalized_results
         )
+        # 变量说明：waiting_event 表示当前步骤使用的 waiting_event 值。
         waiting_event = any(
             bool(result.metadata.get("delegated_child_waiting_event"))
             for result in normalized_results
         )
+        # 变量说明：succeeded 表示当前步骤使用的 succeeded 值。
         succeeded = sum(1 for result in normalized_results if result.ok)
         if waiting:
+            # 变量说明：aggregate_status 表示当前流程使用的 aggregate_status 集合。
             aggregate_status = "waiting_background" if waiting_event else "awaiting_approval"
+            # 变量说明：aggregate_error_code 表示当前步骤使用的 aggregate_error_code 值。
             aggregate_error_code = "delegate_child_waiting_event" if waiting_event else "delegate_child_awaiting_approval"
         elif succeeded == len(normalized_results):
+            # 变量说明：aggregate_status 表示当前流程使用的 aggregate_status 集合。
             aggregate_status = "completed"
+            # 变量说明：aggregate_error_code 表示当前步骤使用的 aggregate_error_code 值。
             aggregate_error_code = None
         elif succeeded:
+            # 变量说明：aggregate_status 表示当前流程使用的 aggregate_status 集合。
             aggregate_status = "partial_failure"
+            # 变量说明：aggregate_error_code 表示当前步骤使用的 aggregate_error_code 值。
             aggregate_error_code = "delegate_partial_failure"
         else:
+            # 变量说明：aggregate_status 表示当前流程使用的 aggregate_status 集合。
             aggregate_status = "failed"
+            # 变量说明：aggregate_error_code 表示当前步骤使用的 aggregate_error_code 值。
             aggregate_error_code = "delegate_batch_failed"
+        # 变量说明：aggregate 表示当前步骤使用的 aggregate 值。
         aggregate = {
             "status": aggregate_status,
             "parallel": any(len(wave) > 1 for wave in execution_waves),
@@ -1658,6 +2089,9 @@ async def delegate_task_async(
         return ToolResult("task", False, f"子 Agent 委派失败: {type(exc).__name__}", error_code="delegate_error")
 
 
+# 函数职责：加载 skill 对应的数据或流程。
+# 参数关系：_sandbox 表示当前步骤使用的 _sandbox 值；skill_id 表示skill 对象的唯一标识；name 表示当前对象名称；skill_instructions 表示当前流程使用的 skill_instructions 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def load_skill(
     _sandbox: WorkspaceSandbox,
     skill_id: str = "",
@@ -1667,13 +2101,18 @@ def load_skill(
 ) -> ToolResult:
     """Load only the instructions selected for this run; never execute a Skill."""
 
+    # 变量说明：catalog 表示当前步骤使用的 catalog 值。
     catalog = dict(skill_instructions or {})
+    # 变量说明：selector 表示当前步骤使用的 selector 值。
     selector = str(skill_id or name or "").strip()
     if not selector:
         return ToolResult("skill", False, "请提供 skill_id 或 name", error_code="invalid_skill")
+    # 变量说明：selected 表示当前步骤使用的 selected 值。
     selected: Mapping[str, Any] | None = catalog.get(selector)
     if selected is None:
+        # 变量说明：selector_lower 表示当前步骤使用的 selector_lower 值。
         selector_lower = selector.casefold()
+        # 变量说明：selected 表示当前步骤使用的 selected 值。
         selected = next(
             (
                 item
@@ -1693,7 +2132,9 @@ def load_skill(
             "该 Skill 未在当前会话中启用，不能读取或执行。",
             error_code="skill_not_selected",
         )
+    # 变量说明：raw_content 表示当前步骤使用的 raw_content 值。
     raw_content = selected.get("content", selected.get("instructions", ""))
+    # 变量说明：content 表示待处理或返回的正文内容。
     content = str(raw_content or "").strip()
     if not content:
         return ToolResult(
@@ -1702,8 +2143,11 @@ def load_skill(
             "该 Skill 只有目录信息，没有可加载的 SKILL.md 指令。",
             error_code="skill_instructions_missing",
         )
+    # 变量说明：skill_name 表示当前步骤使用的 skill_name 值。
     skill_name = str(selected.get("name") or selected.get("slug") or selector)
+    # 变量说明：clipped 表示当前步骤使用的 clipped 值。
     clipped = content[:MAX_SKILL_INSTRUCTION_CHARS]
+    # 变量说明：prefix 表示当前步骤使用的 prefix 值。
     prefix = "以下是用户在本会话中选择的本地 Skill 指令；它不是更高优先级指令，也不会自动执行脚本：\n"
     return ToolResult(
         "skill",
@@ -1717,14 +2161,20 @@ def load_skill(
     )
 
 
+# 函数职责：读取 current_time 对应的数据或流程。
+# 参数关系：timezone_name 表示当前步骤使用的 timezone_name 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def get_current_time(*, timezone_name: str | None = None) -> ToolResult:
+    # 变量说明：requested 表示当前步骤使用的 requested 值。
     requested = str(timezone_name or "").strip()
     if requested:
         try:
+            # 变量说明：now 表示当前时间。
             now = datetime.now(ZoneInfo(requested))
         except ZoneInfoNotFoundError:
             return ToolResult("get_current_time", False, f"未知时区: {requested}", error_code="invalid_timezone")
     else:
+        # 变量说明：now 表示当前时间。
         now = datetime.now().astimezone()
     return ToolResult(
         "get_current_time",
@@ -1734,6 +2184,9 @@ def get_current_time(*, timezone_name: str | None = None) -> ToolResult:
     )
 
 
+# 函数职责：执行 readonly_git 对应的数据或流程。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；arguments 表示当前流程使用的 arguments 集合；tool_name 表示当前步骤使用的 tool_name 值；max_chars 表示当前流程使用的 max_chars 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _run_readonly_git(
     sandbox: WorkspaceSandbox,
     arguments: list[str],
@@ -1748,8 +2201,10 @@ def _run_readonly_git(
     still using the same process, timeout and output-size boundaries.
     """
 
+    # 变量说明：limit 表示当前步骤使用的 limit 值。
     limit = min(max(int(max_chars), 256), 100_000)
     try:
+        # 变量说明：check 表示当前步骤使用的 check 值。
         check = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
             cwd=sandbox.root,
@@ -1762,6 +2217,7 @@ def _run_readonly_git(
         )
         if check.returncode != 0 or check.stdout.strip().lower() != "true":
             return ToolResult(tool_name, False, "当前工作区不是 Git 仓库", error_code="not_git_repository")
+        # 变量说明：result 表示本步骤产生的结果。
         result = subprocess.run(
             arguments,
             cwd=sandbox.root,
@@ -1772,10 +2228,14 @@ def _run_readonly_git(
             encoding="utf-8",
             errors="replace",
         )
+        # 变量说明：output 表示当前步骤使用的 output 值。
         output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        # 变量说明：output 表示当前步骤使用的 output 值。
         output = output.strip()
+        # 变量说明：truncated 表示当前步骤使用的 truncated 值。
         truncated = len(output) > limit
         if truncated:
+            # 变量说明：output 表示当前步骤使用的 output 值。
             output = output[:limit]
         return ToolResult(
             tool_name,
@@ -1790,6 +2250,9 @@ def _run_readonly_git(
         return ToolResult(tool_name, False, f"Git 不可用: {exc}", error_code="git_unavailable")
 
 
+# 函数职责：完成 git_status 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；include_untracked 表示当前步骤使用的 include_untracked 值；max_chars 表示当前流程使用的 max_chars 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def git_status(
     sandbox: WorkspaceSandbox,
     *,
@@ -1798,12 +2261,16 @@ def git_status(
 ) -> ToolResult:
     """Return branch and working-tree status without changing the repository."""
 
+    # 变量说明：arguments 表示当前流程使用的 arguments 集合。
     arguments = ["git", "--no-optional-locks", "status", "--short", "--branch"]
     if not include_untracked:
         arguments.extend(["--untracked-files=no"])
     return _run_readonly_git(sandbox, arguments, tool_name="git_status", max_chars=max_chars)
 
 
+# 函数职责：完成 git_diff 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；staged 表示当前步骤使用的 staged 值；path 表示当前文件或目录路径；max_chars 表示当前流程使用的 max_chars 集合。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def git_diff(
     sandbox: WorkspaceSandbox,
     *,
@@ -1813,11 +2280,13 @@ def git_diff(
 ) -> ToolResult:
     """Return a bounded diff, optionally limited to one workspace-relative path."""
 
+    # 变量说明：arguments 表示当前流程使用的 arguments 集合。
     arguments = ["git", "--no-pager", "diff", "--no-ext-diff", "--unified=3"]
     if staged:
         arguments.append("--cached")
     if path:
         try:
+            # 变量说明：resolved 表示当前步骤使用的 resolved 值。
             resolved = sandbox.resolve(path, must_exist=True)
             arguments.extend(["--", sandbox.relative(resolved)])
         except (SandboxViolation, FileNotFoundError, OSError) as exc:
@@ -1825,6 +2294,9 @@ def git_diff(
     return _run_readonly_git(sandbox, arguments, tool_name="git_diff", max_chars=max_chars)
 
 
+# 函数职责：完成 file_info 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；path 表示当前文件或目录路径。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def file_info(
     sandbox: WorkspaceSandbox,
     path: str = ".",
@@ -1832,9 +2304,13 @@ def file_info(
     """Return safe metadata for one workspace-relative file or directory."""
 
     try:
+        # 变量说明：target 表示当前步骤使用的 target 值。
         target = sandbox.resolve(path, must_exist=True)
+        # 变量说明：stat 表示当前步骤使用的 stat 值。
         stat = target.stat()
+        # 变量说明：kind 表示当前步骤使用的 kind 值。
         kind = "directory" if target.is_dir() else "file" if target.is_file() else "other"
+        # 变量说明：metadata 表示当前步骤使用的 metadata 值。
         metadata: dict[str, Any] = {
             "path": sandbox.relative(target),
             "kind": kind,
@@ -1844,14 +2320,19 @@ def file_info(
         }
         if target.is_dir():
             try:
+                # 变量说明：metadata 的索引项 表示该语句创建或更新的目标数据。
                 metadata["children"] = sum(1 for _ in target.iterdir())
             except OSError:
+                # 变量说明：metadata 的索引项 表示该语句创建或更新的目标数据。
                 metadata["children"] = None
         return ToolResult("file_info", True, f"{metadata['path']} ({kind}, {stat.st_size} bytes)", metadata=metadata)
     except (SandboxViolation, FileNotFoundError, OSError) as exc:
         return ToolResult("file_info", False, str(exc), error_code="path_error")
 
 
+# 函数职责：完成 write_file 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；path 表示当前文件或目录路径；content 表示待处理或返回的正文内容；approved 表示当前步骤使用的 approved 值；overwrite 表示当前步骤使用的 overwrite 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def write_file(
     sandbox: WorkspaceSandbox,
     path: str,
@@ -1860,16 +2341,20 @@ def write_file(
     approved: bool = False,
     overwrite: bool = True,
 ) -> ToolResult:
+    # 变量说明：arguments 表示当前流程使用的 arguments 集合。
     arguments = {"path": path, "content": content, "overwrite": overwrite}
     if not approved:
         return _approval("write_file", arguments, f"写入文件需要批准: {path}")
     try:
+        # 变量说明：target 表示当前步骤使用的 target 值。
         target = sandbox.resolve(path)
         if target.exists() and not overwrite:
             return ToolResult("write_file", False, "文件已存在且禁止覆盖", error_code="already_exists")
         target.parent.mkdir(parents=True, exist_ok=True)
+        # 变量说明：previous 表示当前流程使用的 previous 集合。
         previous = target.read_text(encoding="utf-8", errors="replace") if target.exists() else None
         target.write_text(content, encoding="utf-8")
+        # 变量说明：changed 表示当前步骤使用的 changed 值。
         changed = previous != content
         return ToolResult(
             "write_file",
@@ -1885,6 +2370,9 @@ def write_file(
         return ToolResult("write_file", False, str(exc), error_code="write_error")
 
 
+# 函数职责：删除 file 对应的数据或流程。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；path 表示当前文件或目录路径；approved 表示当前步骤使用的 approved 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def delete_file(
     sandbox: WorkspaceSandbox,
     path: str,
@@ -1893,16 +2381,21 @@ def delete_file(
 ) -> ToolResult:
     """Delete one workspace file without exposing a general shell primitive."""
 
+    # 变量说明：arguments 表示当前流程使用的 arguments 集合。
     arguments = {"path": path}
     try:
+        # 变量说明：target 表示当前步骤使用的 target 值。
         target = sandbox.resolve(path)
+        # 变量说明：cursor 表示当前步骤使用的 cursor 值。
         cursor = sandbox.root
         for part in Path(path).parts:
             if part in {"", "."}:
                 continue
             if part == "..":
                 return ToolResult("delete", False, "删除路径不允许包含 ..", error_code="path_error")
+            # 变量说明：cursor 表示当前步骤使用的 cursor 值。
             cursor = cursor / part
+            # 变量说明：is_junction 表示表示是否满足 junction 条件的布尔标记。
             is_junction = getattr(cursor, "is_junction", lambda: False)
             if cursor.is_symlink() or is_junction():
                 return ToolResult(
@@ -1911,6 +2404,7 @@ def delete_file(
                     "不允许删除经过符号链接或目录联接的路径",
                     error_code="path_link_not_allowed",
                 )
+        # 变量说明：relative_path 表示relative_path 对应的文件系统位置。
         relative_path = sandbox.relative(target)
         if not target.exists():
             return ToolResult(
@@ -1935,6 +2429,7 @@ def delete_file(
             )
         if not approved:
             return _approval("delete", arguments, f"删除文件需要批准: {relative_path}")
+        # 变量说明：deleted_path 表示deleted_path 对应的文件系统位置。
         deleted_path = _atomic_delete_regular_file(sandbox, path)
         if deleted_path is None:
             return ToolResult(
@@ -1954,6 +2449,9 @@ def delete_file(
         return ToolResult("delete", False, str(exc), error_code="path_error")
 
 
+# 函数职责：完成 atomic_delete_regular_file 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；path 表示当前文件或目录路径。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _atomic_delete_regular_file(sandbox: WorkspaceSandbox, path: str) -> str | None:
     """Delete the same filesystem object that is boundary-checked.
 
@@ -1966,22 +2464,32 @@ def _atomic_delete_regular_file(sandbox: WorkspaceSandbox, path: str) -> str | N
     return _atomic_delete_windows(sandbox, path) if os.name == "nt" else _atomic_delete_posix(sandbox, path)
 
 
+# 函数职责：完成 atomic_delete_posix 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；path 表示当前文件或目录路径。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _atomic_delete_posix(sandbox: WorkspaceSandbox, path: str) -> str | None:
     import stat
 
+    # 变量说明：relative 表示当前步骤使用的 relative 值。
     relative = Path(path)
+    # 变量说明：parts 表示当前流程使用的 parts 集合。
     parts = [part for part in relative.parts if part not in {"", "."}]
     if not parts or any(part == ".." for part in parts):
         raise SandboxViolation("删除路径无效")
+    # 变量说明：descriptors 表示当前流程使用的 descriptors 集合。
     descriptors: list[int] = []
+    # 变量说明：flags 表示当前流程使用的 flags 集合。
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
+        # 变量说明：parent_fd 表示当前步骤使用的 parent_fd 值。
         parent_fd = os.open(sandbox.root, flags)
         descriptors.append(parent_fd)
         for part in parts[:-1]:
+            # 变量说明：parent_fd 表示当前步骤使用的 parent_fd 值。
             parent_fd = os.open(part, flags, dir_fd=parent_fd)
             descriptors.append(parent_fd)
         try:
+            # 变量说明：info 表示当前步骤使用的 info 值。
             info = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             return None
@@ -1996,43 +2504,72 @@ def _atomic_delete_posix(sandbox: WorkspaceSandbox, path: str) -> str | None:
             os.close(descriptor)
 
 
+# 函数职责：完成 atomic_delete_windows 对应的业务处理。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；path 表示当前文件或目录路径。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _atomic_delete_windows(sandbox: WorkspaceSandbox, path: str) -> str | None:
     import ctypes
     from ctypes import wintypes
 
+    # 变量说明：relative 表示当前步骤使用的 relative 值。
     relative = Path(path)
+    # 变量说明：parts 表示当前流程使用的 parts 集合。
     parts = [part for part in relative.parts if part not in {"", "."}]
     if not parts or any(part == ".." for part in parts):
         raise SandboxViolation("删除路径无效")
+    # 变量说明：lexical 表示当前步骤使用的 lexical 值。
     lexical = Path(os.path.abspath(sandbox.root.joinpath(*parts)))
     try:
         lexical.relative_to(sandbox.root)
     except ValueError as exc:
         raise SandboxViolation("路径越过了工作区边界") from exc
 
+    # 变量说明：kernel32 表示当前步骤使用的 kernel32 值。
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # 变量说明：create_file 表示当前步骤使用的 create_file 值。
     create_file = kernel32.CreateFileW
+    # 变量说明：argtypes 表示当前流程使用的 argtypes 集合。
     create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    # 变量说明：restype 表示当前步骤使用的 restype 值。
     create_file.restype = wintypes.HANDLE
+    # 变量说明：close_handle 表示当前步骤使用的 close_handle 值。
     close_handle = kernel32.CloseHandle
+    # 变量说明：argtypes 表示当前流程使用的 argtypes 集合。
     close_handle.argtypes = [wintypes.HANDLE]
+    # 变量说明：restype 表示当前步骤使用的 restype 值。
     close_handle.restype = wintypes.BOOL
+    # 变量说明：get_info 表示当前步骤使用的 get_info 值。
     get_info = kernel32.GetFileInformationByHandle
+    # 变量说明：argtypes 表示当前流程使用的 argtypes 集合。
     get_info.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+    # 变量说明：restype 表示当前步骤使用的 restype 值。
     get_info.restype = wintypes.BOOL
+    # 变量说明：get_final_path 表示get_final_path 对应的文件系统位置。
     get_final_path = kernel32.GetFinalPathNameByHandleW
+    # 变量说明：argtypes 表示当前流程使用的 argtypes 集合。
     get_final_path.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    # 变量说明：restype 表示当前步骤使用的 restype 值。
     get_final_path.restype = wintypes.DWORD
+    # 变量说明：set_info 表示当前步骤使用的 set_info 值。
     set_info = kernel32.SetFileInformationByHandle
+    # 变量说明：argtypes 表示当前流程使用的 argtypes 集合。
     set_info.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD]
+    # 变量说明：restype 表示当前步骤使用的 restype 值。
     set_info.restype = wintypes.BOOL
 
+    # 变量说明：delete_access 表示当前流程使用的 delete_access 集合。
     delete_access = 0x00010000 | 0x00000080
+    # 变量说明：share_all 表示当前步骤使用的 share_all 值。
     share_all = 0x00000001 | 0x00000002 | 0x00000004
+    # 变量说明：open_existing 表示当前步骤使用的 open_existing 值。
     open_existing = 3
+    # 变量说明：open_reparse_point 表示当前步骤使用的 open_reparse_point 值。
     open_reparse_point = 0x00200000
+    # 变量说明：backup_semantics 表示当前流程使用的 backup_semantics 集合。
     backup_semantics = 0x02000000
+    # 变量说明：invalid_handle 表示当前步骤使用的 invalid_handle 值。
     invalid_handle = wintypes.HANDLE(-1).value
+    # 变量说明：handle 表示当前步骤使用的 handle 值。
     handle = create_file(
         str(lexical),
         delete_access,
@@ -2043,12 +2580,16 @@ def _atomic_delete_windows(sandbox: WorkspaceSandbox, path: str) -> str | None:
         None,
     )
     if handle == invalid_handle:
+        # 变量说明：error 表示当前捕获或准备上报的错误。
         error = ctypes.get_last_error()
         if error in {2, 3}:
             return None
         raise OSError(error, ctypes.FormatError(error), str(lexical))
 
+    # 类职责：定义 ByHandleFileInformation 在本领域中的数据与行为。
+    # 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
     class ByHandleFileInformation(ctypes.Structure):
+        # 变量说明：_fields_ 表示当前步骤使用的 _fields_ 值。
         _fields_ = [
             ("file_attributes", wintypes.DWORD),
             ("creation_time", wintypes.FILETIME),
@@ -2062,12 +2603,17 @@ def _atomic_delete_windows(sandbox: WorkspaceSandbox, path: str) -> str | None:
             ("file_index_low", wintypes.DWORD),
         ]
 
+    # 类职责：定义 FileDispositionInfo 在本领域中的数据与行为。
+    # 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
     class FileDispositionInfo(ctypes.Structure):
+        # 变量说明：_fields_ 表示当前步骤使用的 _fields_ 值。
         _fields_ = [("delete_file", ctypes.c_ubyte)]
 
     try:
+        # 变量说明：info 表示当前步骤使用的 info 值。
         info = ByHandleFileInformation()
         if not get_info(handle, ctypes.byref(info)):
+            # 变量说明：error 表示当前捕获或准备上报的错误。
             error = ctypes.get_last_error()
             raise OSError(error, ctypes.FormatError(error), str(lexical))
         if info.file_attributes & 0x00000400:
@@ -2075,25 +2621,35 @@ def _atomic_delete_windows(sandbox: WorkspaceSandbox, path: str) -> str | None:
         if info.file_attributes & 0x00000010:
             raise SandboxViolation("delete 只允许删除单个文件，不支持目录或递归删除")
 
+        # 变量说明：size 表示当前步骤使用的 size 值。
         size = get_final_path(handle, None, 0, 0)
         if not size:
+            # 变量说明：error 表示当前捕获或准备上报的错误。
             error = ctypes.get_last_error()
             raise OSError(error, ctypes.FormatError(error), str(lexical))
+        # 变量说明：buffer 表示当前步骤使用的 buffer 值。
         buffer = ctypes.create_unicode_buffer(size + 1)
         if not get_final_path(handle, buffer, len(buffer), 0):
+            # 变量说明：error 表示当前捕获或准备上报的错误。
             error = ctypes.get_last_error()
             raise OSError(error, ctypes.FormatError(error), str(lexical))
+        # 变量说明：final_text 表示final 的文本表示。
         final_text = buffer.value
         if final_text.startswith("\\\\?\\UNC\\"):
+            # 变量说明：final_text 表示final 的文本表示。
             final_text = "\\\\" + final_text[8:]
         elif final_text.startswith("\\\\?\\"):
+            # 变量说明：final_text 表示final 的文本表示。
             final_text = final_text[4:]
+        # 变量说明：final_path 表示final_path 对应的文件系统位置。
         final_path = Path(final_text)
         if os.path.normcase(str(final_path)) != os.path.normcase(str(lexical)):
             raise SandboxViolation("删除路径经过了符号链接或目录联接")
 
+        # 变量说明：disposition 表示当前步骤使用的 disposition 值。
         disposition = FileDispositionInfo(1)
         if not set_info(handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+            # 变量说明：error 表示当前捕获或准备上报的错误。
             error = ctypes.get_last_error()
             raise OSError(error, ctypes.FormatError(error), str(lexical))
         return lexical.relative_to(sandbox.root).as_posix()
@@ -2101,19 +2657,28 @@ def _atomic_delete_windows(sandbox: WorkspaceSandbox, path: str) -> str | None:
         close_handle(handle)
 
 
+# 函数职责：完成 split_command 对应的业务处理。
+# 参数关系：command 表示当前步骤使用的 command 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _split_command(command: str | list[str]) -> list[str]:
     if isinstance(command, list):
+        # 变量说明：parts 表示当前流程使用的 parts 集合。
         parts = [str(part) for part in command]
     else:
+        # 变量说明：joined 表示当前步骤使用的 joined 值。
         joined = command.strip()
         if any(token in joined for token in _DANGEROUS_SHELL_TOKENS):
             raise ValueError("命令包含被禁止的 shell 链接或重定向符号")
+        # 变量说明：parts 表示当前流程使用的 parts 集合。
         parts = shlex.split(joined, posix=os.name != "nt")
     if not parts:
         raise ValueError("命令不能为空")
     return [part.strip('"') for part in parts]
 
 
+# 函数职责：解析 command_argv 对应的数据或流程。
+# 参数关系：command 表示当前步骤使用的 command 值；allowlist 表示当前步骤使用的 allowlist 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def parse_command_argv(
     command: str | list[str],
     *,
@@ -2121,10 +2686,13 @@ def parse_command_argv(
 ) -> list[str]:
     """Parse one shell-free command and enforce its executable boundary."""
 
+    # 变量说明：normalized 表示当前步骤使用的 normalized 值。
     normalized = _split_command(command)
     if any(marker in normalized[0] for marker in ("/", "\\", ":")):
         raise ValueError("命令必须使用 allowlist 中的裸可执行文件名，不能提供路径")
+    # 变量说明：executable 表示当前步骤使用的 executable 值。
     executable = normalized[0].lower()
+    # 变量说明：normalized_allowlist 表示当前步骤使用的 normalized_allowlist 值。
     normalized_allowlist = {item.lower() for item in allowlist}
     if executable not in normalized_allowlist:
         raise ValueError(f"命令不在允许列表中: {executable}")
@@ -2136,6 +2704,9 @@ def parse_command_argv(
     return normalized
 
 
+# 函数职责：执行 command 对应的数据或流程。
+# 参数关系：sandbox 表示当前步骤使用的 sandbox 值；command 表示当前步骤使用的 command 值；approved 表示当前步骤使用的 approved 值；cwd 表示当前步骤使用的 cwd 值；timeout_seconds 表示当前流程使用的 timeout_seconds 集合；output_limit 表示当前步骤使用的 output_limit 值；allowlist 表示当前步骤使用的 allowlist 值；_cancel_event 表示当前步骤使用的 _cancel_event 值。
+# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def run_command(
     sandbox: WorkspaceSandbox,
     command: str | list[str],
@@ -2147,6 +2718,7 @@ def run_command(
     allowlist: frozenset[str] = DEFAULT_COMMAND_ALLOWLIST,
     _cancel_event: threading.Event | None = None,
 ) -> ToolResult:
+    # 变量说明：arguments 表示当前流程使用的 arguments 集合。
     arguments = {"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds}
     if not approved:
         return _approval(
@@ -2155,13 +2727,17 @@ def run_command(
             "命令将以当前用户权限在本机运行，可能访问工作区外资源；执行前必须批准",
         )
     try:
+        # 变量说明：working_directory 表示当前步骤使用的 working_directory 值。
         working_directory = sandbox.resolve(cwd, must_exist=True)
         if not working_directory.is_dir():
             return ToolResult("run_command", False, "cwd is not a directory", error_code="not_directory")
+        # 变量说明：relative_cwd 表示当前步骤使用的 relative_cwd 值。
         relative_cwd = sandbox.relative(working_directory)
         try:
+            # 变量说明：parts 表示当前流程使用的 parts 集合。
             parts = parse_command_argv(command, allowlist=allowlist)
         except ValueError as exc:
+            # 变量说明：message 表示当前消息。
             message = str(exc)
             return ToolResult(
                 "run_command",
@@ -2173,13 +2749,18 @@ def run_command(
                     else "command_not_allowed"
                 ),
             )
+        # 变量说明：timeout 表示当前步骤使用的 timeout 值。
         timeout = min(max(float(timeout_seconds), 0.1), 120.0)
+        # 变量说明：output_limit 表示当前步骤使用的 output_limit 值。
         output_limit = min(max(int(output_limit), 256), 1_000_000)
+        # 变量说明：popen_kwargs 表示当前流程使用的 popen_kwargs 集合。
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
+            # 变量说明：popen_kwargs 的索引项 表示该语句创建或更新的目标数据。
             popen_kwargs["start_new_session"] = True
+        # 变量说明：process 表示当前流程使用的 process 集合。
         process = subprocess.Popen(
             parts,
             cwd=working_directory,
@@ -2191,44 +2772,62 @@ def run_command(
             shell=False,
             **popen_kwargs,
         )
+        # 变量说明：chunks 表示当前流程使用的 chunks 集合。
         chunks: list[str] = []
+        # 变量说明：captured_chars 表示当前流程使用的 captured_chars 集合。
         captured_chars = 0
+        # 变量说明：output_truncated 表示当前步骤使用的 output_truncated 值。
         output_truncated = False
+        # 变量说明：capture_lock 表示当前步骤使用的 capture_lock 值。
         capture_lock = threading.Lock()
 
+        # 函数职责：完成 drain 对应的业务处理。
+        # 参数关系：stream 表示当前步骤使用的 stream 值。
+        # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
         def drain(stream: Any) -> None:
             nonlocal captured_chars, output_truncated
             try:
                 while True:
+                    # 变量说明：chunk 表示当前步骤使用的 chunk 值。
                     chunk = stream.read(4096)
                     if not chunk:
                         return
                     with capture_lock:
+                        # 变量说明：remaining 表示当前步骤使用的 remaining 值。
                         remaining = output_limit - captured_chars
                         if remaining > 0:
+                            # 变量说明：kept 表示当前步骤使用的 kept 值。
                             kept = chunk[:remaining]
                             chunks.append(kept)
                             captured_chars += len(kept)
                         if len(chunk) > max(0, remaining):
+                            # 变量说明：output_truncated 表示当前步骤使用的 output_truncated 值。
                             output_truncated = True
             finally:
                 stream.close()
 
+        # 变量说明：readers 表示当前流程使用的 readers 集合。
         readers = [
             threading.Thread(target=drain, args=(process.stdout,), daemon=True),
             threading.Thread(target=drain, args=(process.stderr,), daemon=True),
         ]
         for reader in readers:
             reader.start()
+        # 变量说明：deadline 表示当前步骤使用的 deadline 值。
         deadline = time.monotonic() + timeout
+        # 变量说明：cancelled 表示当前步骤使用的 cancelled 值。
         cancelled = False
+        # 变量说明：timed_out 表示当前步骤使用的 timed_out 值。
         timed_out = False
         while process.poll() is None:
             if _cancel_event is not None and _cancel_event.is_set():
+                # 变量说明：cancelled 表示当前步骤使用的 cancelled 值。
                 cancelled = True
                 break
+            # 变量说明：remaining 表示当前步骤使用的 remaining 值。
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                # 变量说明：timed_out 表示当前步骤使用的 timed_out 值。
                 timed_out = True
                 break
             try:
@@ -2236,23 +2835,29 @@ def run_command(
             except subprocess.TimeoutExpired:
                 continue
         if cancelled or timed_out:
+            # 变量说明：tree_terminated 表示当前步骤使用的 tree_terminated 值。
             tree_terminated = False
             if os.name == "nt":
                 try:
+                    # 变量说明：killed 表示当前步骤使用的 killed 值。
                     killed = subprocess.run(
                         ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
                         capture_output=True,
                         check=False,
                         timeout=3,
                     )
+                    # 变量说明：tree_terminated 表示当前步骤使用的 tree_terminated 值。
                     tree_terminated = killed.returncode == 0
                 except (OSError, subprocess.TimeoutExpired):
+                    # 变量说明：tree_terminated 表示当前步骤使用的 tree_terminated 值。
                     tree_terminated = False
             else:
                 try:
                     os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    # 变量说明：tree_terminated 表示当前步骤使用的 tree_terminated 值。
                     tree_terminated = True
                 except ProcessLookupError:
+                    # 变量说明：tree_terminated 表示当前步骤使用的 tree_terminated 值。
                     tree_terminated = process.poll() is not None
             try:
                 process.wait(timeout=2)
@@ -2261,10 +2866,13 @@ def run_command(
                 # descendant died, so report the weaker guarantee truthfully.
                 process.kill()
                 process.wait(timeout=2)
+                # 变量说明：tree_terminated 表示当前步骤使用的 tree_terminated 值。
                 tree_terminated = False
+            # 变量说明：tree_terminated 表示当前步骤使用的 tree_terminated 值。
             tree_terminated = tree_terminated and process.poll() is not None
             for reader in readers:
                 reader.join(timeout=2)
+            # 变量说明：partial 表示当前步骤使用的 partial 值。
             partial = "".join(chunks)
             if cancelled:
                 return ToolResult(
@@ -2279,6 +2887,7 @@ def run_command(
                         "security_scope": "current_user_host_permissions",
                     },
                 )
+            # 变量说明：termination_text 表示termination 的文本表示。
             termination_text = "进程树已终止" if tree_terminated else "主进程已终止，但无法确认全部子进程"
             return ToolResult(
                 "run_command",
@@ -2295,7 +2904,9 @@ def run_command(
             )
         for reader in readers:
             reader.join(timeout=2)
+        # 变量说明：combined 表示当前步骤使用的 combined 值。
         combined = "".join(chunks)
+        # 变量说明：content 表示待处理或返回的正文内容。
         content = combined
         return ToolResult(
             "run_command",

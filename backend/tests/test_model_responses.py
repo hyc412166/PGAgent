@@ -1,3 +1,9 @@
+"""验证 Responses 模型适配器对消息、工具调用、推理项、用量和响应续接字段的转换。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
@@ -12,29 +18,37 @@ from src.model.streaming import IncompleteResponse
 from src.model.protocols.responses import input_items, response_tools
 
 
+# 测试替身类：FakeResponses 模拟外部依赖的响应与调用记录，使连接或协议测试无需访问真实服务。
 class FakeResponses:
+    # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
     def __init__(self, streams: list[Callable[[], AsyncIterator[dict[str, Any]]]]) -> None:
         self.streams = streams
         self.requests: list[dict[str, Any]] = []
 
+    # 辅助方法：create 实现测试替身在此调用阶段需要的最小行为。
     async def create(self, **kwargs: Any) -> AsyncIterator[dict[str, Any]]:
         self.requests.append(kwargs)
         return self.streams.pop(0)()
 
 
+# 辅助函数：install_fake_client 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def install_fake_client(
     monkeypatch: pytest.MonkeyPatch,
     streams: list[Callable[[], AsyncIterator[dict[str, Any]]]],
 ) -> FakeResponses:
     responses = FakeResponses(streams)
 
+    # 测试替身类：FakeOpenAI 保存该局部场景的可控状态。
     class FakeOpenAI:
+        # 辅助方法：__init__ 实现测试替身在此调用阶段需要的最小行为。
         def __init__(self, **_kwargs: Any) -> None:
             self.responses = responses
 
+        # 辅助方法：close 实现测试替身在此调用阶段需要的最小行为。
         async def close(self) -> None:
             return None
 
+    # 辅助方法：no_pause 实现测试替身在此调用阶段需要的最小行为。
     async def no_pause(*_args: Any, **_kwargs: Any) -> None:
         return None
 
@@ -44,6 +58,7 @@ def install_fake_client(
     return responses
 
 
+# 辅助函数：responses_config 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def responses_config() -> ProviderConfig:
     return ProviderConfig(
         provider="openai_compatible",
@@ -57,6 +72,7 @@ def responses_config() -> ProviderConfig:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_uses_native_items_and_stateless_request 精确标识本用例的具体条件。
 async def test_responses_uses_native_items_and_stateless_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -68,6 +84,7 @@ async def test_responses_uses_native_items_and_stateless_request(
         "content": [{"type": "output_text", "text": "完成。", "annotations": []}],
     }
 
+    # 辅助方法：stream 实现测试替身在此调用阶段需要的最小行为。
     async def stream() -> AsyncIterator[dict[str, Any]]:
         yield {"type": "response.output_text.delta", "delta": "完成。"}
         yield {"type": "response.output_item.done", "item": output_item}
@@ -140,6 +157,7 @@ async def test_responses_uses_native_items_and_stateless_request(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_responses_replays_only_completed_items_after_stream_disconnect 精确标识本用例的具体条件。
 async def test_responses_replays_only_completed_items_after_stream_disconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -158,10 +176,12 @@ async def test_responses_replays_only_completed_items_after_stream_disconnect(
         "content": [{"type": "output_text", "text": "恢复完成", "annotations": []}],
     }
 
+    # 辅助方法：interrupted 实现测试替身在此调用阶段需要的最小行为。
     async def interrupted() -> AsyncIterator[dict[str, Any]]:
         yield {"type": "response.output_item.done", "item": reasoning_item}
         raise ConnectionError("socket closed")
 
+    # 辅助方法：recovered 实现测试替身在此调用阶段需要的最小行为。
     async def recovered() -> AsyncIterator[dict[str, Any]]:
         yield {"type": "response.output_item.done", "item": message_item}
         yield {
@@ -182,6 +202,7 @@ async def test_responses_replays_only_completed_items_after_stream_disconnect(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_returns_completed_tool_call_without_resampling 精确标识本用例的具体条件。
 async def test_responses_returns_completed_tool_call_without_resampling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -194,6 +215,7 @@ async def test_responses_returns_completed_tool_call_without_resampling(
         "status": "completed",
     }
 
+    # 辅助方法：interrupted 实现测试替身在此调用阶段需要的最小行为。
     async def interrupted() -> AsyncIterator[dict[str, Any]]:
         yield {"type": "response.output_item.done", "item": function_call}
         raise ConnectionError("socket closed")
@@ -208,6 +230,7 @@ async def test_responses_returns_completed_tool_call_without_resampling(
     assert response["usage"]["request_count"] == 1
 
 
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_preserves_native_web_search_tool_definition 精确标识本用例的具体条件。
 def test_responses_preserves_native_web_search_tool_definition() -> None:
     tools = [{
         "type": "web_search",
@@ -239,6 +262,7 @@ def test_responses_preserves_native_web_search_tool_definition() -> None:
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_keeps_hosted_web_search_call_out_of_local_dispatch 精确标识本用例的具体条件。
 async def test_responses_keeps_hosted_web_search_call_out_of_local_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -264,6 +288,7 @@ async def test_responses_keeps_hosted_web_search_call_out_of_local_dispatch(
         }]}],
     }
 
+    # 辅助方法：stream 实现测试替身在此调用阶段需要的最小行为。
     async def stream() -> AsyncIterator[dict[str, Any]]:
         yield {"type": "response.output_item.done", "item": web_search_call}
         yield {"type": "response.output_item.done", "item": message}
@@ -294,6 +319,7 @@ async def test_responses_keeps_hosted_web_search_call_out_of_local_dispatch(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_responses_replays_completed_hosted_call_after_disconnect 精确标识本用例的具体条件。
 async def test_responses_replays_completed_hosted_call_after_disconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -306,10 +332,12 @@ async def test_responses_replays_completed_hosted_call_after_disconnect(
         "content": [{"type": "output_text", "text": "完成。", "annotations": []}],
     }
 
+    # 辅助方法：interrupted 实现测试替身在此调用阶段需要的最小行为。
     async def interrupted() -> AsyncIterator[dict[str, Any]]:
         yield {"type": "response.output_item.done", "item": web_search_call}
         raise ConnectionError("socket closed")
 
+    # 辅助方法：recovered 实现测试替身在此调用阶段需要的最小行为。
     async def recovered() -> AsyncIterator[dict[str, Any]]:
         yield {"type": "response.output_item.done", "item": message}
         yield {"type": "response.completed", "response": {
@@ -337,9 +365,11 @@ async def test_responses_replays_completed_hosted_call_after_disconnect(
     ("off", "auto", None),
     ("high", "compaction", None),
 ])
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_reasoning_effort_respects_thinking_and_compaction 精确标识本用例的具体条件。
 async def test_responses_reasoning_effort_respects_thinking_and_compaction(
     monkeypatch: pytest.MonkeyPatch, level: str, mode: str, expected: dict | None,
 ) -> None:
+    # 辅助方法：stream 实现测试替身在此调用阶段需要的最小行为。
     async def stream():
         yield {"type": "response.completed", "response": {"output": []}}
 
@@ -352,6 +382,7 @@ async def test_responses_reasoning_effort_respects_thinking_and_compaction(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["delta", "partial", "done", "item", "completed"])
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_displays_summary_once_across_completion_events 精确标识本用例的具体条件。
 async def test_responses_displays_summary_once_across_completion_events(
     monkeypatch: pytest.MonkeyPatch, delivery: str,
 ) -> None:
@@ -363,6 +394,7 @@ async def test_responses_displays_summary_once_across_completion_events(
         {"type": "summary_text", "text": "检查条件。"},
     ]}
 
+    # 辅助方法：stream 实现测试替身在此调用阶段需要的最小行为。
     async def stream():
         for current in [item, second]:
             for index, part in enumerate(current["summary"]):
@@ -391,9 +423,11 @@ async def test_responses_displays_summary_once_across_completion_events(
 
 
 @pytest.mark.asyncio
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_responses_encrypted_reasoning_does_not_create_thought_text 精确标识本用例的具体条件。
 async def test_responses_encrypted_reasoning_does_not_create_thought_text(monkeypatch):
     item = {"type": "reasoning", "id": "rs-1", "summary": [], "encrypted_content": "opaque"}
 
+    # 辅助方法：stream 实现测试替身在此调用阶段需要的最小行为。
     async def stream():
         yield {"type": "response.output_item.done", "item": item}
         yield {"type": "response.completed", "response": {"output": [item]}}
@@ -407,9 +441,11 @@ async def test_responses_encrypted_reasoning_does_not_create_thought_text(monkey
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_nonstream_summary_reaches_thought_callback 精确标识本用例的具体条件。
 async def test_responses_nonstream_summary_reaches_thought_callback(monkeypatch):
     fake = install_fake_client(monkeypatch, [])
 
+    # 辅助方法：create 实现测试替身在此调用阶段需要的最小行为。
     async def create(**kwargs):
         return {"status": "completed", "output": [{
             "type": "reasoning", "summary": [{"type": "summary_text", "text": "核对条件。"}],
@@ -424,9 +460,11 @@ async def test_responses_nonstream_summary_reaches_thought_callback(monkeypatch)
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_incomplete_event_is_not_retried 精确标识本用例的具体条件。
 async def test_responses_incomplete_event_is_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # 辅助方法：incomplete 实现测试替身在此调用阶段需要的最小行为。
     async def incomplete() -> AsyncIterator[dict[str, Any]]:
         yield {
             "type": "response.incomplete",
@@ -443,6 +481,7 @@ async def test_responses_incomplete_event_is_not_retried(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["item_done", "completed", "nonstream"])
+# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_responses_sdk_does_not_add_unset_fields_to_native_history 精确标识本用例的具体条件。
 async def test_responses_sdk_does_not_add_unset_fields_to_native_history(monkeypatch, delivery):
     from openai.types.responses import (
         Response, ResponseCompletedEvent, ResponseFunctionToolCall,
@@ -460,6 +499,7 @@ async def test_responses_sdk_does_not_add_unset_fields_to_native_history(monkeyp
     assert reasoning.model_dump()["status"] is None
     response = Response.model_construct(status="completed", output=[reasoning, function])
 
+    # 辅助方法：stream 实现测试替身在此调用阶段需要的最小行为。
     async def stream():
         if delivery == "item_done":
             yield ResponseOutputItemDoneEvent.model_construct(type="response.output_item.done", item=reasoning, output_index=0)
@@ -469,6 +509,7 @@ async def test_responses_sdk_does_not_add_unset_fields_to_native_history(monkeyp
 
     fake = install_fake_client(monkeypatch, [stream])
     if delivery == "nonstream":
+        # 辅助方法：create 实现测试替身在此调用阶段需要的最小行为。
         async def create(**kwargs):
             return response
         monkeypatch.setattr(fake, "create", create)
@@ -482,6 +523,7 @@ async def test_responses_sdk_does_not_add_unset_fields_to_native_history(monkeyp
 
 
 @pytest.mark.parametrize("status", [None, "completed"])
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_legacy_reasoning_status_is_removed_only_from_request 精确标识本用例的具体条件。
 def test_responses_legacy_reasoning_status_is_removed_only_from_request(status):
     from copy import deepcopy
 

@@ -1,3 +1,4 @@
+// 本文件实现 AgentsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { Bot, ChevronRight, LoaderCircle, Pencil, Plus, Trash2, Wrench } from 'lucide-react'
 import { type FormEvent, useState } from 'react'
 import { api, describeError } from '../../api'
@@ -9,10 +10,13 @@ import { useApiData } from '../../shared/hooks/useApiData'
 import { formatDate } from '../../shared/lib/display'
 import type { AgentProfile, SkillCatalogItem, ToolCatalogItem } from '../../types'
 
+// AgentsPage 读取 Agent、工具和技能目录，并完成 Agent 配置的新增、编辑和删除。
 function AgentsPage() {
+  // 三个 useApiData 状态分别提供主体列表及能力选择项；保存后会刷新 agents。
   const agents = useApiData<AgentProfile[]>([], () => api.list<AgentProfile>('/api/agents', ['agents']), [])
   const tools = useApiData<ToolCatalogItem[]>([], () => api.list<ToolCatalogItem>('/api/tools', ['tools']), [])
   const skills = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
+  // 面板/编辑对象控制表单模式，选择数组构成能力关联，busy 与 error 状态负责提交反馈。
   const [panelOpen, setPanelOpen] = useState(false)
   const [editing, setEditing] = useState<AgentProfile | null>(null)
   const [selectedToolIds, setSelectedToolIds] = useState<string[]>([])

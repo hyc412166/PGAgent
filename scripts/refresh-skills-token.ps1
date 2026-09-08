@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
+# 令牌刷新脚本的运行上下文：项目根目录、本地环境文件、Vercel CLI 和超时。
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $LocalEnvironmentFile = Join-Path $ProjectRoot '.env.local'
 $VercelCommand = Get-Command vercel -ErrorAction SilentlyContinue
@@ -14,6 +15,7 @@ if (-not $VercelCommand) {
     throw 'Vercel CLI is unavailable. Install it and run vercel login first.'
 }
 
+# RefreshJob 在后台执行可能阻塞的 Vercel 拉取；参数分别为 CLI、输出文件和工作目录。
 $RefreshJob = Start-Job -ScriptBlock {
     param($VercelPath, $EnvironmentFile, $WorkingDirectory)
     Set-Location -LiteralPath $WorkingDirectory
@@ -22,6 +24,7 @@ $RefreshJob = Start-Job -ScriptBlock {
 } -ArgumentList $VercelCommand.Source, $LocalEnvironmentFile, $ProjectRoot
 
 try {
+    # CompletedJob 为空表示超时；RefreshExitCode 是 Vercel 子进程退出码。
     $CompletedJob = Wait-Job -Job $RefreshJob -Timeout $RefreshTimeoutSeconds
     if (-not $CompletedJob) {
         Stop-Job -Job $RefreshJob -ErrorAction SilentlyContinue

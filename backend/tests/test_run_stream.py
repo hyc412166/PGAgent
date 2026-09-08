@@ -1,3 +1,9 @@
+"""验证运行事件代理的历史回放、生命周期事件发布和跨线程订阅投递。
+
+测试通过 fixture 或辅助函数准备隔离环境，再调用真实服务、路由或运行时，并检查返回值、持久化状态与可观察副作用。
+变量约定：tmp_path/monkeypatch 提供隔离环境，client/store/runtime 驱动被测链路，各类 *_id 串联持久化实体，payload 表示输入，response/result 表示实际输出，expected 表示期望值。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +14,7 @@ from src.runs.stream import RunStreamBroker, TERMINAL_EVENT_TYPES
 
 
 @pytest.mark.asyncio
+# 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_broker_replays_started_events_then_delivers_lifecycle_and_terminal 精确标识本用例的具体条件。
 async def test_broker_replays_started_events_then_delivers_lifecycle_and_terminal() -> None:
     broker = RunStreamBroker(replay_size=8, queue_size=8)
     started = broker.publish("run-1", {"type": "context_prepared", "estimated_tokens": 12})
@@ -32,6 +39,7 @@ async def test_broker_replays_started_events_then_delivers_lifecycle_and_termina
 
 
 @pytest.mark.asyncio
+# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_broker_publish_from_worker_thread_reaches_async_subscriber 精确标识本用例的具体条件。
 async def test_broker_publish_from_worker_thread_reaches_async_subscriber() -> None:
     broker = RunStreamBroker()
     _replay, subscription = broker.subscribe("run-thread")
