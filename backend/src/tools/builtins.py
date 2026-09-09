@@ -20,7 +20,10 @@ import socket
 import subprocess
 import threading
 import time
-from datetime import datetime, timezone
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from html.parser import HTMLParser
@@ -30,6 +33,7 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit, urlunsplit
 
 import httpx
 
+from src.config import settings
 from .sandbox import SandboxViolation, WorkspaceSandbox
 from .types import ApprovalRequest, ToolResult
 
@@ -851,7 +855,7 @@ def _validate_public_http_url(url: str) -> tuple[str, str]:
 # 函数职责：完成 response_peer_is_public 对应的业务处理。
 # 参数关系：response 表示下游返回的响应。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def _response_peer_is_public(response: httpx.Response) -> bool:
+def _response_peer_is_public(response: httpx.Response, *, proxy_configured: bool = False) -> bool:
     """Best-effort second SSRF check against the actual connected peer."""
 
     # 变量说明：stream 表示当前步骤使用的 stream 值。
@@ -865,6 +869,10 @@ def _response_peer_is_public(response: httpx.Response) -> bool:
     if not peer:
         return True
     try:
+        # 通过显式本机代理时，TCP 对端必然是代理地址；目标主机已在
+        # _validate_public_http_url 中完成 DNS 公网校验，不能再把代理误判为 SSRF。
+        if proxy_configured and not _is_public_ip(str(peer[0])):
+            return True
         return _is_public_ip(str(peer[0]))
     except (IndexError, TypeError):
         return False
@@ -1130,6 +1138,39 @@ def _duckduckgo_results(markup: str, limit: int) -> list[tuple[str, str]]:
     return results
 
 
+def _bing_rss_results(markup: str, limit: int) -> list[dict[str, Any]]:
+    """Parse Bing RSS while retaining the evidence fields needed by the model."""
+    try:
+        root = ET.fromstring(markup)
+    except ET.ParseError:
+        return []
+    results: list[dict[str, Any]] = []
+    for item in root.findall('.//item')[:limit]:
+        title = _clean_html_text(item.findtext('title') or '')
+        url = (item.findtext('link') or '').strip()
+        if title and url:
+            description = _clean_html_text(item.findtext('description') or '')
+            published_at: str | None = None
+            raw_date = (item.findtext('pubDate') or '').strip()
+            if raw_date:
+                try:
+                    parsed = parsedate_to_datetime(raw_date)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    published_at = parsed.astimezone(timezone.utc).isoformat()
+                except (TypeError, ValueError, OverflowError):
+                    published_at = None
+            hostname = (urlsplit(url).hostname or '').lower().removeprefix('www.')
+            results.append({
+                "title": title[:500],
+                "url": url[:2_000],
+                "description": description[:2_000],
+                "published_at": published_at,
+                "source": hostname,
+            })
+    return results
+
+
 # 函数职责：完成 web_search 对应的业务处理。
 # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；query 表示当前步骤使用的 query 值；limit 表示当前步骤使用的 limit 值。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
@@ -1138,77 +1179,119 @@ def web_search(
     query: str,
     *,
     limit: int = 5,
+    recency: int | None = None,
+    domains: list[str] | None = None,
 ) -> ToolResult:
-    """Perform a provider-free DuckDuckGo HTML search, or return an honest error."""
+    """Perform a provider-free Bing RSS search with the public-network guard."""
 
     # 变量说明：search_query 表示当前步骤使用的 search_query 值。
     search_query = str(query or "").strip()
     if not search_query or len(search_query) > 500:
         return ToolResult("websearch", False, "query 不能为空或过长", error_code="invalid_query")
+    if not search_query.isascii() or not re.search(r"[A-Za-z]", search_query):
+        return ToolResult(
+            "websearch",
+            False,
+            "搜索查询必须是纯英文（ASCII）文本",
+            error_code="invalid_query_language",
+        )
     # 变量说明：result_limit 表示当前步骤使用的 result_limit 值。
     result_limit = min(max(int(limit), 1), 10)
+    if recency is not None and int(recency) < 0:
+        return ToolResult("websearch", False, "recency 必须是非负整数", error_code="invalid_query")
+    recency_days = int(recency) if recency is not None else None
+    domain_filters = {
+        str(domain).strip().lower().removeprefix("www.")
+        for domain in (domains or [])
+        if str(domain).strip()
+    }
+    provider_query = search_query
+    if domain_filters:
+        provider_query = f"{search_query} ({' OR '.join(f'site:{domain}' for domain in sorted(domain_filters))})"
     try:
-        # 变量说明：search_url 表示search 的访问地址；_host 表示当前步骤使用的 _host 值。
         search_url, _host = _validate_public_http_url(
-            f"https://html.duckduckgo.com/html/?q={quote_plus(search_query)}"
+            f"https://www.bing.com/search?format=rss&q={quote_plus(provider_query)}"
         )
-        with httpx.Client(
-            follow_redirects=False,
-            timeout=httpx.Timeout(15),
-            trust_env=False,
-            headers={"User-Agent": "PGAgent/0.1 (+local search)"},
-        ) as client:
-            # 变量说明：body 表示当前步骤使用的 body 值。
-            body = bytearray()
+        proxy = (
+            settings.web_proxy
+            or os.getenv("HTTPS_PROXY")
+            or os.getenv("https_proxy")
+            or os.getenv("HTTP_PROXY")
+            or os.getenv("http_proxy")
+        )
+        with httpx.Client(timeout=httpx.Timeout(15), follow_redirects=False, trust_env=False,
+                          proxy=proxy or None,
+                          headers={"User-Agent": "PGAgent/0.1 (+local search)"}) as client:
             with client.stream("GET", search_url) as response:
-                if not _response_peer_is_public(response):
+                if not _response_peer_is_public(response, proxy_configured=bool(proxy)):
                     return ToolResult("websearch", False, "连接目标不是公共网络地址", error_code="unsafe_url")
                 response.raise_for_status()
+                body = bytearray()
                 for chunk in response.iter_bytes():
-                    # 变量说明：remaining 表示当前步骤使用的 remaining 值。
                     remaining = MAX_WEB_RESPONSE_BYTES - len(body)
                     if remaining <= 0:
                         break
                     body.extend(chunk[:remaining])
                     if len(chunk) > remaining:
                         break
-                # 变量说明：encoding 表示当前步骤使用的 encoding 值。
                 encoding = response.encoding or "utf-8"
-                # 变量说明：status_code 表示当前步骤使用的 status_code 值。
                 status_code = response.status_code
-        # 变量说明：markup 表示当前步骤使用的 markup 值。
-        markup = bytes(body).decode(encoding, errors="replace")
-    except (UnsafeWebUrlError, WebHostResolutionError, httpx.HTTPError):
-        return ToolResult(
-            "websearch",
-            False,
-            "搜索服务当前不可用",
-            error_code="search_provider_unavailable",
-            metadata={"provider": "duckduckgo_html"},
-        )
+            markup = bytes(body).decode(encoding, errors="replace")
+    except (UnsafeWebUrlError, WebHostResolutionError, httpx.HTTPError, ValueError):
+        return ToolResult("websearch", False, "搜索服务当前不可用", error_code="search_provider_unavailable", metadata={"provider": "bing_rss"})
     # 变量说明：results 表示批量处理结果集合。
-    results = _duckduckgo_results(markup, result_limit)
+    # 先多取一些候选，再应用来源和时效过滤，避免前几条无关结果导致空集。
+    results = _bing_rss_results(markup, max(result_limit, 20))
+    if domain_filters:
+        results = [
+            result for result in results
+            if any(
+                (result.get("source") or "") == domain
+                or (result.get("source") or "").endswith(f".{domain}")
+                for domain in domain_filters
+            )
+        ]
+    if recency_days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=recency_days)
+        recent: list[dict[str, Any]] = []
+        for result in results:
+            published_at = result.get("published_at")
+            if not published_at:
+                continue
+            try:
+                published = datetime.fromisoformat(str(published_at))
+            except ValueError:
+                continue
+            if published >= cutoff:
+                recent.append(result)
+        results = recent
+    results = results[:result_limit]
     if not results:
         return ToolResult(
             "websearch",
             False,
             "搜索服务未返回可解析的公开结果；没有伪造搜索结果。",
             error_code="search_provider_unavailable",
-            metadata={"provider": "duckduckgo_html", "source_status": status_code},
+            metadata={"provider": "bing_rss", "source_status": status_code},
         )
     # 变量说明：lines 表示当前流程使用的 lines 集合。
-    lines = [f"{index}. {title}\n   {url}" for index, (title, url) in enumerate(results, start=1)]
+    lines = [
+        f"{index}. {result['title']}\n   {result['url']}"
+        + (f"\n   {result['description']}" if result.get("description") else "")
+        + (f"\n   发布时间: {result['published_at']}" if result.get("published_at") else "")
+        for index, result in enumerate(results, start=1)
+    ]
     return ToolResult(
         "websearch",
         True,
         "\n".join(lines),
         metadata={
-            "provider": "duckduckgo_html",
+            "provider": "bing_rss",
             "count": len(results),
             "query": search_query,
             "results": [
-                {"ref_id": f"search{index}", "title": title, "url": url}
-                for index, (title, url) in enumerate(results, start=1)
+                {"ref_id": f"search{index}", **result}
+                for index, result in enumerate(results, start=1)
             ],
         },
     )
@@ -1244,18 +1327,23 @@ def web_weather(sandbox: WorkspaceSandbox, *, location: str, days: int = 3) -> T
     # 变量说明：place 表示当前步骤使用的 place 值。
     place = str(location or "").strip()
     if not place or len(place) > 200:
-        return ToolResult("web.run", False, "location 不能为空且不能超过 200 个字符", error_code="invalid_arguments")
+        return ToolResult("web_run", False, "location 不能为空且不能超过 200 个字符", error_code="invalid_arguments")
     # 变量说明：geo 表示当前步骤使用的 geo 值；error 表示当前捕获或准备上报的错误。
     geo, error = _public_json("https://geocoding-api.open-meteo.com/v1/search", params={"name": place, "count": 1, "language": "zh", "format": "json"})
     if error or not isinstance(geo, Mapping) or not geo.get("results"):
-        return ToolResult("web.run", False, "无法找到天气地点", error_code=error or "not_found")
+        return ToolResult("web_run", False, "无法找到天气地点", error_code=error or "not_found")
     # 变量说明：hit 表示当前步骤使用的 hit 值。
     hit = geo["results"][0]
     # 变量说明：forecast 表示当前步骤使用的 forecast 值；error 表示当前捕获或准备上报的错误。
     forecast, error = _public_json("https://api.open-meteo.com/v1/forecast", params={"latitude": hit["latitude"], "longitude": hit["longitude"], "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m", "daily": "temperature_2m_max,temperature_2m_min,weather_code", "forecast_days": min(max(int(days), 1), 7), "timezone": "auto"})
     if error or not isinstance(forecast, Mapping):
-        return ToolResult("web.run", False, "天气服务当前不可用", error_code=error or "network_error")
-    return ToolResult("web.run", True, json.dumps({"location": hit, "forecast": forecast}, ensure_ascii=False), metadata={"provider": "open-meteo"})
+        return ToolResult("web_run", False, "天气服务当前不可用", error_code=error or "network_error")
+    return ToolResult(
+        "web_run",
+        True,
+        json.dumps({"location": hit, "forecast": forecast}, ensure_ascii=False),
+        metadata={"provider": "open-meteo", "source_url": "https://api.open-meteo.com/v1/forecast"},
+    )
 
 
 # 函数职责：完成 web_finance 对应的业务处理。
@@ -1266,18 +1354,18 @@ def web_finance(sandbox: WorkspaceSandbox, *, ticker: str, type: str = "equity")
     # 变量说明：symbol 表示当前步骤使用的 symbol 值。
     symbol = str(ticker or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9.\-^=]{1,20}", symbol):
-        return ToolResult("web.run", False, "ticker 格式无效", error_code="invalid_arguments")
+        return ToolResult("web_run", False, "ticker 格式无效", error_code="invalid_arguments")
     # 变量说明：payload 表示跨层传递的数据载荷；error 表示当前捕获或准备上报的错误。
     payload, error = _public_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(symbol)}", params={"range": "1d", "interval": "5m"})
     if error or not isinstance(payload, Mapping):
-        return ToolResult("web.run", False, "行情服务当前不可用", error_code=error or "network_error")
+        return ToolResult("web_run", False, "行情服务当前不可用", error_code=error or "network_error")
     # 变量说明：result 表示本步骤产生的结果。
     result = ((payload.get("chart") or {}).get("result") or [None])[0]
     if not isinstance(result, Mapping):
-        return ToolResult("web.run", False, "未找到行情数据", error_code="not_found")
+        return ToolResult("web_run", False, "未找到行情数据", error_code="not_found")
     # 变量说明：meta 表示当前步骤使用的 meta 值。
     meta = result.get("meta") or {}
-    return ToolResult("web.run", True, json.dumps({"ticker": symbol, "asset_type": type, "quote": meta}, ensure_ascii=False), metadata={"provider": "yahoo-finance"})
+    return ToolResult("web_run", True, json.dumps({"ticker": symbol, "asset_type": type, "quote": meta}, ensure_ascii=False), metadata={"provider": "yahoo-finance"})
 
 
 # 函数职责：完成 web_sports 对应的业务处理。
@@ -1288,7 +1376,7 @@ def web_sports(sandbox: WorkspaceSandbox, *, league: str, date: str | None = Non
     # 变量说明：competition 表示当前步骤使用的 competition 值。
     competition = str(league or "").strip().lower()
     if not re.fullmatch(r"[a-z0-9._-]{2,20}", competition):
-        return ToolResult("web.run", False, "league 格式无效", error_code="invalid_arguments")
+        return ToolResult("web_run", False, "league 格式无效", error_code="invalid_arguments")
     # 变量说明：params 表示当前流程使用的 params 集合。
     params = {"dates": date} if date else {}
     if team:
@@ -1296,8 +1384,8 @@ def web_sports(sandbox: WorkspaceSandbox, *, league: str, date: str | None = Non
     # 变量说明：payload 表示跨层传递的数据载荷；error 表示当前捕获或准备上报的错误。
     payload, error = _public_json(f"https://site.api.espn.com/apis/site/v2/sports/{competition}/scoreboard", params=params)
     if error or not isinstance(payload, Mapping):
-        return ToolResult("web.run", False, "体育数据服务当前不可用", error_code=error or "network_error")
-    return ToolResult("web.run", True, json.dumps({"league": competition, "events": payload.get("events", [])}, ensure_ascii=False)[:40_000], metadata={"provider": "espn"})
+        return ToolResult("web_run", False, "体育数据服务当前不可用", error_code=error or "network_error")
+    return ToolResult("web_run", True, json.dumps({"league": competition, "events": payload.get("events", [])}, ensure_ascii=False)[:40_000], metadata={"provider": "espn"})
 
 
 # 函数职责：完成 web_screenshot 对应的业务处理。
@@ -1318,9 +1406,9 @@ def web_screenshot(sandbox: WorkspaceSandbox, *, url: str, full_page: bool = Fal
             # 变量说明：data 表示当前处理的数据。
             data = page.screenshot(type="png", full_page=bool(full_page))
             browser.close()
-        return ToolResult("web.run", True, "网页截图已生成", metadata={"mime_type": "image/png", "data_base64": base64.b64encode(data).decode("ascii"), "url": safe_url})
+        return ToolResult("web_run", True, "网页截图已生成", metadata={"mime_type": "image/png", "data_base64": base64.b64encode(data).decode("ascii"), "url": safe_url})
     except (ImportError, Exception) as exc:
-        return ToolResult("web.run", False, f"网页截图不可用: {type(exc).__name__}", error_code="tool_unavailable")
+        return ToolResult("web_run", False, f"网页截图不可用: {type(exc).__name__}", error_code="tool_unavailable")
 
 
 # 函数职责：完成 web_run 对应的业务处理。
@@ -1339,29 +1427,102 @@ def web_run(
     sports: list[Mapping[str, Any]] | None = None,
     time: list[Mapping[str, Any]] | None = None,
     pages: Mapping[str, Any] | None = None,
+    maxItems: int | None = None,
 ) -> ToolResult:
-    """Execute the public Codex web.run command shape using PGAgent primitives."""
+    """Execute the public Codex web_run command shape using PGAgent primitives."""
 
     # 变量说明：stored_pages 表示当前流程使用的 stored_pages 集合。
     stored_pages = dict(pages or {})
+    # 兼容旧模型把数组 schema 的 maxItems 元数据误传为顶层参数；实际
+    # 查询数量仍由 search_items 的运行时上限约束，不把该元数据当搜索命令。
+    del maxItems
     # 变量说明：output 表示当前步骤使用的 output 值。
     output: list[dict[str, Any]] = []
-    for item in search_query or []:
-        # 变量说明：query 表示当前步骤使用的 query 值。
-        query = str(item.get("q") or item.get("query") or "").strip()
-        # 变量说明：result 表示本步骤产生的结果。
-        result = web_search(sandbox, query, limit=int(item.get("limit") or 5))
-        output.append({"type": "search_query", "query": query, "ok": result.ok, "content": result.content})
+    # 变量说明：source_url 表示本轮结果中可安全展示的来源地址。
+    source_url: str | None = None
+    search_items = list(search_query or [])
+    if len(search_items) > 4:
+        return ToolResult("web_run", False, "一次 web_run 最多包含 4 个 search_query", error_code="invalid_command")
+
+    # 先规范化并去重查询，再并发请求；这样可避免模型在同一轮重复消耗搜索配额。
+    unique_searches: list[tuple[str, Mapping[str, Any]]] = []
+    seen_queries: set[str] = set()
+    for item in search_items:
+        query = " ".join(str(item.get("q") or item.get("query") or "").split())
+        if not query or not query.isascii() or not re.search(r"[A-Za-z]", query):
+            return ToolResult(
+                "web_run",
+                False,
+                "搜索查询必须是纯英文（ASCII）文本；请先将用户意图转换为英文关键词",
+                error_code="invalid_query_language",
+            )
+        key = query.casefold()
+        if key in seen_queries:
+            continue
+        seen_queries.add(key)
+        unique_searches.append((query, item))
+
+    def run_search(entry: tuple[str, Mapping[str, Any]]) -> tuple[str, ToolResult]:
+        query, item = entry
+        domains_value = item.get("domains")
+        domains = list(domains_value) if isinstance(domains_value, (list, tuple)) else None
+        result = web_search(
+            sandbox,
+            query,
+            limit=int(item.get("limit") or 5),
+            recency=int(item["recency"]) if item.get("recency") is not None else None,
+            domains=domains,
+        )
+        # 严格来源/时效过滤在 RSS 上容易造成空召回；保留原查询并放宽过滤重试一次。
+        if not result.ok and result.error_code == "search_provider_unavailable" and (domains or item.get("recency") is not None):
+            fallback = web_search(
+                sandbox,
+                query,
+                limit=int(item.get("limit") or 5),
+                recency=None,
+                domains=None,
+            )
+            if fallback.ok:
+                fallback.metadata["fallback"] = "relaxed_filters"
+                fallback.metadata["initial_error_code"] = result.error_code
+                return query, fallback
+        return query, result
+
+    with ThreadPoolExecutor(max_workers=max(1, len(unique_searches))) as executor:
+        search_results = list(executor.map(run_search, unique_searches))
+    existing_search_numbers = [
+        int(str(key)[6:]) for key in stored_pages
+        if str(key).startswith("search") and str(key)[6:].isdigit()
+    ]
+    next_ref = max(existing_search_numbers, default=0) + 1
+    for query, result in search_results:
+        query_results: list[dict[str, Any]] = []
         for hit in result.metadata.get("results", []) if isinstance(result.metadata, Mapping) else []:
+            if not isinstance(hit, Mapping):
+                continue
+            ref_id = f"search{next_ref}"
+            next_ref += 1
+            normalized_hit = {"ref_id": ref_id, **dict(hit)}
+            query_results.append(normalized_hit)
             # 变量说明：stored_pages 的索引项 表示该语句创建或更新的目标数据。
-            stored_pages[str(hit.get("ref_id"))] = hit
+            stored_pages[ref_id] = normalized_hit
+        output.append({
+            "type": "search_query",
+            "query": query,
+            "ok": result.ok,
+            "content": result.content,
+            "results": query_results,
+            "error_code": result.error_code,
+        })
     for item in open or []:
         # 变量说明：ref_id 表示ref 对象的唯一标识。
-        ref_id = str(item.get("ref_id") or item.get("url") or "").strip()
+        ref_id = str(item.get("ref_id") or item.get("ref") or item.get("url") or "").strip()
         # 变量说明：target 表示当前步骤使用的 target 值。
         target = stored_pages.get(ref_id, {})
         # 变量说明：url 表示当前步骤使用的 url 值。
-        url = str(target.get("url") if isinstance(target, Mapping) else target or ref_id)
+        # 空的 stored_pages 条目不能把直接 URL 解析成字符串 "None"。
+        stored_url = target.get("url") if isinstance(target, Mapping) else target
+        url = str(stored_url or ref_id)
         # 变量说明：result 表示本步骤产生的结果。
         result = web_open(
             sandbox,
@@ -1409,7 +1570,12 @@ def web_run(
     for item in weather or []:
         # 变量说明：result 表示本步骤产生的结果。
         result = web_weather(sandbox, location=str(item.get("location") or item.get("city") or ""), days=int(item.get("days") or 3))
-        output.append({"type": "weather", "ok": result.ok, "content": result.content, "error_code": result.error_code})
+        weather_command = {"type": "weather", "ok": result.ok, "content": result.content, "error_code": result.error_code}
+        weather_source = result.metadata.get("source_url") if isinstance(result.metadata, Mapping) else None
+        if isinstance(weather_source, str) and weather_source:
+            weather_command["source_url"] = weather_source
+            source_url = source_url or weather_source
+        output.append(weather_command)
     for item in sports or []:
         # 变量说明：result 表示本步骤产生的结果。
         result = web_sports(sandbox, league=str(item.get("league") or ""), date=item.get("date"), team=item.get("team"))
@@ -1419,8 +1585,21 @@ def web_run(
         result = get_current_time(timezone_name=str(item.get("timezone") or item.get("timezone_name") or "") or None)
         output.append({"type": "time", "ok": result.ok, "content": result.content, "error_code": result.error_code})
     if not output:
-        return ToolResult("web.run", False, "至少提供一个 search_query、open、click 或 find 命令", error_code="invalid_command")
-    return ToolResult("web.run", True, json.dumps(output, ensure_ascii=False)[:40_000], metadata={"commands": output, "pages": stored_pages})
+        return ToolResult("web_run", False, "至少提供一个 search_query、open、click 或 find 命令", error_code="invalid_command")
+    successful_commands = [item for item in output if item.get("ok") is True]
+    if not successful_commands:
+        failure_code = next(
+            (str(item.get("error_code")) for item in output if item.get("error_code")),
+            "tool_execution_failed",
+        )
+        return ToolResult(
+            "web_run",
+            False,
+            json.dumps(output, ensure_ascii=False)[:40_000],
+            error_code=failure_code,
+            metadata={"commands": output, "pages": stored_pages, **({"source_url": source_url} if source_url else {})},
+        )
+    return ToolResult("web_run", True, json.dumps(output, ensure_ascii=False)[:40_000], metadata={"commands": output, "pages": stored_pages, **({"source_url": source_url} if source_url else {})})
 
 
 # 函数职责：规范化 todos 对应的数据或流程。

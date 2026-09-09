@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import httpx
 
@@ -114,7 +115,7 @@ def test_web_run_dispatches_codex_command_families(monkeypatch, tmp_path) -> Non
     ))
     monkeypatch.setattr(builtins, "web_open", lambda *_args, **_kwargs: builtins.ToolResult("web_open", True, "page"))
     for name, value in (("web_finance", "finance"), ("web_weather", "weather"), ("web_sports", "sports"), ("web_screenshot", "shot")):
-        monkeypatch.setattr(builtins, name, lambda *_args, _value=value, **_kwargs: builtins.ToolResult("web.run", True, _value))
+        monkeypatch.setattr(builtins, name, lambda *_args, _value=value, **_kwargs: builtins.ToolResult("web_run", True, _value))
     monkeypatch.setattr(builtins, "get_current_time", lambda **_kwargs: builtins.ToolResult("get_current_time", True, "time"))
     result = builtins.web_run(
         WorkspaceSandbox(tmp_path), search_query=[{"q": "test"}], open=[{"ref_id": "search1"}],
@@ -124,3 +125,178 @@ def test_web_run_dispatches_codex_command_families(monkeypatch, tmp_path) -> Non
     )
     assert result.ok
     assert {item["type"] for item in json.loads(result.content)} == {"search_query", "open", "finance", "weather", "sports", "screenshot", "time"}
+
+
+# 测试场景：web_run 聚合天气结果时保留安全来源地址，供 tool_finished 摘要展示。
+def test_web_run_weather_propagates_source_url(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        builtins,
+        "web_weather",
+        lambda *_args, **_kwargs: builtins.ToolResult(
+            "web_weather", True, "weather payload", metadata={"source_url": "https://api.open-meteo.com/v1/forecast"}
+        ),
+    )
+
+    result = builtins.web_run(WorkspaceSandbox(tmp_path), weather=[{"location": "New York"}])
+
+    assert result.ok
+    assert result.metadata["source_url"] == "https://api.open-meteo.com/v1/forecast"
+    assert json.loads(result.content)[0]["source_url"] == "https://api.open-meteo.com/v1/forecast"
+
+
+# 测试场景：直接使用 open.url 时，空的缓存条目不能把 URL 变成字符串 None。
+def test_web_run_opens_direct_url(monkeypatch, tmp_path) -> None:
+    opened: list[str] = []
+
+    def fake_open(_sandbox, url, **_kwargs):
+        opened.append(url)
+        return builtins.ToolResult("web_open", True, "page")
+
+    monkeypatch.setattr(builtins, "web_open", fake_open)
+    result = builtins.web_run(WorkspaceSandbox(tmp_path), open=[{"url": "https://example.com/story"}])
+
+    assert result.ok
+    assert opened == ["https://example.com/story"]
+
+
+# 测试场景：直接 URL 兼容 Codex 的 ref 字段，避免模型使用别名时被解析成空 URL。
+def test_web_run_accepts_ref_alias_for_open(monkeypatch, tmp_path) -> None:
+    opened: list[str] = []
+
+    def fake_open(_sandbox, url, **_kwargs):
+        opened.append(url)
+        return builtins.ToolResult("web_open", True, "page")
+
+    monkeypatch.setattr(builtins, "web_open", fake_open)
+    result = builtins.web_run(WorkspaceSandbox(tmp_path), open=[{"ref": "https://example.com/story"}])
+
+    assert result.ok
+    assert opened == ["https://example.com/story"]
+
+
+# 测试场景：搜索入口严格拒绝包含中文的查询，模型必须先转换为纯英文再调用联网工具。
+def test_web_run_rejects_non_english_search_query(monkeypatch, tmp_path) -> None:
+    called = False
+
+    def fake_search(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return builtins.ToolResult("websearch", True, "unexpected")
+
+    monkeypatch.setattr(builtins, "web_search", fake_search)
+    result = builtins.web_run(WorkspaceSandbox(tmp_path), search_query=[{"q": "美国 今日 新闻"}])
+
+    assert not result.ok
+    assert result.error_code == "invalid_query_language"
+    assert not called
+
+
+# 测试场景：严格来源/时效约束没有召回结果时，自动用宽泛英文查询重试一次。
+def test_web_run_retries_failed_search_without_strict_filters(monkeypatch, tmp_path) -> None:
+    calls: list[dict] = []
+
+    def fake_search(_sandbox, query, **kwargs):
+        calls.append({"query": query, **kwargs})
+        if len(calls) == 1:
+            return builtins.ToolResult("websearch", False, "no results", error_code="search_provider_unavailable")
+        return builtins.ToolResult(
+            "websearch", True, "hit",
+            metadata={"results": [{"url": "https://example.com/story", "title": "Story"}]},
+        )
+
+    monkeypatch.setattr(builtins, "web_search", fake_search)
+    result = builtins.web_run(
+        WorkspaceSandbox(tmp_path),
+        search_query=[{"q": "latest US news", "recency": 1, "domains": ["reuters.com"]}],
+    )
+
+    assert result.ok
+    assert len(calls) == 2
+    assert calls[0]["recency"] == 1 and calls[0]["domains"] == ["reuters.com"]
+    assert calls[1]["recency"] is None and calls[1]["domains"] is None
+
+
+# 测试场景：一次 web_run 应合并去重查询并把时效、来源约束传给搜索后端。
+def test_web_run_deduplicates_searches_and_preserves_order(monkeypatch, tmp_path) -> None:
+    calls: list[dict] = []
+
+    def fake_search(_sandbox, query, **kwargs):
+        calls.append({"query": query, **kwargs})
+        return builtins.ToolResult(
+            "websearch", True, f"hit:{query}",
+            metadata={"results": [{"ref_id": "search1", "title": query, "url": f"https://example.com/{len(calls)}"}]},
+        )
+
+    monkeypatch.setattr(builtins, "web_search", fake_search)
+    result = builtins.web_run(
+        WorkspaceSandbox(tmp_path),
+        search_query=[
+            {"q": "  latest US news  ", "recency": 1, "domains": ["apnews.com"]},
+            {"q": "latest   US news"},
+            {"q": "second query"},
+        ],
+    )
+
+    assert result.ok
+    assert [item["query"] for item in calls] == ["latest US news", "second query"]
+    assert calls[0]["recency"] == 1
+    assert calls[0]["domains"] == ["apnews.com"]
+    output = json.loads(result.content)
+    assert [item["query"] for item in output] == ["latest US news", "second query"]
+    assert len({ref for ref in result.metadata["pages"]}) == 2
+
+
+# 测试场景：旧模型可能把 schema 的 maxItems 元数据误放到调用参数顶层，兼容入口不能再让整轮搜索失败。
+def test_web_run_accepts_legacy_max_items_alias(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        builtins,
+        "web_search",
+        lambda *_args, **_kwargs: builtins.ToolResult(
+            "websearch", True, "hit", metadata={"results": []}
+        ),
+    )
+
+    result = builtins.web_run(
+        WorkspaceSandbox(tmp_path),
+        search_query=[{"q": "today"}],
+        maxItems=4,
+    )
+
+    assert result.ok
+
+
+# 测试场景：批量搜索全部没有结果时，顶层状态必须反映失败，便于模型触发可观测重试。
+def test_web_run_reports_all_search_failures(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        builtins,
+        "web_search",
+        lambda *_args, **_kwargs: builtins.ToolResult(
+            "websearch", False, "搜索服务当前不可用", error_code="search_provider_unavailable"
+        ),
+    )
+
+    result = builtins.web_run(
+        WorkspaceSandbox(tmp_path),
+        search_query=[{"q": "today"}, {"q": "tomorrow"}],
+    )
+
+    assert not result.ok
+    assert result.error_code == "search_provider_unavailable"
+
+
+# 测试场景：Bing RSS 的发布时间、摘要和来源必须进入结构化搜索结果，以便模型判断新闻时效。
+def test_bing_rss_results_keep_date_description_and_source() -> None:
+    markup = """<?xml version="1.0"?><rss><channel><item>
+      <title>Headline</title><link>https://www.apnews.com/story</link>
+      <description>Summary text</description><pubDate>Wed, 09 Sep 2026 08:20:00 GMT</pubDate>
+    </item></channel></rss>"""
+
+    results = builtins._bing_rss_results(markup, 5)
+
+    assert results == [{
+        "title": "Headline",
+        "url": "https://www.apnews.com/story",
+        "description": "Summary text",
+        "published_at": "2026-09-09T08:20:00+00:00",
+        "source": "apnews.com",
+    }]

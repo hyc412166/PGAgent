@@ -212,7 +212,9 @@
 .durable-task-actions button:disabled { cursor: wait; opacity: .58; }
 
 .completed-thought {
-  border-color: transparent;
+  width: 100%;
+  margin: 8px 0 13px;
+  border: 0;
   background: transparent;
   box-shadow: none;
 }
@@ -396,21 +398,37 @@
 
 .live-phase { color: var(--muted); }
 
-/* Compact progress timeline. Answer text and model reasoning stay in separate
-   typed streams so reasoning can be disclosed without becoming a chat reply. */
-.completed-thought-summary { display: inline-block; max-width: min(340px, 44vw); overflow: hidden; color: var(--muted-2); font-size: 0.5rem; font-weight: 560; text-overflow: ellipsis; white-space: nowrap; }
-.thought-activity-list { display: flex; flex-direction: column; gap: 2px; margin: 1px 0 0 4px; padding: 1px 0 2px 12px; border-left: 1px solid var(--line); }
-.thought-activity { min-height: 24px; display: flex; align-items: flex-start; gap: 7px; min-width: 0; color: var(--muted); }
-.thought-activity-copy { min-width: 0; display: flex; align-items: baseline; gap: 6px; line-height: 1.35; }
-.thought-activity-copy strong { flex: 0 0 auto; color: var(--ink); font-size: 0.5rem; font-weight: 720; line-height: 19px; }
-.thought-activity.is-active .thought-activity-copy strong {
+/* 思考区与最终回答共享正文排版；工具/命令作为可逐层展开的执行轨迹。 */
+.completed-thought-summary { display: none; }
+.completed-thought-toggle,
+.completed-thought-static { min-height: 27px; display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0; color: var(--muted); background: transparent; font-size: .75rem; font-weight: 650; }
+.completed-thought-toggle:hover,
+.completed-thought-toggle:focus-visible { color: var(--ink); background: transparent; outline: none; }
+.completed-thought-toggle:focus-visible { box-shadow: 0 0 0 3px var(--orange-soft); }
+.completed-thought-duration { color: inherit; font-weight: inherit; }
+.completed-thought-chevron { color: var(--muted-2); transition: transform .16s ease; }
+.completed-thought.expanded .completed-thought-chevron { transform: rotate(90deg); }
+.thought-activity-list { display: flex; flex-direction: column; gap: 8px; margin: 5px 0 0; padding: 3px 0 4px; }
+.thought-activity { min-width: 0; display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: start; column-gap: 8px; color: var(--muted); }
+.thought-activity-copy { min-width: 0; flex: 1; line-height: 1.6; }
+.thought-activity-static { min-height: 20px; display: flex; flex-direction: row; align-items: center; gap: 10px; justify-content: space-between; }
+.thought-activity.kind-tool .thought-activity-static { justify-content: flex-start; }
+.thought-activity.kind-tool .thought-activity-static .thought-activity-summary { margin-left: 0; }
+.thought-activity-title { display: block; min-width: max-content; color: var(--ink); font-size: .75rem; font-weight: 400; line-height: 20px; white-space: nowrap; }
+.thought-activity-thought { margin: 0; color: var(--ink); font-size: .75rem; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
+.thought-activity.is-active .thought-activity-title {
   animation: deep-sea-breathe 2s ease-in-out infinite;
   will-change: color, text-shadow, opacity;
 }
-.thought-activity-copy span { min-width: 0; overflow: hidden; color: var(--muted-2); font: 0.5rem/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
-.thought-activity.kind-thought .thought-activity-copy span { overflow: visible; text-overflow: clip; white-space: pre-wrap; overflow-wrap: anywhere; }
-.thought-activity.failed .thought-activity-copy strong { color: var(--red); }
-.thought-activity-icon { width: 19px; height: 19px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 6px; color: var(--muted); background: var(--surface-soft); }
+.thought-activity-toggle { width: 100%; min-width: 0; min-height: 25px; display: flex; align-items: center; gap: 7px; padding: 0; border: 0; color: var(--ink); background: transparent; font: inherit; text-align: left; }
+.thought-activity-toggle > span:first-child { min-width: 0; width: 100%; flex: 1 1 auto; display: flex; flex-direction: row; align-items: center; gap: 10px; overflow: hidden; }
+.thought-activity-summary { min-width: 0; max-width: min(720px, 100%); flex: 1 1 auto; margin-left: auto; overflow: hidden; color: var(--muted-2); font-size: .6875rem; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.thought-activity-toggle:hover { color: var(--ocean-700); }
+.thought-activity-chevron { color: var(--muted-2); transition: transform .16s ease; }
+.thought-activity-toggle[aria-expanded="true"] .thought-activity-chevron { transform: rotate(90deg); }
+.thought-activity-detail { max-height: 260px; margin: 3px 0 5px; padding: 9px 11px; overflow: auto; border: 1px solid var(--line); border-radius: 9px; color: var(--muted); background: var(--surface-soft); font: .6875rem/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.thought-activity.failed .thought-activity-title { color: var(--red); }
+.thought-activity-icon { width: 20px; height: 20px; display: grid; place-items: center; margin-top: 0; align-self: start; border-radius: 6px; color: var(--muted); background: var(--surface-soft); }
 .thought-activity-icon.is-think { color: var(--violet); background: var(--violet-soft); }
 .thought-activity-icon.is-read, .thought-activity-icon.is-search { color: var(--green); background: var(--green-soft); }
 .thought-activity-icon.is-write, .thought-activity-icon.is-shell { color: var(--orange-dark); background: var(--orange-soft); }
@@ -424,15 +442,15 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .thought-activity.is-active .thought-activity-copy strong {
+  .thought-activity.is-active .thought-activity-title {
     animation: none;
     color: #087ca8;
     opacity: 1;
     text-shadow: none;
   }
 }
-.live-thought { margin: 3px 0 5px; }
-.live-thought-toggle { min-height: 23px; display: inline-flex; align-items: center; gap: 3px; padding: 2px 4px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: 0.5rem; font-weight: 700; }
+.live-thought { margin: 8px 0 13px; }
+.live-thought-toggle { min-height: 27px; display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: .75rem; font-weight: 650; }
 .live-thought-toggle:hover, .live-thought-toggle:focus-visible { color: var(--ink); background: var(--surface-soft); outline: none; }
 .live-thought-chevron { color: var(--muted-2); transition: transform .16s ease; }
 .live-thought.expanded .live-thought-chevron { transform: rotate(90deg); }

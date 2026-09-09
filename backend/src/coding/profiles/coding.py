@@ -34,7 +34,7 @@ CODING_PROFILE = WorkflowProfile(
         "validate_baseline",
         "write",
         "write_stdin",
-        "web.run",
+        "web_run",
     }),
     instructions=(
         "## Coding workflow\n"

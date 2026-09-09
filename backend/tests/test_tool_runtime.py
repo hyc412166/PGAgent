@@ -7,14 +7,30 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
 from src.context.window import ContextManager
 from src.context.assembly import COMPACTION_SECTION_TITLES, ContextAssembler, ConversationCompactor
-from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, safe_tool_argument_summary
+from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, safe_tool_argument_summary, safe_tool_result_summary
 from src.tools import create_default_registry
+from src.tools.catalog import BUILTIN_TOOL_IDS
 from src.tools.policy import assess_tool_call
+
+
+# 测试场景：默认能力目录应让完全访问会话直接看到 Codex 风格 web_run，而不是退回工具搜索。
+def test_full_mode_default_catalog_exposes_web_run_without_approval(tmp_path) -> None:
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=list(BUILTIN_TOOL_IDS),
+        permission_mode="full",
+    )
+
+    assert "web_run" in registry.model_visible_tool_names
+    result = registry.execute("web_run", {"time": [{"timezone": "UTC"}]})
+    assert result.ok
+    assert not result.approval_required
 
 
 # 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_registry_exposes_only_selected_tools_and_enforces_permission_modes 精确标识本用例的具体条件。
@@ -105,6 +121,35 @@ def test_timeline_redacts_patch_and_stdin_payloads() -> None:
     )
 
     assert summary == {"arguments": {"patch": "[redacted]", "input": "[redacted]"}}
+
+
+def test_timeline_keeps_safe_search_and_open_details() -> None:
+    summary = safe_tool_argument_summary(
+        "web_run",
+        {"search_query": [{"q": "latest US news"}], "open": [{"ref_id": "https://example.com/story"}]},
+    )
+
+    assert summary["arguments"]["search_query"]["items"] == ["latest US news"]
+    assert summary["arguments"]["open"]["items"] == ["https://example.com/story"]
+    assert safe_tool_result_summary("read", "secret body") == "读取完成（11 字符）"
+    assert safe_tool_result_summary("rg", "2 matches") == "2 matches"
+    assert safe_tool_result_summary(
+        "web_run",
+        '[{"type":"search_query","content":"private page body"}]',
+        {"commands": [{"type": "search_query", "ok": True, "results": [{"url": "https://example.com"}]}]},
+    ) == "搜索完成（1 条结果）"
+
+
+# 测试场景：天气工具的地点和来源地址必须进入安全的用户可见摘要。
+def test_weather_argument_and_result_summaries_keep_location_and_source_url() -> None:
+    assert safe_tool_argument_summary("web_run", {"weather": [{"location": "New York", "days": 1}]}) == {
+        "arguments": {"weather": {"items": ["New York"], "count": 1}}
+    }
+    assert safe_tool_result_summary(
+        "web_run",
+        "weather payload",
+        {"source_url": "https://api.open-meteo.com/v1/forecast"},
+    ) == "来源：https://api.open-meteo.com/v1/forecast"
 
 
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_smart_mode_allows_routine_code_edits_but_escalates_sensitive_or_broad_writes 精确标识本用例的具体条件。
@@ -451,6 +496,30 @@ async def test_question_stops_for_input_without_claiming_completion(tmp_path) ->
     assert isinstance(finished["duration_ms"], int)
     assert tool_started["tool_name"] == "question"
     assert "thought_duration_ms" in tool_started
+
+
+@pytest.mark.asyncio
+# 测试场景：首轮真实模型消息必须包含运行时日期注入，避免模型沿用过期日期。
+async def test_initial_model_context_includes_runtime_date(tmp_path) -> None:
+    model_messages: list[dict] = []
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        model_messages.extend(kwargs["messages"])
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+    )
+    outcome = await runtime.run(
+        system_prompt="rules",
+        agent_instructions="instructions",
+        recent_messages=[{"role": "user", "content": "what is today's date?"}],
+    )
+
+    assert outcome.status == "completed"
+    rendered = "\n".join(str(item.get("content") or "") for item in model_messages)
+    assert re.search(r"<current_date>\d{4}-\d{2}-\d{2}</current_date>", rendered)
 
 
 @pytest.mark.asyncio

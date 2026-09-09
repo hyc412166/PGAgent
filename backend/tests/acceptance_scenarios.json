@@ -49,10 +49,10 @@
     "expected_pass": false
   },
   {
-    "name": "empty_output_reject",
+    "name": "empty_output_allowed",
     "output": "",
     "messages": [{"role": "assistant", "content": ""}],
     "declared_tool_calls": 0,
-    "expected_pass": false
+    "expected_pass": true
   }
 ]

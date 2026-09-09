@@ -1354,6 +1354,7 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
                     "changed": False,
                     "duration_ms": 5,
                     "elapsed_ms": 25,
+                    "result_summary": "来源：https://api.open-meteo.com/v1/forecast",
                     "output": "private tool output",
                     "messages": [{"content": "private"}],
                 },
@@ -1395,6 +1396,7 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
         "ok": True,
         "tool_name": "read",
         "tool_call_id": "call-1",
+        "result_summary": "来源：https://api.open-meteo.com/v1/forecast",
     }
     thought = events_by_type["thought_summary"]["payload"]
     assert thought["complete"] is True
@@ -1580,6 +1582,35 @@ def test_run_event_post_uses_safe_projection_and_rejects_private_events(client: 
 
     with database.SessionLocal() as db:
         assert db.query(database.RunEvent).filter_by(run_id=run_id).count() == 1
+
+
+# 测试场景：模型失败事件向前端公开稳定错误标识，但不公开供应商原始错误正文。
+def test_model_failure_event_exposes_only_safe_provider_identifiers(client: TestClient) -> None:
+    sentinel = "SUPER_SECRET_PROVIDER_BODY"
+    run_id = client.post("/api/runs", json={}).json()["id"]
+
+    response = client.post(
+        f"/api/runs/{run_id}/events",
+        json={
+            "event_type": "model_failed",
+            "payload": {
+                "error_kind": "invalid_request",
+                "error_type": "IncompleteResponse",
+                "provider_error_code": "invalid_prompt",
+                "provider_error_type": "invalid_request_error",
+                "message": sentinel,
+            },
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["payload"] == {
+        "error_kind": "invalid_request",
+        "error_type": "IncompleteResponse",
+        "provider_error_code": "invalid_prompt",
+        "provider_error_type": "invalid_request_error",
+    }
+    assert sentinel.encode() not in response.content
 
 
 @pytest.mark.parametrize("run_status", ["received", "awaiting_approval"])

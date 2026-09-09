@@ -13,6 +13,7 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -49,11 +50,22 @@ logger = logging.getLogger(__name__)
 _DIAGNOSTIC_EVENT_FIELDS = frozenset({
     "step", "elapsed_ms", "monotonic_ms", "duration_ms", "thought_duration_ms",
     "tool_name", "tool_call_id", "ok", "changed", "error_code", "error_type",
-    "error_kind", "status_code", "retryable", "retry_exhausted",
+    "error_kind", "provider_error_code", "provider_error_type", "status_code", "retryable", "retry_exhausted",
     "retry_attempt_count", "source_count", "attempt", "phase", "child_run_id",
     "background_job_id", "pending_approval", "accepted", "complete",
     "input_tokens", "output_tokens",
 })
+
+
+def _safe_provider_error_identifiers(error: BaseException) -> dict[str, str]:
+    """仅保留可用于分类的短标识符，避免把供应商响应正文写入运行事件。"""
+
+    identifiers: dict[str, str] = {}
+    for field_name in ("provider_error_code", "provider_error_type"):
+        value = getattr(error, field_name, None)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", value):
+            identifiers[field_name] = value
+    return identifiers
 
 
 # 变量说明：USAGE_COUNTER_KEYS 表示USAGE_COUNTER_KEYS 集合。
@@ -161,6 +173,17 @@ def safe_tool_argument_summary(tool_name: str, arguments: Mapping[str, Any] | No
             # 变量说明：summary 的索引项 表示该语句创建或更新的目标数据。
             summary[key] = {"count": len(value)}
             continue
+        if key in {"search_query", "open", "click", "find", "weather"} and isinstance(value, list):
+            items: list[str] = []
+            for item in value[:3]:
+                if not isinstance(item, Mapping):
+                    continue
+                fields = ("location", "city", "q", "query", "url", "ref_id", "pattern", "id")
+                detail = next((item.get(field) for field in fields if item.get(field)), "")
+                if detail:
+                    items.append(_safe_argument_text(detail, 320))
+            summary[key] = {"items": items, "count": len(value)}
+            continue
         if isinstance(value, str):
             # 变量说明：summary 的索引项 表示该语句创建或更新的目标数据。
             summary[key] = {"text": _safe_argument_text(value), "chars": len(value)} if key in {"query", "pattern", "question", "task"} else value[:300]
@@ -179,6 +202,39 @@ def safe_tool_argument_summary(tool_name: str, arguments: Mapping[str, Any] | No
     # ``tool_name`` is emitted as a top-level event field by the caller; keep
     # this helper limited to the non-sensitive argument summary.
     return {"arguments": summary}
+
+
+def safe_tool_result_summary(tool_name: str, content: object, metadata: Mapping[str, Any] | None = None) -> str:
+    """Return a bounded, redacted result line for the user-facing activity detail."""
+    name = str(tool_name or '').casefold()
+    source_url = metadata.get("source_url") if isinstance(metadata, Mapping) else None
+    if isinstance(source_url, str) and urlsplit(source_url).scheme in {"http", "https"}:
+        return f"来源：{urlsplit(source_url)._replace(query='', fragment='').geturl()}"
+    if name == "web_run":
+        commands = metadata.get("commands") if isinstance(metadata, Mapping) else None
+        if isinstance(commands, list):
+            summaries: list[str] = []
+            for command in commands[:8]:
+                if not isinstance(command, Mapping):
+                    continue
+                command_type = str(command.get("type") or "").casefold()
+                if command_type == "search_query":
+                    results = command.get("results")
+                    count = len(results) if isinstance(results, list) else 0
+                    summaries.append(f"搜索完成（{count} 条结果）")
+                elif command_type == "open":
+                    summaries.append("打开完成" if command.get("ok") is True else "打开失败")
+                elif command_type == "weather":
+                    summaries.append("天气查询完成" if command.get("ok") is True else "天气查询失败")
+                elif command_type:
+                    summaries.append(f"{command_type}完成" if command.get("ok") is True else f"{command_type}失败")
+            if summaries:
+                return " · ".join(summaries)
+        return "执行完成"
+    text = str(content or '')
+    if name in {'read', 'read_file', 'read_artifact'}:
+        return f'读取完成（{len(text)} 字符）'
+    return _safe_argument_text(text, 480) or '执行完成'
 
 
 # 函数职责：完成 safe_approval_request_summary 对应的智能体处理。
@@ -676,6 +732,11 @@ class AgentRuntime:
                 "on_delta" in model_signature.parameters
                 or accepts_var_kwargs
             )
+            # 模型协议会按增量提供 provider reasoning；该字段仅用于协议续接，不直接展示。
+            self._model_accepts_thought_delta = (
+                "on_thought_delta" in model_signature.parameters
+                or accepts_var_kwargs
+            )
             # 变量说明：_model_accepts_activity 表示当前步骤使用的 _model_accepts_activity 值。
             self._model_accepts_activity = (
                 "on_activity" in model_signature.parameters
@@ -690,6 +751,7 @@ class AgentRuntime:
         except (TypeError, ValueError):
             # 变量说明：_model_accepts_delta 表示当前步骤使用的 _model_accepts_delta 值。
             self._model_accepts_delta = False
+            self._model_accepts_thought_delta = False
             # 变量说明：_model_accepts_activity 表示当前步骤使用的 _model_accepts_activity 值。
             self._model_accepts_activity = False
             # 变量说明：_model_accepts_prompt_cache_key 表示当前步骤使用的 _model_accepts_prompt_cache_key 值。
@@ -990,7 +1052,21 @@ class AgentRuntime:
             # 变量说明：auto_rule 表示当前步骤使用的 auto_rule 值。
             auto_rule = "根据任务复杂度自行决定是否先在内部规则中规划；简单任务可直接执行。"
             # 变量说明：rendered 表示当前步骤使用的 rendered 值。
+            local_now = datetime.now().astimezone()
+            environment_context = (
+                "<environment_context>\n"
+                f"  <current_date>{local_now.date().isoformat()}</current_date>\n"
+                f"  <utc_offset>{local_now.strftime('%z')}</utc_offset>\n"
+                "</environment_context>"
+            )
             rendered = f"{instructions}\n{auto_rule}" if instructions else auto_rule
+            rendered = (
+                f"{rendered}\n"
+                "联网搜索规则：search_query 的 q 必须是纯 ASCII 英文；不要把中文原句、"
+                "未确认的月份或年份直接写入查询。当前日期只能以 environment_context 中的 "
+                "current_date 为准；优先使用宽泛英文关键词，避免 site:、完整日期和精确引号的组合。"
+            )
+            rendered = f"{rendered}\n{environment_context}"
             # 变量说明：skill_catalog 表示当前步骤使用的 skill_catalog 值。
             skill_catalog = self.tool_registry.skill_catalog_prompt
             if skill_catalog:
@@ -1271,27 +1347,8 @@ class AgentRuntime:
                     affected_call_ids=protocol_repair["affected_call_ids"],
                     affected_call_count=len(protocol_repair["affected_call_ids"]),
                 )
-            # 变量说明：instructions 表示instructions 集合。
-            instructions = context.get("agent_instructions")
-            # 变量说明：auto_rule 表示当前步骤使用的 auto_rule 值。
-            auto_rule = "根据任务复杂度自行决定是否先在内部规划；简单任务可直接执行。"
-            # 变量说明：instructions 表示instructions 集合。
-            instructions = f"{instructions}\n{auto_rule}" if instructions else auto_rule
-            # 变量说明：skill_catalog 表示当前步骤使用的 skill_catalog 值。
-            skill_catalog = self.tool_registry.skill_catalog_prompt
-            if skill_catalog:
-                # 变量说明：instructions 表示instructions 集合。
-                instructions = f"{instructions}\n{skill_catalog}"
-            # 变量说明：deferred_tool_catalog 表示当前步骤使用的 deferred_tool_catalog 值。
-            deferred_tool_catalog = self.tool_registry.deferred_tool_catalog_prompt
-            if deferred_tool_catalog:
-                # 变量说明：instructions 表示instructions 集合。
-                instructions = f"{instructions}\n{deferred_tool_catalog}"
-            # 变量说明：workflow_prompt 表示当前步骤使用的 workflow_prompt 值。
-            workflow_prompt = self.tool_registry.workflow_prompt
-            if workflow_prompt:
-                # 变量说明：instructions 表示instructions 集合。
-                instructions = f"{instructions}\n{workflow_prompt}"
+            # 统一复用模型请求实际使用的动态指令，确保日期与搜索规则不会因重复拼装而丢失。
+            instructions = render_instructions(context)
             # 变量说明：extra_messages 表示extra_messages 集合。
             extra_messages = [{"role": "system", "content": instructions}]
             if str(context.get("memory_index") or "").strip():
@@ -1519,12 +1576,18 @@ class AgentRuntime:
                         await on_activity()
                         if self.completion_verifier is not None:
                             buffered_candidate_deltas.append(delta)
+                            # 验收前不提交最终回答，但实时展示模型进度，避免思考整段延迟出现。
+                            await self._publish_transient("thought_delta", delta=delta, step=guard.steps)
                             return
                         await self._publish_transient(
                             "assistant_delta",
                             delta=delta,
                             step=guard.steps,
                         )
+
+                    async def on_thought_delta(delta: str) -> None:
+                        # provider reasoning summary 属于模型内部摘要，仅用于组装下一轮请求，不进入用户可见时间线。
+                        await on_activity()
 
                     # 变量说明：step_context 表示当前步骤使用的 step_context 值。
                     step_context = AgentStepContext(
@@ -1550,6 +1613,8 @@ class AgentRuntime:
                     if self._model_accepts_delta:
                         # 变量说明：kwargs 的索引项 表示该语句创建或更新的目标数据。
                         kwargs["on_delta"] = on_delta
+                    if self._model_accepts_thought_delta:
+                        kwargs["on_thought_delta"] = on_thought_delta
                     if self._model_accepts_activity:
                         # 变量说明：kwargs 的索引项 表示该语句创建或更新的目标数据。
                         kwargs["on_activity"] = on_activity
@@ -1674,11 +1739,13 @@ class AgentRuntime:
                 status_code = status_code_from_error(exc)
                 # 变量说明：retryable 表示当前步骤使用的 retryable 值。
                 retryable = is_retryable_api_error(exc)
+                provider_error_identifiers = _safe_provider_error_identifiers(exc)
                 failed["events"] = await self._publish(
                     failed,
                     "model_failed",
                     error_type=type(exc).__name__,
                     error_kind=classify_api_error(exc).value,
+                    **provider_error_identifiers,
                     status_code=status_code,
                     retryable=retryable,
                     retry_exhausted=retryable and retry_attempt_count > 0,
@@ -2263,6 +2330,7 @@ class AgentRuntime:
                     ok=result.ok,
                     changed=result.changed,
                     error_code=result.error_code,
+                    result_summary=safe_tool_result_summary(call.name, result.content, result.metadata),
                     duration_ms=round((self.clock() - tool_started_at) * 1000),
                     elapsed_ms=round((self.clock() - active_started_at) * 1000),
                 )
@@ -2665,6 +2733,7 @@ class AgentRuntime:
             ok=result.ok,
             changed=result.changed,
             error_code=result.error_code,
+            result_summary=safe_tool_result_summary(tool_name, result.content, result.metadata),
             duration_ms=round((self.clock() - tool_started_at) * 1000),
             elapsed_ms=elapsed_ms(),
         )

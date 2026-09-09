@@ -297,6 +297,100 @@ def test_model_failure_status_code_is_preserved_for_classification(
         assert "private upstream response" not in reply.content
 
 
+# 测试场景：Responses 流式重试耗尽后应明确归类为模型服务不可用，而不是 Agent 内部错误。
+def test_stream_interrupted_failure_is_classified_as_model_unavailable(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+    outcome = RunOutcome(
+        status="failed",
+        output=None,
+        messages=[],
+        transcript_delta=[],
+        events=[{
+            "type": "model_failed",
+            "error_type": "StreamInterrupted",
+            "retryable": True,
+            "retry_exhausted": True,
+        }],
+        error="StreamInterrupted",
+        steps=1,
+        tool_calls=0,
+    )
+
+    RunCoordinator._persist_outcome(run_id, outcome)
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.error_code == "model_unavailable"
+        reply = db.scalar(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+        ))
+        assert reply is not None
+        assert "模型服务暂时不可用" in reply.content
+
+
+@pytest.mark.parametrize(
+    ("provider_error_code", "error_kind", "expected_code", "expected_message"),
+    [
+        ("rate_limit_exceeded", "rate_limit", "model_rate_limited", "模型服务当前请求过多"),
+        ("vector_store_timeout", "timeout", "model_timeout", "模型服务响应超时"),
+        ("max_output_tokens", "unknown", "model_output_limit", "模型输出达到长度上限"),
+        ("content_filter", "unknown", "model_content_filtered", "模型输出被内容安全策略阻止"),
+        ("bio_policy", "invalid_request", "model_content_filtered", "模型输出被内容安全策略阻止"),
+        ("invalid_prompt", "invalid_request", "model_input_error", "模型服务无法处理本次输入内容"),
+        (
+            "data_residency_mismatch",
+            "invalid_request",
+            "model_data_residency_error",
+            "模型服务的数据驻留配置与本次请求不匹配",
+        ),
+        ("vendor_specific_failure", "unknown", "model_provider_error", "模型服务返回了无法识别的错误"),
+    ],
+)
+# 测试场景：模型返回的稳定错误码必须映射为明确用户提示，同时不泄露供应商原始正文。
+def test_provider_response_errors_have_specific_public_messages(
+    accepted_run: tuple[str, str],
+    provider_error_code: str,
+    error_kind: str,
+    expected_code: str,
+    expected_message: str,
+) -> None:
+    run_id, session_id = accepted_run
+    outcome = RunOutcome(
+        status="failed",
+        output=None,
+        messages=[],
+        transcript_delta=[],
+        events=[{
+            "type": "model_failed",
+            "error_type": "IncompleteResponse",
+            "error_kind": error_kind,
+            "provider_error_code": provider_error_code,
+            "retryable": error_kind in {"rate_limit", "timeout", "server"},
+            "retry_exhausted": error_kind in {"rate_limit", "timeout", "server"},
+        }],
+        error="private provider response body",
+        steps=1,
+        tool_calls=0,
+    )
+
+    RunCoordinator._persist_outcome(run_id, outcome)
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.error_code == expected_code
+        assert "private provider response body" not in str(run.error_message)
+        reply = db.scalar(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+        ))
+        assert reply is not None
+        assert expected_message in reply.content
+        assert "private provider response body" not in reply.content
+
+
 # 测试场景：验证失败会保留可诊断信息并收敛为一致、可恢复的状态；函数名 test_parent_failure_fallback_summarizes_mixed_delegated_results 精确标识本用例的具体条件。
 def test_parent_failure_fallback_summarizes_mixed_delegated_results(
     accepted_run: tuple[str, str],

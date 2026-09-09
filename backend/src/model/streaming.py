@@ -17,10 +17,19 @@ class StreamInterrupted(ConnectionError):
     # 函数职责：初始化实例依赖与初始状态。
     # 参数关系：message 表示当前消息；completed_items 表示当前流程使用的 completed_items 集合。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-    def __init__(self, message: str, *, completed_items: list[dict] | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        completed_items: list[dict] | None = None,
+        provider_error_code: str | None = None,
+        provider_error_type: str | None = None,
+    ):
         super().__init__(message)
         # 变量说明：completed_items 表示当前流程使用的 completed_items 集合。
         self.completed_items = list(completed_items or [])
+        self.provider_error_code = str(provider_error_code or "").strip() or None
+        self.provider_error_type = str(provider_error_type or "").strip() or None
 
 
 # 类职责：定义 IncompleteResponse 的跨层数据契约。
@@ -28,6 +37,17 @@ class StreamInterrupted(ConnectionError):
 class IncompleteResponse(RuntimeError):
     # 变量说明：retryable 表示当前步骤使用的 retryable 值。
     retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_error_code: str | None = None,
+        provider_error_type: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider_error_code = str(provider_error_code or "").strip() or None
+        self.provider_error_type = str(provider_error_type or "").strip() or None
 
 
 # 函数职责：异步流式传输 events 对应的数据或流程。

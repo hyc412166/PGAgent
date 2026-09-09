@@ -33,6 +33,30 @@ class APIErrorKind(StrEnum):
     UNKNOWN = "unknown"
 
 
+_PROVIDER_RATE_LIMIT_CODES = {"rate_limit_exceeded"}
+_PROVIDER_SERVER_CODES = {"server_error", "server_is_overloaded"}
+_PROVIDER_TIMEOUT_CODES = {"vector_store_timeout"}
+_PROVIDER_INVALID_REQUEST_CODES = {
+    "bio_policy",
+    "data_residency_mismatch",
+    "empty_image_file",
+    "failed_to_download_image",
+    "image_content_policy_violation",
+    "image_file_not_found",
+    "image_file_too_large",
+    "image_parse_error",
+    "image_too_large",
+    "image_too_small",
+    "invalid_base64_image",
+    "invalid_image",
+    "invalid_image_format",
+    "invalid_image_mode",
+    "invalid_image_url",
+    "invalid_prompt",
+    "unsupported_image_media_type",
+}
+
+
 
 # 从异常本身或其 response 对象提取 HTTP 状态码；无法转换时返回 None。
 # 函数职责：完成 status_code_from_error 对应的智能体处理。
@@ -60,6 +84,19 @@ def status_code_from_error(error: BaseException) -> int | None:
 # 参数关系：error 表示当前异常。
 # 返回关系：结果用于更新运行状态、形成模型输入或发送给上层调用方。
 def classify_api_error(error: BaseException) -> APIErrorKind:
+    provider_code = str(getattr(error, "provider_error_code", None) or "").casefold()
+    provider_type = str(getattr(error, "provider_error_type", None) or "").casefold()
+    if provider_code in _PROVIDER_RATE_LIMIT_CODES or provider_type == "rate_limit_error":
+        return APIErrorKind.RATE_LIMIT
+    if provider_code in _PROVIDER_TIMEOUT_CODES:
+        return APIErrorKind.TIMEOUT
+    if (
+        provider_code in _PROVIDER_SERVER_CODES
+        or provider_type in {"server_error", "service_unavailable_error"}
+    ):
+        return APIErrorKind.SERVER
+    if provider_code in _PROVIDER_INVALID_REQUEST_CODES or provider_type == "invalid_request_error":
+        return APIErrorKind.INVALID_REQUEST
     # 变量说明：status 表示status 集合。
     status = status_code_from_error(error)
     if status in {401, 403}:

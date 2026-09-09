@@ -13,6 +13,7 @@ import pytest
 
 from src.model import gateway as model_gateway
 from src.model.gateway import ModelConfigurationError, ProviderConfig, _litellm_model, bind_attachment_store, build_model_call
+from src.model.streaming import IncompleteResponse
 
 
 # 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_gateway_keeps_namespaced_openrouter_models_on_openrouter 精确标识本用例的具体条件。
@@ -262,6 +263,35 @@ async def test_gateway_aggregates_streamed_text_and_usage(monkeypatch: pytest.Mo
     assert response["usage"]["output_tokens"] == 2
     assert response["usage"]["cost_usd"] == 0.01
     assert deltas == ["hello ", "world"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter"])
+# 测试场景：Chat Completions 的未完成原因必须作为稳定错误码进入统一交付分类。
+async def test_gateway_preserves_incomplete_finish_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    finish_reason: str,
+) -> None:
+    async def chunks():  # type: ignore[no-untyped-def]
+        yield {"choices": [{"delta": {}, "finish_reason": finish_reason}]}
+
+    async def fake_completion(**_kwargs):  # type: ignore[no-untyped-def]
+        return chunks()
+
+    monkeypatch.setattr(model_gateway, "get_api_key", lambda _ref: "secret")
+    monkeypatch.setattr(model_gateway.litellm, "acompletion", fake_completion)
+    call = build_model_call(ProviderConfig(
+        provider="openai_compatible",
+        base_url="https://relay.test/v1",
+        secret_ref="credential:test",
+        model_id="custom-model",
+    ))
+
+    with pytest.raises(IncompleteResponse) as captured:
+        await call(messages=[], tools=[], mode="auto")
+
+    expected_code = "max_output_tokens" if finish_reason == "length" else "content_filter"
+    assert captured.value.provider_error_code == expected_code
 
 
 @pytest.mark.asyncio

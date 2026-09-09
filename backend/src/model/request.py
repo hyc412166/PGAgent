@@ -78,7 +78,8 @@ def create_model_call(config: ProviderConfig, *, credentials):
                     }
                     if config.thinking_level not in {"off", "auto", ""} and mode != "compaction":
                         # 变量说明：kwargs 的索引项 表示该语句创建或更新的目标数据。
-                        kwargs["reasoning"] = {"effort": config.thinking_level}
+                        # 请求摘要级 reasoning，Responses 才会发送可展示的增量摘要事件。
+                        kwargs["reasoning"] = {"effort": config.thinking_level, "summary": "auto"}
                     if prompt_cache_key:
                         # 变量说明：kwargs 的索引项 表示该语句创建或更新的目标数据。
                         kwargs["prompt_cache_key"] = prompt_cache_key
@@ -96,7 +97,10 @@ def create_model_call(config: ProviderConfig, *, credentials):
                             # 变量说明：raw 表示当前步骤使用的 raw 值。
                             raw = _as_mapping(stream, exclude_unset=True)
                             if raw.get("status") != "completed":
-                                raise IncompleteResponse("Responses 返回了未完成的响应")
+                                raise responses.response_failure_error(
+                                    raw,
+                                    f"response.{str(raw.get('status') or 'unknown')}",
+                                )
                             # 变量说明：payload 表示跨层传递的数据载荷。
                             payload = responses.project_items(raw.get("output") or [], raw.get("usage"))
                             await _emit_delta(on_thought_delta, payload["reasoning_content"])
@@ -119,7 +123,13 @@ def create_model_call(config: ProviderConfig, *, credentials):
                         # 变量说明：finish 表示当前步骤使用的 finish 值。
                         finish = (payload.get("choices") or [{}])[0].get("finish_reason")
                         if finish not in {"stop", "tool_calls", "function_call"}:
-                            raise IncompleteResponse(f"模型响应未完整结束：{finish}")
+                            provider_error_code = (
+                                "max_output_tokens" if finish == "length" else str(finish or "unknown_finish_reason")
+                            )
+                            raise IncompleteResponse(
+                                f"模型响应未完整结束：{finish}",
+                                provider_error_code=provider_error_code,
+                            )
                         await _emit_delta(on_thought_delta, _assistant_reasoning(payload))
                         await _emit_delta(on_delta, _assistant_content(payload))
                     # 变量说明：normalized 表示当前步骤使用的 normalized 值。

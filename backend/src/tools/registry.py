@@ -239,7 +239,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "websearch": {
-        "description": "使用公开 DuckDuckGo HTML 搜索；服务不可用时会明确返回错误而不编造结果。",
+        "description": "使用 Bing RSS 公开搜索；查询必须为纯英文 ASCII，服务不可用时会明确返回错误而不编造结果。",
         "parameters": {
             "type": "object",
             "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
@@ -415,12 +415,25 @@ TOOL_SCHEMAS["web_open"] = {
     },
 }
 # 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
-TOOL_SCHEMAS["web.run"] = {
+TOOL_SCHEMAS["web_run"] = {
     "description": "Codex 风格联网工具；在一次调用中执行搜索、打开、查找、截图、财经、天气、体育或时间查询。",
     "parameters": {
         "type": "object",
         "properties": {
-            "search_query": {"type": "array", "items": {"type": "object"}},
+            "search_query": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "q": {"type": "string", "minLength": 1, "maxLength": 500},
+                        "query": {"type": "string", "minLength": 1, "maxLength": 500},
+                        "recency": {"type": "integer", "minimum": 0},
+                        "domains": {"type": "array", "items": {"type": "string"}},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                    },
+                    "anyOf": [{"required": ["q"]}, {"required": ["query"]}],
+                },
+            },
             "open": {"type": "array", "items": {"type": "object"}},
             "click": {"type": "array", "items": {"type": "object"}},
             "find": {"type": "array", "items": {"type": "object"}},
@@ -449,7 +462,7 @@ PUBLIC_TOOL_NAMES: tuple[str, ...] = (
     "rg",
     "web_search",
     "web_open",
-    "web.run",
+    "web_run",
     "task",
     "update_plan",
     "tool_search",
@@ -476,7 +489,7 @@ _GENERAL_DIRECT_TOOL_NAMES = frozenset({
     "read_artifact",
     "glob",
     "rg",
-    "web.run",
+    "web_run",
     "apply_patch",
     "update_plan",
     "task",
@@ -487,7 +500,7 @@ _GENERAL_DIRECT_TOOL_NAMES = frozenset({
 # directly available even when a custom workflow selects the deferred-tool
 # discovery surface.
 # 变量说明：_CORE_DIRECT_TOOL_NAMES 表示当前流程使用的 _CORE_DIRECT_TOOL_NAMES 集合。
-_CORE_DIRECT_TOOL_NAMES = frozenset({"web.run"})
+_CORE_DIRECT_TOOL_NAMES = frozenset({"web_run"})
 
 # A provider batch containing only these tools is safe to execute concurrently:
 # none mutates workspace/runtime state and result ordering is restored to the
@@ -790,7 +803,7 @@ class ToolRegistry:
             "websearch": builtins.web_search,
             "web_search": builtins.web_search,
             "web_open": builtins.web_open,
-            "web.run": builtins.web_run,
+            "web_run": builtins.web_run,
             "task": lambda sandbox, **kwargs: builtins.delegate_task(sandbox, delegate=self._task_delegate, **kwargs),
             "todowrite": lambda sandbox, todos: self._write_todos(sandbox, todos),
             "update_plan": lambda sandbox, todos: self._write_todos(sandbox, todos),

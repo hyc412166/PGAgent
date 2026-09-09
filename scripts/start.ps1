@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 # 启动脚本变量：项目根目录、后端解释器、前端构建产物、本地环境文件和服务地址。
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path

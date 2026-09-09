@@ -50,7 +50,7 @@ export const agentTemplates: AgentTemplate[] = [
     description: '将开放问题拆成检索、交叉验证和可引用结论。',
     systemPrompt: '你是一名研究分析师。把问题拆成可验证的子问题，优先使用公开来源，区分事实、推断与不确定性，最后给出带来源和下一步的结构化摘要。',
     workflowProfileId: 'general',
-    toolIds: ['web.run', 'web_search', 'read', 'tool_search'],
+    toolIds: ['web_run', 'web_search', 'read', 'tool_search'],
     accent: 'blue',
   },
   {

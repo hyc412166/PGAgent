@@ -252,11 +252,15 @@ def classify_error_details(
     message: str | None,
     *,
     status_code: Any = None,
+    error_kind: str | None = None,
+    provider_error_code: str | None = None,
 ) -> str:
     """Normalize provider/integration details without exposing their text."""
 
     # 变量说明：name 表示当前对象名称。
     name = str(error_type or "").casefold()
+    kind = str(error_kind or "").casefold()
+    provider_code = str(provider_error_code or "").casefold()
     # 变量说明：normalized_message 表示当前步骤使用的 normalized_message 值。
     normalized_message = str(message or "").casefold()
     try:
@@ -265,8 +269,43 @@ def classify_error_details(
     except (TypeError, ValueError):
         # 变量说明：status_number 表示当前步骤使用的 status_number 值。
         status_number = None
+    if provider_code == "max_output_tokens":
+        return "model_output_limit"
+    if provider_code in {"bio_policy", "content_filter", "image_content_policy_violation"}:
+        return "model_content_filtered"
+    if provider_code == "data_residency_mismatch":
+        return "model_data_residency_error"
+    if provider_code in {
+        "empty_image_file",
+        "failed_to_download_image",
+        "image_file_not_found",
+        "image_file_too_large",
+        "image_parse_error",
+        "image_too_large",
+        "image_too_small",
+        "invalid_base64_image",
+        "invalid_image",
+        "invalid_image_format",
+        "invalid_image_mode",
+        "invalid_image_url",
+        "invalid_prompt",
+        "unsupported_image_media_type",
+    }:
+        return "model_input_error"
+    if kind == "rate_limit" or provider_code == "rate_limit_exceeded":
+        return "model_rate_limited"
+    if kind == "timeout" or provider_code == "vector_store_timeout":
+        return "model_timeout"
+    if kind in {"server", "connection"} or provider_code in {"server_error", "server_is_overloaded"}:
+        return "model_unavailable"
+    if kind == "auth":
+        return "model_authentication_error"
+    if provider_code:
+        return "model_provider_error"
     if "partialmodelstream" in name:
         return "model_stream_interrupted"
+    if "streaminterrupted" in name:
+        return "model_unavailable"
     if "timeout" in name or "timed out" in normalized_message:
         return "model_timeout"
     if status_number == 429 or "ratelimit" in name or "rate limit" in normalized_message:
@@ -300,12 +339,14 @@ def classify_error_details(
 # 参数关系：error 表示当前捕获或准备上报的错误。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def classify_exception(error: BaseException) -> str:
-    from src.agent.errors import status_code_from_error
+    from src.agent.errors import classify_api_error, status_code_from_error
 
     return classify_error_details(
         type(error).__name__,
         str(error),
         status_code=status_code_from_error(error),
+        error_kind=classify_api_error(error).value,
+        provider_error_code=getattr(error, "provider_error_code", None),
     )
 
 
@@ -324,6 +365,11 @@ _PUBLIC_REASONS = {
     "model_authentication_error": "模型服务身份验证失败。",
     "model_bad_request": "模型服务拒绝了本次请求。",
     "model_configuration_error": "当前会话没有可用的模型配置。",
+    "model_content_filtered": "模型输出被内容安全策略阻止。",
+    "model_data_residency_error": "模型服务的数据驻留配置与本次请求不匹配。",
+    "model_input_error": "模型服务无法处理本次输入内容。",
+    "model_output_limit": "模型输出达到长度上限，未能完整结束。",
+    "model_provider_error": "模型服务返回了无法识别的错误。",
     "model_rate_limited": "模型服务当前请求过多，请稍后重试。",
     "model_stream_interrupted": "模型输出过程中连接中断。",
     "model_timeout": "模型服务响应超时。",

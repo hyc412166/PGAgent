@@ -2314,6 +2314,8 @@ class RunCoordinator:
                 event_error_type,
                 outcome.error,
                 status_code=error_event.get("status_code"),
+                error_kind=error_event.get("error_kind"),
+                provider_error_code=error_event.get("provider_error_code"),
             )
             # 变量说明：safe_error_message 表示当前步骤使用的 safe_error_message 值。
             safe_error_message = public_error_message(normalized_error_code)

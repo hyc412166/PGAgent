@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 import shutil
 from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
@@ -222,6 +223,14 @@ def _public_event_text(value: Any, *, limit: int = 160) -> str | None:
     return " ".join(value.replace("\x00", "").split())[:limit] or None
 
 
+def _public_event_identifier(value: Any) -> str | None:
+    """公开事件只接受短错误标识符，拒绝正文式供应商内容。"""
+
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", value) is None:
+        return None
+    return value
+
+
 # 函数职责：完成 public_thought_text 对应的业务处理。
 # 参数关系：value 表示当前字段或计算值；limit 表示当前步骤使用的 limit 值。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
@@ -332,6 +341,12 @@ def _public_tool_argument_summary(value: Any) -> dict[str, Any]:
                 for metadata_key in ("text", "chars", "count", "argument_count", "provided")
                 if isinstance((metadata_value := raw_value.get(metadata_key)), (int, float, bool))
             }
+            items = raw_value.get("items")
+            if isinstance(items, list):
+                safe_items = [_public_event_text(item, limit=320) for item in items[:3] if isinstance(item, str)]
+                safe_items = [item for item in safe_items if item is not None]
+                if safe_items:
+                    metadata["items"] = safe_items
             # 变量说明：text_value 表示当前步骤使用的 text_value 值。
             text_value = _public_event_text(raw_value.get("text"), limit=320)
             if text_value is not None:
@@ -375,6 +390,12 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
         if isinstance(value, bool):
             public[key] = value
 
+    if event_type == "model_failed":
+        for key in ("error_kind", "error_type", "provider_error_code", "provider_error_type"):
+            identifier = _public_event_identifier(source.get(key))
+            if identifier is not None:
+                public[key] = identifier
+
     if event_type in _TOOL_START_EVENT_TYPES | _TOOL_FINISH_EVENT_TYPES | {"user_question_requested"}:
         for key in ("tool_name", "tool_call_id"):
             # 变量说明：text 表示当前步骤使用的 text 值。
@@ -385,6 +406,12 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
         arguments = _public_tool_argument_summary(source.get("arguments"))
         if arguments:
             public["arguments"] = arguments
+        # tool_finished 的 result_summary 已由运行时按工具类型生成并做过边界限制；
+        # 这里只透传这个安全摘要，不暴露原始工具结果或 metadata。
+        if event_type in _TOOL_FINISH_EVENT_TYPES:
+            result_summary = _public_event_text(source.get("result_summary"), limit=480)
+            if result_summary is not None:
+                public["result_summary"] = result_summary
 
     if event_type in {
         "context_protocol_repaired",
