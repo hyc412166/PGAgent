@@ -693,9 +693,10 @@ async def test_aggregate_tool_results_are_budgeted_before_nine_section_compactio
     tool_results = [item for item in provider_messages if item.get("role") == "tool"]
     assert sum(len(str(item.get("content") or "")) for item in tool_results) <= 150_000
     assert str(tool_results[0]["content"]).startswith("<persisted-tool-output>")
-    assert str(tool_results[1]["content"]).startswith("<persisted-tool-output>")
+    # 110001 字符未超过新的单条 150000 阈值，累计压缩在首条外部化后已达到目标。
+    assert str(tool_results[1]["content"]) == "b" * 110_001
     assert [item["content"] for item in tool_results[-2:]] == ["recent-one", "recent-two"]
-    assert len(outcome.artifact_refs) == 2
+    assert len(outcome.artifact_refs) == 1
 
 
 @pytest.mark.asyncio

@@ -59,11 +59,11 @@ def test_small_tool_output_remains_verbatim_without_artifact() -> None:
     assert prepared.artifact_ref is None
 
 
-# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_individually_large_tool_result_is_externalized_below_aggregate_trigger 精确标识本用例的具体条件。
-def test_individually_large_tool_result_is_externalized_below_aggregate_trigger() -> None:
+# 测试场景：150000 字符以内的单条结果在累计压力未达到阈值时保持原文，避免过早进入 artifact。
+def test_single_tool_result_at_or_below_150k_remains_inline_below_aggregate_trigger() -> None:
     messages = [
         {"role": "user", "content": "work"},
-        {"role": "tool", "tool_call_id": "small", "name": "read", "content": "x" * 300_000},
+        {"role": "tool", "tool_call_id": "small", "name": "read", "content": "x" * 150_000},
     ]
     store = InMemoryArtifactStore()
 
@@ -72,12 +72,25 @@ def test_individually_large_tool_result_is_externalized_below_aggregate_trigger(
         budgeter=ToolOutputBudgeter(store),
     )
 
-    assert result.messages is not messages
+    assert result.messages is messages
+    assert result.changed is False
+    assert result.before_chars == 150_000
+    assert result.after_chars == 150_000
+    assert result.artifact_refs == []
+
+
+# 测试场景：单条结果超过 150000 字符时，即使累计结果未超过 300000，也会在下一轮模型调用前外部化。
+def test_single_tool_result_over_150k_is_externalized_below_aggregate_trigger() -> None:
+    content = "x" * 150_001
+    messages = [{"role": "tool", "tool_call_id": "large", "name": "read", "content": content}]
+    store = InMemoryArtifactStore()
+
+    result = compact_tool_results_for_model(messages, budgeter=ToolOutputBudgeter(store))
+
     assert result.changed is True
-    assert result.before_chars == 300_000
-    assert result.after_chars < 30_000
-    assert result.messages[1]["content"].startswith("<persisted-tool-output>")
-    assert store.get(result.artifact_refs[0].artifact_id) == b"x" * 300_000
+    assert result.before_chars == 150_001
+    assert result.messages[0]["content"].startswith("<persisted-tool-output>")
+    assert store.get(result.artifact_refs[0].artifact_id) == content.encode()
 
 
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_tool_results_are_externalized_largest_first_until_target 精确标识本用例的具体条件。
@@ -96,17 +109,17 @@ def test_tool_results_are_externalized_largest_first_until_target() -> None:
     )
 
     assert result.changed is True
-    assert result.compacted_count == 3
+    # 累计压力下按最大结果优先处理，达到 150000 目标后停止。
+    assert result.compacted_count == 2
     assert result.before_chars == 310_001
     assert result.after_chars <= 150_000
     assert result.messages[0]["content"].startswith("<persisted-tool-output>")
     assert result.messages[1]["content"].startswith("<persisted-tool-output>")
-    assert result.messages[2]["content"].startswith("<persisted-tool-output>")
+    assert result.messages[2]["content"] == contents[2]
     assert messages[0]["content"] == contents[0]
     assert [store.get(ref.artifact_id) for ref in result.artifact_refs] == [
         contents[0].encode(),
         contents[1].encode(),
-        contents[2].encode(),
     ]
 
 
@@ -124,10 +137,11 @@ def test_two_most_recent_tool_results_are_still_bounded_individually() -> None:
     )
 
     assert result.messages[0]["content"].startswith("<persisted-tool-output>")
-    assert result.messages[1]["content"].startswith("<persisted-tool-output>")
-    assert result.messages[2]["content"].startswith("<persisted-tool-output>")
-    assert result.compacted_count == 3
-    assert result.target_reached is True
+    # 默认保留最近两条结果，只有超过 150000 的首条会提前外部化。
+    assert result.messages[1]["content"] == contents[1]
+    assert result.messages[2]["content"] == contents[2]
+    assert result.compacted_count == 1
+    assert result.target_reached is False
 
 
 # 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_small_aggregate_results_pass_through_when_preview_cannot_reduce 精确标识本用例的具体条件。

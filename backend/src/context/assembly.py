@@ -27,6 +27,8 @@ Message = dict[str, Any]
 ModelCall = Callable[..., Any | Awaitable[Any]]
 # 变量说明：DEFAULT_TOOL_OUTPUT_MAX_CHARS 表示当前流程使用的 DEFAULT_TOOL_OUTPUT_MAX_CHARS 集合。
 DEFAULT_TOOL_OUTPUT_MAX_CHARS = 30_000
+# 单条工具结果只有达到该大小才会在下一次模型调用前提前外部化。
+SINGLE_TOOL_RESULT_EXTERNALIZATION_CHARS = 150_000
 # 变量说明：COMPACTION_SCHEMA 表示当前步骤使用的 COMPACTION_SCHEMA 值。
 COMPACTION_SCHEMA = "pgagent_nine_section_v2"
 # 变量说明：CONTINUATION_PREFIX 表示当前步骤使用的 CONTINUATION_PREFIX 值。
@@ -429,10 +431,10 @@ def compact_tool_results_for_model(
     target_chars: int = 150_000,
     keep_recent_tool_results: int = 2,
 ) -> ToolResultCompaction:
-    """Externalize individually large results, then handle aggregate pressure.
+    """Externalize very large individual results, then handle aggregate pressure.
 
-    Any one result above the budgeter's per-result limit is persisted before its
-    next model exposure, including a recent result. If the remaining aggregate
+    A single result is persisted before its next model exposure only when it
+    exceeds ``SINGLE_TOOL_RESULT_EXTERNALIZATION_CHARS``. If the aggregate
     provider-visible content exceeds ``trigger_chars``, older raw results are
     then processed largest-first until ``target_chars`` is reached. Existing
     artifact previews are never shortened or nested.
@@ -451,7 +453,7 @@ def compact_tool_results_for_model(
     # 变量说明：individually_large 表示当前步骤使用的 individually_large 值。
     individually_large = [
         index for index in tool_indexes
-        if len(str(messages[index].get("content") or "")) > budgeter.max_chars
+        if len(str(messages[index].get("content") or "")) > SINGLE_TOOL_RESULT_EXTERNALIZATION_CHARS
         if not str(messages[index].get("content") or "").startswith("<persisted-tool-output>")
     ]
     if before_chars <= trigger_chars and not individually_large:
