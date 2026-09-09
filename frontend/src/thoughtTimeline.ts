@@ -156,6 +156,7 @@ export function displayToolName(name: string): string {
   const labels: Record<string, string> = {
     read: 'Read',
     read_file: 'Read',
+    read_artifact: '读取文件',
     write: 'Write',
     write_file: 'Write',
     edit: 'Edit',
@@ -164,6 +165,7 @@ export function displayToolName(name: string): string {
     web_open: 'Web Open',
     websearch: 'WebSearch',
     web_search: 'WebSearch',
+    web_run: '联网搜索',
     bash: 'Shell',
     shell: 'Shell',
     run_command: 'Shell',
@@ -253,12 +255,6 @@ function mcpToolCount(event: RunStreamEvent): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
 }
 
-function verificationReason(event: RunStreamEvent, type: string): string {
-  if (!type.startsWith('completion_verification_')) return ''
-  const payload = record(event.payload)
-  return cleanActivityText(firstString(event.failure_reason, payload?.failure_reason, event.reason, payload?.reason), 240)
-}
-
 function stableDelegationActivityId(event: RunStreamEvent, fallback: string): string {
   const payload = record(event.payload)
   const key = firstString(
@@ -284,6 +280,44 @@ function safeArgumentDetail(event: RunStreamEvent): string {
   const query = record(args.query)
   if (typeof query?.text === 'string' && query.text.trim()) return `查询：${query.text.trim()}`
   if (query?.chars !== undefined) return `搜索查询（${String(query.chars)} 字符）`
+  if (typeof args.pattern === 'string' && args.pattern.trim()) {
+    const path = firstString(args.path, args.file_path)
+    return path ? `匹配：${args.pattern.trim()} · 路径：${path}` : `匹配：${args.pattern.trim()}`
+  }
+  if (typeof args.path === 'string' && args.path.trim()) return `读取：${args.path.trim()}`
+  if (typeof args.artifact_id === 'string' && args.artifact_id.trim()) return `读取：${args.artifact_id.trim()}`
+  if (typeof args.storage_key === 'string' && args.storage_key.trim()) return `读取：${args.storage_key.trim()}`
+  const weather = Array.isArray(args.weather) ? args.weather[0] : record(args.weather)
+  if (weather) {
+    const weatherRecord = record(weather)
+    const weatherItems = Array.isArray(weatherRecord?.items) ? weatherRecord.items : []
+    const location = firstString(weatherRecord?.location, weatherRecord?.city, weatherItems[0])
+    if (location) return `天气：${location}`
+  }
+  const searchQuery = Array.isArray(args.search_query) ? args.search_query[0] : record(args.search_query)
+  if (searchQuery) {
+    const text = firstString(record(searchQuery)?.q, record(searchQuery)?.query)
+    if (text) return `搜索：${text}`
+    const item = Array.isArray(record(searchQuery)?.items) ? (record(searchQuery)?.items as unknown[])[0] : undefined
+    if (typeof item === 'string' && item.trim()) return `搜索：${item.trim()}`
+  }
+  const searchItems = Array.isArray(searchQuery?.items) ? searchQuery.items : []
+  if (searchItems.length) {
+    const text = firstString(searchItems[0])
+    if (text) return `搜索：${text}`
+  }
+  const open = Array.isArray(args.open) ? args.open[0] : record(args.open)
+  if (open) {
+    const ref = firstString(record(open)?.url, record(open)?.ref_id)
+    if (ref) return `打开：${ref}`
+    const item = Array.isArray(record(open)?.items) ? (record(open)?.items as unknown[])[0] : undefined
+    if (typeof item === 'string' && item.trim()) return `打开：${item.trim()}`
+  }
+  const openItems = Array.isArray(open?.items) ? open.items : []
+  if (openItems.length) {
+    const text = firstString(openItems[0])
+    if (text) return `打开：${text}`
+  }
   const task = record(args.task)
   if (typeof task?.text === 'string' && task.text.trim()) return `任务：${task.text.trim()}`
   if (task?.chars !== undefined) return `编排子 Agent（任务 ${String(task.chars)} 字符）`
@@ -300,6 +334,7 @@ function safeActivityDetail(event: RunStreamEvent, toolName = ''): string {
   if (argumentDetail) return argumentDetail
   if (target) return target
   const normalized = toolName.trim().toLowerCase()
+  if (normalized === 'read_artifact') return ''
   if (normalized.includes('read') || normalized.includes('list') || normalized.includes('glob')) return '读取项目内容'
   if (normalized.includes('write') || normalized.includes('create') || normalized.includes('edit') || normalized.includes('patch')) return '准备修改项目文件'
   if (normalized.includes('search') || normalized.includes('fetch') || normalized.includes('browse') || normalized.includes('web')) return '查找相关资料'
@@ -427,7 +462,17 @@ export function updateThoughtTimeline(
   const type = firstString(event.type, event.event_type).toLowerCase()
   const start = state.startedAt ?? (type === 'model_step_started' || type === 'mcp_connecting' || toolStartTypes.has(type) ? now : null)
   const payload = record(event.payload)
-  if (type === 'thought_delta' || (type === 'thought_summary' && (event.complete === true || payload?.complete === true))) {
+  if (type === 'thought_delta') {
+    const text = cleanThoughtText(firstString(event.delta, payload?.delta))
+    if (!text) return start === state.startedAt ? state : { ...state, startedAt: start }
+    const items = [...(state.items || [])]
+    const id = thoughtItemId(event, items.length)
+    const index = items.findIndex((item) => item.id === id)
+    if (index >= 0) items[index] = { ...items[index], detail: `${items[index].detail}${text}`, status: 'running' }
+    else items.push({ id, kind: 'thought', icon: 'think', title: '思考', detail: text, status: 'running' })
+    return { ...state, startedAt: start ?? now, items, activeItemId: id }
+  }
+  if (type === 'thought_summary' && (event.complete === true || payload?.complete === true)) {
     return start === state.startedAt ? state : { ...state, startedAt: start }
   }
   if (type === 'thought_summary') {
@@ -457,6 +502,7 @@ export function updateThoughtTimeline(
   }
   if (toolStartTypes.has(type)) {
     const name = firstString(event.tool_name, event.name, record(event.payload)?.tool_name, record(event.payload)?.name) || 'Tool'
+    if (name.trim().toLowerCase() === 'tool_search' || name.trim().toLowerCase() === 'toolsearch') return { ...state, startedAt: start }
     const id = firstString(event.tool_call_id, event.call_id, event.id, event.event_id) || `${name}-${state.tools.length}`
     if (state.tools.some((tool) => tool.id === id)) return { ...state, startedAt: start }
     const detail = safeActivityDetail(event, name)
@@ -472,18 +518,20 @@ export function updateThoughtTimeline(
   if (toolFinishTypes.has(type)) {
     const id = firstString(event.tool_call_id, event.call_id, event.id, event.event_id)
     const rawName = firstString(event.tool_name, event.name, record(event.payload)?.tool_name, record(event.payload)?.name)
+    if (rawName.trim().toLowerCase() === 'tool_search' || rawName.trim().toLowerCase() === 'toolsearch') return state
     const displayName = rawName ? displayToolName(rawName) : ''
     let matchIndex = id ? state.tools.findIndex((tool) => tool.id === id) : -1
     if (matchIndex < 0 && displayName) matchIndex = state.tools.findLastIndex((tool) => tool.name === displayName && tool.status === 'running')
     if (matchIndex < 0) matchIndex = state.tools.findLastIndex((tool) => tool.status === 'running')
     if (matchIndex < 0) return state
     const failed = Boolean(event.error) || (event.ok === false && event.pending_approval !== true)
+    const resultSummary = firstString(event.result_summary, record(event.payload)?.result_summary)
     const tools = state.tools.map((tool, index) => index === matchIndex
       ? { ...tool, status: failed ? 'failed' as const : 'completed' as const }
       : tool)
     const matchedId = state.tools[matchIndex]?.id
     const items = (state.items || []).map((item) => item.id === matchedId
-      ? { ...item, status: failed ? 'failed' as const : 'completed' as const, detail: safeActivityDetail(event, rawName) || item.detail }
+      ? { ...item, status: failed ? 'failed' as const : 'completed' as const, detail: resultSummary ? `${item.detail}${item.detail ? ' · ' : ''}${resultSummary}` : item.detail }
       : item)
     return { ...state, tools, items, activeItemId: state.activeItemId === matchedId ? undefined : state.activeItemId }
   }
@@ -492,10 +540,7 @@ export function updateThoughtTimeline(
   if (activity?.kind === 'task') {
     activity = { ...activity, id: stableDelegationActivityId(event, activity.id) }
   }
-  if (activity?.kind === 'event' && type.startsWith('completion_verification_')) {
-    const reason = verificationReason(event, type)
-    if (reason) activity = { ...activity, detail: reason }
-  }
+  if (activity?.kind === 'event' && type.startsWith('completion_verification_')) activity = null
   if (activity) {
     const items = [...(state.items || [])]
     const existingIndex = items.findIndex((item) => item.id === activity.id)
@@ -590,8 +635,12 @@ export function summarizeThoughtConclusion(content: string, maxLength = 72): str
 // 格式化已完成思考耗时。
 export function formatThoughtDuration(milliseconds: number): string {
   if (milliseconds < 1000) return `${Math.max(0, Math.round(milliseconds))}ms`
-  const seconds = milliseconds / 1000
-  return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`
+  const roundedSeconds = Math.max(0, Math.round(milliseconds / 1000))
+  if (roundedSeconds >= 60) {
+    const minutes = Math.floor(roundedSeconds / 60)
+    return `${minutes}m ${roundedSeconds % 60}s`
+  }
+  return `${roundedSeconds}s`
 }
 
 // 格式化仍在进行中的思考耗时，保留实时感知需要的精度。

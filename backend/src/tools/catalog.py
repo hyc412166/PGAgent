@@ -78,6 +78,7 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
     _tool("debug_evidence", "记录调试证据", "记录复现、观察、假设、根因或回归结果。", "developer"),
     _tool("web_search", "联网搜索", "使用模型连接提供的原生联网搜索能力并保留来源。", "network", "medium"),
     _tool("web_open", "打开网页", "提取公开网页的标题、发布时间和有限正文；支持分页续读。", "network", "medium"),
+    _tool("web_run", "联网工具", "Codex 风格联网入口，支持搜索、打开、查找、截图、财经、天气、体育和时间查询。", "network", "medium"),
     _tool("update_plan", "更新计划", "创建或更新本次运行的结构化任务计划。", "planning"),
     _tool("task", "委派任务", "把独立任务委派给已启用的用户创建子 Agent。", "orchestration", "medium"),
     _tool("tool_search", "搜索工具", "按需搜索并激活当前 Agent 已选择的低频工具。", "extension"),

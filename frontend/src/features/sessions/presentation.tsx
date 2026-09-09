@@ -65,7 +65,7 @@ function childTaskStatusLabel(status?: string) {
 }
 
 // 按优先级提取子任务最终输出、错误或当前阶段说明。
-function childTaskOutput(task?: DelegatedTask) {
+function childTaskOutput(_task?: DelegatedTask) {
   // 子任务原始结果可能包含文件正文、命令输出或 provider 错误；仅使用 RunEvent 的安全摘要。
   return ''
 }
@@ -130,7 +130,7 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
 })
 
 // MessageBubble 根据角色渲染正文、附件和复制动作，是持久消息的统一展示入口。
-export const MessageBubble = memo(function MessageBubble({ message }: { message: Message }) {
+export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId, thoughtTimeline }: { message: Message; thoughtRunId?: string; thoughtTimeline?: ThoughtTimelineState }) {
   const [copied, setCopied] = useState(false)
   const attachments = messageAttachments(message.metadata?.attachments)
   const imageAttachments = message.session_id
@@ -165,6 +165,7 @@ export const MessageBubble = memo(function MessageBubble({ message }: { message:
       <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <PenguinMark size={21} />}</div>
       <div className="message-body">
         <div className="message-meta"><strong>{speaker}</strong><time>{formatUiDate(message.created_at)}</time></div>
+        {thoughtRunId && thoughtTimeline && <CompletedThoughtTimeline runId={thoughtRunId} timeline={thoughtTimeline} />}
         {!!imageAttachments.length && <div className="message-image-gallery" aria-label="消息图片">
           {imageAttachments.map((attachment) => {
             const href = apiUrl(`/api/sessions/${message.session_id}/attachments/${attachment.id}/content`)
@@ -237,13 +238,26 @@ function hasActivityDetails(items: ThoughtActivityItem[]) {
 
 // ThoughtActivityList 统一渲染实时与历史活动，并突出当前活动。
 function ThoughtActivityList({ items, live = false, activeItemId }: { items: ThoughtActivityItem[]; live?: boolean; activeItemId?: string }) {
-  const visibleItems = items.filter((item) => item.kind !== 'thought' || Boolean(item.detail.trim()))
+  const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({})
+  const visibleItems = items.filter((item) => item.title !== 'Tool Search' && (item.kind !== 'thought' || Boolean(item.detail.trim())))
   if (!visibleItems.length) return null
   return <div className={`thought-activity-list ${live ? 'is-live' : ''}`} aria-label="执行详情">
-    {visibleItems.map((item) => <div key={item.id} className={`thought-activity kind-${item.kind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
-      <ThoughtActivityIcon icon={item.icon} />
-      <div className="thought-activity-copy"><strong>{item.title}</strong>{item.detail && <span title={item.detail}>{item.detail}</span>}</div>
-    </div>)}
+    {visibleItems.map((item) => {
+      if (item.kind === 'thought') return <p key={item.id} className={`thought-activity-thought ${item.status}`}>{item.detail}</p>
+      // 普通联网搜索保持紧凑；当来源 URL 过长时提供展开入口，避免摘要撑坏标题布局。
+      const hasLongUrl = /https?:\/\/\S{72,}/i.test(item.detail)
+      const expandable = item.kind === 'tool' && Boolean(item.detail.trim()) && (item.title !== '联网搜索' || hasLongUrl)
+      const expanded = Boolean(expandedItems[item.id])
+      return <div key={item.id} className={`thought-activity kind-${item.kind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
+        <ThoughtActivityIcon icon={item.icon} />
+        <div className="thought-activity-copy">
+          {expandable ? <>
+            <button type="button" className="thought-activity-toggle" aria-expanded={expanded} onClick={() => setExpandedItems((current) => ({ ...current, [item.id]: !current[item.id] }))}><span><span className="thought-activity-title">{item.title}</span><span className="thought-activity-summary">{item.detail}</span></span><ChevronRight className="thought-activity-chevron" size={14} aria-hidden="true" /></button>
+            {expanded && <div className="thought-activity-detail">{item.detail}</div>}
+          </> : <div className="thought-activity-static"><span className="thought-activity-title">{item.title}</span>{item.detail && item.title !== '准备上下文' && <span className="thought-activity-summary">{item.detail}</span>}</div>}
+        </div>
+      </div>
+    })}
   </div>
 }
 

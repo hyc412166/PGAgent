@@ -1,6 +1,6 @@
 // 本文件实现 SessionsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { AlertCircle, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
-import { Fragment, type FormEvent, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { type FormEvent, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, describeError } from '../../api'
 import { attachmentForm, attachmentSignature, formatAttachmentSize, selectAttachmentFiles } from '../../attachments'
@@ -16,7 +16,7 @@ import type { ThoughtTimelineState } from '../../thoughtTimeline'
 import { ThoughtHydrationRegistry } from '../../thoughtHydration'
 import type { ThoughtHydrationToken } from '../../thoughtHydration'
 import { ContextUsageRing, EmptyState, ErrorState, LoadingState } from '../../components/ui'
-import { ApprovalCard, ChildAgentPanel, CompletedThoughtTimeline, LiveAssistantMessage, MessageBubble } from './presentation'
+import { ApprovalCard, ChildAgentPanel, LiveAssistantMessage, MessageBubble } from './presentation'
 import { useApiData } from '../../shared/hooks/useApiData'
 import { stringId } from '../../shared/lib/display'
 import { ComposerTextArea } from './components/ComposerTextArea'
@@ -1082,7 +1082,7 @@ function SessionsPage() {
                 {draftActive ? liveRun.status === 'idle' && <EmptyState icon={MessageSquare} title="开始一次新任务" description="直接描述目标；需要处理本地文件时，可以在输入框中选择一个项目文件夹。" /> : messages.error && !visibleMessages.length ? <ErrorState message={messages.error} onRetry={messages.reload} /> : messages.loading && !visibleMessages.length ? <LoadingState /> : visibleMessages.length ? visibleMessages.map((message) => {
                   const messageRunId = message.role === 'assistant' ? stringId(message.metadata?.run_id) : ''
                   const completedThought = messageRunId ? completedThoughtsByRun[messageRunId] : undefined
-                  return <Fragment key={message.id}>{completedThought && <CompletedThoughtTimeline runId={messageRunId} timeline={completedThought} />}<MessageBubble message={message} /></Fragment>
+                  return <MessageBubble key={message.id} message={message} thoughtRunId={messageRunId || undefined} thoughtTimeline={completedThought} />
                 }) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
                 {!draftActive && messages.error && !!visibleMessages.length && <p className="inline-error" role="alert">消息同步失败：{messages.error}</p>}
                 {!draftActive && durableTask.data && <DurableTaskCard

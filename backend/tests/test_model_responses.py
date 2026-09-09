@@ -14,7 +14,8 @@ import pytest
 from src.model import gateway as model_gateway
 from src.model import request as model_request
 from src.model.gateway import ProviderConfig, build_model_call
-from src.model.streaming import IncompleteResponse
+from src.agent.errors import APIErrorKind, classify_api_error
+from src.model.streaming import IncompleteResponse, StreamInterrupted
 from src.model.protocols.responses import input_items, response_tools
 
 
@@ -139,7 +140,7 @@ async def test_responses_uses_native_items_and_stateless_request(
     request = fake.requests[0]
     assert request["store"] is False
     assert request["include"] == ["reasoning.encrypted_content"]
-    assert request["reasoning"] == {"effort": "high"}
+    assert request["reasoning"] == {"effort": "high", "summary": "auto"}
     assert request["input"][1] == native_call
     assert request["input"][2] == {
         "type": "function_call_output",
@@ -361,7 +362,7 @@ async def test_responses_replays_completed_hosted_call_after_disconnect(
 @pytest.mark.parametrize(("level", "mode", "expected"), [
     ("auto", "auto", None),
     ("", "auto", None),
-    ("medium", "auto", {"effort": "medium"}),
+    ("medium", "auto", {"effort": "medium", "summary": "auto"}),
     ("off", "auto", None),
     ("high", "compaction", None),
 ])
@@ -474,9 +475,162 @@ async def test_responses_incomplete_event_is_not_retried(
     fake = install_fake_client(monkeypatch, [incomplete])
     call = build_model_call(responses_config())
 
-    with pytest.raises(IncompleteResponse, match="max_output_tokens"):
+    with pytest.raises(IncompleteResponse, match="max_output_tokens") as captured:
         await call(messages=[{"role": "user", "content": "回答"}], tools=[], mode="auto")
+    assert captured.value.provider_error_code == "max_output_tokens"
     assert len(fake.requests) == 1
+
+
+@pytest.mark.asyncio
+# 测试场景：服务端在事件流中报告临时过载时，应走流式重试并在下一次请求成功后继续交付。
+async def test_responses_overloaded_event_retries_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def overloaded() -> AsyncIterator[dict[str, Any]]:
+        yield {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "code": "server_is_overloaded",
+                    "type": "service_unavailable_error",
+                    "message": "Our servers are currently overloaded.",
+                },
+            },
+        }
+
+    message = {
+        "type": "message",
+        "id": "msg-recovered",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "已恢复。", "annotations": []}],
+    }
+
+    async def recovered() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.output_item.done", "item": message}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "output": [message], "usage": {}},
+        }
+
+    fake = install_fake_client(monkeypatch, [overloaded, recovered])
+    retries: list[tuple[str, int]] = []
+
+    async def record_pause(stage: str, attempt: int, callback=None) -> None:
+        if callback is not None:
+            callback(stage, attempt, 0.0)
+
+    monkeypatch.setattr(model_request, "pause", record_pause)
+    call = build_model_call(responses_config())
+
+    result = await call(
+        messages=[{"role": "user", "content": "继续"}],
+        tools=[],
+        mode="auto",
+        on_retry=lambda stage, attempt, _delay: retries.append((stage, attempt)),
+    )
+
+    assert result["content"] == "已恢复。"
+    assert len(fake.requests) == 2
+    assert retries == [("stream", 1)]
+
+
+@pytest.mark.asyncio
+# 测试场景：仅有供应商错误 code 时也应识别为可恢复过载并重试。
+async def test_responses_overloaded_code_only_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def failed() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.failed", "response": {"error": {"code": "server_is_overloaded"}}}
+
+    async def recovered() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.completed", "response": {"status": "completed", "output": [], "usage": {}}}
+
+    fake = install_fake_client(monkeypatch, [failed, recovered])
+    async def no_pause(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(model_request, "pause", no_pause)
+    result = await build_model_call(responses_config())(messages=[], tools=[], mode="auto")
+    assert result["content"] == ""
+    assert len(fake.requests) == 2
+
+
+@pytest.mark.asyncio
+# 测试场景：仅有供应商错误 type 时也应识别为可恢复服务不可用并重试。
+async def test_responses_service_unavailable_type_only_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def failed() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.failed", "response": {"error": {"type": "service_unavailable_error"}}}
+
+    async def recovered() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.completed", "response": {"status": "completed", "output": [], "usage": {}}}
+
+    fake = install_fake_client(monkeypatch, [failed, recovered])
+    async def no_pause(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(model_request, "pause", no_pause)
+    result = await build_model_call(responses_config())(messages=[], tools=[], mode="auto")
+    assert result["content"] == ""
+    assert len(fake.requests) == 2
+
+
+@pytest.mark.asyncio
+# 测试场景：确定性输入错误即使配置了重试次数也不得重复请求。
+async def test_responses_deterministic_failed_event_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def failed() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.failed", "response": {"error": {"code": "invalid_prompt"}}}
+
+    fake = install_fake_client(monkeypatch, [failed, failed])
+    call = build_model_call(responses_config())
+    with pytest.raises(IncompleteResponse):
+        await call(messages=[], tools=[], mode="auto")
+    assert len(fake.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "error_type", "expected_exception", "expected_kind"),
+    [
+        ("server_error", "server_error", StreamInterrupted, APIErrorKind.SERVER),
+        ("rate_limit_exceeded", "rate_limit_error", StreamInterrupted, APIErrorKind.RATE_LIMIT),
+        ("vector_store_timeout", "server_error", StreamInterrupted, APIErrorKind.TIMEOUT),
+        ("invalid_prompt", "invalid_request_error", IncompleteResponse, APIErrorKind.INVALID_REQUEST),
+        ("bio_policy", "invalid_request_error", IncompleteResponse, APIErrorKind.INVALID_REQUEST),
+        ("vendor_specific_failure", "vendor_error", IncompleteResponse, APIErrorKind.UNKNOWN),
+    ],
+)
+# 测试场景：Responses 流内错误必须保留稳定供应商错误码，并据此区分重试类别。
+async def test_responses_failed_event_preserves_provider_error_classification(
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    error_type: str,
+    expected_exception: type[BaseException],
+    expected_kind: APIErrorKind,
+) -> None:
+    async def failed() -> AsyncIterator[dict[str, Any]]:
+        yield {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "code": error_code,
+                    "type": error_type,
+                    "message": "private provider detail",
+                },
+            },
+        }
+
+    install_fake_client(monkeypatch, [failed])
+    monkeypatch.setattr(model_request.settings, "model_stream_retries", 0)
+    call = build_model_call(responses_config())
+
+    with pytest.raises(expected_exception) as captured:
+        await call(messages=[{"role": "user", "content": "回答"}], tools=[], mode="auto")
+
+    assert getattr(captured.value, "provider_error_code") == error_code
+    assert getattr(captured.value, "provider_error_type") == error_type
+    assert "private provider detail" not in str(captured.value)
+    assert classify_api_error(captured.value) == expected_kind
 
 
 @pytest.mark.asyncio

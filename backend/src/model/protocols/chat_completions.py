@@ -51,7 +51,11 @@ async def consume(
             # 变量说明：finish 表示当前步骤使用的 finish 值。
             finish = choices[0].get("finish_reason") if choices else None
             if finish in {"length", "content_filter"}:
-                raise IncompleteResponse(f"模型响应未完整结束：{finish}")
+                provider_error_code = "max_output_tokens" if finish == "length" else "content_filter"
+                raise IncompleteResponse(
+                    f"模型响应未完整结束：{finish}",
+                    provider_error_code=provider_error_code,
+                )
             # 变量说明：finished 表示当前步骤使用的 finished 值。
             finished = finished or finish in {"stop", "tool_calls", "function_call"}
             # 变量说明：fragment 表示当前步骤使用的 fragment 值。

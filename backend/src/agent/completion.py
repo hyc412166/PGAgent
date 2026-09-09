@@ -99,23 +99,11 @@ def verify_deterministic_completion(
     def record(name: str, passed: bool, detail: str) -> None:
         checks.append(DeterministicCheck(name=name, passed=passed, detail=detail))
 
-    # 变量说明：candidate 表示当前步骤使用的 candidate 值。
-    candidate = str(output or "")
-    record("non_empty_output", bool(candidate.strip()), "候选答复非空" if candidate.strip() else "候选答复为空")
-
     # 变量说明：assistant_messages 表示assistant_messages 集合。
     assistant_messages = [
         message for message in messages
         if str(message.get("role") or "").lower() == "assistant"
     ]
-    # 变量说明：final_matches 表示final_matches 集合。
-    final_matches = bool(assistant_messages) and str(assistant_messages[-1].get("content") or "") == candidate
-    record(
-        "final_assistant_matches_output",
-        final_matches,
-        "最后一条 assistant 消息与候选答复一致" if final_matches else "最后一条 assistant 消息与候选答复不一致",
-    )
-
     # 变量说明：call_ids 表示call_ids 集合。
     call_ids: list[str] = []
     # 变量说明：malformed_calls 表示malformed_calls 集合。

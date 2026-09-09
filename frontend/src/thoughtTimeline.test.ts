@@ -13,6 +13,7 @@ describe('实时 Thought 时间线', () => {
     expect(displayToolName('update_plan')).toBe('Update Plan')
     expect(displayToolName('todowrite')).toBe('Update Plan')
     expect(displayToolName('tool_search')).toBe('Tool Search')
+    expect(displayToolName('web_run')).toBe('联网搜索')
   })
 
   // 测试场景：累计思考耗时并跟踪工具的开始与完成。
@@ -26,6 +27,23 @@ describe('实时 Thought 时间线', () => {
     expect(completed.finished).toBe(true)
     expect(completed.tools).toEqual([{ id: 'call-1', name: 'Read', target: '.gitignore', status: 'completed' }])
     expect(formatThoughtDuration(completed.elapsedMs)).toBe('858ms')
+    expect(completed.items.find((item) => item.kind === 'tool')?.detail).toContain('读取：.gitignore')
+  })
+
+  it('展示 rg/read 的具体参数并隐藏内部 tool_search', () => {
+    const searched = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'tool_started', tool_name: 'rg', tool_call_id: 'rg-1', arguments: { pattern: 'web_run', path: 'backend/src' },
+    }, 1_000)
+    const hidden = updateThoughtTimeline(searched, { type: 'tool_started', tool_name: 'tool_search', tool_call_id: 'internal-1', arguments: { query: 'select:web_search' } }, 1_100)
+    expect(hidden.items).toHaveLength(1)
+    expect(hidden.items[0].detail).toBe('匹配：web_run · 路径：backend/src')
+  })
+
+  it('展示 read_artifact 的具体 artifact 标识', () => {
+    const state = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'tool_started', tool_name: 'read_artifact', tool_call_id: 'artifact-1', arguments: { artifact_id: 'artifact_abc123' },
+    }, 1_000)
+    expect(state.items[0].detail).toBe('读取：artifact_abc123')
   })
 
   // 测试场景：只提取路径或去掉查询参数的 URL，不显示其它工具参数。
@@ -33,7 +51,8 @@ describe('实时 Thought 时间线', () => {
     const event = { type: 'tool_call', arguments: { url: 'https://example.com/docs/long?token=secret#private', api_key: 'never-show', content: 'never-show' } }
     expect(safeToolTarget(event)).toBe('https://example.com/docs/long')
     expect(JSON.stringify(safeToolTarget(event))).not.toContain('secret')
-    expect(formatThoughtDuration(2_450)).toBe('2.5s')
+    expect(formatThoughtDuration(2_450)).toBe('2s')
+    expect(formatThoughtDuration(14 * 60_000 + 28_000)).toBe('14m 28s')
   })
 
   // 测试场景：为一次运行稳定选择幽默状态，并用秒显示实时耗时。
@@ -107,7 +126,49 @@ describe('实时 Thought 时间线', () => {
     expect(finished.activeItemId).toBeUndefined()
 
     const verifying = updateThoughtTimeline(finished, { type: 'completion_verification_started', event_id: 'verify-1' }, 1_300)
-    expect(verifying.activeItemId).toBe('verify-1')
+    expect(verifying.activeItemId).toBeUndefined()
+    expect(verifying.items).toHaveLength(2)
+  })
+
+  // 测试场景：工具完成事件不带参数时，不能覆盖开始阶段记录的具体命令。
+  it('工具完成后保留具体调用详情', () => {
+    const started = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'tool_started', tool_name: 'shell', tool_call_id: 'shell-1',
+      arguments: { command: { text: 'rg -n web_run backend/src', executable: 'rg', argument_count: 3 } },
+    }, 1_000)
+    const finished = updateThoughtTimeline(started, {
+      type: 'tool_finished', tool_name: 'shell', tool_call_id: 'shell-1', ok: true,
+      result_summary: '命中 5 行',
+    }, 1_100)
+
+    expect(finished.items[0]).toMatchObject({
+      title: 'Shell',
+      detail: '执行 rg（3 个参数） · 命中 5 行',
+      status: 'completed',
+    })
+  })
+
+  // 测试场景：联网搜索的长网址仍保持单行详情，天气调用显示具体地点并追加来源地址。
+  it('展示长网址和天气来源详情而不退回通用文案', () => {
+    const longUrl = 'https://example.com/technology/' + 'very-long-article-slug-'.repeat(12)
+    const opened = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'tool_started', tool_name: 'web_run', tool_call_id: 'web-open-1',
+      arguments: { open: [{ url: longUrl }] },
+    }, 1_000)
+    expect(opened.items[0]).toMatchObject({ title: '联网搜索', detail: `打开：${longUrl}` })
+
+    const weather = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'tool_started', tool_name: 'web_run', tool_call_id: 'weather-1',
+      arguments: { weather: { count: 1, items: ['New York, NY'] } },
+    }, 2_000)
+    const finished = updateThoughtTimeline(weather, {
+      type: 'tool_finished', tool_name: 'web_run', tool_call_id: 'weather-1', ok: true,
+      result_summary: '来源：https://api.open-meteo.com/v1/forecast',
+    }, 2_100)
+    expect(finished.items[0]).toMatchObject({
+      title: '联网搜索',
+      detail: '天气：New York, NY · 来源：https://api.open-meteo.com/v1/forecast',
+    })
   })
 
   // 测试场景：分别展示 MCP 目录准备和按需连接进度。
@@ -159,13 +220,13 @@ describe('实时 Thought 时间线', () => {
     expect(connected.activeItemId).toBeUndefined()
   })
 
-  // 测试场景：中断后不显示服务端保存的 provider reasoning 片段。
-  it('中断后不显示服务端保存的 provider reasoning 片段', () => {
+  // 测试场景：中断后保留已经流式到达的思考片段。
+  it('中断后保留已经流式到达的思考片段', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 2 }, 1_000)
     const partial = updateThoughtTimeline(started, { type: 'thought_delta', step: 2, delta: '正在分析' }, 1_100)
     const stopped = updateThoughtTimeline(partial, { type: 'run_stopped', partial_thought: '正在分析天气数据。' }, 1_200)
 
-    expect(stopped.items[0]).toMatchObject({ title: '思考', detail: '', status: 'completed' })
+    expect(stopped.items[0]).toMatchObject({ title: '思考', detail: '正在分析', status: 'completed' })
   })
 
   // 测试场景：重放未知持久事件时不把任意 payload 变成可见时间线内容。

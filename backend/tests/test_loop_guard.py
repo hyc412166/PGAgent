@@ -722,6 +722,55 @@ async def test_provider_managed_retry_is_persisted_before_terminal_failure(tmp_p
 
 
 @pytest.mark.asyncio
+# 测试场景：模型协议异常携带的安全供应商错误码必须进入诊断事件，原始正文不得进入事件或结果。
+async def test_model_failure_event_preserves_safe_provider_error_code(tmp_path) -> None:
+    class ProviderFailure(RuntimeError):
+        retryable = False
+        provider_error_code = "invalid_prompt"
+        provider_error_type = "invalid_request_error"
+
+    async def model_call(**_kwargs) -> ModelTurn:
+        raise ProviderFailure("private provider response body")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    failed = next(event for event in outcome.events if event["type"] == "model_failed")
+    assert failed["provider_error_code"] == "invalid_prompt"
+    assert failed["provider_error_type"] == "invalid_request_error"
+    assert "private provider response body" not in json.dumps(failed, ensure_ascii=False)
+    assert outcome.error == "ProviderFailure"
+
+
+@pytest.mark.asyncio
+# 测试场景：供应商错误标识若包含正文式内容，不得进入持久事件或诊断日志字段。
+async def test_model_failure_event_drops_untrusted_provider_error_identifiers(tmp_path) -> None:
+    class ProviderFailure(RuntimeError):
+        retryable = False
+        provider_error_code = "invalid_prompt private response body"
+        provider_error_type = "invalid_request_error\nsecret"
+
+    async def model_call(**_kwargs) -> ModelTurn:
+        raise ProviderFailure("private provider response body")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    failed = next(event for event in outcome.events if event["type"] == "model_failed")
+    assert "provider_error_code" not in failed
+    assert "provider_error_type" not in failed
+    assert "private provider response body" not in json.dumps(failed, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
 # 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_runtime_stops_repeated_model_tool_call 精确标识本用例的具体条件。
 async def test_runtime_stops_repeated_model_tool_call(tmp_path) -> None:
     # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
@@ -1411,14 +1460,16 @@ async def test_assistant_deltas_use_only_transient_stream_sink(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_provider_reasoning_is_not_published_to_the_user_timeline 精确标识本用例的具体条件。
-async def test_provider_reasoning_is_not_published_to_the_user_timeline(tmp_path) -> None:
+# 测试场景：验证 provider reasoning 只用于协议续接，不进入用户时间线。
+async def test_provider_reasoning_is_not_published_to_user_timeline(tmp_path) -> None:
     durable_events: list[dict] = []
     transient_events: list[dict] = []
 
     # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
     async def model_call(**kwargs) -> ModelTurn:  # type: ignore[no-untyped-def]
-        assert "on_thought_delta" not in kwargs
+        assert "on_thought_delta" in kwargs
+        await kwargs["on_thought_delta"]("先看天气")
+        await kwargs["on_thought_delta"]("，再给结论")
         await kwargs["on_delta"]("今天晴。")
         return ModelTurn(content="今天晴。", reasoning_content="内部摘要")
 

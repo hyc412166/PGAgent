@@ -102,6 +102,50 @@ _HOSTED_OUTPUT_ITEMS = {
     "image_generation_call",
 }
 
+# Responses 可能在已建立的事件流内报告临时服务故障；这些错误没有 HTTP
+# 状态码可供外层重试器判断，因此只对明确的服务过载类型开放流式重试。
+_RETRYABLE_RESPONSE_ERROR_CODES = {
+    "rate_limit_exceeded",
+    "server_error",
+    "server_is_overloaded",
+    "vector_store_timeout",
+}
+_RETRYABLE_RESPONSE_ERROR_TYPES = {
+    "rate_limit_error",
+    "server_error",
+    "service_unavailable_error",
+}
+
+
+def response_failure_error(
+    response: Mapping[str, Any],
+    event_type: str,
+) -> IncompleteResponse | StreamInterrupted:
+    """Build a sanitized typed failure while preserving stable provider codes."""
+
+    nested = response.get("error") or response.get("incomplete_details")
+    error = _as_mapping(nested) if nested else dict(response) if event_type == "error" else {}
+    error_code = str(error.get("code") or error.get("reason") or "").strip()
+    error_type = str(error.get("type") or "").strip()
+    reason = error_code or error_type or str(event_type)
+    if (
+        event_type in {"response.failed", "error"}
+        and (
+            error_code in _RETRYABLE_RESPONSE_ERROR_CODES
+            or error_type in _RETRYABLE_RESPONSE_ERROR_TYPES
+        )
+    ):
+        return StreamInterrupted(
+            f"模型服务暂时不可用：{reason}",
+            provider_error_code=error_code,
+            provider_error_type=error_type,
+        )
+    return IncompleteResponse(
+        f"模型响应未完成：{reason}",
+        provider_error_code=error_code,
+        provider_error_type=error_type,
+    )
+
 
 # 函数职责：完成 project_items 对应的业务处理。
 # 参数关系：items 表示待处理的元素集合；usage 表示当前步骤使用的 usage 值。
@@ -201,10 +245,13 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
             elif kind in {"response.failed", "response.incomplete", "error"}:
                 # 变量说明：response 表示下游返回的响应。
                 response = _as_mapping(event.get("response") or event)
-                # 变量说明：error 表示当前捕获或准备上报的错误。
-                error = response.get("error") or response.get("incomplete_details") or {}
-                raise IncompleteResponse(f"模型响应未完成：{error.get('code') or error.get('reason') or kind}")
+                failure = response_failure_error(response, str(kind))
+                if isinstance(failure, StreamInterrupted):
+                    failure.completed_items = list(completed)
+                raise failure
     except asyncio.CancelledError:
+        raise
+    except StreamInterrupted:
         raise
     except IncompleteResponse:
         raise

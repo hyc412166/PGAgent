@@ -109,12 +109,14 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
         "validate_baseline",
         "review_finding",
         "debug_evidence",
+        "web_run",
     }
     assert by_id["shell"]["runtime_tool_id"] == "shell"
     assert by_id["read"]["risk_level"] == "low"
     assert by_id["apply_patch"]["risk_level"] == "adaptive"
     assert by_id["git_diff"]["risk_level"] == "low"
     assert by_id["web_search"]["availability"] == "available"
+    assert by_id["web_run"]["runtime_tool_id"] == "web_run"
     assert by_id["web_open"]["runtime_tool_id"] == "web_open"
     assert by_id["review_finding"]["risk_level"] == "low"
     assert by_id["debug_evidence"]["runtime_tool_id"] == "debug_evidence"

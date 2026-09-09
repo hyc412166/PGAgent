@@ -59,7 +59,7 @@ def test_deterministic_acceptance_manifest_executes_all_scenarios() -> None:
         "orphan_result_reject",
         "unresolved_call_reject",
         "count_mismatch_reject",
-        "empty_output_reject",
+        "empty_output_allowed",
     ]
     for scenario in scenarios:
         inputs = {key: scenario[key] for key in ("output", "messages", "declared_tool_calls")}

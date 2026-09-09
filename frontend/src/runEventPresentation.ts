@@ -99,8 +99,7 @@ function truncate(value: string, limit = 240): string {
 
 function formatDuration(milliseconds: number): string {
   if (milliseconds < 1_000) return `${Math.max(0, Math.round(milliseconds))} 毫秒`
-  const seconds = milliseconds / 1_000
-  return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} 秒`
+  return `${Math.round(milliseconds / 1_000)} 秒`
 }
 
 // 安全诊断字段只接受标量；对象和数组不会被序列化到界面。

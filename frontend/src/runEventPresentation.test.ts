@@ -39,7 +39,7 @@ describe('run record presentation', () => {
 
     expect(presented.title).toBe('开始调用 mcp__playwright__browser_navigate')
     expect(presented.detail).toBe('工具正在执行')
-    expect(presented.facts).toEqual([{ label: '耗时', value: '1.4 秒' }])
+    expect(presented.facts).toEqual([{ label: '耗时', value: '1 秒' }])
     expect(JSON.stringify(presented)).not.toContain('secret')
     expect(JSON.stringify(presented)).not.toContain('private-value')
     expect(JSON.stringify(presented)).not.toContain('api_key')
