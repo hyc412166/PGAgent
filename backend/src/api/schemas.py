@@ -96,7 +96,7 @@ class WorkspaceRead(ORMModel):
 
 
 # 变量说明：ThinkingLevel 表示当前步骤使用的 ThinkingLevel 值。
-ThinkingLevel = Literal["off", "auto", "low", "medium", "high", "xhigh"]
+ThinkingLevel = Literal["low", "medium", "high", "xhigh"]
 # 变量说明：AgentMode 表示当前步骤使用的 AgentMode 值。
 AgentMode = Literal["auto", "direct", "plan"]
 # 变量说明：WorkflowProfileId 表示当前步骤使用的 WorkflowProfileId 值。
@@ -329,7 +329,7 @@ class AgentCreate(BaseModel):
     # 变量说明：model_id 表示model 对象的唯一标识。
     model_id: str | None = None
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-    thinking_level: ThinkingLevel = "auto"
+    thinking_level: ThinkingLevel = "medium"
     # 变量说明：mode 表示当前步骤使用的 mode 值。
     mode: AgentMode = "auto"
     # 变量说明：workflow_profile_id 表示workflow_profile 对象的唯一标识。
@@ -422,7 +422,7 @@ class SessionCreate(BaseModel):
     # 变量说明：model_id 表示model 对象的唯一标识。
     model_id: str | None = None
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-    thinking_level: ThinkingLevel = "auto"
+    thinking_level: ThinkingLevel = "medium"
     # 变量说明：permission_mode 表示当前步骤使用的 permission_mode 值。
     permission_mode: PermissionMode = "smart"
     # 变量说明：use_memories 表示当前流程使用的 use_memories 集合。
@@ -744,7 +744,7 @@ class DraftLaunchRequest(BaseModel):
     # 变量说明：model_id 表示model 对象的唯一标识。
     model_id: str | None = Field(default=None, max_length=255)
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-    thinking_level: ThinkingLevel = "auto"
+    thinking_level: ThinkingLevel = "medium"
     # 变量说明：permission_mode 表示当前步骤使用的 permission_mode 值。
     permission_mode: PermissionMode = "smart"
     # 变量说明：use_memories 表示当前流程使用的 use_memories 集合。
@@ -1014,10 +1014,12 @@ class ModelConnectionCreate(BaseModel):
     api_protocol: Literal["responses", "chat_completions"] = "responses"
     # 变量说明：manual_models 表示当前流程使用的 manual_models 集合。
     manual_models: list[str] = Field(default_factory=list)
+    # disabled_models 记录用户在模型目录中明确停用的模型 ID。
+    disabled_models: list[str] = Field(default_factory=list)
     # 变量说明：default_model 表示当前步骤使用的 default_model 值。
     default_model: str | None = None
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-    thinking_level: ThinkingLevel = "auto"
+    thinking_level: ThinkingLevel = "medium"
     # 变量说明：custom_headers 表示当前流程使用的 custom_headers 集合。
     custom_headers: dict[str, str] = Field(default_factory=dict)
     # 变量说明：enabled 表示当前步骤使用的 enabled 值。
@@ -1026,7 +1028,7 @@ class ModelConnectionCreate(BaseModel):
     # 函数职责：完成 unique_models 对应的业务处理。
     # 参数关系：models 表示当前流程使用的 models 集合。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-    @field_validator("manual_models")
+    @field_validator("manual_models", "disabled_models")
     @classmethod
     def unique_models(cls, models: list[str]) -> list[str]:
         return list(dict.fromkeys(model.strip() for model in models if model.strip()))
@@ -1059,6 +1061,8 @@ class ModelConnectionUpdate(BaseModel):
     api_protocol: Literal["responses", "chat_completions"] | None = None
     # 变量说明：manual_models 表示当前流程使用的 manual_models 集合。
     manual_models: list[str] | None = None
+    # disabled_models 由模型标签的启停操作整体提交。
+    disabled_models: list[str] | None = None
     # 变量说明：default_model 表示当前步骤使用的 default_model 值。
     default_model: str | None = None
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
@@ -1071,7 +1075,7 @@ class ModelConnectionUpdate(BaseModel):
     # 函数职责：完成 unique_models 对应的业务处理。
     # 参数关系：models 表示当前流程使用的 models 集合。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-    @field_validator("manual_models")
+    @field_validator("manual_models", "disabled_models")
     @classmethod
     def unique_models(cls, models: list[str] | None) -> list[str] | None:
         if models is None:
@@ -1110,6 +1114,8 @@ class ModelConnectionRead(ORMModel):
     discovered_models: list[str]
     # 变量说明：manual_models 表示当前流程使用的 manual_models 集合。
     manual_models: list[str]
+    # 变量说明：disabled_models 表示当前连接中不可供会话选择的模型集合。
+    disabled_models: list[str]
     # 变量说明：default_model 表示当前步骤使用的 default_model 值。
     default_model: str | None
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。

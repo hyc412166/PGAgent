@@ -102,6 +102,7 @@ from src.context.compaction import (
 )
 from .configuration import (
     _allowed_runtime_tool_names,
+    _enabled_connection_models,
     _effective_connection,
     _explicit_setting,
     _read_selected_skill_instructions,
@@ -1714,32 +1715,31 @@ class RunCoordinator:
                 connection = _effective_connection(db, session, agent)
                 if connection is None:
                     raise ModelConfigurationError("当前 Agent 没有可用模型连接")
+                enabled_models = _enabled_connection_models(connection)
+                disabled_model_ids = set(connection.disabled_models or [])
                 # 变量说明：session_model 表示当前步骤使用的 session_model 值。
                 session_model = None
                 if session is not None and (
                     not session.model_connection_id or session.model_connection_id == connection.id
                 ):
                     # 变量说明：session_model 表示当前步骤使用的 session_model 值。
-                    session_model = session.model_id
+                    session_model = session.model_id if session.model_id not in disabled_model_ids else None
                 # 变量说明：agent_model 表示当前步骤使用的 agent_model 值。
                 agent_model = agent.model_id if (
                     not agent.model_connection_id or agent.model_connection_id == connection.id
-                ) else None
+                ) and agent.model_id not in disabled_model_ids else None
                 # 变量说明：model_id 表示model 对象的唯一标识。
-                model_id = session_model or agent_model or connection.default_model
-                if not model_id:
-                    # 变量说明：candidates 表示当前流程使用的 candidates 集合。
-                    candidates = [*(connection.discovered_models or []), *(connection.manual_models or [])]
-                    # 变量说明：model_id 表示model 对象的唯一标识。
-                    model_id = candidates[0] if candidates else None
+                default_model = connection.default_model if connection.default_model not in disabled_model_ids else None
+                model_id = session_model or agent_model or default_model or (enabled_models[0] if enabled_models else None)
                 if not model_id:
                     raise ModelConfigurationError("模型连接中没有可用模型，请发现模型或填写手动模型 ID")
                 # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-                thinking_level = _explicit_setting(
-                    session.thinking_level if session is not None else None,
-                    agent.thinking_level,
-                    connection.thinking_level,
-                ) or "auto"
+                # 普通会话 Run 直接采用会话保存值，确保每一轮都与前端当前选择一致。
+                thinking_level = (
+                    str(session.thinking_level)
+                    if session is not None
+                    else _explicit_setting(agent.thinking_level, connection.thinking_level) or "medium"
+                )
                 # 变量说明：workspace_root 表示当前步骤使用的 workspace_root 值。
                 workspace_root = workspace.root_path
                 # 变量说明：agents_instructions 表示当前流程使用的 agents_instructions 集合；agents_instruction_sources 表示当前流程使用的 agents_instruction_sources 集合。

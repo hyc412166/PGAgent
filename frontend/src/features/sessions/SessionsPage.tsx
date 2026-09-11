@@ -1,15 +1,15 @@
 // 本文件实现 SessionsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { AlertCircle, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
-import { type FormEvent, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { type FormEvent, type SetStateAction, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, describeError } from '../../api'
 import { attachmentForm, attachmentSignature, formatAttachmentSize, selectAttachmentFiles } from '../../attachments'
 import type { PendingAttachment } from '../../attachments'
 import { permissionLabel, permissionOptions, toggleSelectedId } from '../../capabilitySelection'
-import { modelSelectionPayload, resolveEffectiveThinking, shortModelLabel, thinkingLevelLabels } from '../../composerSettings'
+import { modelSelectionPayload, resolveEffectiveThinking, sessionThinkingOptions, shortModelLabel, thinkingLevelLabels } from '../../composerSettings'
 import { buildDraftLaunchPayload, createDraftIdempotencyKey, createTurnIdempotencyKey } from '../../draftLaunch'
 import { availableConnectionModels, resolveEffectiveModelSettings } from '../../modelSettings'
-import { buildSessionNavigation, draftSessionTitle, folderName, isDefaultWorkspace, projectRootForSession } from '../../sessionNavigation'
+import { buildSessionNavigation, draftSessionTitle, folderName, isDefaultWorkspace, mergePendingSession, pendingSessionAfterRemoval, projectRootForSession } from '../../sessionNavigation'
 import { isResumableWaitingRun, isTerminalRunStatus, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from '../../sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, pickThinkingStatus, timelineFromRunEvents } from '../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../thoughtTimeline'
@@ -25,14 +25,55 @@ import { DurableTaskCard } from './components/DurableTaskCard'
 import { ProjectTreeItem } from './components/ProjectTreeItem'
 import { projectDeleteConfirmation } from './projectDeletion'
 import { useRunTransport } from './hooks/useRunTransport'
-import { activeRunStatuses, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates } from './sessionState'
+import { activeRunStatuses, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, runThinkingStartedAt } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
 import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
+
+type ChildPanelState = { sessionId: string; open: boolean; autoOpened: boolean }
+type WorkspaceExpansion = { contextKey: string; ids: Set<string> }
+
+// 首次加载会话列表时直接派生选中项，草稿模式则始终保持未持久化状态。
+function resolveActiveSessionId(selectedSessionId: string, draftActive: boolean, sessions: Session[]): string {
+  return draftActive ? '' : selectedSessionId || stringId(sessions[0]?.id)
+}
+
+function nextSelectedSessionId(current: string, sessions: Session[]): string {
+  return current || stringId(sessions[0]?.id)
+}
+
+// 子任务首次出现时自动打开；手动关闭持续到任务清空或切换会话。
+function nextChildPanelStateForTasks(current: ChildPanelState, sessionId: string, tasks: DelegatedTask[]): ChildPanelState {
+  const scoped = current.sessionId === sessionId
+    ? current
+    : { sessionId, open: current.open, autoOpened: false }
+  if (!tasks.length) return { ...scoped, autoOpened: false }
+  return scoped.autoOpened ? scoped : { ...scoped, open: true, autoOpened: true }
+}
+
+// 展开状态只属于创建它的会话或草稿；切换上下文时改用当前项目作为默认值。
+function resolveExpandedWorkspaceIds(
+  expansion: WorkspaceExpansion | null,
+  contextKey: string,
+  defaultWorkspaceId: string,
+): Set<string> {
+  if (expansion?.contextKey === contextKey) return expansion.ids
+  return defaultWorkspaceId ? new Set([defaultWorkspaceId]) : new Set()
+}
+
+// 菜单的打开请求必须仍属于当前会话/运行上下文，运行锁定后不再重新显现。
+function resolveMenuOpen(open: boolean, openedContextKey: string, currentContextKey: string, locked: boolean): boolean {
+  return open && !locked && openedContextKey === currentContextKey
+}
 
 // SessionsPage 是会话工作台协调器：连接项目/会话导航、消息历史、实时运行、审批、子任务和编辑器设置。
 function SessionsPage() {
   // 首组资源是页面级目录数据，提供会话归属、Agent 默认值以及可选择的模型与能力。
-  const sessions = useApiData<Session[]>([], () => api.list<Session>('/api/sessions', ['sessions']), [])
+  const [selectedSessionId, setActiveId] = useState('')
+  const sessions = useApiData<Session[]>([], async () => {
+    const items = await api.list<Session>('/api/sessions', ['sessions'])
+    setActiveId((current) => nextSelectedSessionId(current, items))
+    return items
+  }, [])
   const agents = useApiData<AgentProfile[]>([], () => api.list<AgentProfile>('/api/agents', ['agents']), [])
   const workspaces = useApiData<Workspace[]>([], () => api.list<Workspace>('/api/workspaces', ['workspaces']), [])
   const connections = useApiData<Connection[]>([], () => api.list<Connection>('/api/connections', ['connections']), [])
@@ -40,7 +81,6 @@ function SessionsPage() {
   const mcpServers = useApiData<McpServer[]>([], () => api.list<McpServer>('/api/mcp/servers', ['mcp-servers']), [])
   const memorySettings = useApiData<MemorySettings | null>(null, () => api.get<MemorySettings>('/api/memories/settings'), [])
   // activeId 选择当前会话；编辑器、发送、中断和删除状态共同描述当前用户操作。
-  const [activeId, setActiveId] = useState('')
   const [composerHasValue, setComposerHasValue] = useState(false)
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([])
   const [sending, setSending] = useState(false)
@@ -49,6 +89,7 @@ function SessionsPage() {
   const [deletingSessionId, setDeletingSessionId] = useState('')
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState('')
   const [interruptedRunId, setInterruptedRunId] = useState('')
+  const [lastSubmittedContent, setLastSubmittedContent] = useState('')
   // 下列状态控制设置菜单及其子菜单；capabilitySaving 单独标记技能/MCP/权限写入。
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false)
@@ -57,6 +98,7 @@ function SessionsPage() {
   const [skillSubmenuOpen, setSkillSubmenuOpen] = useState(false)
   const [mcpSubmenuOpen, setMcpSubmenuOpen] = useState(false)
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false)
+  const [openedMenuContextKey, setOpenedMenuContextKey] = useState('')
   const [capabilitySaving, setCapabilitySaving] = useState(false)
   // 菜单 DOM 引用用于点击外部关闭和键盘焦点管理。
   const settingsMenuRef = useRef<HTMLDivElement>(null)
@@ -69,19 +111,20 @@ function SessionsPage() {
   const [decidingApproval, setDecidingApproval] = useState('')
   const [actionError, setActionError] = useState('')
   const [draftActive, setDraftActive] = useState(false)
+  const [pendingSession, setPendingSession] = useState<Session | null>(null)
+  const activeId = resolveActiveSessionId(selectedSessionId, draftActive, sessions.data)
   const [draftRootPath, setDraftRootPath] = useState('')
   const [draftSettings, setDraftSettings] = useState<DraftSessionSettings>(emptyDraftSettings)
   // 项目树展开、文件夹选择、悬浮卡片，以及完成思考/子 Agent 面板属于展示层状态。
-  const [expandedWorkspaceIds, setExpandedWorkspaceIds] = useState<Set<string>>(() => new Set())
+  const [workspaceExpansion, setWorkspaceExpansion] = useState<WorkspaceExpansion | null>(null)
   const [addingProject, setAddingProject] = useState(false)
   const [pickingDraftProject, setPickingDraftProject] = useState(false)
   const [projectError, setProjectError] = useState('')
   const [projectHoverCard, setProjectHoverCard] = useState<ProjectHoverCard | null>(null)
   const [completedThoughtsByRun, setCompletedThoughtsByRun] = useState<Record<string, ThoughtTimelineState>>({})
-  const [childPanelOpen, setChildPanelOpen] = useState(false)
+  const [childPanelState, setChildPanelState] = useState<ChildPanelState>({ sessionId: '', open: false, autoOpened: false })
   const [selectedChildTaskId, setSelectedChildTaskId] = useState('')
   // 运输层 refs 跨渲染保存 EventSource、计时器、事件去重集合和当前运行 ID，交给 useRunTransport 管理。
-  const childPanelAutoOpenedRef = useRef(false)
   const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRun)
   const eventSourceRef = useRef<EventSource | null>(null)
   const fallbackTimerRef = useRef<number | null>(null)
@@ -103,78 +146,23 @@ function SessionsPage() {
   const pendingSessionSendRef = useRef<{ sessionId: string; content: string; attachmentSignature: string; key: string } | null>(null)
   const draftVersionRef = useRef(0)
   const sendingRef = useRef(false)
-  const lastSubmittedContentRef = useRef('')
   const thoughtHydrationRegistryRef = useRef(new ThoughtHydrationRegistry())
   // 历史水合状态区分“数据已到达”和“滚动锚定已完成”，防止首次打开跳动。
   const [historyHydration, setHistoryHydration] = useState({ sessionId: '', complete: false })
   const [historyOpenVersion, setHistoryOpenVersion] = useState(0)
-  activeIdRef.current = activeId
   const liveRunRef = useRef(liveRun)
-  liveRunRef.current = liveRun
-  pendingAttachmentsRef.current = pendingAttachments
+
+  useLayoutEffect(() => {
+    activeIdRef.current = activeId
+    liveRunRef.current = liveRun
+    pendingAttachmentsRef.current = pendingAttachments
+  }, [activeId, liveRun, pendingAttachments])
 
   useEffect(() => () => {
     pendingAttachmentsRef.current.forEach((item) => {
       if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
     })
   }, [])
-
-  useEffect(() => {
-    if (!activeId && !draftActive && sessions.data[0]) setActiveId(stringId(sessions.data[0].id))
-  }, [activeId, draftActive, sessions.data])
-
-  useEffect(() => {
-    if (!settingsMenuOpen) return
-    const closeOnPointerDown = (event: PointerEvent) => {
-      if (!settingsMenuRef.current?.contains(event.target as Node)) {
-        setSettingsMenuOpen(false); setSettingsSubmenu(null)
-      }
-    }
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setSettingsMenuOpen(false); setSettingsSubmenu(null)
-        window.requestAnimationFrame(() => settingsTriggerRef.current?.focus())
-      }
-    }
-    document.addEventListener('pointerdown', closeOnPointerDown)
-    document.addEventListener('keydown', closeOnEscape)
-    return () => {
-      document.removeEventListener('pointerdown', closeOnPointerDown)
-      document.removeEventListener('keydown', closeOnEscape)
-    }
-  }, [settingsMenuOpen])
-
-  useEffect(() => {
-    if (!addMenuOpen && !permissionMenuOpen) return
-    const closeOnPointerDown = (event: PointerEvent) => {
-      const target = event.target as Node
-      if (addMenuOpen && !addMenuRef.current?.contains(target)) {
-        setAddMenuOpen(false)
-        setSkillSubmenuOpen(false)
-        setMcpSubmenuOpen(false)
-      }
-      if (permissionMenuOpen && !permissionMenuRef.current?.contains(target)) setPermissionMenuOpen(false)
-    }
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      setAddMenuOpen(false)
-      setSkillSubmenuOpen(false)
-      setMcpSubmenuOpen(false)
-      setPermissionMenuOpen(false)
-    }
-    document.addEventListener('pointerdown', closeOnPointerDown)
-    document.addEventListener('keydown', closeOnEscape)
-    return () => {
-      document.removeEventListener('pointerdown', closeOnPointerDown)
-      document.removeEventListener('keydown', closeOnEscape)
-    }
-  }, [addMenuOpen, permissionMenuOpen])
-
-  useEffect(() => {
-    setSettingsMenuOpen(false); setSettingsSubmenu(null)
-    setAddMenuOpen(false); setSkillSubmenuOpen(false); setMcpSubmenuOpen(false); setPermissionMenuOpen(false)
-    setSelectedChildTaskId('')
-  }, [activeId])
 
   // 会话关联资源均携带 ownerSessionId；异步结果返回后只有 owner 与 activeId 一致才会展示。
   const messages = useApiData<OwnedSessionMessages>(
@@ -193,9 +181,15 @@ function SessionsPage() {
   )
   const childTasks = useApiData<OwnedSessionDelegations>({ ownerSessionId: '', items: [] }, async () => {
     if (!activeId) return { ownerSessionId: '', items: [] }
+    const sessionId = activeId
+    const items = await api.list<DelegatedTask>(`/api/sessions/${encodeURIComponent(sessionId)}/delegations`, ['delegations'])
+    if (activeIdRef.current === sessionId) {
+      setChildPanelState((current) => nextChildPanelStateForTasks(current, sessionId, items))
+      setSelectedChildTaskId((current) => items.some((task) => task.id === current) ? current : stringId(items[0]?.id))
+    }
     return {
-      ownerSessionId: activeId,
-      items: await api.list<DelegatedTask>(`/api/sessions/${encodeURIComponent(activeId)}/delegations`, ['delegations']),
+      ownerSessionId: sessionId,
+      items,
     }
   }, [activeId])
   const teammates = useApiData<Teammate[]>([], () => activeId
@@ -208,7 +202,14 @@ function SessionsPage() {
   const context = useApiData<SessionContext | null>(null, () => activeId ? api.get<SessionContext>(`/api/sessions/${activeId}/context`) : Promise.resolve(null), [activeId])
   // 以下派生值把原始资源收敛为当前会话、当前运行、可见消息及可操作状态。
   const activeSession = sessions.data.find((item) => stringId(item.id) === activeId)
+    ?? (pendingSession && stringId(pendingSession.id) === activeId ? pendingSession : undefined)
   const activeAgent = agents.data.find((item) => item.id === activeSession?.agent_id)
+  const workspaceExpansionContextKey = draftActive ? 'draft' : `session:${activeId}`
+  const activeWorkspaceId = activeSession?.workspace_id || ''
+  const defaultExpandedWorkspaceId = !draftActive && workspaces.data.some((workspace) => workspace.id === activeWorkspaceId && !isDefaultWorkspace(workspace))
+    ? activeWorkspaceId
+    : ''
+  const expandedWorkspaceIds = resolveExpandedWorkspaceIds(workspaceExpansion, workspaceExpansionContextKey, defaultExpandedWorkspaceId)
   const sessionRuns = visibleSessionItems(runs.data.ownerSessionId, activeId, runs.data.items)
     .filter((item) => !item.session_id || item.session_id === activeId)
   // awaitingApprovalRunIds 驱动审批查询；只关注当前会话中仍等待决策的运行。
@@ -245,7 +246,7 @@ function SessionsPage() {
     interruptedRunId
       && liveRun.runId === interruptedRunId
       && liveRun.status === 'terminal'
-      && lastSubmittedContentRef.current.trim(),
+      && lastSubmittedContent.trim(),
   )
   // 旧版本曾把子任务原始响应写入聊天记录；这些行也隐藏，当前权威展示位于子 Agent 侧栏。
   // visibleMessages 与 repliedRunIds 用于渲染历史，并判定终止运行是否已有权威回复。
@@ -279,7 +280,14 @@ function SessionsPage() {
   // 子任务、队友和选中子任务运行共同驱动右侧 ChildAgentPanel。
   const visibleChildTasks = childTasks.data.ownerSessionId === activeId ? childTasks.data.items : noDelegatedTasks
   const visibleTeammates = activeId ? teammates.data : noTeammates
-  const sessionNavigation = buildSessionNavigation(workspaces.data, sessions.data)
+  const childPanelOpen = childPanelState.open
+  const setChildPanelOpen = useCallback((update: SetStateAction<boolean>) => {
+    setChildPanelState((current) => {
+      const open = typeof update === 'function' ? update(current.open) : update
+      return { ...current, open }
+    })
+  }, [])
+  const sessionNavigation = buildSessionNavigation(workspaces.data, mergePendingSession(sessions.data, pendingSession))
   const activeChildTask = visibleChildTasks.find((task) => task.id === selectedChildTaskId) ?? visibleChildTasks[0]
   const childTaskRunId = stringId(activeChildTask?.child_run_id) || stringId(activeChildTask?.result?.child_run_id)
   const childTaskRun = childTaskRunId ? sessionRuns.find((run) => run.id === childTaskRunId) : undefined
@@ -309,36 +317,54 @@ function SessionsPage() {
   const setRunsState = runs.setState
   const setApprovalsState = approvals.setState
   const settingsLocked = activeRunCanStream || !['idle', 'terminal'].includes(liveRun.status)
+  const currentMenuContextKey = `${draftActive ? 'draft' : activeId}:${activeRunId}:${liveRun.runId}:${liveRun.status}`
+  const menusLocked = settingsLocked || sending
+  const visibleSettingsMenuOpen = resolveMenuOpen(settingsMenuOpen, openedMenuContextKey, currentMenuContextKey, menusLocked)
+  const visibleAddMenuOpen = resolveMenuOpen(addMenuOpen, openedMenuContextKey, currentMenuContextKey, menusLocked)
+  const visiblePermissionMenuOpen = resolveMenuOpen(permissionMenuOpen, openedMenuContextKey, currentMenuContextKey, menusLocked)
 
   useEffect(() => {
-    if (liveRun.status !== 'terminal' || !liveRun.runId || !hasVisibleCompletedThought(liveRun.thought)) return
-    setCompletedThoughtsByRun((current) => current[liveRun.runId] === liveRun.thought ? current : { ...current, [liveRun.runId]: liveRun.thought })
-  }, [liveRun.runId, liveRun.status, liveRun.thought])
+    if (!visibleSettingsMenuOpen) return
+    const closeOnPointerDown = (event: PointerEvent) => {
+      if (!settingsMenuRef.current?.contains(event.target as Node)) closeSettingsMenu()
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeSettingsMenu()
+        window.requestAnimationFrame(() => settingsTriggerRef.current?.focus())
+      }
+    }
+    document.addEventListener('pointerdown', closeOnPointerDown)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [visibleSettingsMenuOpen])
+
+  useEffect(() => {
+    if (!visibleAddMenuOpen && !visiblePermissionMenuOpen) return
+    const closeOnPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node
+      if (visibleAddMenuOpen && !addMenuRef.current?.contains(target)) closeCapabilityMenus()
+      if (visiblePermissionMenuOpen && !permissionMenuRef.current?.contains(target)) closeCapabilityMenus()
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeCapabilityMenus()
+    }
+    document.addEventListener('pointerdown', closeOnPointerDown)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [visibleAddMenuOpen, visiblePermissionMenuOpen])
 
   useLayoutEffect(() => {
-    setCompletedThoughtsByRun({})
-    setInterruptedRunId('')
     thoughtHydrationRegistryRef.current.reset()
     historyScrollSessionRef.current = activeId
     stickToBottomRef.current = true
-    setHistoryHydration({ sessionId: activeId, complete: false })
   }, [activeId])
-
-  useEffect(() => {
-    if (!visibleChildTasks.length) {
-      childPanelAutoOpenedRef.current = false
-      setSelectedChildTaskId('')
-      return
-    }
-    // 打开含委派任务的历史会话时自动展示一次侧栏；之后尊重手动关闭，直到子任务清空或切换会话。
-    if (!childPanelAutoOpenedRef.current) {
-      childPanelAutoOpenedRef.current = true
-      setChildPanelOpen(true)
-    }
-    if (!visibleChildTasks.some((task) => task.id === selectedChildTaskId)) {
-      setSelectedChildTaskId(visibleChildTasks[0].id)
-    }
-  }, [selectedChildTaskId, visibleChildTasks])
 
   useEffect(() => {
     if (!activeId || runs.loading || runs.data.ownerSessionId !== activeId) return
@@ -382,23 +408,16 @@ function SessionsPage() {
       for (const request of activeRequests) registry.cancel(request.runId, request.token)
     }
   }, [activeId, historyMessageRunIds, runs.data.items, runs.data.ownerSessionId, runs.loading])
-  useEffect(() => {
-    if (settingsLocked || sending) {
-      setSettingsMenuOpen(false)
-      setSettingsSubmenu(null)
-      setAddMenuOpen(false)
-      setSkillSubmenuOpen(false)
-      setMcpSubmenuOpen(false)
-      setPermissionMenuOpen(false)
-    }
-  }, [sending, settingsLocked])
 
-  useEffect(() => {
-    if (draftActive) return
-    const workspaceId = activeSession?.workspace_id || ''
-    const isProject = workspaces.data.some((workspace) => workspace.id === workspaceId && !isDefaultWorkspace(workspace))
-    setExpandedWorkspaceIds(isProject ? new Set([workspaceId]) : new Set())
-  }, [activeSession?.workspace_id, draftActive, workspaces.data])
+  function setExpandedWorkspaceIds(update: SetStateAction<Set<string>>) {
+    setWorkspaceExpansion((current) => {
+      const currentIds = resolveExpandedWorkspaceIds(current, workspaceExpansionContextKey, defaultExpandedWorkspaceId)
+      return {
+        contextKey: workspaceExpansionContextKey,
+        ids: typeof update === 'function' ? update(currentIds) : update,
+      }
+    })
+  }
 
   // 清除待上传附件及对应 input 值，保证再次选择同名文件仍会触发 change。
   function clearPendingAttachments() {
@@ -456,11 +475,18 @@ function SessionsPage() {
   // 进入新会话模式，关闭现有会话运输和菜单，并准备默认能力设置。
   function beginDraft() {
     if (sendingRef.current) return
+    closeAllMenus()
+    setPendingSession(null)
     clearPendingAttachments()
     const selectedProjectRoot = projectRootForSession(workspaces.data, activeSession)
     const selectedProjectId = selectedProjectRoot ? activeSession?.workspace_id : ''
     draftVersionRef.current += 1
     setActionError('')
+    setCompletedThoughtsByRun({})
+    setInterruptedRunId('')
+    setSelectedChildTaskId('')
+    setChildPanelState((current) => ({ ...current, sessionId: '', autoOpened: false }))
+    setHistoryHydration({ sessionId: '', complete: false })
     setDraftRootPath(selectedProjectRoot)
     setDraftSettings(emptyDraftSettings)
     setLiveRun(emptyLiveRun())
@@ -473,10 +499,17 @@ function SessionsPage() {
   // 切换至持久化会话；后续 useApiData 依赖 activeId 自动加载关联资源。
   function openExistingSession(sessionId: string) {
     if (draftActive && sendingRef.current) return
+    closeAllMenus()
     if (draftActive) {
       clearDraftState()
     }
     setActionError('')
+    setCompletedThoughtsByRun({})
+    setInterruptedRunId('')
+    setSelectedChildTaskId('')
+    setHistoryHydration({ sessionId, complete: false })
+    setLiveRun(emptyLiveRun())
+    setPendingSession(null)
     clearPendingAttachments()
     stickToBottomRef.current = true
     historyScrollSessionRef.current = sessionId
@@ -543,12 +576,17 @@ function SessionsPage() {
     try {
       await api.delete<void>(`/api/workspaces/${encodeURIComponent(workspaceId)}`)
       const [, latestSessions] = await Promise.all([workspaces.refresh(), sessions.refresh()])
+      setPendingSession((current) => pendingSessionAfterRemoval(current, deletedSessionIds))
       if (deletedSessionIds.has(activeIdRef.current)) {
+        const nextSessionId = latestSessions?.[0] ? stringId(latestSessions[0].id) : ''
         closeRunTransport()
         terminalSyncVersionRef.current += 1
         setLiveRun(emptyLiveRun())
         setCompletedThoughtsByRun({})
-        setActiveId(latestSessions?.[0] ? stringId(latestSessions[0].id) : '')
+        setInterruptedRunId('')
+        setSelectedChildTaskId('')
+        setHistoryHydration({ sessionId: nextSessionId, complete: false })
+        setActiveId(nextSessionId)
       }
       setExpandedWorkspaceIds((current) => {
         const next = new Set(current)
@@ -615,7 +653,6 @@ function SessionsPage() {
     if (pendingSessionSendRef.current?.sessionId !== activeId) pendingSessionSendRef.current = null
     terminalSyncVersionRef.current += 1
     seenStreamEventsRef.current = { runId: '', eventIds: new Set() }
-    setLiveRun(emptyLiveRun())
     stickToBottomRef.current = true
     return () => {
       closeRunTransport()
@@ -637,7 +674,7 @@ function SessionsPage() {
     if (!activeId || messages.loading || !activeRun?.id || !activeRunCanStream || liveRun.status === 'terminal') return
     if (streamRunIdRef.current === activeRun.id) return
     startRunStream(activeRun.id, activeId, activeRun.started_at)
-  }, [activeId, activeRun?.id, activeRun?.status, activeRun?.stop_reason, activeRunCanStream, liveRun.status, messages.loading, startRunStream, visibleMessages])
+  }, [activeId, activeRun?.id, activeRun?.started_at, activeRun?.status, activeRun?.stop_reason, activeRunCanStream, liveRun.status, messages.loading, startRunStream, visibleMessages])
 
   // 新打开的历史在消息和持久化思考/工具时间线均水合前保持锚定；程序布局滚动不能取消首次锚点。
   useEffect(() => {
@@ -688,10 +725,11 @@ function SessionsPage() {
   async function submitMessage(content: string, files: File[], consumeComposer: boolean) {
     if (sendingRef.current || (!activeId && !draftActive) || (!content && !files.length) || settingsSaving || capabilitySaving || settingsLocked) return
     sendingRef.current = true
+    closeAllMenus()
     setSending(true); setActionError('')
-    lastSubmittedContentRef.current = content
+    setLastSubmittedContent(content)
     stickToBottomRef.current = true
-    setLiveRun({ ...emptyLiveRun(), phase: '思考中…', status: 'connecting', thought: { ...emptyThoughtTimeline, startedAt: Date.now() }, thinkingStatus: pickThinkingStatus() })
+    setLiveRun({ ...emptyLiveRun(), phase: '思考中…', status: 'connecting', thought: { ...emptyThoughtTimeline, startedAt: runThinkingStartedAt(undefined) }, thinkingStatus: pickThinkingStatus() })
     try {
       if (draftActive) {
         const draftVersion = draftVersionRef.current
@@ -711,6 +749,7 @@ function SessionsPage() {
         const sessionId = stringId(launched.session?.id)
         const runId = stringId(launched.run?.id)
         if (!sessionId || !runId) throw new Error('草稿启动响应缺少会话或运行标识。')
+        setPendingSession(launched.session)
         setInterruptedRunId('')
         pendingDraftRunRef.current = { sessionId, runId, startedAt: launched.run.started_at }
         if (consumeComposer) composerInputRef.current?.clear()
@@ -819,7 +858,7 @@ function SessionsPage() {
 
   // 把用户中断后的最后一次提交恢复进编辑器，供修改后重新发送。
   function editInterruptedPrompt() {
-    const content = lastSubmittedContentRef.current.trim()
+    const content = lastSubmittedContent.trim()
     if (!content || !canEditInterrupted) return
     composerInputRef.current?.setValue(content)
     setInterruptedRunId('')
@@ -907,12 +946,17 @@ function SessionsPage() {
     try {
       await api.delete<void>(`/api/sessions/${encodeURIComponent(sessionId)}`)
       const latest = await sessions.refresh()
+      setPendingSession((current) => pendingSessionAfterRemoval(current, new Set([sessionId])))
       if (sessionId === activeIdRef.current) {
+        const nextSessionId = latest?.[0] ? stringId(latest[0].id) : ''
         closeRunTransport()
         terminalSyncVersionRef.current += 1
         setLiveRun(emptyLiveRun())
         setCompletedThoughtsByRun({})
-        setActiveId(latest?.[0] ? stringId(latest[0].id) : '')
+        setInterruptedRunId('')
+        setSelectedChildTaskId('')
+        setHistoryHydration({ sessionId: nextSessionId, complete: false })
+        setActiveId(nextSessionId)
       }
     } catch (error) {
       setActionError(describeError(error))
@@ -950,7 +994,7 @@ function SessionsPage() {
 
   // 保存权限模式并关闭对应弹出菜单。
   function selectPermissionMode(mode: PermissionMode) {
-    setPermissionMenuOpen(false)
+    closeCapabilityMenus()
     void updateSessionCapabilities({ permission_mode: mode })
   }
 
@@ -962,32 +1006,69 @@ function SessionsPage() {
     use_memories: draftSettings.use_memories,
   } : undefined)
   const effectiveSettings = resolveEffectiveModelSettings(connections.data, settingsSession, activeAgent)
-  const effectiveConnection = effectiveSettings.connection
   const effectiveModel = effectiveSettings.model
-  const effectiveThinking = resolveEffectiveThinking(settingsSession?.thinking_level, activeAgent?.thinking_level, effectiveConnection?.thinking_level)
+  const selectedThinkingValue = resolveEffectiveThinking(settingsSession?.thinking_level)
   const modelOptions = connections.data.filter((connection) => connection.enabled !== false).flatMap((connection) => {
     return availableConnectionModels(connection).map((model) => ({ value: `${connection.id}::${model}`, label: model, connection: connection.name }))
   })
   const selectedModelValue = effectiveSettings.selectedValue
-  const selectedThinkingValue = effectiveThinking
+  const thinkingButtonLabel = thinkingLevelLabels[selectedThinkingValue]
   const modelButtonLabel = shortModelLabel(effectiveModel)
-  const thinkingOptions: Array<{ value: ThinkingLevel; label: string; hint?: string }> = [
-    { value: 'low', label: '低' },
-    { value: 'medium', label: '中' },
-    { value: 'high', label: '高' },
-    { value: 'xhigh', label: '极高', hint: '更快消耗使用额度' },
-  ]
   // 同时关闭设置主菜单和二级菜单，防止残留不可见焦点。
   function closeSettingsMenu() {
     setSettingsMenuOpen(false)
     setSettingsSubmenu(null)
+    setOpenedMenuContextKey('')
+  }
+  function closeCapabilityMenus() {
+    setAddMenuOpen(false)
+    setSkillSubmenuOpen(false)
+    setMcpSubmenuOpen(false)
+    setPermissionMenuOpen(false)
+    setOpenedMenuContextKey('')
+  }
+  function closeAllMenus() {
+    setSettingsMenuOpen(false)
+    setSettingsSubmenu(null)
+    setAddMenuOpen(false)
+    setSkillSubmenuOpen(false)
+    setMcpSubmenuOpen(false)
+    setPermissionMenuOpen(false)
+    setOpenedMenuContextKey('')
+  }
+  function toggleSettingsMenu() {
+    const nextOpen = !visibleSettingsMenuOpen
+    closeCapabilityMenus()
+    setOpenedMenuContextKey(nextOpen ? currentMenuContextKey : '')
+    setSettingsMenuOpen(nextOpen)
+    setSettingsSubmenu(null)
+  }
+  function toggleAddMenu() {
+    const nextOpen = !visibleAddMenuOpen
+    setSettingsMenuOpen(false)
+    setSettingsSubmenu(null)
+    setPermissionMenuOpen(false)
+    setOpenedMenuContextKey(nextOpen ? currentMenuContextKey : '')
+    setAddMenuOpen(nextOpen)
+    setSkillSubmenuOpen(false)
+    setMcpSubmenuOpen(false)
+  }
+  function togglePermissionMenu() {
+    const nextOpen = !visiblePermissionMenuOpen
+    setSettingsMenuOpen(false)
+    setSettingsSubmenu(null)
+    setAddMenuOpen(false)
+    setSkillSubmenuOpen(false)
+    setMcpSubmenuOpen(false)
+    setOpenedMenuContextKey(nextOpen ? currentMenuContextKey : '')
+    setPermissionMenuOpen(nextOpen)
   }
   // 将组合选择值转换成连接/模型字段后保存。
   function selectModel(value: string) {
     closeSettingsMenu()
     void updateSessionSettings(modelSelectionPayload(value))
   }
-  // 保存显式思考等级；auto 仍由有效设置解析函数结合默认值决定。
+  // 保存用户实际选择的四档思考强度，下一次普通 Run 将直接读取该会话值。
   function selectThinking(value: ThinkingLevel) {
     closeSettingsMenu()
     void updateSessionSettings({ thinking_level: value })
@@ -1128,11 +1209,11 @@ function SessionsPage() {
                       {!!pendingAttachments.length && <b>{pendingAttachments.length}</b>}
                     </button>
                     <div className="session-capability-picker" ref={addMenuRef}>
-                      <button type="button" className="composer-tool-button composer-plus-button" aria-label="添加能力" aria-haspopup="menu" aria-expanded={addMenuOpen} aria-busy={capabilitySaving} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setAddMenuOpen((open) => !open); setSkillSubmenuOpen(false); setMcpSubmenuOpen(false); setPermissionMenuOpen(false) }}>
+                      <button type="button" className="composer-tool-button composer-plus-button" aria-label="添加能力" aria-haspopup="menu" aria-expanded={visibleAddMenuOpen} aria-busy={capabilitySaving} disabled={settingsLocked || sending || capabilitySaving} onClick={toggleAddMenu}>
                         <Plus size={15} />
                         {!!(selectedSessionSkillIds.length + selectedSessionMcpNames.length) && <b>{selectedSessionSkillIds.length + selectedSessionMcpNames.length}</b>}
                       </button>
-                      {addMenuOpen && <div className="capability-popover capability-level-two" role="menu" aria-label="添加能力">
+                      {visibleAddMenuOpen && <div className="capability-popover capability-level-two" role="menu" aria-label="添加能力">
                         <button type="button" className={skillSubmenuOpen ? 'active' : ''} role="menuitem" aria-haspopup="menu" aria-expanded={skillSubmenuOpen} onMouseEnter={() => { setSkillSubmenuOpen(true); setMcpSubmenuOpen(false) }} onClick={() => { setSkillSubmenuOpen((open) => !open); setMcpSubmenuOpen(false) }}><BookOpen size={14} /><span>Skill</span><small>{selectedSessionSkillIds.length ? `已选 ${selectedSessionSkillIds.length}` : '未选择'}</small><ChevronRight size={13} /></button>
                         {skillSubmenuOpen && <div className="capability-popover capability-level-three" role="menu" aria-label="选择 Skill">
                           <p>可用 Skill</p>
@@ -1156,8 +1237,8 @@ function SessionsPage() {
                       </div>}
                     </div>
                     <div className="session-capability-picker permission-picker" ref={permissionMenuRef}>
-                      <button type="button" className={`composer-tool-button permission-trigger${selectedPermissionMode === 'full' ? ' permission-trigger-full' : ''}`} aria-label={`权限模式：${permissionLabel(selectedPermissionMode)}`} aria-haspopup="menu" aria-expanded={permissionMenuOpen} disabled={settingsLocked || sending || capabilitySaving} onClick={() => { setPermissionMenuOpen((open) => !open); setAddMenuOpen(false); setSkillSubmenuOpen(false); setMcpSubmenuOpen(false) }}>{selectedPermissionMode === 'full' ? <ShieldAlert size={14} /> : <ShieldCheck size={14} />}<span>{permissionLabel(selectedPermissionMode)}</span><ChevronRight size={12} /></button>
-                      {permissionMenuOpen && <div className="capability-popover permission-popover" role="menu" aria-label="权限模式">
+                      <button type="button" className={`composer-tool-button permission-trigger${selectedPermissionMode === 'full' ? ' permission-trigger-full' : ''}`} aria-label={`权限模式：${permissionLabel(selectedPermissionMode)}`} aria-haspopup="menu" aria-expanded={visiblePermissionMenuOpen} disabled={settingsLocked || sending || capabilitySaving} onClick={togglePermissionMenu}>{selectedPermissionMode === 'full' ? <ShieldAlert size={14} /> : <ShieldCheck size={14} />}<span>{permissionLabel(selectedPermissionMode)}</span><ChevronRight size={12} /></button>
+                      {visiblePermissionMenuOpen && <div className="capability-popover permission-popover" role="menu" aria-label="权限模式">
                         <p>权限</p>
                         {permissionOptions.map((option) => <button key={option.value} type="button" role="menuitemradio" aria-checked={selectedPermissionMode === option.value} className={selectedPermissionMode === option.value ? 'selected' : ''} onClick={() => selectPermissionMode(option.value)}><span>{option.label}</span><Check className="selection-check" size={14} aria-hidden="true" /></button>)}
                       </div>}
@@ -1169,16 +1250,16 @@ function SessionsPage() {
                         ref={settingsTriggerRef}
                         type="button"
                         className="session-settings-trigger"
-                        aria-label={`当前模型 ${modelButtonLabel}，思考强度 ${thinkingLevelLabels[effectiveThinking]}。点击更改`}
+                        aria-label={`当前模型 ${modelButtonLabel}，思考强度 ${thinkingButtonLabel}。点击更改`}
                         aria-haspopup="menu"
-                        aria-expanded={settingsMenuOpen}
+                        aria-expanded={visibleSettingsMenuOpen}
                         aria-busy={settingsSaving}
                         disabled={settingsSaving || settingsLocked || sending}
-                        onClick={() => { setSettingsMenuOpen((open) => !open); setSettingsSubmenu(null) }}
+                        onClick={toggleSettingsMenu}
                       >
-                        <span>{modelButtonLabel}</span><strong>{thinkingLevelLabels[effectiveThinking]}</strong><ChevronRight size={12} aria-hidden="true" />
+                        <span>{modelButtonLabel}</span><strong>{thinkingButtonLabel}</strong><ChevronRight size={12} aria-hidden="true" />
                       </button>
-                      {settingsMenuOpen && <div className="session-settings-popover" role="menu" aria-label="模型和思考设置">
+                      {visibleSettingsMenuOpen && <div className="session-settings-popover" role="menu" aria-label="模型和思考设置">
                         <button type="button" className="session-memory-setting" role="menuitemcheckbox" aria-checked={selectedUseMemories} aria-busy={settingsSaving} disabled={globalMemoriesDisabled || settingsSaving || settingsLocked || sending} onClick={toggleSessionMemories}>
                           <span><strong>使用已有记忆</strong><small>{globalMemoriesDisabled ? '全局已关闭' : selectedUseMemories ? '此会话会使用已有记忆' : '此会话不会使用已有记忆'}</small></span>
                           <span className="session-memory-switch" aria-hidden="true"><span /></span>
@@ -1188,16 +1269,17 @@ function SessionsPage() {
                         </button>
                         {settingsSubmenu === 'model' && <div className="session-settings-submenu" ref={modelSubmenuRef} role="menu" aria-label="选择模型">
                           <p>模型</p>
+                          {!modelOptions.length && <div className="session-settings-empty" role="status">暂无启用模型</div>}
                           {modelOptions.map((option, index) => <button key={`${option.value}:${index}`} type="button" role="menuitemradio" aria-checked={selectedModelValue === option.value} className={selectedModelValue === option.value ? 'selected' : ''} onClick={() => selectModel(option.value)}>
                             <span><strong>{option.label}</strong><small>{option.connection}</small></span><Check className="selection-check" size={14} aria-hidden="true" />
                           </button>)}
                         </div>}
                         <button type="button" className={settingsSubmenu === 'thinking' ? 'active' : ''} role="menuitem" aria-haspopup="menu" aria-expanded={settingsSubmenu === 'thinking'} onMouseEnter={() => openSettingsSubmenu('thinking')} onKeyDown={(event) => { if (event.key === 'ArrowRight') { event.preventDefault(); openSettingsSubmenu('thinking', true) } }} onClick={() => openSettingsSubmenu('thinking', true)}>
-                          <span>推理强度</span><small>{thinkingLevelLabels[effectiveThinking]}</small><ChevronRight size={13} aria-hidden="true" />
+                          <span>推理强度</span><small>{thinkingButtonLabel}</small><ChevronRight size={13} aria-hidden="true" />
                         </button>
                         {settingsSubmenu === 'thinking' && <div className="session-settings-submenu" ref={thinkingSubmenuRef} role="menu" aria-label="选择推理强度">
                           <p>推理强度</p>
-                          {thinkingOptions.map((option) => <button key={option.value} type="button" role="menuitemradio" aria-checked={selectedThinkingValue === option.value} className={selectedThinkingValue === option.value ? 'selected' : ''} onClick={() => selectThinking(option.value)}>
+                          {sessionThinkingOptions.map((option) => <button key={option.value} type="button" role="menuitemradio" aria-checked={selectedThinkingValue === option.value} className={selectedThinkingValue === option.value ? 'selected' : ''} onClick={() => selectThinking(option.value)}>
                             <span><strong>{option.label}</strong>{option.hint && <small>{option.hint}</small>}</span><Check className="selection-check" size={14} aria-hidden="true" />
                           </button>)}
                         </div>}
@@ -1253,4 +1335,6 @@ function SessionsPage() {
 }
 
 
-export { SessionsPage }
+const SessionsPageState = { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveExpandedWorkspaceIds, resolveMenuOpen }
+
+export { SessionsPage, SessionsPageState }

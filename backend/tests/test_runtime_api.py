@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from src.persistence import database
 from src.api.runtime import _stream_event_is_terminal, router
+from src.api.routes import router as resources_router
 from src.persistence.database import (
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
@@ -28,6 +29,7 @@ from src.persistence.database import (
     DelegatedTask,
     DraftLaunch,
     DurableTask,
+    ModelConnection,
     PlanStep,
     Run,
     RunEvent,
@@ -55,6 +57,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient,
         lambda run_id, resume=False: launched["calls"].append((run_id, resume)) or True,
     )
     app = FastAPI()
+    app.include_router(resources_router)
     app.include_router(router)
     with TestClient(app) as test_client:
         yield test_client, launched
@@ -997,6 +1000,89 @@ def test_launch_uses_fixed_defaults_when_session_has_no_bindings(
         assert run.agent_id == DEFAULT_AGENT_ID
         assert run.workspace_id == DEFAULT_WORKSPACE_ID
         assert run.mode == "auto"
+
+
+# 测试场景：会话在两次用户消息之间修改模型设置时，下一次普通 Run 必须重新读取 Session，而非复用上一轮快照。
+def test_next_user_turn_resolves_patched_session_model_settings(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, _launched = client
+    with database.SessionLocal() as db:
+        first_connection = ModelConnection(
+            name="First relay",
+            provider="openai_compatible",
+            base_url="https://first.example.invalid/v1",
+            secret_ref="test:first-relay",
+            default_model="first-model",
+            thinking_level="low",
+            status="connected",
+        )
+        second_connection = ModelConnection(
+            name="Second relay",
+            provider="openai_compatible",
+            base_url="https://second.example.invalid/v1",
+            secret_ref="test:second-relay",
+            discovered_models=["second-model", "second-default"],
+            default_model="second-default",
+            thinking_level="medium",
+            status="connected",
+        )
+        db.add_all([first_connection, second_connection])
+        db.flush()
+        session = Session(
+            title="Switch settings between turns",
+            workspace_id=DEFAULT_WORKSPACE_ID,
+            agent_id=DEFAULT_AGENT_ID,
+            model_connection_id=first_connection.id,
+            model_id="first-model",
+            thinking_level="low",
+        )
+        db.add(session)
+        db.commit()
+        session_id = session.id
+        first_connection_id = first_connection.id
+        second_connection_id = second_connection.id
+
+    first = test_client.post(
+        f"/api/sessions/{session_id}/run",
+        json={"content": "first turn", "idempotency_key": "turn-first"},
+    )
+    assert first.status_code == 202, first.text
+    _first_runtime, first_context = RunCoordinator._resolve_runtime(first.json()["id"])
+    assert first_context["provider"].model_connection_id == first_connection_id
+    assert first_context["provider"].model_id == "first-model"
+    assert first_context["provider"].thinking_level == "low"
+    with database.SessionLocal() as db:
+        first_run = db.get(Run, first.json()["id"])
+        assert first_run is not None
+        first_run.status = "completed"
+        db.add(RunEvent(
+            run_id=first_run.id,
+            event_type="runtime_snapshot",
+            payload={"runtime_binding": first_context["runtime_binding"]},
+        ))
+        db.commit()
+
+    updated = test_client.patch(
+        f"/api/sessions/{session_id}",
+        json={
+            "model_connection_id": second_connection_id,
+            "model_id": "second-model",
+            "thinking_level": "high",
+        },
+    )
+    assert updated.status_code == 200, updated.text
+
+    second = test_client.post(
+        f"/api/sessions/{session_id}/run",
+        json={"content": "second turn", "idempotency_key": "turn-second"},
+    )
+    assert second.status_code == 202, second.text
+    _runtime, context = RunCoordinator._resolve_runtime(second.json()["id"])
+    provider = context["provider"]
+    assert provider.model_connection_id == second_connection_id
+    assert provider.model_id == "second-model"
+    assert provider.thinking_level == "high"
 
 
 # 辅助函数：_draft_payload 封装本组测试重复使用的输入准备、状态查询或测试替身行为。

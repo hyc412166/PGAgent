@@ -9,11 +9,11 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.persistence.database import ModelConnection, get_db, new_id
+from src.persistence.database import Agent, ModelConnection, Session as ChatSession, get_db, new_id
 from src.api.schemas import (
     ConnectionTestResult,
     ModelConnectionCreate,
@@ -33,6 +33,46 @@ from src.model.credentials import (
 router = APIRouter(prefix="/api/connections", tags=["model connections"])
 # 变量说明：REQUEST_TIMEOUT_SECONDS 表示当前流程使用的 REQUEST_TIMEOUT_SECONDS 集合。
 REQUEST_TIMEOUT_SECONDS = 12.0
+
+
+def _connection_model_catalog(connection: ModelConnection) -> list[str]:
+    """返回连接当前可展示的去重模型目录，并保持默认模型优先。"""
+
+    return list(dict.fromkeys([
+        *([connection.default_model] if connection.default_model else []),
+        *(connection.discovered_models or []),
+        *(connection.manual_models or []),
+    ]))
+
+
+def _reconcile_model_selection(db: Session, connection: ModelConnection) -> None:
+    """收敛禁用集合，并移除仍指向禁用模型的可编辑选择。"""
+
+    catalog = _connection_model_catalog(connection)
+    # /models 目录可能短暂缺项；停用记录必须独立保留，避免模型恢复后被静默重新启用。
+    connection.disabled_models = list(dict.fromkeys(connection.disabled_models or []))
+    requested_disabled = set(connection.disabled_models)
+    enabled_models = [model for model in catalog if model not in requested_disabled]
+    if connection.default_model not in enabled_models:
+        connection.default_model = enabled_models[0] if enabled_models else None
+    if not requested_disabled:
+        return
+    db.execute(
+        update(Agent)
+        .where(
+            Agent.model_connection_id == connection.id,
+            Agent.model_id.in_(requested_disabled),
+        )
+        .values(model_id=None)
+    )
+    db.execute(
+        update(ChatSession)
+        .where(
+            ChatSession.model_connection_id == connection.id,
+            ChatSession.model_id.in_(requested_disabled),
+        )
+        .values(model_id=None)
+    )
 
 
 # 函数职责：完成 models_url 对应的业务处理。
@@ -307,6 +347,7 @@ def create_connection(payload: ModelConnectionCreate, db: Session = Depends(get_
         secret_ref=secret_ref,
         discovered_models=result.models,
         manual_models=payload.manual_models,
+        disabled_models=payload.disabled_models,
         default_model=default_model,
         thinking_level=payload.thinking_level,
         custom_headers=payload.custom_headers,
@@ -316,6 +357,7 @@ def create_connection(payload: ModelConnectionCreate, db: Session = Depends(get_
         capabilities={"model_discovery": result.success, payload.api_protocol: True},
         enabled=payload.enabled,
     )
+    _reconcile_model_selection(db, connection)
     db.add(connection)
     try:
         db.commit()
@@ -428,6 +470,8 @@ def update_connection(
             })
         # 变量说明：capabilities 表示当前流程使用的 capabilities 集合。
         connection.capabilities = {**connection.capabilities, connection.api_protocol: True}
+    if {"disabled_models", "manual_models", "default_model"}.intersection(payload.model_fields_set) or should_discover:
+        _reconcile_model_selection(db, connection)
     if payload.api_key is not None:
         _save_or_503(connection.secret_ref, payload.api_key)
     try:
@@ -435,6 +479,43 @@ def update_connection(
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="A connection with this name already exists") from exc
+    db.refresh(connection)
+    return connection
+
+
+# 函数职责：只刷新模型目录，不发送模型推理请求或改变已选择的 API 协议。
+@router.post("/{connection_id}/discover", response_model=ModelConnectionRead)
+def rediscover_connection_models(
+    connection_id: str, db: Session = Depends(get_db)
+) -> ModelConnection:
+    connection = _require_connection(db, connection_id)
+    try:
+        api_key = get_api_key(connection.secret_ref)
+    except SecretStoreError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not api_key:
+        raise HTTPException(status_code=409, detail="Stored API key is missing")
+
+    result = discover_models(connection.base_url, api_key, connection.custom_headers)
+    connection.last_checked_at = datetime.now(timezone.utc)
+    if not result.success:
+        connection.status = result.category
+        connection.last_error = result.message
+        connection.capabilities = {**connection.capabilities, "model_discovery": False}
+        db.commit()
+        raise HTTPException(status_code=400, detail={
+            "message": result.message,
+            "category": result.category,
+            "retryable": result.retryable,
+            "http_status": result.http_status,
+        })
+
+    connection.discovered_models = result.models
+    connection.status = "connected"
+    connection.last_error = None
+    connection.capabilities = {**connection.capabilities, "model_discovery": True}
+    _reconcile_model_selection(db, connection)
+    db.commit()
     db.refresh(connection)
     return connection
 

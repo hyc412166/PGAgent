@@ -296,9 +296,69 @@ select:focus-visible {
   display: flex;
   align-items: center;
   gap: 4px;
+  max-width: 100%;
+  min-width: 0;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
-.connection-card-actions .status { margin-right: 2px; }
+.connection-card > header {
+  grid-template-columns: 40px minmax(0, 1fr) minmax(0, auto);
+}
+
+.connection-card > header > div:nth-child(2) {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.connection-card h2,
+.connection-card header p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-card-actions .status {
+  max-width: 104px;
+  margin-right: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-tag {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted-2);
+  background: var(--surface);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.5rem;
+  cursor: pointer;
+  transition: color 120ms ease-out, border-color 120ms ease-out, background-color 120ms ease-out, scale 120ms ease-out;
+}
+
+.model-tag:hover:not(:disabled) { border-color: var(--ocean-500); }
+.model-tag:active:not(:disabled) { scale: 0.96; }
+.model-tag:focus-visible { outline: 2px solid var(--ocean-500); outline-offset: 2px; }
+.model-tag.is-enabled {
+  color: var(--ocean-700);
+  border-color: var(--ocean-500);
+  background: var(--blue-soft);
+}
+.model-tag:disabled { cursor: wait; opacity: 0.68; }
+
+.session-settings-empty {
+  padding: 12px 8px;
+  color: var(--muted-2);
+  font-size: .5rem;
+  text-align: center;
+}
 
 /* Agent 新建/编辑：能力行保持可读、滚动稳定并降低重绘开销。 */
 .capability-select {

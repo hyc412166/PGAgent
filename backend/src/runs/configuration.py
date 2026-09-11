@@ -107,6 +107,18 @@ def _explicit_setting(*values: str | None) -> str | None:
     return None
 
 
+def _enabled_connection_models(connection: ModelConnection) -> list[str]:
+    """按连接目录顺序返回可用于新 Run 的模型。"""
+
+    disabled = set(connection.disabled_models or [])
+    catalog = dict.fromkeys([
+        *([connection.default_model] if connection.default_model else []),
+        *(connection.discovered_models or []),
+        *(connection.manual_models or []),
+    ])
+    return [model for model in catalog if model not in disabled]
+
+
 # 函数职责：完成 fallback_connection 对应的业务处理。
 # 参数关系：db 表示当前数据库会话；provider 表示模型供应商。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
@@ -126,7 +138,8 @@ def _fallback_connection(db: Any, *, provider: str | None = None) -> ModelConnec
         ModelConnection.last_checked_at.desc(),
         ModelConnection.created_at.asc(),
     )
-    return db.scalar(query)
+    # 连接开启不等于存在可用模型；继续寻找下一条可运行连接。
+    return next((connection for connection in db.scalars(query) if _enabled_connection_models(connection)), None)
 
 
 # 函数职责：完成 effective_connection 对应的业务处理。
@@ -138,7 +151,7 @@ def _effective_connection(db: Any, session: Session | None, agent: Agent) -> Mod
     for connection_id in dict.fromkeys(item for item in candidate_ids if item):
         # 变量说明：connection 表示当前步骤使用的 connection 值。
         connection = db.get(ModelConnection, connection_id)
-        if connection is not None and connection.enabled:
+        if connection is not None and connection.enabled and _enabled_connection_models(connection):
             return connection
     return _fallback_connection(db)
 
