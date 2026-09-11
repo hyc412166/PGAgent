@@ -1,30 +1,32 @@
 // 本文件实现 PersonalizationPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { AlertCircle, Check, CheckCircle2, LoaderCircle } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { api, describeError } from '../../api'
 import { ErrorState, LoadingState, PageHeader } from '../../components/ui'
 import { useApiData } from '../../shared/hooks/useApiData'
 import type { PersonalizationSettings } from '../../types'
+import { normalizePersonalizationDraft, personalizationDraftAfterSave, resolvePersonalizationDraft } from './personalizationDraft'
 
 // PersonalizationPage 读取并保存用户自定义指令，后端会在后续 Agent 上下文准备时使用它。
 function PersonalizationPage() {
   const personalization = useApiData<PersonalizationSettings | null>(null, () => api.get<PersonalizationSettings>('/api/system/personalization'), [])
   // draft 与已保存值分离；saving/error/saved 提供一次提交的完整可见反馈。
-  const [draft, setDraft] = useState('')
+  const [localDraft, setLocalDraft] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [saved, setSaved] = useState(false)
 
-  useEffect(() => {
-    if (personalization.data) setDraft(personalization.data.custom_instructions)
-  }, [personalization.data])
+  const persistedDraft = personalization.data?.custom_instructions ?? ''
+  const normalizedLocalDraft = normalizePersonalizationDraft(localDraft, persistedDraft)
+  if (normalizedLocalDraft !== localDraft) setLocalDraft(normalizedLocalDraft)
+  const draft = resolvePersonalizationDraft(normalizedLocalDraft, persistedDraft)
 
   async function savePersonalization() {
     setSaving(true); setSaveError(''); setSaved(false)
     try {
       const result = await api.put<PersonalizationSettings>('/api/system/personalization', { custom_instructions: draft })
       personalization.setState({ data: result, loading: false, error: '' })
-      setDraft(result.custom_instructions)
+      setLocalDraft((current) => personalizationDraftAfterSave(current, draft))
       setSaved(true)
     } catch (cause) {
       setSaveError(describeError(cause))
@@ -49,13 +51,13 @@ function PersonalizationPage() {
           maxLength={maximum}
           rows={16}
           placeholder={'例如：\n- 默认使用中文解释\n- 修改代码后运行相关测试\n- 涉及架构变化时先说明取舍'}
-          onChange={(event) => { setDraft(event.target.value); setSaved(false) }}
+          onChange={(event) => { setLocalDraft(event.target.value); setSaved(false) }}
         />
         <div className="personalization-meta"><span>保存位置</span><code>{personalization.data?.agents_path}</code></div>
         <div className="personalization-actions">
           {saveError && <div className="inline-error"><AlertCircle size={15} />{saveError}</div>}
           {saved && <span className="personalization-saved"><CheckCircle2 size={15} />已保存，将从下一次新运行开始生效</span>}
-          <button className="button button-secondary" type="button" disabled={!changed || saving} onClick={() => { setDraft(personalization.data?.custom_instructions ?? ''); setSaved(false) }}>撤销修改</button>
+          <button className="button button-secondary" type="button" disabled={!changed || saving} onClick={() => { setLocalDraft(null); setSaved(false) }}>撤销修改</button>
           <button className="button button-primary" type="button" disabled={!changed || saving || draft.length > maximum} onClick={() => void savePersonalization()}>{saving ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}保存指令</button>
         </div>
       </>}

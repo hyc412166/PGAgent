@@ -63,7 +63,7 @@ def _tool(
 
 # 变量说明：BUILTIN_TOOL_CATALOG 表示当前步骤使用的 BUILTIN_TOOL_CATALOG 值。
 BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
-    _tool("shell", "运行命令", "在当前项目目录执行受控命令；长任务可返回持久 session_id。", "execution", "adaptive"),
+    _tool("shell", "运行命令", "在 Windows 项目目录中通过 PowerShell 执行命令；支持管道、cmdlet 和持久 session_id。", "execution", "adaptive"),
     _tool("write_stdin", "继续命令", "向持久命令会话写入输入或读取后续输出。", "execution", "adaptive"),
     _tool("read", "读取文件", "分页读取项目目录中的 UTF-8 文本文件。", "filesystem"),
     _tool("read_artifact", "读取 Artifact", "分页读取当前会话拥有的大型工具输出或压缩对话。", "filesystem"),

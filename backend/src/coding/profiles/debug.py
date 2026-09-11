@@ -21,12 +21,9 @@ DEBUG_PROFILE = WorkflowProfile(
         "file_info",
         "git_diff",
         "git_status",
-        "glob",
         "grep",
         "question",
-        "read",
         "read_artifact",
-        "rg",
         "skill",
         "update_plan",
         "validate",
@@ -37,7 +34,8 @@ DEBUG_PROFILE = WorkflowProfile(
     }),
     instructions=(
         "## Debug workflow\n"
-        "Diagnose from observable evidence before changing code. Reproduce the symptom when possible, "
+        "Diagnose from observable evidence before changing code. Use the PowerShell-backed shell with rg, "
+        "rg --files, Get-Content, or Get-ChildItem to collect repository evidence. Reproduce the symptom when possible, "
         "inspect the owning code path and recent diff, and, when available, use debug_evidence to record reproductions, "
         "observations, hypotheses, and the confirmed root cause. Keep hypotheses distinct from confirmed "
         "facts and actively disprove alternatives. Once the root cause is supported, make the smallest "

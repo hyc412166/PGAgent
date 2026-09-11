@@ -167,7 +167,7 @@ def test_attachment_only_draft_is_created_atomically(
         "idempotency_key": "draft-attachment-only",
         "title": "report.pdf",
         "content": "",
-        "thinking_level": "auto",
+        "thinking_level": "medium",
         "permission_mode": "smart",
         "use_memories": True,
         "skill_ids": [],

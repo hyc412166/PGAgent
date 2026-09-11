@@ -60,7 +60,7 @@ function AgentsPage() {
         workflow_profile_id: form.get('workflow_profile_id'),
         model_connection_id: null,
         model_id: null,
-        thinking_level: 'auto',
+        thinking_level: 'medium',
         tool_ids: selectedToolIds,
         skill_ids: selectedSkillIds,
       }

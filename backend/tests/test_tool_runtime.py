@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 
 import pytest
 
@@ -17,6 +18,7 @@ from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConf
 from src.tools import create_default_registry
 from src.tools.catalog import BUILTIN_TOOL_IDS
 from src.tools.policy import assess_tool_call
+from src.tools.types import ToolResult
 
 
 # 测试场景：默认能力目录应让完全访问会话直接看到 Codex 风格 web_run，而不是退回工具搜索。
@@ -261,6 +263,38 @@ def test_legacy_delete_is_hidden_but_still_requires_approval(tmp_path) -> None:
     approved = registry.execute("delete", {"path": "obsolete.txt"}, approved=True)
     assert approved.ok and approved.changed
     assert not target.exists()
+
+
+def test_shell_is_classified_as_a_command_for_approval_modes(tmp_path) -> None:
+    ask = create_default_registry(str(tmp_path), allowed_tool_names=["shell"], permission_mode="ask")
+    smart = create_default_registry(str(tmp_path), allowed_tool_names=["shell"], permission_mode="smart")
+
+    assert ask.execute("shell", {"command": "Remove-Item important.txt"}).approval_required
+    assert smart.execute("shell", {"command": "Remove-Item important.txt"}).approval_required
+
+
+def test_shell_cancellation_event_is_forwarded_to_background_wait(tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    class Store:
+        def start(self, **kwargs):
+            return ToolResult("background_run", True, "started", metadata={"background_job_id": "job-1"})
+
+        def check(self, **kwargs):
+            captured.update(kwargs)
+            return ToolResult("check_background", False, "cancelled", error_code="cancelled", metadata={"background_job_active": False})
+
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["shell"],
+        permission_mode="full",
+        background_store=Store(),
+    )
+    cancel_event = threading.Event()
+    result = registry.execute("shell", {"command": "Write-Output test", "yield_time_ms": 0}, approved=True, _cancel_event=cancel_event)
+
+    assert result.error_code == "cancelled"
+    assert captured["_cancel_event"] is cancel_event
 
 
 # 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_malformed_provider_tool_arguments_are_rejected_without_execution 精确标识本用例的具体条件。

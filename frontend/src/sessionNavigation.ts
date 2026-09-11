@@ -33,6 +33,17 @@ export function buildSessionNavigation(workspaces: Workspace[], sessions: Sessio
   }
 }
 
+// 首轮启动接口先返回会话、列表刷新稍后才完成；临时合并该会话避免页面退回空状态。
+export function mergePendingSession(sessions: Session[], pending?: Session | null): Session[] {
+  if (!pending || sessions.some((session) => session.id === pending.id)) return sessions
+  return [pending, ...sessions]
+}
+
+// 删除会话或整个项目时同步废弃对应临时会话，避免列表刷新后重新插入后端已不存在的条目。
+export function pendingSessionAfterRemoval(pending: Session | null, removedSessionIds: ReadonlySet<string>): Session | null {
+  return pending && removedSessionIds.has(String(pending.id)) ? null : pending
+}
+
 /**
  * Return the selected project directory for an existing project conversation.
  * One-off tasks intentionally return an empty string so a new draft remains a

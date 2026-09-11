@@ -3,13 +3,19 @@ import type { ThinkingLevel } from './types'
 
 // thinkingLevelLabels 为所有思考等级提供统一界面名称。
 export const thinkingLevelLabels: Record<ThinkingLevel, string> = {
-  off: '关闭',
-  auto: '自动',
   low: '低',
   medium: '中',
   high: '高',
   xhigh: '极高',
 }
+
+// 用户侧只提交后端明确支持的四档强度，页面展示值与持久化值保持一致。
+export const sessionThinkingOptions: ReadonlyArray<{ value: ThinkingLevel; label: string; hint?: string }> = [
+  { value: 'low', label: '低' },
+  { value: 'medium', label: '中' },
+  { value: 'high', label: '高' },
+  { value: 'xhigh', label: '极高', hint: '更快消耗使用额度' },
+]
 
 // 按会话、Agent、连接默认值的优先级解析实际思考等级。
 export function resolveEffectiveThinking(

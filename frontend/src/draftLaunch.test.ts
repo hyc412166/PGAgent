@@ -13,7 +13,7 @@ describe('临时草稿原子启动', () => {
     expect(buildDraftLaunchPayload(key, '  分析   当前项目  ', '', {
       model_connection_id: null,
       model_id: null,
-      thinking_level: 'auto',
+      thinking_level: 'medium',
       skill_ids: [],
       mcp_server_names: [],
       permission_mode: 'smart',
@@ -22,7 +22,7 @@ describe('临时草稿原子启动', () => {
       idempotency_key: key,
       title: '分析 当前项目',
       content: '分析   当前项目',
-      thinking_level: 'auto',
+      thinking_level: 'medium',
       skill_ids: [],
       mcp_server_names: [],
       permission_mode: 'smart',

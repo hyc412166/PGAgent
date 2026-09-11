@@ -241,6 +241,36 @@ def test_bash_returns_terminal_output_when_command_finishes_inside_yield_window(
     assert "fast" in result.content
 
 
+def test_shell_persists_a_powershell_background_job(background_store) -> None:
+    """默认 shell 必须把 PowerShell 类型写入持久任务，供恢复流程使用同一解释器。"""
+
+    store, _manager = background_store
+    registry = create_default_registry(
+        store.workspace_root,
+        allowed_tool_names=["shell"],
+        permission_mode="full",
+        background_store=store,
+    )
+
+    result = registry.execute(
+        "shell",
+        {
+            "command": "Write-Output powershell-session",
+            "yield_time_ms": 10_000,
+        },
+        approved=True,
+    )
+
+    job_id = result.metadata["background_job_id"]
+    assert result.ok is True
+    assert result.metadata["shell"] == "powershell"
+    assert "powershell-session" in result.content
+    with database.SessionLocal() as db:
+        job = db.get(BackgroundJob, job_id)
+        assert job is not None
+        assert job.shell == "powershell"
+
+
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_recover_relaunches_queued_job_and_settles_stale_running_job 精确标识本用例的具体条件。
 def test_recover_relaunches_queued_job_and_settles_stale_running_job(background_store) -> None:
     store, manager = background_store

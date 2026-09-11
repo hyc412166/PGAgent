@@ -673,15 +673,17 @@ async def test_general_surface_activates_selected_low_frequency_tools(tmp_path) 
         permission_mode="full",
     )
 
-    assert set(registry.model_visible_tool_names) == {
-        "tool_search", "apply_patch", "read", "rg",
-    }
+    assert set(registry.model_visible_tool_names) == {"tool_search", "apply_patch"}
+    assert {"read", "rg"}.isdisjoint(registry.model_visible_tool_names)
+    activated_rg = await registry.execute_async("tool_search", {"query": "select:rg"})
+    assert activated_rg.metadata["activated_tools"] == ["rg"]
+    assert "rg" in registry.model_visible_tool_names
     search = await registry.execute_async("tool_search", {"query": "select:validate"})
     assert json.loads(search.content)[0]["name"] == "validate"
     assert search.metadata["activated_tools"] == ["validate"]
     assert "validate" in registry.model_visible_tool_names
     snapshot = registry.runtime_state()
-    assert snapshot["builtin_active_tools"] == ["validate"]
+    assert snapshot["builtin_active_tools"] == ["rg", "validate"]
 
     resumed = create_default_registry(
         str(tmp_path),
@@ -690,7 +692,7 @@ async def test_general_surface_activates_selected_low_frequency_tools(tmp_path) 
         coding_state=snapshot["coding_state"],
         active_builtin_tool_names=snapshot["builtin_active_tools"],
     )
-    assert "validate" in resumed.model_visible_tool_names
+    assert {"rg", "validate"}.issubset(resumed.model_visible_tool_names)
 
 
 # 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_coding_profile_does_not_defer_tools_when_tool_search_is_unavailable 精确标识本用例的具体条件。
@@ -718,7 +720,7 @@ async def test_canonical_surface_hides_legacy_aliases_but_keeps_them_executable(
     )
 
     assert set(registry.model_visible_tool_names) == {
-        "tool_search", "shell", "update_plan", "read",
+        "tool_search", "shell", "update_plan",
     }
     assert {"bash", "todowrite", "ToolSearch", "read_file", "WebSearch"}.issubset(
         registry.enabled_tool_names
@@ -728,6 +730,59 @@ async def test_canonical_surface_hides_legacy_aliases_but_keeps_them_executable(
     legacy = registry.execute("read_file", {"path": "missing.txt"})
     assert not legacy.ok
     assert legacy.error_code == "path_error"
+
+
+def test_explicit_structured_file_tools_remain_visible_without_tool_search(tmp_path) -> None:
+    """自定义只读 Agent 未选择命令工具时，显式配置的结构化文件工具仍可直接使用。"""
+
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["read", "glob", "rg"],
+        permission_mode="full",
+    )
+
+    assert registry.model_visible_tool_names == ("read", "glob", "rg")
+
+
+def test_default_coding_and_debug_surfaces_prefer_shell_over_structured_file_tools(tmp_path) -> None:
+    selected = ["tool_search", "shell", "read", "glob", "rg", "apply_patch"]
+
+    for profile_id in ("coding", "debug"):
+        registry = create_default_registry(
+            str(tmp_path),
+            allowed_tool_names=selected,
+            workflow_profile_id=profile_id,
+            permission_mode="full",
+        )
+
+        assert {"shell", "apply_patch"}.issubset(registry.model_visible_tool_names)
+        assert {"read", "glob", "rg"}.isdisjoint(registry.model_visible_tool_names)
+
+
+def test_shell_executes_real_powershell_pipeline_in_workspace(tmp_path) -> None:
+    source = tmp_path / "sample.txt"
+    source.write_text("pgagent shell\n", encoding="utf-8")
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["shell"],
+        permission_mode="full",
+    )
+
+    result = registry.execute(
+        "shell",
+        {
+            "command": (
+                "Get-Content -Raw 'sample.txt' | "
+                "ForEach-Object { $_.Trim().ToUpperInvariant() }"
+            ),
+            "cwd": ".",
+        },
+    )
+
+    assert result.ok
+    assert "PGAGENT SHELL" in result.content
+    assert result.metadata["shell"] == "powershell"
+    assert result.metadata["cwd"] == "."
 
 
 @pytest.mark.asyncio

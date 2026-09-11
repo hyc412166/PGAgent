@@ -21,12 +21,9 @@ CODING_PROFILE = WorkflowProfile(
         "file_info",
         "git_diff",
         "git_status",
-        "glob",
         "grep",
         "question",
-        "read",
         "read_artifact",
-        "rg",
         "skill",
         "task",
         "update_plan",
@@ -39,7 +36,8 @@ CODING_PROFILE = WorkflowProfile(
     instructions=(
         "## Coding workflow\n"
         "Work toward a completed, verified repository change. Read project instructions and inspect the "
-        "owning implementation, callers, and relevant tests before editing. Use rg when available for fast repository "
+        "owning implementation, callers, and relevant tests before editing. Use the PowerShell-backed shell with rg "
+        "and rg --files for repository navigation, and Get-Content/Get-ChildItem when those commands fit better. "
         "navigation and use tool_search for lower-frequency capabilities. Keep the plan proportional to "
         "the task, preserve unrelated user changes, and prefer apply_patch for existing source files. "
         "After editing, inspect git status/diff and run the narrowest relevant checks with validate. "

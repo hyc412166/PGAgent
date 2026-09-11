@@ -3,6 +3,7 @@ import { createElement, type ElementType } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 
+import { appendRunEventPage } from './runEventPagination'
 import * as RunsPageModule from './RunsPage'
 import type { RunEventPage } from '../../types'
 
@@ -24,8 +25,6 @@ describe('运行事件诊断视图', () => {
 
   // 测试场景：加载更多按后端顺序追加事件，并采用新页返回的下一游标。
   it('追加游标分页结果', () => {
-    const appendRunEventPage = Reflect.get(RunsPageModule, 'appendRunEventPage')
-    expect(appendRunEventPage).toBeTypeOf('function')
     const current = {
       items: [{ id: 'event-10', run_id: 'run-1', event_type: 'model_step_started', sequence: 10, step: 1, payload: {}, created_at: '2026-09-08T08:00:00Z' }],
       next_before: 10,

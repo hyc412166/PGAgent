@@ -8,6 +8,7 @@ import { useApiData } from '../../shared/hooks/useApiData'
 import { formatCost, formatTokens } from '../../shared/lib/display'
 import type { Run, RunEventFilters, RunEventPage, RunUsage } from '../../types'
 import { formatRunEventOffset, formatRunEventTime, presentRunEvent, runDisplayTitle, runSecondaryLabel } from '../../runEventPresentation'
+import { appendRunEventPage } from './runEventPagination'
 
 // RunRow 将单条运行压缩为可选择的列表行，状态、时间和目标信息均来自 Run。
 function RunRow({ run, onClick }: { run: Run; onClick?: () => void }) {
@@ -49,11 +50,6 @@ function RunEventFilterControls({ filters, onChange }: { filters: RunEventFilter
     <label>步骤<input type="number" min={0} value={filters.step ?? ''} placeholder="全部" onChange={(event) => onChange({ ...filters, step: event.target.value === '' ? undefined : Number(event.target.value), before: undefined })} /></label>
     <label><input type="checkbox" checked={filters.errors_only || false} onChange={(event) => onChange({ ...filters, errors_only: event.target.checked, before: undefined })} />仅看错误</label>
   </div>
-}
-
-// 游标页按接口返回顺序追加；筛选变化由数据钩子重新创建第一页。
-function appendRunEventPage(current: RunEventPage, incoming: RunEventPage): RunEventPage {
-  return { items: [...current.items, ...incoming.items], next_before: incoming.next_before }
 }
 
 // RunDetails 以 run.id 并行加载事件时间线与计费用量，形成运行诊断详情。
@@ -108,4 +104,4 @@ function RunDetails({ run }: { run: Run }) {
   )
 }
 
-export { appendRunEventPage, RunEventFilterControls, RunRow, RunsPage }
+export { RunEventFilterControls, RunRow, RunsPage }

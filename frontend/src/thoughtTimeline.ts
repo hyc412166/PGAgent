@@ -296,9 +296,10 @@ function safeArgumentDetail(event: RunStreamEvent): string {
   }
   const searchQuery = Array.isArray(args.search_query) ? args.search_query[0] : record(args.search_query)
   if (searchQuery) {
-    const text = firstString(record(searchQuery)?.q, record(searchQuery)?.query)
+    const searchQueryRecord = record(searchQuery)
+    const text = firstString(searchQueryRecord?.q, searchQueryRecord?.query)
     if (text) return `搜索：${text}`
-    const item = Array.isArray(record(searchQuery)?.items) ? (record(searchQuery)?.items as unknown[])[0] : undefined
+    const item = Array.isArray(searchQueryRecord?.items) ? searchQueryRecord.items[0] : undefined
     if (typeof item === 'string' && item.trim()) return `搜索：${item.trim()}`
   }
   const searchItems = Array.isArray(searchQuery?.items) ? searchQuery.items : []
@@ -308,9 +309,10 @@ function safeArgumentDetail(event: RunStreamEvent): string {
   }
   const open = Array.isArray(args.open) ? args.open[0] : record(args.open)
   if (open) {
-    const ref = firstString(record(open)?.url, record(open)?.ref_id)
+    const openRecord = record(open)
+    const ref = firstString(openRecord?.url, openRecord?.ref_id)
     if (ref) return `打开：${ref}`
-    const item = Array.isArray(record(open)?.items) ? (record(open)?.items as unknown[])[0] : undefined
+    const item = Array.isArray(openRecord?.items) ? openRecord.items[0] : undefined
     if (typeof item === 'string' && item.trim()) return `打开：${item.trim()}`
   }
   const openItems = Array.isArray(open?.items) ? open.items : []

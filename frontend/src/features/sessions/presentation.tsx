@@ -28,6 +28,8 @@ import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../compone
 import { statusText } from '../../components/status'
 import { PenguinMark } from '../../components/penguin'
 import { presentRunEvent } from '../../runEventPresentation'
+import { MarkdownContent } from './MarkdownContent'
+import { groupThoughtActivities } from './thoughtActivityGrouping'
 
 // LiveRunView 是运输状态到实时回复组件之间的最小只读接口。
 export type LiveRunView = {
@@ -174,7 +176,9 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
             </a>
           })}
         </div>}
-        {!!message.content && <div className="message-content">{message.content}</div>}
+        {!!message.content && (message.role === 'assistant' || (isTool && message.role !== 'user')
+          ? <MarkdownContent content={message.content} />
+          : <div className="message-content">{message.content}</div>)}
         {!!message.citations?.length && <div className="message-citations" aria-label="参考来源">
           <strong>参考来源</strong>
           {message.citations.map((citation, index) => <a key={`${citation.url}-${index}`} href={citation.url} target="_blank" rel="noreferrer">
@@ -230,19 +234,65 @@ function fallbackThoughtItems(timeline: ThoughtTimelineState): ThoughtActivityIt
   }))
 }
 
-// 判断活动列表是否包含需要展开查看的详情。
+// 实时阶段只要存在工具、进度或可见思考，就保留执行详情入口；上下文准备事件单独隐藏。
 function hasActivityDetails(items: ThoughtActivityItem[]) {
-  // 通用模型步骤标记只用于实时阶段和计时；仅在存在安全进度摘要或工具/上下文活动时才允许展开。
-  return items.some((item) => Boolean(item.detail.trim()) || item.kind !== 'thought')
+  return items.some((item) => item.kind !== 'context' && item.title !== 'Tool Search' && (Boolean(item.detail.trim()) || item.kind !== 'thought'))
+}
+
+// 历史消息只有真实的思考文本才显示可展开入口；工具或上下文状态不属于思考内容。
+function hasThoughtContent(items: ThoughtActivityItem[]) {
+  return items.some((item) => item.kind === 'thought' && Boolean(item.detail.trim()))
+}
+
+function toolGroupLabel(items: ThoughtActivityItem[]) {
+  const shellOnly = items.every((item) => item.icon === 'shell')
+  const running = items.some((item) => item.status === 'running')
+  const failed = items.some((item) => item.status === 'failed')
+  if (shellOnly) return running ? '正在运行命令' : failed ? '运行命令时出错' : '运行了命令'
+  return running ? '正在调用多个工具' : failed ? '调用多个工具时出错' : '调用了多个工具'
+}
+
+function groupedToolStatus(item: ThoughtActivityItem) {
+  if (item.status === 'running') return item.icon === 'shell' ? '正在运行' : '正在调用'
+  if (item.status === 'failed') return item.icon === 'shell' ? '运行失败' : '调用失败'
+  return item.icon === 'shell' ? '已运行' : '已调用'
 }
 
 // ThoughtActivityList 统一渲染实时与历史活动，并突出当前活动。
 function ThoughtActivityList({ items, live = false, activeItemId }: { items: ThoughtActivityItem[]; live?: boolean; activeItemId?: string }) {
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({})
-  const visibleItems = items.filter((item) => item.title !== 'Tool Search' && (item.kind !== 'thought' || Boolean(item.detail.trim())))
-  if (!visibleItems.length) return null
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({})
+  const entries = groupThoughtActivities(items)
+    .filter((entry) => entry.kind === 'tool-group' || (entry.item.kind !== 'context' && entry.item.title !== 'Tool Search' && (entry.item.kind !== 'thought' || Boolean(entry.item.detail.trim()))))
+  if (!entries.length) return null
   return <div className={`thought-activity-list ${live ? 'is-live' : ''}`} aria-label="执行详情">
-    {visibleItems.map((item) => {
+    {entries.map((entry) => {
+      if (entry.kind === 'tool-group') {
+        const expanded = Boolean(expandedGroups[entry.id])
+        const label = toolGroupLabel(entry.items)
+        return <section className={`tool-activity-group ${expanded ? 'expanded' : ''}`} key={entry.id}>
+          <button type="button" className="tool-activity-group-toggle" aria-expanded={expanded} onClick={() => setExpandedGroups((current) => ({ ...current, [entry.id]: !current[entry.id] }))}>
+            <SquareTerminal size={14} aria-hidden="true" />
+            <span>{label}</span>
+            <ChevronRight className="tool-activity-group-chevron" size={14} aria-hidden="true" />
+          </button>
+          {expanded && <div className="tool-activity-group-items">
+            {entry.items.map((item) => {
+              const itemExpanded = Boolean(expandedItems[item.id])
+              const expandable = Boolean(item.detail.trim())
+              return <div className={`tool-activity-group-item ${item.status}`} key={item.id}>
+                <button type="button" className="tool-activity-group-item-toggle" aria-expanded={expandable ? itemExpanded : undefined} disabled={!expandable} onClick={() => expandable && setExpandedItems((current) => ({ ...current, [item.id]: !current[item.id] }))}>
+                  <SquareTerminal size={13} aria-hidden="true" />
+                  <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>
+                  {expandable && <ChevronRight className="tool-activity-item-chevron" size={13} aria-hidden="true" />}
+                </button>
+                {itemExpanded && <div className="tool-activity-group-detail"><strong>{item.title}</strong><pre>{item.detail}</pre></div>}
+              </div>
+            })}
+          </div>}
+        </section>
+      }
+      const item = entry.item
       if (item.kind === 'thought') return <p key={item.id} className={`thought-activity-thought ${item.status}`}>{item.detail}</p>
       // 普通联网搜索保持紧凑；当来源 URL 过长时提供展开入口，避免摘要撑坏标题布局。
       const hasLongUrl = /https?:\/\/\S{72,}/i.test(item.detail)
@@ -266,7 +316,7 @@ export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({
   const [expanded, setExpanded] = useState(false)
   const duration = formatThoughtDuration(timeline.elapsedMs)
   const items = fallbackThoughtItems(timeline)
-  const hasDetails = hasActivityDetails(items)
+  const hasDetails = hasThoughtContent(items)
   const summary = timeline.conclusion || '执行完成'
 
   return <article className={`completed-thought ${hasDetails && expanded ? 'expanded' : ''} ${hasDetails ? '' : 'no-details'}`}>
@@ -277,22 +327,15 @@ export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({
   </article>
 })
 
-// LiveAssistantMessage 合并阶段、实时耗时、活动时间线和逐字回复草稿。
-export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunView }) {
+// 每个运行阶段以独立实例持有计时和展开状态：新运行默认展开，进入终态时默认收起且仍允许用户再次展开。
+function LiveAssistantMessageState({ liveRun, initiallyExpanded }: { liveRun: LiveRunView; initiallyExpanded: boolean }) {
   const [now, setNow] = useState(() => Date.now())
-  const [expanded, setExpanded] = useState(true)
+  const [expanded, setExpanded] = useState(initiallyExpanded)
   useEffect(() => {
     if (liveRun.thought.startedAt === null || liveRun.thought.finished) return
-    setNow(Date.now())
     const timer = window.setInterval(() => setNow(Date.now()), 1_000)
     return () => window.clearInterval(timer)
   }, [liveRun.thought.finished, liveRun.thought.startedAt])
-  useEffect(() => {
-    setExpanded(true)
-  }, [liveRun.runId])
-  useEffect(() => {
-    if (liveRun.thought.finished || liveRun.status === 'terminal') setExpanded(false)
-  }, [liveRun.status, liveRun.thought.finished])
   const liveThoughtMs = liveRun.thought.startedAt === null ? 0 : Math.max(0, now - liveRun.thought.startedAt)
   const operationalPhase = liveRun.phase.startsWith('正在连接 MCP') || liveRun.phase.startsWith('MCP ')
   const phase = liveRun.phase.includes('子 Agent')
@@ -312,10 +355,17 @@ export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun
           <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
           {expanded && <ThoughtActivityList items={items} live activeItemId={liveRun.thought.activeItemId} />}
         </div>}
-        {liveRun.draft && <div className="message-content">{liveRun.draft}</div>}{liveRun.error && <p className="live-error">{liveRun.error}</p>}
+        {liveRun.draft && <MarkdownContent content={liveRun.draft} />}{liveRun.error && <p className="live-error">{liveRun.error}</p>}
       </div>
     </article>
   )
+}
+
+// LiveAssistantMessage 合并阶段、实时耗时、活动时间线和逐字回复草稿。
+export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunView }) {
+  const terminal = liveRun.thought.finished || liveRun.status === 'terminal'
+  const stateKey = `${liveRun.runId}:${liveRun.thought.startedAt ?? 'pending'}:${terminal ? 'terminal' : 'active'}`
+  return <LiveAssistantMessageState key={stateKey} liveRun={liveRun} initiallyExpanded={!terminal} />
 })
 
 // ApprovalCard 展示待执行动作及风险信息，并将批准/拒绝决策回传会话协调器。

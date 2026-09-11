@@ -7,6 +7,7 @@ import { EmptyState, ErrorState, LoadingState, PageHeader } from '../../componen
 import { useApiData } from '../../shared/hooks/useApiData'
 import { formatDate } from '../../shared/lib/display'
 import type { FolderSelection, SkillCatalogItem, SkillInstallPreview, SkillMarketplaceBrowse, SkillMarketplaceCategory, SkillMarketplaceItem, SkillMarketplaceLeaderboards, SkillMarketplaceSearch, SkillMarketplaceView } from '../../types'
+import { isCurrentMarketRequest, mergeMarketBrowsePage, shouldStartLeaderboardRequest } from './marketRequestState'
 
 // SkillsPage 同时管理已安装技能和远程市场，负责浏览、搜索、预览、安装、导入与删除链路。
 function SkillsPage() {
@@ -38,6 +39,7 @@ function SkillsPage() {
   const [boardRefreshAfterSeconds, setBoardRefreshAfterSeconds] = useState(30 * 60)
   const browseRequestRef = useRef(0)
   const leaderboardRequestRef = useRef(0)
+  const leaderboardRequestInFlightRef = useRef(false)
 
   const showingSearchResults = searchedQuery !== '' && searchedQuery === query.trim() && !searchError && !searching
   const activeMarketItems = showingSearchResults ? results : (browse.items ?? [])
@@ -47,25 +49,26 @@ function SkillsPage() {
     setBrowsing(true); setBrowseError('')
     try {
       const response = await api.get<SkillMarketplaceBrowse>(`/api/skills/market/browse?view=${encodeURIComponent(view)}&page=${page}&per_page=12`)
-      if (requestId === browseRequestRef.current) {
-        setBrowse((current) => ({
-          ...response,
-          items: append ? [...(current.items ?? []), ...(response.items ?? [])] : (response.items ?? []),
-        }))
+      if (isCurrentMarketRequest(requestId, browseRequestRef.current)) {
+        setBrowse((current) => mergeMarketBrowsePage(current, response, append))
       }
     } catch (error) {
-      if (requestId === browseRequestRef.current) setBrowseError(describeError(error))
+      if (isCurrentMarketRequest(requestId, browseRequestRef.current)) setBrowseError(describeError(error))
     } finally {
-      if (requestId === browseRequestRef.current) setBrowsing(false)
+      if (isCurrentMarketRequest(requestId, browseRequestRef.current)) setBrowsing(false)
     }
   }, [])
 
   useEffect(() => {
-    if (market.data.available) void loadBrowse(browseView)
+    if (!market.data.available) return
+    const timer = window.setTimeout(() => void loadBrowse(browseView), 0)
+    return () => window.clearTimeout(timer)
   }, [browseView, loadBrowse, market.data.available])
 
   const loadCategoryBoards = useCallback(async (manual = false) => {
+    if (!shouldStartLeaderboardRequest(manual, leaderboardRequestInFlightRef.current)) return
     const requestId = ++leaderboardRequestRef.current
+    leaderboardRequestInFlightRef.current = true
     if (manual) setBoardsRefreshing(true)
     else setBoardsLoading(true)
     setBoardsError('')
@@ -83,15 +86,16 @@ function SkillsPage() {
         }))
         payload = { categories: fallbackMarketCategories(Object.fromEntries(entries)) }
       }
-      if (requestId === leaderboardRequestRef.current) {
+      if (isCurrentMarketRequest(requestId, leaderboardRequestRef.current)) {
         setCategoryBoards(normalizeMarketCategories(payload))
         setBoardsUpdatedAt(payload.updated_at || payload.refreshed_at || new Date().toISOString())
         setBoardRefreshAfterSeconds(payload.refresh_after_seconds || payload.refresh_interval_seconds || payload.ttl_seconds || 30 * 60)
       }
     } catch (error) {
-      if (requestId === leaderboardRequestRef.current) setBoardsError(describeError(error))
+      if (isCurrentMarketRequest(requestId, leaderboardRequestRef.current)) setBoardsError(describeError(error))
     } finally {
-      if (requestId === leaderboardRequestRef.current) {
+      if (isCurrentMarketRequest(requestId, leaderboardRequestRef.current)) {
+        leaderboardRequestInFlightRef.current = false
         setBoardsLoading(false)
         setBoardsRefreshing(false)
       }
@@ -100,7 +104,8 @@ function SkillsPage() {
 
   useEffect(() => {
     if (!market.data.available) return
-    void loadCategoryBoards()
+    const timer = window.setTimeout(() => void loadCategoryBoards(), 0)
+    return () => window.clearTimeout(timer)
   }, [loadCategoryBoards, market.data.available])
 
   useEffect(() => {

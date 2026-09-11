@@ -12,6 +12,7 @@ import { useEffect, useState, type ReactNode, type TransitionEvent } from 'react
 import { buildContextUsageView } from '../contextUsage'
 import type { SessionContext } from '../types'
 import { PenguinMark } from './penguin'
+import { alignSlidePanelState, finishSlidePanelClosing } from './slidePanelState'
 import { statusText } from './status'
 
 // StatusBadge 将内部状态映射为统一颜色和中文标签。
@@ -176,11 +177,9 @@ export function ContextUsageRing({ context }: { context: SessionContext }) {
 
 // SlidePanel 提供带退出动画、遮罩关闭和焦点语义的侧滑容器。
 export function SlidePanel({ title, description, open = true, onClose, onExited, children }: { title: string; description?: string; open?: boolean; onClose: () => void; onExited?: () => void; children: ReactNode }) {
-  const [rendered, setRendered] = useState(open)
-
-  useEffect(() => {
-    if (open) setRendered(true)
-  }, [open])
+  const [renderState, setRenderState] = useState({ open, rendered: open })
+  const alignedRenderState = alignSlidePanelState(renderState, open)
+  if (alignedRenderState !== renderState) setRenderState(alignedRenderState)
 
   useEffect(() => {
     if (!open) return
@@ -189,12 +188,12 @@ export function SlidePanel({ title, description, open = true, onClose, onExited,
     return () => window.removeEventListener('keydown', closeOnEscape)
   }, [onClose, open])
 
-  if (!rendered) return null
+  if (!alignedRenderState.rendered) return null
 
   function finishClosing(event: TransitionEvent<HTMLDivElement>) {
     const target = event.target as HTMLElement
     if (open || event.propertyName !== 'transform' || !target.classList.contains('slide-panel')) return
-    setRendered(false)
+    setRenderState((current) => finishSlidePanelClosing(current))
     onExited?.()
   }
 
