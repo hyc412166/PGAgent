@@ -60,6 +60,7 @@ SIDE_EFFECT_OR_NETWORK_TOOLS: Final[frozenset[str]] = frozenset(
         "apply_patch",
         "delete",
         "bash",
+        "shell",
         "run_command",
         "validate",
         "validate_baseline",
@@ -121,7 +122,7 @@ FILE_WRITE_TOOLS: Final[frozenset[str]] = frozenset({"write", "write_file", "edi
 # 变量说明：FILE_DELETE_TOOLS 表示当前流程使用的 FILE_DELETE_TOOLS 集合。
 FILE_DELETE_TOOLS: Final[frozenset[str]] = frozenset({"delete"})
 # 变量说明：COMMAND_TOOLS 表示当前流程使用的 COMMAND_TOOLS 集合。
-COMMAND_TOOLS: Final[frozenset[str]] = frozenset({"bash", "run_command", "validate", "validate_baseline", "PowerShell", "REPL", "background_run"})
+COMMAND_TOOLS: Final[frozenset[str]] = frozenset({"bash", "shell", "run_command", "validate", "validate_baseline", "PowerShell", "REPL", "background_run"})
 
 # 变量说明：_SENSITIVE_FILE_NAMES 表示当前流程使用的 _SENSITIVE_FILE_NAMES 集合。
 _SENSITIVE_FILE_NAMES: Final[frozenset[str]] = frozenset(

@@ -19,7 +19,7 @@ class ProviderConfig:
     # 变量说明：model_connection_id 表示model_connection 对象的唯一标识。
     model_connection_id: str | None = None
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-    thinking_level: str = "auto"
+    thinking_level: str = "medium"
     # 变量说明：custom_headers 表示当前流程使用的 custom_headers 集合。
     custom_headers: dict[str, str] = field(default_factory=dict)
     # 变量说明：api_protocol 表示当前步骤使用的 api_protocol 值。

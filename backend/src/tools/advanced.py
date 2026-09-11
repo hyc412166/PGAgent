@@ -309,12 +309,21 @@ def powershell(
     sandbox: WorkspaceSandbox,
     command: str,
     *,
+    cwd: str = ".",
     timeout: int = 30,
     description: str | None = None,
     run_in_background: bool = False,
 ) -> ToolResult:
     if run_in_background:
         return background_run(sandbox, command=command, timeout=timeout, shell="powershell")
+    try:
+        working_directory = sandbox.resolve(cwd, must_exist=True)
+    except (SandboxViolation, OSError) as exc:
+        return ToolResult("PowerShell", False, str(exc), error_code="path_error")
+    if not working_directory.is_dir():
+        return ToolResult("PowerShell", False, "cwd is not a directory", error_code="not_directory")
+    relative_cwd = sandbox.relative(working_directory)
+
     # 变量说明：executable 表示当前步骤使用的 executable 值。
     executable = shutil.which("pwsh") or shutil.which("powershell")
     if not executable:
@@ -323,7 +332,7 @@ def powershell(
         # 变量说明：completed 表示当前步骤使用的 completed 值。
         completed = subprocess.run(
             [executable, "-NoProfile", "-NonInteractive", "-Command", str(command)],
-            cwd=sandbox.root,
+            cwd=working_directory,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -338,7 +347,13 @@ def powershell(
             completed.returncode == 0,
             output,
             error_code=None if completed.returncode == 0 else "powershell_error",
-            metadata={"exit_code": completed.returncode, "description": description or ""},
+            metadata={
+                "exit_code": completed.returncode,
+                "description": description or "",
+                "cwd": relative_cwd,
+                "shell": "powershell",
+                "security_scope": "current_user_host_permissions",
+            },
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return ToolResult("PowerShell", False, str(exc), error_code="timeout" if isinstance(exc, subprocess.TimeoutExpired) else "runtime_unavailable")

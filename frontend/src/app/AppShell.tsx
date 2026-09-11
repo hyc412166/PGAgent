@@ -17,6 +17,7 @@ import { SkillsPage } from '../features/skills/SkillsPage'
 import { UsagePage } from '../features/usage/UsagePage'
 import { useApiData } from '../shared/hooks/useApiData'
 import type { Health } from '../types'
+import { alignMobileMenuState, isMobileMenuOpen, type MobileMenuState } from './mobileMenuState'
 
 // navigation 是侧栏和路由展示共用的导航元数据；前七项属于工作台，其余属于系统设置。
 const navigation = [
@@ -52,7 +53,8 @@ function loadFontScale() {
 // AppShell 是前端顶层布局，负责导航、主题、字号、健康状态和所有页面路由的装配。
 function AppShell() {
   // mobileOpen/collapsed 控制两种侧栏形态；theme/fontScale 是跨页面的外观状态。
-  const [mobileOpen, setMobileOpen] = useState(false)
+  const location = useLocation()
+  const [mobileMenu, setMobileMenu] = useState<MobileMenuState>({ routeKey: location.key, open: false })
   const [collapsed, setCollapsed] = useState(false)
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     try {
@@ -63,10 +65,11 @@ function AppShell() {
   })
   const [fontScale, setFontScale] = useState(loadFontScale)
   // location 用于路由变化后关闭移动导航；health 驱动侧栏底部的后端在线状态。
-  const location = useLocation()
   const health = useApiData<Health | null>(null, () => api.get<Health>('/api/health'), [])
 
-  useEffect(() => setMobileOpen(false), [location.pathname])
+  const alignedMobileMenu = alignMobileMenuState(mobileMenu, location.key)
+  if (alignedMobileMenu !== mobileMenu) setMobileMenu(alignedMobileMenu)
+  const mobileOpen = isMobileMenuOpen(alignedMobileMenu, location.key)
   useEffect(() => {
     document.documentElement.style.colorScheme = theme
     document.documentElement.dataset.theme = theme
@@ -79,8 +82,8 @@ function AppShell() {
 
   return (
     <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''} theme-${theme}`}>
-      <button className="mobile-menu" aria-label="打开导航" onClick={() => setMobileOpen(true)}><Menu /></button>
-      {mobileOpen && <button className="mobile-backdrop" aria-label="关闭导航" onClick={() => setMobileOpen(false)} />}
+      <button className="mobile-menu" aria-label="打开导航" onClick={() => setMobileMenu({ routeKey: location.key, open: true })}><Menu /></button>
+      {mobileOpen && <button className="mobile-backdrop" aria-label="关闭导航" onClick={() => setMobileMenu({ routeKey: location.key, open: false })} />}
       <aside className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
           <div className="brand">
             <div className="brand-mark"><PenguinMark size={27} /></div>

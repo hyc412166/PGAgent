@@ -393,7 +393,19 @@ TOOL_SCHEMAS.update(ADVANCED_TOOL_SCHEMAS)
 # Canonical names reuse the proven executors while presenting one unambiguous
 # vocabulary to new model calls.
 # 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
-TOOL_SCHEMAS["shell"] = dict(TOOL_SCHEMAS["bash"])
+TOOL_SCHEMAS["shell"] = {
+    "description": "在 Windows 工作区中通过 PowerShell 执行命令；支持管道与 cmdlet，长命令会返回可继续读取的持久 session_id。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "cwd": {"type": "string"},
+            "timeout_seconds": {"type": "number"},
+            "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 300000},
+        },
+        "required": ["command"],
+    },
+}
 # 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
 TOOL_SCHEMAS["update_plan"] = dict(TOOL_SCHEMAS["todowrite"])
 # 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
@@ -485,10 +497,7 @@ _HIDDEN_COMPATIBILITY_TOOL_NAMES = frozenset(LEGACY_TOOL_NAMES) - _CANONICAL_MEM
 # 变量说明：_GENERAL_DIRECT_TOOL_NAMES 表示当前流程使用的 _GENERAL_DIRECT_TOOL_NAMES 集合。
 _GENERAL_DIRECT_TOOL_NAMES = frozenset({
     "shell",
-    "read",
     "read_artifact",
-    "glob",
-    "rg",
     "web_run",
     "apply_patch",
     "update_plan",
@@ -779,7 +788,7 @@ class ToolRegistry:
     def _register_default(self, name: str) -> None:
         # 变量说明：mapping 表示当前步骤使用的 mapping 值。
         mapping: dict[str, Callable[..., ToolResult]] = {
-            "shell": self._bash,
+            "shell": self._shell,
             "bash": self._bash,
             "read": builtins.read_file,
             "read_artifact": lambda _sandbox, **kwargs: self._artifact_store.read(**kwargs),
@@ -985,7 +994,53 @@ class ToolRegistry:
 
         return apply_patch(sandbox, **kwargs)
 
-    # 函数职责：完成 bash 对应的业务处理。
+    # 函数职责：通过宿主 PowerShell 执行默认编码 Agent 的真实 shell 命令。
+    # 参数关系：sandbox 表示工作区边界；kwargs 包含命令、cwd、超时和 yield 窗口。
+    # 返回关系：同步命令直接返回结果，长命令返回可继续读取的持久后台任务。
+    def _shell(self, sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+        from src.coding.worktree import annotate_command_changes, capture_worktree_state
+
+        yield_time_ms = kwargs.pop("yield_time_ms", 10_000)
+        cancel_event = kwargs.pop("_cancel_event", None)
+        kwargs.pop("approved", None)
+        command = kwargs.pop("command")
+        cwd = str(kwargs.pop("cwd", "."))
+        timeout_seconds = max(1, int(kwargs.pop("timeout_seconds", 3600)))
+        before = capture_worktree_state(sandbox.root) if self.workflow_profile_id in {"coding", "debug"} else None
+
+        if self._background_store is not None and yield_time_ms is not None:
+            started = self._background_store.start(
+                command=command,
+                cwd=cwd,
+                timeout=timeout_seconds,
+                shell="powershell",
+            )
+            if not started.ok:
+                return started
+            job_id = str(started.metadata["background_job_id"])
+            result = self._background_store.check(
+                task_id=job_id,
+                wait=True,
+                wait_timeout=min(300_000, max(0, int(yield_time_ms))) / 1000,
+                output_offset=0,
+                _cancel_event=cancel_event,
+            )
+            result.metadata = {**started.metadata, **result.metadata, "shell": "powershell", "cwd": cwd}
+            if before is not None and not result.metadata.get("background_job_active"):
+                return annotate_command_changes(result, sandbox.root, before, source="shell")
+            return result
+
+        result = advanced.powershell(
+            sandbox,
+            command=command,
+            cwd=cwd,
+            timeout=min(timeout_seconds, 120),
+        )
+        if before is not None:
+            return annotate_command_changes(result, sandbox.root, before, source="shell")
+        return result
+
+    # 函数职责：完成旧 bash/run_command 的 shell-free 兼容执行。
     # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；kwargs 表示当前流程使用的 kwargs 集合。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _bash(self, sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
@@ -1660,7 +1715,7 @@ class ToolRegistry:
             # 变量说明：kwargs 的索引项 表示该语句创建或更新的目标数据。
             kwargs["approved"] = True
         if _cancel_event is not None and name in {
-            "bash", "run_command", "validate", "validate_baseline", "check_background",
+            "bash", "shell", "run_command", "validate", "validate_baseline", "check_background",
         }:
             # This is an in-process cancellation signal, not a model/tool
             # argument.  Inject it only after policy approval so it can never

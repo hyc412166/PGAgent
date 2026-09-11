@@ -4,11 +4,11 @@ import { modelSelectionPayload, resolveEffectiveThinking, shortModelLabel, think
 
 // 测试分组：会话组合设置菜单。
 describe('会话组合设置菜单', () => {
-  // 测试场景：自动思考会逐层继承实际强度。
-  it('自动思考会逐层继承实际强度', () => {
-    expect(resolveEffectiveThinking('auto', 'auto', 'high')).toBe('high')
-    expect(thinkingLevelLabels[resolveEffectiveThinking('auto', 'low', 'high')]).toBe('低')
+  // 测试场景：界面只接受四档显式强度；遇到历史自动或关闭值时统一显示默认“中”。
+  it('只解析四档显式推理强度并默认使用中', () => {
+    expect(resolveEffectiveThinking('high')).toBe('high')
     expect(resolveEffectiveThinking('auto', 'off', 'auto')).toBe('medium')
+    expect(thinkingLevelLabels[resolveEffectiveThinking()]).toBe('中')
   })
 
   // 测试场景：模型按钮使用短名但保留可识别信息。

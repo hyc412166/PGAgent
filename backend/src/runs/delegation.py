@@ -433,7 +433,7 @@ class _SubagentTaskDelegate:
             child.thinking_level,
             connection.thinking_level,
             str(self.parent_binding.get("thinking_level") or ""),
-        ) or "auto"
+        ) or "medium"
 
         # A child can only receive the capability intersection. The primary
         # coordinator normally has the full catalog, but this remains safe for

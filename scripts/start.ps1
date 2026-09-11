@@ -6,6 +6,31 @@ $PythonPath = 'E:\anaconda3\envs\agent_dock\python.exe'
 $FrontendIndex = Join-Path $ProjectRoot 'frontend\dist\index.html'
 $LocalEnvironmentFile = Join-Path $ProjectRoot '.env.local'
 $Url = 'http://127.0.0.1:8765'
+$NodeRoot = "$env:USERPROFILE\Tools\nodejs\22.22.2"
+$NodePath = Join-Path $NodeRoot 'node.exe'
+$NpmPath = Join-Path $NodeRoot 'npm.cmd'
+$RipgrepDirectory = Join-Path $ProjectRoot 'vendor\ripgrep\windows-x64'
+$RipgrepPath = Join-Path $RipgrepDirectory 'rg.exe'
+
+# 启动服务时显式恢复独立 Node/npm，避免依赖旧终端继承的 PATH。
+if (-not (Test-Path -LiteralPath $NodePath) -or -not (Test-Path -LiteralPath $NpmPath)) {
+    throw "独立 Node.js/npm 未找到：$NodeRoot。请确认 Node.js 文件完整存在。"
+}
+$env:Path = "$NodeRoot;$env:Path"
+
+# 默认编码 Agent 只从项目维护的目录解析 rg，避免绑定 Codex 或机器上的偶然安装。
+if (-not (Test-Path -LiteralPath $RipgrepPath -PathType Leaf)) {
+    throw "PGAgent bundled ripgrep is missing: $RipgrepPath"
+}
+try {
+    $null = & $RipgrepPath --version
+    if ($LASTEXITCODE -ne 0) {
+        throw "exit code $LASTEXITCODE"
+    }
+} catch {
+    throw "PGAgent bundled ripgrep is not executable: $RipgrepPath. $($_.Exception.Message)"
+}
+$env:Path = "$RipgrepDirectory;$env:Path"
 
 if (-not (Test-Path -LiteralPath $PythonPath)) {
     throw 'PGAgent Conda environment is missing. Run setup_pgagent.bat first.'
@@ -13,7 +38,7 @@ if (-not (Test-Path -LiteralPath $PythonPath)) {
 if (-not (Test-Path -LiteralPath $FrontendIndex)) {
     Write-Host 'Building the web interface...'
     Push-Location (Join-Path $ProjectRoot 'frontend')
-    try { npm run build } finally { Pop-Location }
+    try { & $NpmPath run build } finally { Pop-Location }
 }
 
 # Import only the supported marketplace values into the PGAgent process; never print secrets.
