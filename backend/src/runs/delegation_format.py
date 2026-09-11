@@ -46,6 +46,7 @@ from src.persistence.database import (
     UsageRecord,
     Workspace,
 )
+from .configuration import _enabled_connection_models
 from src.agent import (
     AgentRuntime,
     CompletionDecision,
@@ -204,17 +205,17 @@ def _model_id_for_delegate(
 ) -> str | None:
     """Resolve a child model without accidentally crossing connections."""
 
+    enabled_models = _enabled_connection_models(connection)
+    disabled_model_ids = set(connection.disabled_models or [])
     # 变量说明：selected 表示当前步骤使用的 selected 值。
     selected = str(preferred or "").strip()
-    if selected:
+    if selected and selected not in disabled_model_ids:
         return selected[:255]
     # 变量说明：selected 表示当前步骤使用的 selected 值。
     selected = str(connection.default_model or "").strip()
-    if selected:
+    if selected and selected not in disabled_model_ids:
         return selected[:255]
-    # 变量说明：candidates 表示当前流程使用的 candidates 集合。
-    candidates = [*(connection.discovered_models or []), *(connection.manual_models or [])]
-    for candidate in candidates:
+    for candidate in enabled_models:
         # 变量说明：normalized 表示当前步骤使用的 normalized 值。
         normalized = str(candidate or "").strip()
         if normalized:

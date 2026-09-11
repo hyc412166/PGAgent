@@ -38,6 +38,7 @@ from src.runs import lifecycle as lifecycle_service
 from src.tasks.state import sync_todos_for_run
 from src.context import instructions as instruction_service
 from src.agent import AgentRuntime, decide_deterministic_completion
+from src.model.gateway import ModelConfigurationError
 from src.tools import create_default_registry
 
 
@@ -1185,8 +1186,8 @@ def test_history_uses_sequence_when_tool_messages_share_a_timestamp(
     assert history[1]["tool_call_id"] == "call-1"
 
 
-# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settings 精确标识本用例的具体条件。
-def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settings(
+# 测试场景：普通会话 Run 使用会话保存的思考强度，同时忽略子 Agent 的模型配置。
+def test_runtime_uses_session_thinking_and_ignores_child_agent_settings(
     seeded_run: tuple[str, str],
 ) -> None:
     run_id, session_id = seeded_run
@@ -1210,7 +1211,7 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
             "kind": "docker",
             "image": "swebench/frozen-runtime:latest",
         }
-        session.thinking_level = "auto"
+        session.thinking_level = "medium"
         agent = db.get(Agent, run.agent_id)
         assert agent is not None
         agent.description = "UI metadata, not a model prompt"
@@ -1231,7 +1232,7 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
     # Conversations run through the fixed PGAgent coordinator. A user-created
     # child profile can no longer override its model/thinking configuration;
     # it is only surfaced as safe capability metadata for the task tool.
-    assert context["provider"].thinking_level == "low"
+    assert context["provider"].thinking_level == "medium"
     assert context["todo_state"] == []
     assert context["runtime_binding"]["validation_runtime"] == {
         "kind": "docker",
@@ -1242,6 +1243,7 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
     )
     assert agent.id in context["agent_instructions"]
     assert "Builder" in context["agent_instructions"]
+
 
     binding = dict(context["runtime_binding"])
     with database.SessionLocal() as db:
@@ -1277,6 +1279,34 @@ def test_runtime_uses_enabled_fallback_connection_and_ignores_child_agent_settin
 
     with pytest.raises(RuntimeError, match="模型连接配置在审批等待期间已改变"):
         RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
+
+
+# 测试场景：普通新 Run 不得继续调用已经被连接明确禁用的模型。
+def test_runtime_rejects_connection_when_all_models_are_disabled(
+    seeded_run: tuple[str, str],
+) -> None:
+    run_id, session_id = seeded_run
+    with database.SessionLocal() as db:
+        connection = ModelConnection(
+            name="Disabled model catalog",
+            provider="openai_compatible",
+            base_url="https://example.test/v1",
+            secret_ref="disabled-model-secret",
+            discovered_models=["model-a"],
+            default_model="model-a",
+            disabled_models=["model-a"],
+            status="connected",
+        )
+        db.add(connection)
+        db.flush()
+        session = db.get(Session, session_id)
+        assert session is not None
+        session.model_connection_id = connection.id
+        session.model_id = "model-a"
+        db.commit()
+
+    with pytest.raises(ModelConfigurationError, match="没有可用模型"):
+        RunCoordinator._resolve_runtime(run_id)
 
 
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_freezes_global_and_chat_memory_preferences 精确标识本用例的具体条件。
@@ -1530,3 +1560,37 @@ def test_fallback_connection_does_not_reuse_model_from_disabled_connection(
     assert context["model_connection_id"] == fallback_id
     assert context["provider"].provider == "openai_compatible"
     assert context["provider"].model_id == "fallback-model"
+
+
+# 测试场景：自动连接跳过模型全部停用的连接，继续选择仍有可用模型的后备连接。
+def test_fallback_connection_skips_connection_without_enabled_models(
+    seeded_run: tuple[str, str],
+) -> None:
+    run_id, _session_id = seeded_run
+    with database.SessionLocal() as db:
+        empty = ModelConnection(
+            name="Empty connected catalog",
+            provider="openai_compatible",
+            base_url="https://empty.test/v1",
+            secret_ref="empty-secret",
+            discovered_models=["disabled-model"],
+            default_model="disabled-model",
+            disabled_models=["disabled-model"],
+            status="connected",
+        )
+        fallback = ModelConnection(
+            name="Usable connected catalog",
+            provider="openai_compatible",
+            base_url="https://usable.test/v1",
+            secret_ref="usable-secret",
+            default_model="usable-model",
+            status="connected",
+        )
+        db.add_all([empty, fallback])
+        db.commit()
+        fallback_id = fallback.id
+
+    _runtime, context = RunCoordinator._resolve_runtime(run_id)
+
+    assert context["model_connection_id"] == fallback_id
+    assert context["provider"].model_id == "usable-model"

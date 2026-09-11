@@ -130,6 +130,7 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "model_connections": {
         "api_protocol": "VARCHAR(32) NOT NULL DEFAULT 'chat_completions'",
+        "disabled_models": "JSON NOT NULL DEFAULT '[]'",
     },
     "agents": {
         "is_default": "BOOLEAN NOT NULL DEFAULT 0",
@@ -138,7 +139,7 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
     "sessions": {
         "model_connection_id": "VARCHAR(36)",
         "model_id": "VARCHAR(255)",
-        "thinking_level": "VARCHAR(16) NOT NULL DEFAULT 'auto'",
+        "thinking_level": "VARCHAR(16) NOT NULL DEFAULT 'medium'",
         "permission_mode": "VARCHAR(16) NOT NULL DEFAULT 'smart'",
         "use_memories": "BOOLEAN NOT NULL DEFAULT 1",
         "mcp_server_names": "JSON NOT NULL DEFAULT '[]'",
@@ -598,6 +599,13 @@ def _seed_defaults() -> None:
     root = _default_workspace_root()
     root.mkdir(parents=True, exist_ok=True)
     with SessionLocal() as db:
+        # 用户侧已取消自动和关闭档位；初始化时只迁移可编辑配置，历史 Run 的冻结快照保持原样。
+        for model in (ModelConnection, Agent, Session):
+            db.execute(
+                update(model)
+                .where(model.thinking_level.in_(("auto", "off")))
+                .values(thinking_level="medium")
+            )
         # 变量说明：workspace 表示当前步骤使用的 workspace 值。
         workspace = db.get(Workspace, DEFAULT_WORKSPACE_ID)
         if workspace is None:
@@ -661,7 +669,7 @@ def _seed_defaults() -> None:
         # 变量说明：model_id 表示model 对象的唯一标识。
         agent.model_id = None
         # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-        agent.thinking_level = "auto"
+        agent.thinking_level = "medium"
         # 变量说明：mode 表示当前步骤使用的 mode 值。
         agent.mode = "auto"
         # 变量说明：workflow_profile_id 表示workflow_profile 对象的唯一标识。

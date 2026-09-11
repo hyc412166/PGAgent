@@ -112,7 +112,7 @@ export interface Session {
 }
 
 // ThinkingLevel 和 PermissionMode 是编辑器可提交的两组枚举配置。
-export type ThinkingLevel = 'off' | 'auto' | 'low' | 'medium' | 'high' | 'xhigh'
+export type ThinkingLevel = 'low' | 'medium' | 'high' | 'xhigh'
 export type PermissionMode = 'ask' | 'smart' | 'full'
 
 // ToolCatalogItem 描述 Agent 能力选择器中的内置工具。
@@ -442,6 +442,7 @@ export interface Connection {
   models?: string[]
   discovered_models?: string[]
   manual_models?: string[]
+  disabled_models?: string[]
   thinking_level?: string
   status?: string
   enabled?: boolean

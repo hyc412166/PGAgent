@@ -70,10 +70,12 @@ class ModelConnection(TimestampMixin, Base):
     discovered_models: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     # 变量说明：manual_models 表示当前流程使用的 manual_models 集合。
     manual_models: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    # disabled_models 只保存用户主动关闭的模型；空列表让现有连接升级后继续保持全部可用。
+    disabled_models: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     # 变量说明：default_model 表示当前步骤使用的 default_model 值。
     default_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-    thinking_level: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
+    thinking_level: Mapped[str] = mapped_column(String(16), default="medium", nullable=False)
     # 变量说明：custom_headers 表示当前流程使用的 custom_headers 集合。
     custom_headers: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
     # 变量说明：capabilities 表示当前流程使用的 capabilities 集合。
@@ -147,7 +149,7 @@ class Agent(TimestampMixin, Base):
     # 变量说明：model_id 表示model 对象的唯一标识。
     model_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-    thinking_level: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
+    thinking_level: Mapped[str] = mapped_column(String(16), default="medium", nullable=False)
     # 变量说明：mode 表示当前步骤使用的 mode 值。
     mode: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
     # 变量说明：workflow_profile_id 表示workflow_profile 对象的唯一标识。
@@ -249,7 +251,7 @@ class Session(TimestampMixin, Base):
     # 变量说明：model_id 表示model 对象的唯一标识。
     model_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-    thinking_level: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
+    thinking_level: Mapped[str] = mapped_column(String(16), default="medium", nullable=False)
     # 变量说明：permission_mode 表示当前步骤使用的 permission_mode 值。
     permission_mode: Mapped[str] = mapped_column(String(16), default="smart", nullable=False)
     # 变量说明：use_memories 表示当前流程使用的 use_memories 集合。

@@ -634,6 +634,7 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     assert "is_default" in agent_columns
     assert "workflow_profile_id" in agent_columns
     assert "api_protocol" in connection_columns
+    assert "disabled_models" in connection_columns
     assert {
         "model_connection_id", "model_id", "thinking_level", "permission_mode",
         "use_memories", "mcp_server_names", "context_tokens",
@@ -642,10 +643,15 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
     assert "last_compacted_at" not in session_columns
     with database.SessionLocal() as db:
         assert db.get(database.Workspace, "legacy-workspace") is not None
-        assert db.get(database.ModelConnection, "legacy-connection").api_protocol == "chat_completions"
-        assert db.get(database.Session, "legacy-session").mcp_server_names == ["filesystem"]
+        legacy_connection = db.get(database.ModelConnection, "legacy-connection")
+        assert legacy_connection.api_protocol == "chat_completions"
+        assert legacy_connection.disabled_models == []
+        assert legacy_connection.thinking_level == "medium"
+        legacy_session = db.get(database.Session, "legacy-session")
+        assert legacy_session.mcp_server_names == ["filesystem"]
+        assert legacy_session.thinking_level == "medium"
         assert db.get(database.Workspace, DEFAULT_WORKSPACE_ID) is not None
-        assert db.get(database.Agent, DEFAULT_AGENT_ID) is not None
+        assert db.get(database.Agent, DEFAULT_AGENT_ID).thinking_level == "medium"
     migration_app = FastAPI()
     migration_app.include_router(resources_router)
     with TestClient(migration_app) as migration_client:
@@ -653,6 +659,41 @@ def test_init_incrementally_migrates_legacy_database_and_preserves_rows(tmp_path
             "/api/sessions", json={"model_connection_id": "missing-after-migration"}
         )
     assert response.status_code == 409
+
+
+# 测试场景：初始化会将三个用户配置表中遗留的 auto/off 全部收敛为 medium。
+@pytest.mark.parametrize("legacy_level", ["auto", "off"])
+def test_init_migrates_all_user_thinking_settings_to_medium(
+    tmp_path: Path, legacy_level: str
+) -> None:
+    configure_database(f"sqlite:///{(tmp_path / f'thinking-{legacy_level}.db').as_posix()}")
+    database.Base.metadata.create_all(bind=database.engine)
+    with database.SessionLocal() as db:
+        connection = ModelConnection(
+            name=f"Legacy {legacy_level} connection",
+            provider="openai_compatible",
+            base_url="https://legacy.example.invalid/v1",
+            secret_ref=f"test:legacy:{legacy_level}",
+            thinking_level=legacy_level,
+        )
+        agent = database.Agent(
+            name=f"Legacy {legacy_level} agent",
+            thinking_level=legacy_level,
+        )
+        session = Session(
+            title=f"Legacy {legacy_level} session",
+            thinking_level=legacy_level,
+        )
+        db.add_all([connection, agent, session])
+        db.commit()
+        ids = (connection.id, agent.id, session.id)
+
+    init_db()
+
+    with database.SessionLocal() as db:
+        assert db.get(ModelConnection, ids[0]).thinking_level == "medium"
+        assert db.get(database.Agent, ids[1]).thinking_level == "medium"
+        assert db.get(Session, ids[2]).thinking_level == "medium"
 
 
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_init_adds_background_waiter_column_to_the_owning_table 精确标识本用例的具体条件。
@@ -1014,7 +1055,7 @@ def test_defaults_are_seeded_protected_and_used_for_new_sessions(client: TestCli
     body = created.json()
     assert body["workspace_id"] == DEFAULT_WORKSPACE_ID
     assert body["agent_id"] == DEFAULT_AGENT_ID
-    assert body["thinking_level"] == "auto"
+    assert body["thinking_level"] == "medium"
     assert body["context_tokens"] == 0
 
 
@@ -1144,6 +1185,21 @@ def test_session_model_overrides_can_be_patched(client: TestClient) -> None:
     assert updated.json()["model_connection_id"] == connection_id
     assert updated.json()["model_id"] == "provider/model-a"
     assert updated.json()["thinking_level"] == "high"
+
+
+@pytest.mark.parametrize("legacy_level", ["auto", "off"])
+# 测试场景：用户会话契约只允许前端提供的四档显式思考强度，拒绝历史自动与关闭值重新写入。
+def test_session_api_rejects_non_ui_thinking_levels(
+    client: TestClient, legacy_level: str
+) -> None:
+    created = client.post("/api/sessions", json={"thinking_level": legacy_level})
+    assert created.status_code == 422
+
+    session_id = client.post("/api/sessions", json={}).json()["id"]
+    updated = client.patch(
+        f"/api/sessions/{session_id}", json={"thinking_level": legacy_level}
+    )
+    assert updated.status_code == 422
 
 
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_global_and_session_memory_preferences_persist 精确标识本用例的具体条件。

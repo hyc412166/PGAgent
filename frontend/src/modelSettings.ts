@@ -15,7 +15,7 @@ function checkedAt(connection: Connection) {
 export function chooseAutomaticConnection(connections: Connection[]): Connection | undefined {
   return connections
     .map((connection, index) => ({ connection, index }))
-    .filter(({ connection }) => connection.enabled !== false)
+    .filter(({ connection }) => connection.enabled !== false && availableConnectionModels(connection).length > 0)
     .sort((left, right) => {
       const healthDifference = Number(healthyStatuses.has((right.connection.status || '').toLowerCase())) - Number(healthyStatuses.has((left.connection.status || '').toLowerCase()))
       if (healthDifference) return healthDifference
@@ -24,15 +24,21 @@ export function chooseAutomaticConnection(connections: Connection[]): Connection
     })[0]?.connection
 }
 
-// 合并默认、发现和手动模型并去重，默认模型始终排在首位。
-export function availableConnectionModels(connection?: Connection): string[] {
+// 按模型目录自身的顺序合并并去重；默认模型只补充缺项，不参与列表置顶。
+export function allConnectionModels(connection?: Connection): string[] {
   if (!connection) return []
   return Array.from(new Set([
-    ...(connection.default_model ? [connection.default_model] : []),
     ...(connection.models || []),
     ...(connection.discovered_models || []),
     ...(connection.manual_models || []),
+    ...(connection.default_model ? [connection.default_model] : []),
   ]))
+}
+
+// 会话和新 Run 只消费用户当前启用的模型。
+export function availableConnectionModels(connection?: Connection): string[] {
+  const disabledModels = new Set(connection?.disabled_models || [])
+  return allConnectionModels(connection).filter((model) => !disabledModels.has(model))
 }
 
 // 按“会话覆盖 > Agent 默认 > 自动连接”解析本轮实际连接和模型，并返回选择器所需值。
@@ -52,16 +58,22 @@ export function resolveEffectiveModelSettings(
   const connection = sessionConnection || agentConnection || automaticConnection
   const connectionId = connection?.id || ''
 
-  const sessionModel = session?.model_id && (!session.model_connection_id || session.model_connection_id === connectionId)
+  const availableModels = availableConnectionModels(connection)
+  const availableModelIds = new Set(availableModels)
+  const sessionModel = session?.model_id && availableModelIds.has(session.model_id) && (!session.model_connection_id || session.model_connection_id === connectionId)
     ? session.model_id
     : ''
   const agentModelId = agent?.model_id || agent?.model || ''
-  const agentModel = agentModelId && (!agentConnectionId || agentConnectionId === connectionId) ? agentModelId : ''
-  const model = sessionModel || agentModel || availableConnectionModels(connection)[0] || ''
+  const agentModel = agentModelId && availableModelIds.has(agentModelId) && (!agentConnectionId || agentConnectionId === connectionId) ? agentModelId : ''
+  const connectionDefaultModel = connection?.default_model && availableModelIds.has(connection.default_model) ? connection.default_model : ''
+  const model = sessionModel || agentModel || connectionDefaultModel || availableModels[0] || ''
 
   const fallbackConnection = agentConnection || automaticConnection
-  const fallbackAgentModel = agentModelId && (!agentConnectionId || agentConnectionId === fallbackConnection?.id) ? agentModelId : ''
-  const fallbackModel = fallbackAgentModel || availableConnectionModels(fallbackConnection)[0] || ''
+  const fallbackAvailableModels = availableConnectionModels(fallbackConnection)
+  const fallbackAvailableModelIds = new Set(fallbackAvailableModels)
+  const fallbackAgentModel = agentModelId && fallbackAvailableModelIds.has(agentModelId) && (!agentConnectionId || agentConnectionId === fallbackConnection?.id) ? agentModelId : ''
+  const fallbackDefaultModel = fallbackConnection?.default_model && fallbackAvailableModelIds.has(fallbackConnection.default_model) ? fallbackConnection.default_model : ''
+  const fallbackModel = fallbackAgentModel || fallbackDefaultModel || fallbackAvailableModels[0] || ''
   const sessionConnectionMatches = !session?.model_connection_id || session.model_connection_id === connectionId
   const hasUsableSessionOverride = sessionConnectionMatches && Boolean(session?.model_connection_id || session?.model_id)
 

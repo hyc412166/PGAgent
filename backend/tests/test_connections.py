@@ -135,7 +135,7 @@ def test_create_discovers_models_and_keeps_key_out_of_database_and_response(
     assert body["discovered_models"] == ["model-a", "model-b"]
     assert body["default_model"] == "model-a"
     assert body["api_protocol"] == "responses"
-    assert body["thinking_level"] == "auto"
+    assert body["thinking_level"] == "medium"
     assert "api_key" not in body
     assert "secret_ref" not in body
     assert list(secret_backend.values()) == ["secret-key"]
@@ -236,6 +236,103 @@ def test_connection_thinking_level_can_be_updated(
     )
     assert updated.status_code == 200
     assert updated.json()["thinking_level"] == "high"
+
+
+# 测试场景：重新发现只刷新 /models 目录，不发送可能产生计费或权限错误的模型推理请求。
+def test_rediscover_models_does_not_probe_chat_completions(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mock_response(monkeypatch, 200, {"data": [{"id": "model-a"}]})
+    created = client.post(
+        "/api/connections",
+        json={
+            "name": "Chat relay",
+            "base_url": "https://provider.test/v1",
+            "api_key": "key",
+            "api_protocol": "chat_completions",
+        },
+    ).json()
+
+    mock_response(
+        monkeypatch,
+        200,
+        {"data": [{"id": "model-b"}, {"id": "model-a"}]},
+        protocol_status=403,
+    )
+    response = client.post(f"/api/connections/{created['id']}/discover")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["discovered_models"] == ["model-a", "model-b"]
+    assert response.json()["status"] == "connected"
+    assert response.json()["last_error"] is None
+
+
+# 测试场景：禁用模型后连接默认值及现有会话、Agent 选择同步移除，后端不能继续引用已禁用模型。
+def test_disabling_model_clears_persisted_model_selections(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mock_response(monkeypatch, 200, {"data": [{"id": "model-a"}, {"id": "model-b"}]})
+    created = client.post(
+        "/api/connections",
+        json={
+            "name": "Selectable relay",
+            "base_url": "https://provider.test/v1",
+            "api_key": "key",
+        },
+    ).json()
+    with database.SessionLocal() as db:
+        agent = database.Agent(
+            name="Selected model agent",
+            model_connection_id=created["id"],
+            model_id="model-a",
+        )
+        session = database.Session(
+            title="Selected model session",
+            model_connection_id=created["id"],
+            model_id="model-a",
+        )
+        db.add_all([agent, session])
+        db.commit()
+        agent_id, session_id = agent.id, session.id
+
+    response = client.patch(
+        f"/api/connections/{created['id']}",
+        json={"disabled_models": ["model-a"]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["disabled_models"] == ["model-a"]
+    assert response.json()["default_model"] == "model-b"
+    with database.SessionLocal() as db:
+        assert db.get(database.Agent, agent_id).model_id is None
+        assert db.get(database.Session, session_id).model_id is None
+
+
+# 测试场景：模型目录暂时缺项时保留用户停用记录，避免模型恢复后被静默重新启用。
+def test_rediscover_preserves_disabled_models_missing_from_current_catalog(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mock_response(monkeypatch, 200, {"data": [{"id": "model-a"}, {"id": "model-b"}]})
+    created = client.post(
+        "/api/connections",
+        json={
+            "name": "Changing catalog relay",
+            "base_url": "https://provider.test/v1",
+            "api_key": "key",
+        },
+    ).json()
+    disabled = client.patch(
+        f"/api/connections/{created['id']}",
+        json={"disabled_models": ["model-b"]},
+    )
+    assert disabled.status_code == 200, disabled.text
+
+    mock_response(monkeypatch, 200, {"data": [{"id": "model-a"}]})
+    rediscovered = client.post(f"/api/connections/{created['id']}/discover")
+
+    assert rediscovered.status_code == 200, rediscovered.text
+    assert rediscovered.json()["discovered_models"] == ["model-a"]
+    assert rediscovered.json()["disabled_models"] == ["model-b"]
 
 
 # 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_secret_headers_cannot_be_persisted 精确标识本用例的具体条件。
