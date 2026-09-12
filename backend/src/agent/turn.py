@@ -194,6 +194,21 @@ class TurnLedger:
 
         if not self._awaiting_approval:
             raise ValueError("approval ledger is not awaiting approval")
+        self.validate_scheduled_call(
+            call_id=call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+
+    def validate_scheduled_call(
+        self,
+        *,
+        call_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Validate one persisted call before any resumed dispatch."""
+
         record = self._local_record(call_id)
         if record.status is not LocalToolStatus.SCHEDULED:
             raise ValueError(f"approval ledger call is ambiguous: {call_id}={record.status.value}")
@@ -204,6 +219,9 @@ class TurnLedger:
 
     def has_running_calls(self) -> bool:
         return any(record.status is LocalToolStatus.RUNNING for record in self._local_calls.values())
+
+    def clear_background_wait(self) -> None:
+        self._background_wait = False
 
     def mark_stopped(self) -> None:
         self._stopped = True
@@ -267,8 +285,11 @@ class TurnLedger:
             for raw_response in raw_responses:
                 if not isinstance(raw_response, Mapping):
                     raise ValueError("ledger snapshot response must be an object")
+                raw_items = raw_response.get("items")
+                if not isinstance(raw_items, list):
+                    raise ValueError("ledger snapshot response items must be a list")
                 items = []
-                for raw_item in raw_response.get("items") or []:
+                for raw_item in raw_items:
                     if not isinstance(raw_item, Mapping):
                         raise ValueError("ledger snapshot item must be an object")
                     item_type = str(raw_item.get("type") or raw_item.get("item_type") or "")
@@ -296,12 +317,17 @@ class TurnLedger:
         for raw_call in raw_calls:
             if not isinstance(raw_call, Mapping):
                 raise ValueError("invalid ledger snapshot local call")
-            call_id = str(raw_call.get("call_id") or "")
+            call_id = raw_call.get("call_id")
+            if not isinstance(call_id, str):
+                raise ValueError("invalid ledger snapshot local call id")
             if not call_id or call_id in persisted_call_ids:
                 raise ValueError("invalid ledger snapshot local call id")
             persisted_call_ids.add(call_id)
             try:
-                status = LocalToolStatus(str(raw_call.get("status") or LocalToolStatus.SCHEDULED.value))
+                raw_status = raw_call.get("status")
+                if not isinstance(raw_status, str):
+                    raise ValueError("ledger snapshot local call status must be a string")
+                status = LocalToolStatus(raw_status)
                 record = ledger._local_record(call_id)
                 expected_arguments = json.dumps(record.item.arguments, sort_keys=True, separators=(",", ":"))
                 persisted_arguments = json.dumps(raw_call.get("arguments"), sort_keys=True, separators=(",", ":"))
@@ -309,11 +335,20 @@ class TurnLedger:
                 raise ValueError(f"invalid ledger snapshot local call: {call_id}") from exc
             if record.item.tool_name != str(raw_call.get("tool_name") or "") or expected_arguments != persisted_arguments:
                 raise ValueError(f"ledger snapshot call identity mismatch: {call_id}")
+            raw_observed = raw_call.get("observed_by_model")
+            if not isinstance(raw_observed, bool):
+                raise ValueError("ledger snapshot observed_by_model must be boolean")
+            if raw_observed and status is not LocalToolStatus.RESULT_COMMITTED:
+                raise ValueError("ledger snapshot cannot observe an uncommitted local call")
             record.status = status
-            record.observed_by_model = bool(raw_call.get("observed_by_model"))
+            record.observed_by_model = raw_observed
         if persisted_call_ids != declared_call_ids:
             raise ValueError("ledger snapshot call set does not match responses")
-        ledger._taken_local_call_ids = {str(call_id) for call_id in raw_taken if str(call_id)}
+        if any(not isinstance(call_id, str) or not call_id for call_id in raw_taken):
+            raise ValueError("ledger snapshot taken call ids must be non-empty strings")
+        ledger._taken_local_call_ids = set(raw_taken)
+        if len(ledger._taken_local_call_ids) != len(raw_taken):
+            raise ValueError("ledger snapshot taken call ids must be unique")
         if not ledger._taken_local_call_ids.issubset(declared_call_ids):
             raise ValueError("ledger snapshot taken call is unknown")
         if any(
@@ -321,13 +356,34 @@ class TurnLedger:
             for call_id, record in ledger._local_calls.items()
         ):
             raise ValueError("ledger snapshot active call was never taken")
-        persisted_hosted_count = max(0, int(payload.get("hosted_tool_count") or 0))
+        persisted_hosted_count = payload.get("hosted_tool_count")
+        if (
+            isinstance(persisted_hosted_count, bool)
+            or not isinstance(persisted_hosted_count, int)
+            or persisted_hosted_count < 0
+        ):
+            raise ValueError("ledger snapshot hosted tool count must be a non-negative integer")
         if persisted_hosted_count != ledger._hosted_tool_count:
             raise ValueError("ledger snapshot hosted tool count mismatch")
-        ledger._awaiting_approval = bool(payload.get("awaiting_approval"))
-        ledger._background_wait = bool(payload.get("background_wait"))
-        ledger._stopped = bool(payload.get("stopped"))
-        ledger._failed = bool(payload.get("failed"))
+        flag_names = ("awaiting_approval", "background_wait", "stopped", "failed")
+        flags: dict[str, bool] = {}
+        for flag_name in flag_names:
+            raw_flag = payload.get(flag_name)
+            if not isinstance(raw_flag, bool):
+                raise ValueError(f"ledger snapshot {flag_name} must be boolean")
+            flags[flag_name] = raw_flag
+        if flags["awaiting_approval"] and flags["background_wait"]:
+            raise ValueError("ledger snapshot cannot await approval and background together")
+        if flags["stopped"] and flags["failed"]:
+            raise ValueError("ledger snapshot cannot be stopped and failed together")
+        if (flags["stopped"] or flags["failed"]) and (
+            flags["awaiting_approval"] or flags["background_wait"]
+        ):
+            raise ValueError("ledger snapshot terminal state cannot retain waiting flags")
+        ledger._awaiting_approval = flags["awaiting_approval"]
+        ledger._background_wait = flags["background_wait"]
+        ledger._stopped = flags["stopped"]
+        ledger._failed = flags["failed"]
         return ledger
 
     def decision(self) -> TurnDecision:

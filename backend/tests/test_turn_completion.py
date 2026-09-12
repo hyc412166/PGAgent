@@ -286,3 +286,42 @@ def test_ledger_snapshot_rejects_contradictory_call_identity() -> None:
 
     with pytest.raises(ValueError, match="ledger snapshot"):
         TurnLedger.from_snapshot(snapshot)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"awaiting_approval": "false"},
+        {"background_wait": 1},
+        {"stopped": True, "failed": True},
+        {"awaiting_approval": True, "background_wait": True},
+    ],
+)
+def test_ledger_snapshot_rejects_non_boolean_and_mutually_exclusive_flags(updates) -> None:
+    snapshot = TurnLedger().to_snapshot()
+    snapshot.update(updates)
+    with pytest.raises(ValueError, match="ledger snapshot"):
+        TurnLedger.from_snapshot(snapshot)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda snapshot: snapshot["local_calls"][0].pop("status"),
+        lambda snapshot: snapshot["local_calls"][0].update(observed_by_model=True),
+        lambda snapshot: snapshot.update(taken_local_call_ids=[1]),
+        lambda snapshot: snapshot["responses"][0].update(items={}),
+        lambda snapshot: snapshot.update(hosted_tool_count="0"),
+    ],
+)
+def test_ledger_snapshot_rejects_normalized_call_state(mutate) -> None:
+    ledger = TurnLedger()
+    ledger.accept_response(_response(
+        "resp-ledger",
+        LocalToolCallItem(call_id="call-1", tool_name="write", arguments={"path": "a"}),
+    ))
+    snapshot = ledger.to_snapshot()
+    mutate(snapshot)
+
+    with pytest.raises(ValueError, match="ledger snapshot"):
+        TurnLedger.from_snapshot(snapshot)

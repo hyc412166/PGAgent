@@ -478,11 +478,16 @@ async def test_parallel_child_approval_keeps_sibling_results_and_resumes_all(tmp
         if message.get("role") == "tool"
     ] == ["task-a", "task-b"]
 
+    still_waiting = await runtime.resume_after_delegated_child(waiting)
+    assert still_waiting.status == "stopped"
+    assert still_waiting.stop_reason == "delegated_child_awaiting_approval"
+    assert still_waiting.output_ledger is waiting.output_ledger
+
     child_a_completed = True
-    resumed = await runtime.resume_after_delegated_child(waiting)
+    resumed = await runtime.resume_after_delegated_child(still_waiting)
     assert resumed.status == "completed"
     assert resumed.output == "all child results received"
-    assert calls == ["task-a", "task-b", "task-a"]
+    assert calls == ["task-a", "task-b", "task-a", "task-a"]
 
 
 @pytest.mark.asyncio
@@ -1164,6 +1169,7 @@ async def test_multi_side_effect_batch_pauses_for_each_approval(tmp_path) -> Non
     first = await runtime.run(system_prompt="safe", recent_messages=[])
     second = await runtime.resume_after_approval(first)
     assert second.status == "awaiting_approval"
+    assert second.output_ledger is first.output_ledger
     assert second.pending_approval["id"] == "write-2"
     assert (tmp_path / "one.txt").exists()
     assert not (tmp_path / "two.txt").exists()
@@ -1171,6 +1177,32 @@ async def test_multi_side_effect_batch_pauses_for_each_approval(tmp_path) -> Non
     assert final.status == "completed"
     assert (tmp_path / "two.txt").exists()
     assert turns == 2
+
+
+@pytest.mark.asyncio
+async def test_approval_resume_validates_all_remaining_calls_before_any_dispatch(tmp_path) -> None:
+    async def model_call(**_kwargs) -> ModelTurn:
+        return ModelTurn(tool_calls=[
+            write_call("write-1", "one.txt", "1"),
+            write_call("write-2", "two.txt", "2"),
+        ])
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
+    )
+    waiting = await runtime.run(system_prompt="safe", recent_messages=[])
+    waiting.pending_approval["remaining_calls"][0]["arguments"] = {
+        "path": "tampered.txt",
+        "content": "unsafe",
+    }
+
+    with pytest.raises(ValueError, match="approval.*ledger"):
+        await runtime.resume_after_approval(waiting)
+
+    assert not (tmp_path / "one.txt").exists()
+    assert not (tmp_path / "two.txt").exists()
+    assert not (tmp_path / "tampered.txt").exists()
 
 
 @pytest.mark.asyncio

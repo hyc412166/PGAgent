@@ -1848,21 +1848,44 @@ class AgentRuntime:
                 )
                 output_ledger.accept_response(normalized_response)
                 turn_decision = output_ledger.decision()
-                if turn_decision.status is TurnStatus.COMPLETED and self.background_wait_provider is not None:
+                if (
+                    self.background_wait_provider is not None
+                    and (
+                        turn_decision.status is TurnStatus.COMPLETED
+                        or turn_decision.reason == "background_wait"
+                    )
+                ):
                     # 后台作业属于 Turn 的结构化等待事实；不再通过 completion
                     # verifier 拒绝候选文本，直接阻止终态交付并等待事件恢复。
                     background_boundary = dict(self.background_wait_provider() or {})
                     boundary_status = str(background_boundary.get("status") or "clear")
+                    if boundary_status not in {"clear", "waiting", "observe"}:
+                        raise ValueError(f"unsupported background completion boundary: {boundary_status}")
+                    output_ledger.clear_background_wait()
+                    turn_decision = output_ledger.decision()
                     if boundary_status == "waiting":
                         output_ledger.set_waiting(background=True)
-                        waiting = {
+                        boundary_state = {
                             **state,
+                            "usage": merge_usage(state.get("usage"), turn.usage),
+                            "output_ledger": output_ledger,
+                        }
+                        boundary_usage = normalize_usage(turn.usage)
+                        boundary_state["events"] = await self._publish(
+                            boundary_state,
+                            "model_step_finished",
+                            step=guard.steps,
+                            duration_ms=round((self.clock() - thought_started_at) * 1000),
+                            input_tokens=boundary_usage["input_tokens"],
+                            output_tokens=boundary_usage["output_tokens"],
+                        )
+                        waiting = {
+                            **boundary_state,
                             "status": "stopped",
                             "output": None,
                             "stop_reason": "waiting_background",
                             "error": "后台作业仍在运行；等待终态事件后恢复。",
                             "messages": state.get("messages", []),
-                            "output_ledger": output_ledger,
                         }
                         waiting["events"] = await self._publish(
                             waiting,
@@ -1873,9 +1896,22 @@ class AgentRuntime:
                         return waiting
                     if boundary_status == "observe":
                         terminal_results = list(background_boundary.get("results") or [])
-                        output_ledger.set_waiting(background=False)
-                        return {
+                        boundary_state = {
                             **state,
+                            "usage": merge_usage(state.get("usage"), turn.usage),
+                            "output_ledger": output_ledger,
+                        }
+                        boundary_usage = normalize_usage(turn.usage)
+                        boundary_state["events"] = await self._publish(
+                            boundary_state,
+                            "model_step_finished",
+                            step=guard.steps,
+                            duration_ms=round((self.clock() - thought_started_at) * 1000),
+                            input_tokens=boundary_usage["input_tokens"],
+                            output_tokens=boundary_usage["output_tokens"],
+                        )
+                        return {
+                            **boundary_state,
                             "status": "observing",
                             "messages": [
                                 *state.get("messages", []),
@@ -1888,7 +1924,6 @@ class AgentRuntime:
                                 },
                             ],
                             "current_made_progress": True,
-                            "output_ledger": output_ledger,
                         }
                 local_items = (
                     output_ledger.take_local_calls()
@@ -2879,6 +2914,14 @@ class AgentRuntime:
                 tool_name=tool_name,
                 arguments=arguments,
             )
+            for raw_remaining in pending.get("remaining_calls") or []:
+                if not isinstance(raw_remaining, Mapping):
+                    raise ValueError("approval remaining call does not match output ledger")
+                prior.output_ledger.validate_scheduled_call(
+                    call_id=str(raw_remaining.get("id") or ""),
+                    tool_name=str(raw_remaining.get("name") or ""),
+                    arguments=dict(raw_remaining.get("arguments") or {}),
+                )
 
         # 函数职责：完成 elapsed_ms 对应的智能体处理。
         # 返回关系：结果用于更新运行状态、形成模型输入或发送给上层调用方。
@@ -2931,6 +2974,7 @@ class AgentRuntime:
                 verification_trace=[dict(item) for item in resume_verification_trace],
                 acceptance_report=dict(prior.acceptance_report),
                 completion_verification_attempts=prior.completion_verification_attempts,
+                output_ledger=prior.output_ledger,
             )
 
         # 变量说明：resume_state 表示当前步骤使用的 resume_state 值。
@@ -3044,6 +3088,7 @@ class AgentRuntime:
                 verification_trace=[dict(item) for item in resume_verification_trace],
                 acceptance_report=dict(prior.acceptance_report),
                 completion_verification_attempts=prior.completion_verification_attempts,
+                output_ledger=prior.output_ledger,
             )
         # 变量说明：timed_out 表示当前步骤使用的 timed_out 值。
         timed_out = await timeout_outcome(events, messages)
@@ -3106,6 +3151,7 @@ class AgentRuntime:
                     verification_trace=[dict(item) for item in resume_verification_trace],
                     acceptance_report=dict(prior.acceptance_report),
                     completion_verification_attempts=prior.completion_verification_attempts,
+                    output_ledger=prior.output_ledger,
                 )
 
             # 变量说明：tool_started_at 表示当前步骤使用的 tool_started_at 值。
@@ -3119,6 +3165,8 @@ class AgentRuntime:
                 **safe_tool_argument_summary(call.name, call.arguments),
                 elapsed_ms=elapsed_ms(),
             )
+            if prior.output_ledger is not None:
+                prior.output_ledger.mark_local_running(call.id)
             # 变量说明：remaining_result 表示当前步骤使用的 remaining_result 值。
             remaining_result = await self._dispatch_tool(
                 call.name,
@@ -3127,6 +3175,8 @@ class AgentRuntime:
                 call_id=call.id,
             )
             if remaining_result.approval_required:
+                if prior.output_ledger is not None:
+                    prior.output_ledger.mark_local_awaiting_approval(call.id)
                 # 变量说明：events 表示events 集合。
                 events = await self._publish(
                     {"events": events},
@@ -3186,6 +3236,7 @@ class AgentRuntime:
                     verification_trace=[dict(item) for item in resume_verification_trace],
                     acceptance_report=dict(prior.acceptance_report),
                     completion_verification_attempts=prior.completion_verification_attempts,
+                    output_ledger=prior.output_ledger,
                 )
 
             # 变量说明：remaining_tool_message 表示当前步骤使用的 remaining_tool_message 值；resume_artifact_refs 表示resume_artifact_refs 集合。
@@ -3196,6 +3247,8 @@ class AgentRuntime:
                 artifact_refs=resume_artifact_refs,
             )
             messages.append(remaining_tool_message)
+            if prior.output_ledger is not None:
+                prior.output_ledger.commit_local_result(call.id, tool_name=remaining_result.tool_name)
             resume_transcript_delta.append(dict(remaining_tool_message))
             resume_verification_trace.append(dict(remaining_tool_message))
             # 变量说明：remaining_fingerprint 表示当前步骤使用的 remaining_fingerprint 值。
@@ -3264,6 +3317,7 @@ class AgentRuntime:
                     verification_trace=[dict(item) for item in resume_verification_trace],
                     acceptance_report=dict(prior.acceptance_report),
                     completion_verification_attempts=prior.completion_verification_attempts,
+                    output_ledger=prior.output_ledger,
                 )
             if remaining_result.metadata.get("needs_user_input"):
                 # 变量说明：question 表示当前步骤使用的 question 值。
@@ -3306,6 +3360,7 @@ class AgentRuntime:
                     verification_trace=[dict(item) for item in resume_verification_trace],
                     acceptance_report=dict(prior.acceptance_report),
                     completion_verification_attempts=prior.completion_verification_attempts,
+                    output_ledger=prior.output_ledger,
                 )
             # 变量说明：timed_out 表示当前步骤使用的 timed_out 值。
             timed_out = await timeout_outcome(events, messages)
@@ -3341,6 +3396,7 @@ class AgentRuntime:
                 verification_trace=[dict(item) for item in resume_verification_trace],
                 acceptance_report=dict(prior.acceptance_report),
                 completion_verification_attempts=prior.completion_verification_attempts,
+                output_ledger=prior.output_ledger,
             )
         # 变量说明：resumed_context 表示当前步骤使用的 resumed_context 值。
         resumed_context = dict(runtime_context or {})
@@ -3519,6 +3575,7 @@ class AgentRuntime:
                 verification_trace=[dict(item) for item in prior.verification_trace],
                 acceptance_report=dict(prior.acceptance_report),
                 completion_verification_attempts=prior.completion_verification_attempts,
+                output_ledger=prior.output_ledger,
             )
 
         # 变量说明：messages 表示模型消息序列。
@@ -3622,6 +3679,7 @@ class AgentRuntime:
                 verification_trace=delegated_verification_trace,
                 acceptance_report=dict(prior.acceptance_report),
                 completion_verification_attempts=prior.completion_verification_attempts,
+                output_ledger=prior.output_ledger,
             )
         # 变量说明：resumed_context 表示当前步骤使用的 resumed_context 值。
         resumed_context = dict(runtime_context or {})
