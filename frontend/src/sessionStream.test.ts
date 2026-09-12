@@ -1,6 +1,6 @@
 // 本测试文件验证 sessionStream 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
-import { appendAssistantDelta, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
+import { appendAssistantDelta, composerSurface, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
 
 // 测试分组：会话 SSE 事件。
 describe('会话 SSE 事件', () => {
@@ -101,6 +101,13 @@ describe('会话 SSE 事件', () => {
     expect(shouldMarkApprovalResuming('terminal', 'run-1', 'run-1')).toBe(false)
     expect(shouldMarkApprovalResuming('idle', '', 'run-1')).toBe(false)
     expect(shouldMarkApprovalResuming('awaiting_approval', 'run-2', 'run-1')).toBe(false)
+  })
+  // 测试场景：待审批时底部交互区切换为审批面板，草稿页仍保持输入框。
+  it('根据待审批数量选择底部交互面板', () => {
+    expect(composerSurface(1, false)).toBe('approval')
+    expect(composerSurface(2, false)).toBe('approval')
+    expect(composerSurface(0, false)).toBe('composer')
+    expect(composerSurface(1, true)).toBe('composer')
   })
   // 测试场景：refreshes the session after a rejected child approval。
   it('refreshes the session after a rejected child approval', () => {

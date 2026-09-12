@@ -37,15 +37,15 @@
   margin-bottom: 0;
 }
 .market-leaderboards { border-color: var(--line); background: var(--surface-soft); }
-.market-category-card { border-color: var(--line); border-radius: 13px 13px 13px 6px; background: var(--surface); }
+.market-category-card { border-color: var(--line); border-radius: 13px; background: var(--surface); }
 .market-category-card li:hover,
 .market-category-card li.market-category-preview { background: var(--blue-soft); }
 .market-category-card li:nth-child(1) .market-category-rank { color: var(--yellow); background: var(--beak-soft); }
-.market-view-tabs button { border-radius: 9px 9px 9px 4px; }
+.market-view-tabs button { border-radius: 9px; }
 .market-view-tabs button:hover,
 .market-view-tabs button.active { color: var(--scarf-dark); border-color: #ebb1b9; background: var(--scarf-soft); }
 .market-category-download:hover:not(:disabled) { color: var(--scarf-dark); background: var(--scarf-soft); }
-.market-results > article { border-color: var(--line); border-radius: 12px 12px 12px 5px; background: var(--surface-soft); }
+.market-results > article { border-color: var(--line); border-radius: 12px; background: var(--surface-soft); }
 
 .filter-bar {
   width: max-content;
@@ -53,11 +53,11 @@
   margin-bottom: 13px;
   padding: 4px;
   border: 1px solid var(--line);
-  border-radius: 12px 12px 12px 5px;
+  border-radius: 12px;
   background: var(--surface-deep);
 }
 
-.filter-bar button { border-radius: 8px 8px 8px 3px; color: var(--muted); }
+.filter-bar button { border-radius: 8px; color: var(--muted); }
 .filter-bar button.active { color: var(--scarf-dark); background: var(--surface); box-shadow: var(--shadow-sm); }
 
 .run-table-card { overflow: hidden; }
@@ -80,7 +80,7 @@
 .detail-hero,
 .detail-grid > div,
 .stop-reason {
-  border-radius: 13px 13px 13px 6px;
+  border-radius: 13px;
 }
 
 .timeline span { border-color: var(--scarf); }
@@ -113,7 +113,7 @@
   min-width: 0;
   padding: 10px 11px;
   border: 1px solid var(--line);
-  border-radius: 12px 12px 12px 5px;
+  border-radius: 12px;
   background: var(--surface-soft);
 }
 .run-event > article > header {
@@ -150,7 +150,7 @@
   max-width: 100%;
   padding: 4px 6px;
   border: 1px solid var(--line);
-  border-radius: 7px 7px 7px 3px;
+  border-radius: 7px;
   background: var(--surface);
 }
 .run-event > article dt { color: var(--muted-2); font-size: 0.5rem; white-space: nowrap; }
@@ -201,26 +201,26 @@
 
 .usage-date-filter {
   border-color: rgb(255 255 255 / 78%);
-  border-radius: 15px 15px 15px 6px;
+  border-radius: 15px;
   background: var(--glass);
   -webkit-backdrop-filter: blur(16px);
   backdrop-filter: blur(16px);
 }
 
 .usage-date-filter-head > div svg { color: var(--scarf); }
-.usage-date-presets button { border-radius: 8px 8px 8px 3px; }
+.usage-date-presets button { border-radius: 8px; }
 .usage-date-presets button:hover,
 .usage-date-presets button.active { color: var(--scarf-dark); border-color: #eab2ba; background: var(--scarf-soft); }
 
 .usage-hero { padding: 16px; }
 .usage-bolt { color: var(--scarf-dark); background: var(--scarf-soft); }
 .usage-total strong { color: var(--ink); font-size: clamp(24px, 4vw, 32px); }
-.usage-mini-totals { border-color: var(--line); border-radius: 12px 12px 12px 5px; }
+.usage-mini-totals { border-color: var(--line); border-radius: 12px; }
 .usage-card-grid { grid-template-columns: repeat(4, 1fr); gap: 7px; }
-.usage-card-grid article { min-height: 62px; border-color: var(--line); border-radius: 11px 11px 11px 5px; }
-.cache-meter { border-color: var(--line); border-radius: 11px 11px 11px 5px; }
+.usage-card-grid article { min-height: 62px; border-color: var(--line); border-radius: 11px; }
+.cache-meter { border-color: var(--line); border-radius: 11px; }
 .cache-meter b { background: var(--ocean-500); }
-.usage-models { border-radius: 17px 17px 17px 7px; }
+.usage-models { border-radius: 17px; }
 .usage-models thead th { background: var(--surface-soft); }
 .usage-models tbody tr:hover { background: var(--blue-soft); }
 
@@ -245,6 +245,6 @@
 .provider-icon { color: var(--scarf-dark); background: var(--scarf-soft); }
 .connection-card > header,
 .thinking-row { border-color: var(--line); }
-.model-block { border-color: var(--line); border-radius: 12px 12px 12px 5px; background: var(--surface-soft); }
+.model-block { border-color: var(--line); border-radius: 12px; background: var(--surface-soft); }
 .model-tags span { border-color: var(--line); background: var(--surface); }
 .model-tags span.selected { color: var(--scarf-dark); border-color: #eab2ba; background: var(--scarf-soft); }

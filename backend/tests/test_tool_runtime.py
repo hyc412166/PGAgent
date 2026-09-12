@@ -133,6 +133,8 @@ def test_timeline_keeps_safe_search_and_open_details() -> None:
 
     assert summary["arguments"]["search_query"]["items"] == ["latest US news"]
     assert summary["arguments"]["open"]["items"] == ["https://example.com/story"]
+    ref_summary = safe_tool_argument_summary("web_run", {"open": [{"ref": "https://example.com/ref-alias"}]})
+    assert ref_summary["arguments"]["open"]["items"] == ["https://example.com/ref-alias"]
     assert safe_tool_result_summary("read", "secret body") == "读取完成（11 字符）"
     assert safe_tool_result_summary("rg", "2 matches") == "2 matches"
     assert safe_tool_result_summary(
@@ -140,6 +142,16 @@ def test_timeline_keeps_safe_search_and_open_details() -> None:
         '[{"type":"search_query","content":"private page body"}]',
         {"commands": [{"type": "search_query", "ok": True, "results": [{"url": "https://example.com"}]}]},
     ) == "搜索完成（1 条结果）"
+    assert safe_tool_result_summary(
+        "web_run",
+        "search failure",
+        {"commands": [{"type": "search_query", "ok": False, "results": [], "error_code": "search_timeout"}]},
+    ) == "搜索失败（search_timeout）"
+    assert safe_tool_result_summary(
+        "web_run",
+        "open payload",
+        {"commands": [{"type": "open", "ok": True, "url": "https://example.com/story"}]},
+    ) == "打开完成：https://example.com/story"
 
 
 # 测试场景：天气工具的地点和来源地址必须进入安全的用户可见摘要。

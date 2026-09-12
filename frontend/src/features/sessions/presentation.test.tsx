@@ -4,9 +4,18 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 
 import { ChildAgentPanel, CompletedThoughtTimeline, LiveAssistantMessage, MessageBubble } from './presentation'
+import { formatApprovalArguments } from './approvalPresentation'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
 
 describe('子 Agent 运行事件展示', () => {
+  it('将审批参数格式化为可读内容并脱敏敏感字段', () => {
+    expect(formatApprovalArguments('shell', { command: 'Get-ChildItem -Force', cwd: 'C:\\repo', timeout_seconds: 30 }))
+      .toContain('Get-ChildItem -Force')
+    expect(formatApprovalArguments('http', { url: 'https://example.com', api_token: 'secret-value' }))
+      .toContain('[已隐藏]')
+    expect(formatApprovalArguments('http', {})).toBe('无参数')
+  })
+
   // 测试场景：工具事件显示可读标题，未知事件也不会回显内部事件名或 payload。
   it('复用安全事件描述而不是原始事件类型', () => {
     const markup = renderToStaticMarkup(createElement(ChildAgentPanel, {

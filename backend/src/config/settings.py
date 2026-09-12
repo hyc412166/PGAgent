@@ -63,9 +63,6 @@ class Settings(BaseSettings):
     completion_verification_max_attempts: int = 3
     # 变量说明：mcp_config_path 表示mcp_config_path 对应的文件系统位置。
     mcp_config_path: str | None = None
-    # 联网搜索显式使用的代理；未配置时回退到进程的 HTTPS_PROXY/HTTP_PROXY。
-    web_proxy: str | None = None
-
     # 函数职责：完成 data_dir 对应的业务处理。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @property

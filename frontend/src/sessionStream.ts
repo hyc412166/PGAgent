@@ -169,6 +169,11 @@ export function shouldStartHistoryScroll(
   return anchoringHistory ? historyReady : stickToBottom
 }
 
+// 底部交互区只在真实会话存在待审批项时切换；草稿始终保留输入能力。
+export function composerSurface(approvalCount: number, draftActive: boolean): 'composer' | 'approval' {
+  return !draftActive && approvalCount > 0 ? 'approval' : 'composer'
+}
+
 // 校验异步回调仍属于当前会话和运行，避免过期流修改新会话状态。
 export function isCurrentSessionRun(
   activeSessionId: string,

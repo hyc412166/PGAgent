@@ -61,7 +61,7 @@
   width: 42px;
   height: 42px;
   border: 2px solid rgb(255 255 255 / 74%);
-  border-radius: 15px 15px 15px 7px;
+  border-radius: 15px;
   color: var(--penguin);
   background: linear-gradient(145deg, #fff, var(--ice));
   box-shadow: 0 8px 18px rgb(0 12 24 / 24%);
@@ -117,7 +117,7 @@
   margin-bottom: 4px;
   padding: 0 11px;
   border: 1px solid transparent;
-  border-radius: 13px 13px 13px 6px;
+  border-radius: 13px;
   color: #b8d7e2;
   font-size: 0.75rem;
   font-weight: 720;
@@ -151,7 +151,7 @@
 .service-pill {
   padding: 9px 10px;
   border-color: rgb(215 244 255 / 17%);
-  border-radius: 13px 13px 13px 6px;
+  border-radius: 13px;
   background: rgb(218 246 255 / 8%);
   box-shadow: none;
 }

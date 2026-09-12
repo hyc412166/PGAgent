@@ -57,7 +57,7 @@
 .skill-search,
 .usage-date-inputs input {
   border-color: var(--line-strong);
-  border-radius: 11px 11px 11px 5px;
+  border-radius: 11px;
   color: var(--ink);
   background: rgb(255 255 255 / 72%);
 }
@@ -74,13 +74,13 @@
 .capability-select,
 .market-browser {
   border-color: var(--line);
-  border-radius: 13px 13px 13px 6px;
+  border-radius: 13px;
   background: rgb(255 255 255 / 52%);
 }
 
 .capability-options > button {
   border-color: var(--line);
-  border-radius: 10px 10px 10px 4px;
+  border-radius: 10px;
   background: var(--surface);
 }
 

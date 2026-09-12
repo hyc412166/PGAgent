@@ -76,7 +76,7 @@
     width: 24px;
     height: 24px;
     border-color: rgb(205 238 249 / 38%);
-    border-radius: 9px 9px 9px 4px;
+    border-radius: 9px;
     color: var(--ocean-900);
     background: var(--ice);
     box-shadow: 0 4px 12px rgb(0 17 31 / 20%), inset 0 1px 0 rgb(255 255 255 / 82%);
@@ -101,7 +101,7 @@
   .main-content { padding-top: 54px; }
   .sidebar { width: min(276px, 84vw); border-radius: 0 26px 26px 0; transform: translateX(-100%); }
   .sidebar.mobile-open { transform: translateX(0); }
-  .mobile-menu { top: 10px; left: 12px; display: grid; border-color: var(--line); border-radius: 12px 12px 12px 5px; background: var(--glass-strong); box-shadow: var(--shadow-sm); }
+  .mobile-menu { top: 10px; left: 12px; display: grid; border-color: var(--line); border-radius: 12px; background: var(--glass-strong); box-shadow: var(--shadow-sm); }
   .mobile-backdrop { background: rgb(5 35 51 / 38%); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px); }
   .page { padding: 22px 20px 44px; }
   .page-chat { height: calc(100dvh - 54px); padding: 8px 10px 10px; }

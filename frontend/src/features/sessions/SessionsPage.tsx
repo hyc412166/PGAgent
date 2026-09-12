@@ -10,7 +10,7 @@ import { modelSelectionPayload, resolveEffectiveThinking, sessionThinkingOptions
 import { buildDraftLaunchPayload, createDraftIdempotencyKey, createTurnIdempotencyKey } from '../../draftLaunch'
 import { availableConnectionModels, resolveEffectiveModelSettings } from '../../modelSettings'
 import { buildSessionNavigation, draftSessionTitle, folderName, isDefaultWorkspace, mergePendingSession, pendingSessionAfterRemoval, projectRootForSession } from '../../sessionNavigation'
-import { isResumableWaitingRun, isTerminalRunStatus, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from '../../sessionStream'
+import { composerSurface, isResumableWaitingRun, isTerminalRunStatus, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from '../../sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, pickThinkingStatus, timelineFromRunEvents } from '../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../thoughtTimeline'
 import { ThoughtHydrationRegistry } from '../../thoughtHydration'
@@ -308,6 +308,7 @@ function SessionsPage() {
     awaitingApprovalRunIds.includes(stringId(approval.run_id))
       || (liveRun.status === 'awaiting_approval' && stringId(approval.run_id) === liveRun.runId)
   ))
+  const activeComposerSurface = composerSurface(visibleApprovals.length, draftActive)
   // 为运输 Hook 提供稳定命名的刷新/状态写入函数，使终态同步不依赖页面实现细节。
   const refreshMessages = messages.refresh
   const refreshRuns = runs.refresh
@@ -1185,9 +1186,9 @@ function SessionsPage() {
                 </div>}
                 {!draftActive && approvals.error && <ErrorState message={`审批状态读取失败：${approvals.error}`} onRetry={approvals.reload} />}
                 {!draftActive && approvals.loading && activeRunId && !visibleApprovals.length && liveRun.status === 'awaiting_approval' && <LoadingState label="正在读取审批状态" />}
-                {!draftActive && visibleApprovals.map((approval) => <ApprovalCard key={approval.id} approval={approval} deciding={decidingApproval === approval.id} onDecision={decideApproval} />)}
               </div>
-              <form className="composer" onSubmit={sendMessage}>
+              <div className={`composer-stage composer-stage-${activeComposerSurface}`} aria-live="polite">
+              <form className={`composer composer-surface composer-surface-composer${activeComposerSurface === 'composer' ? ' is-active' : ''}`} aria-hidden={activeComposerSurface !== 'composer'} inert={activeComposerSurface !== 'composer' || undefined} onSubmit={sendMessage}>
                 {actionError && <p className="form-error" role="alert">{actionError}</p>}
                 {draftActive && <div className="draft-project-controls">
                   <button type="button" className="draft-project-button" disabled={pickingDraftProject || sending} onClick={() => void selectDraftProject()}>{pickingDraftProject ? <LoaderCircle className="spin" size={13} /> : <FolderOpen size={13} />}选择项目</button>
@@ -1304,6 +1305,12 @@ function SessionsPage() {
                   </div>
                 </div>
               </form>
+              <section className={`composer composer-surface composer-surface-approval${activeComposerSurface === 'approval' ? ' is-active' : ''}`} aria-hidden={activeComposerSurface !== 'approval'} inert={activeComposerSurface !== 'approval' || undefined} aria-label="待审批操作">
+                <div className="approval-composer-list">
+                  {visibleApprovals.map((approval) => <ApprovalCard key={approval.id} approval={approval} embedded deciding={decidingApproval === approval.id} onDecision={decideApproval} />)}
+                </div>
+              </section>
+              </div>
             </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={beginDraft}>新建对话</button>} />}
           </section>
           <ChildAgentPanel

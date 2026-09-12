@@ -12,7 +12,7 @@
   gap: 11px;
   padding: 13px;
   border-color: var(--line);
-  border-radius: 16px 16px 16px 7px;
+  border-radius: 16px;
   background: var(--surface);
   box-shadow: var(--shadow-sm);
 }
@@ -32,7 +32,7 @@
 .usage-bolt,
 .empty-icon,
 .skill-card-icon {
-  border-radius: 12px 12px 12px 5px;
+  border-radius: 12px;
 }
 
 .stat-icon { width: 34px; height: 34px; }
@@ -60,7 +60,7 @@
 }
 
 .run-row:not(:disabled):hover {
-  border-radius: 12px 12px 12px 5px;
+  border-radius: 12px;
   background: var(--surface-soft);
 }
 
@@ -78,7 +78,7 @@
 .status {
   gap: 5px;
   padding: 4px 7px;
-  border-radius: 8px 8px 8px 4px;
+  border-radius: 8px;
   font-size: 0.5625rem;
   font-weight: 800;
 }
@@ -86,7 +86,7 @@
 .number-chip {
   min-width: 24px;
   height: 24px;
-  border-radius: 9px 9px 9px 4px;
+  border-radius: 9px;
   color: var(--yellow);
   background: var(--beak-soft);
 }
@@ -100,7 +100,7 @@
   margin-top: 13px;
   padding: 10px 13px;
   border-color: #f0d395;
-  border-radius: 16px 16px 16px 7px;
+  border-radius: 16px;
   background: linear-gradient(135deg, var(--beak-soft), var(--surface));
 }
 
@@ -117,5 +117,5 @@
 .error-state,
 .notice,
 .security-note {
-  border-radius: 14px 14px 14px 6px;
+  border-radius: 14px;
 }

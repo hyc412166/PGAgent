@@ -32,7 +32,7 @@
 .session-create {
   min-height: 35px;
   border: 1px solid #73bdd5;
-  border-radius: 11px 11px 11px 5px;
+  border-radius: 11px;
   color: var(--ocean-900);
   background: #d5f0f7;
   font-size: 0.5625rem;
@@ -47,7 +47,7 @@
 
 .project-row,
 .tree-session-item {
-  border-radius: 9px 9px 9px 4px;
+  border-radius: 9px;
   color: var(--muted);
   font-size: 0.5625rem;
 }
@@ -71,7 +71,7 @@
 .context-tooltip {
   color: var(--ink);
   border-color: rgb(91 180 214 / 46%);
-  border-radius: 13px 13px 13px 6px;
+  border-radius: 13px;
   background: linear-gradient(145deg, rgb(239 251 255 / 96%), rgb(211 241 251 / 94%));
   box-shadow: var(--shadow-md);
   -webkit-backdrop-filter: blur(22px) saturate(135%);
@@ -96,7 +96,7 @@
   width: 31px;
   height: 31px;
   border-color: var(--line);
-  border-radius: 11px 11px 11px 5px;
+  border-radius: 11px;
   color: var(--ocean-700);
   background: var(--glass-strong);
 }
@@ -113,6 +113,47 @@
   margin-left: auto;
 }
 
+/* 输入与审批共享一个底部舞台，避免审批卡片被推到消息滚动区之外。 */
+.composer-stage {
+  position: relative;
+  display: grid;
+  width: min(840px, calc(100% - 30px));
+  margin: 0 auto 14px;
+}
+
+.composer-surface {
+  grid-area: 1 / 1;
+  width: 100%;
+  margin: 0;
+  transform-origin: 50% 100%;
+  transition: transform 280ms cubic-bezier(.2, 0, 0, 1), opacity 220ms ease;
+  will-change: transform, opacity;
+}
+
+.composer-surface:not(.is-active) {
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(18px) scaleX(.86);
+}
+
+.composer-surface.is-active { position: relative; z-index: 1; opacity: 1; transform: translateY(0) scaleX(1); }
+.composer-stage-approval .composer-surface-composer:not(.is-active) { transform: translateY(18px) scaleX(.86); }
+.composer-stage-approval .composer-surface-approval.is-active { transform-origin: 50% 0; }
+
+.approval-composer-list { display: grid; gap: 6px; max-height: min(25vh, 180px); overflow-y: auto; padding-right: 2px; }
+.approval-card-embedded { margin: 0; border: 0; border-radius: 10px; background: var(--surface-soft); }
+.approval-card-embedded header { padding: 6px 8px; }
+.approval-card-embedded header > span:first-child { width: 24px; height: 24px; }
+.approval-card-embedded header p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.approval-card-embedded .approval-command { margin: 6px 8px; }
+.approval-card-embedded .approval-command pre { max-height: 58px; color: #e8f7ff; background: #183b4d; font-size: .5625rem; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; }
+.approval-card-embedded .approval-reason { margin: 0 8px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.approval-card-embedded footer { padding: 6px 8px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .composer-surface { transition: none; }
+}
+
 .message,
 .completed-thought,
 .approval-card,
@@ -127,7 +168,7 @@
   padding: 14px 16px 13px;
   overflow: hidden;
   border: 1px solid var(--line-strong);
-  border-radius: 15px 15px 15px 6px;
+  border-radius: 15px;
   background:
     linear-gradient(120deg, rgb(255 255 255 / 62%), transparent 38%),
     var(--surface-soft);
@@ -165,7 +206,7 @@
   display: grid;
   place-items: center;
   border: 1px solid var(--line);
-  border-radius: 9px 9px 9px 4px;
+  border-radius: 9px;
   color: var(--ocean-700);
   background: var(--ice);
 }
@@ -204,7 +245,7 @@
 .durable-task-summary { margin: 7px 0 0 43px; color: var(--muted); font-size: .5rem; line-height: 1.55; }
 .durable-task-actions { display: flex; align-items: center; gap: 6px; margin: 9px 0 0 43px; }
 .durable-task-resume,
-.durable-task-cancel { min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 9px 9px 9px 4px; font-size: .5rem; font-weight: 800; }
+.durable-task-cancel { min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 9px; font-size: .5rem; font-weight: 800; }
 .durable-task-resume { color: var(--ocean-700); background: var(--ice); }
 .durable-task-resume:hover { border-color: var(--ocean-500); background: var(--ice-strong); }
 .durable-task-cancel { color: var(--red); background: transparent; }
@@ -232,7 +273,7 @@
   width: 31px;
   height: 31px;
   border: 1px solid var(--line);
-  border-radius: 11px 11px 11px 5px;
+  border-radius: 11px;
   color: var(--penguin);
   background: var(--ice);
 }
@@ -301,7 +342,7 @@
   margin: 12px 0;
   overflow: hidden;
   border: 1px solid #145471;
-  border-radius: 14px 14px 14px 7px;
+  border-radius: 14px;
   color: #f2fbff;
   background: #246f91;
   box-shadow: 0 6px 18px rgb(16 43 61 / 10%);
@@ -398,7 +439,7 @@
 .message.user .message-content {
   padding: 9px 12px;
   border: 1px solid #c9e7f2;
-  border-radius: 14px 5px 14px 14px;
+  border-radius: 14px;
   color: var(--ink);
   background: var(--blue-soft);
   box-shadow: 0 4px 12px rgb(30 104 137 / 7%);
@@ -420,13 +461,13 @@
   display: block;
   overflow: hidden;
   border: 1px solid rgb(168 211 228 / 78%);
-  border-radius: 14px 14px 14px 5px;
+  border-radius: 14px;
   background: rgb(255 255 255 / 72%);
   box-shadow: 0 5px 14px rgb(24 94 124 / 9%);
   transition: border-color .15s ease, transform .15s ease, box-shadow .15s ease;
 }
 
-.message.user .message-image-link { border-radius: 14px 5px 14px 14px; }
+.message.user .message-image-link { border-radius: 14px; }
 
 .message-image-link:hover {
   border-color: var(--ocean-500);
@@ -458,7 +499,7 @@
   padding: 6px 9px 6px 6px;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 12px 12px 12px 5px;
+  border-radius: 12px;
   color: var(--ink);
   background: rgb(255 255 255 / 66%);
   text-decoration: none;
@@ -479,7 +520,7 @@
   display: grid;
   place-items: center;
   overflow: hidden;
-  border-radius: 9px 9px 9px 4px;
+  border-radius: 9px;
   color: var(--ocean-700);
   background: var(--ice);
 }
@@ -525,7 +566,7 @@
 .thought-tool,
 .approval-card {
   border-color: var(--line);
-  border-radius: 13px 13px 13px 6px;
+  border-radius: 13px;
   background: var(--surface-soft);
 }
 
@@ -675,7 +716,7 @@
   gap: 7px;
   padding: 6px 5px 6px 6px;
   border: 1px solid rgb(91 180 214 / 48%);
-  border-radius: 13px 13px 13px 6px;
+  border-radius: 13px;
   background: rgb(255 255 255 / 62%);
   box-shadow: 0 3px 10px rgb(32 101 132 / 6%);
 }
@@ -686,7 +727,7 @@
   display: grid;
   place-items: center;
   overflow: hidden;
-  border-radius: 9px 9px 9px 4px;
+  border-radius: 9px;
   color: var(--ocean-700);
   background: var(--ice);
 }
@@ -786,7 +827,7 @@
 .context-state,
 .context-usage {
   min-height: 30px;
-  border-radius: 10px 10px 10px 4px;
+  border-radius: 10px;
   color: var(--muted);
 }
 
@@ -868,3 +909,6 @@
 .teammate-roster .teammate small { color: var(--muted-2); font-size: .48rem; }
 .teammate-roster .teammate-working svg { color: var(--ocean-600); }
 .teammate-roster .teammate-failed svg { color: var(--scarf-dark); }
+
+/* 舞台容器负责外边距，两个表面保持完全相同的可用宽度。 */
+.composer-stage .composer-surface { width: 100%; margin: 0; }

@@ -27,6 +27,54 @@ def _install_transport(monkeypatch, handler) -> None:
     monkeypatch.setattr(builtins.httpx, "Client", client_factory)
 
 
+# 测试场景：所有公共联网工具都允许 httpx 读取进程级 HTTP(S)_PROXY 配置，避免搜索和打开网页使用不同出口。
+def test_public_web_clients_enable_environment_proxy(monkeypatch, tmp_path) -> None:
+    real_client = httpx.Client
+    observed: list[bool] = []
+
+    def client_factory(**kwargs):
+        observed.append(kwargs.get("trust_env"))
+        kwargs["transport"] = httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={"ok": True},
+            )
+        )
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(builtins.httpx, "Client", client_factory)
+    monkeypatch.setattr(builtins, "_validate_public_http_url", lambda url: (url, "example.com"))
+
+    opened = builtins.web_open(WorkspaceSandbox(tmp_path), "https://example.com/page")
+    payload, error = builtins._public_json("https://example.com/api")
+
+    assert opened.ok
+    assert payload == {"ok": True} and error is None
+    assert observed == [True, True]
+
+
+# 测试场景：通过环境代理访问公共网页时，代理对端不能被误判为非公共目标。
+def test_public_web_clients_mark_proxy_peer_as_allowed(monkeypatch, tmp_path) -> None:
+    observed: list[bool] = []
+
+    def peer_check(_response, *, proxy_configured=False):
+        observed.append(proxy_configured)
+        return proxy_configured
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setattr(builtins, "_response_peer_is_public", peer_check)
+    _install_transport(
+        monkeypatch,
+        lambda request: httpx.Response(200, headers={"content-type": "text/plain"}, text="page"),
+    )
+
+    result = builtins.web_open(WorkspaceSandbox(tmp_path), "https://example.com/page")
+
+    assert result.ok
+    assert observed == [True]
+
+
 # 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_web_address_classifier_rejects_non_global_ranges 精确标识本用例的具体条件。
 def test_web_address_classifier_rejects_non_global_ranges() -> None:
     assert builtins._is_public_ip("8.8.8.8")
@@ -282,6 +330,74 @@ def test_web_run_reports_all_search_failures(monkeypatch, tmp_path) -> None:
 
     assert not result.ok
     assert result.error_code == "search_provider_unavailable"
+
+
+# 测试场景：搜索服务发生一次瞬时网络失败后，同一次 web_run 应自动重试并交付结果。
+def test_web_run_retries_transient_provider_failure(monkeypatch, tmp_path) -> None:
+    calls = 0
+
+    def flaky_search(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return builtins.ToolResult("websearch", False, "搜索服务当前不可用", error_code="search_provider_unavailable")
+        return builtins.ToolResult(
+            "websearch", True, "1. Headline\n   https://example.com/news",
+            metadata={"provider": "bing_rss", "results": [{"title": "Headline", "url": "https://example.com/news"}]},
+        )
+
+    monkeypatch.setattr(builtins, "web_search", flaky_search)
+    result = builtins.web_run(WorkspaceSandbox(tmp_path), search_query=[{"q": "latest US news"}])
+
+    assert result.ok
+    assert calls == 2
+    assert json.loads(result.content)[0]["results"][0]["url"] == "https://example.com/news"
+
+
+# 测试场景：一次 web_run 最多允许 5 个搜索查询，并保持每个查询的结果顺序。
+def test_web_run_accepts_five_search_queries(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        builtins,
+        "web_search",
+        lambda _sandbox, query, **_kwargs: builtins.ToolResult(
+            "websearch", True, query, metadata={"results": [{"title": query, "url": f"https://example.com/{query.replace(' ', '-') }"}]}
+        ),
+    )
+
+    result = builtins.web_run(
+        WorkspaceSandbox(tmp_path),
+        search_query=[{"q": f"query {index}"} for index in range(5)],
+    )
+
+    assert result.ok
+    assert [item["query"] for item in json.loads(result.content)] == [f"query {index}" for index in range(5)]
+
+
+# 测试场景：DNS 解析失败和连接超时必须产生可区分的搜索错误码。
+def test_web_search_classifies_dns_and_timeout_failures(monkeypatch, tmp_path) -> None:
+    def fail_dns(*_args, **_kwargs):
+        raise builtins.WebHostResolutionError("dns failed")
+
+    monkeypatch.setattr(builtins, "_validate_public_http_url", fail_dns)
+    dns_result = builtins.web_search(WorkspaceSandbox(tmp_path), "latest news")
+    assert dns_result.error_code == "search_dns_error"
+    assert dns_result.metadata["stage"] == "dns"
+
+    monkeypatch.setattr(builtins, "_validate_public_http_url", lambda _url: ("https://www.bing.com/search", "www.bing.com"))
+
+    def fail_timeout(**_kwargs):
+        raise builtins.httpx.ConnectTimeout("timeout")
+
+    monkeypatch.setattr(builtins.httpx, "Client", fail_timeout)
+    timeout_result = builtins.web_search(WorkspaceSandbox(tmp_path), "latest news")
+    assert timeout_result.error_code == "search_timeout"
+    assert timeout_result.metadata["stage"] == "request"
+
+
+# 测试场景：没有代理时直接使用区域 Bing 入口，避免 www.bing.com 的未跟随重定向。
+def test_bing_search_endpoint_uses_region_host_without_proxy() -> None:
+    assert "https://cn.bing.com/search" in builtins._bing_search_endpoint("latest news", None)
+    assert "https://www.bing.com/search" in builtins._bing_search_endpoint("latest news", "http://127.0.0.1:7897")
 
 
 # 测试场景：Bing RSS 的发布时间、摘要和来源必须进入结构化搜索结果，以便模型判断新闻时效。

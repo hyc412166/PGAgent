@@ -33,7 +33,6 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit, urlunsplit
 
 import httpx
 
-from src.config import settings
 from .sandbox import SandboxViolation, WorkspaceSandbox
 from .types import ApprovalRequest, ToolResult
 
@@ -803,6 +802,15 @@ def _is_public_ip(address: str) -> bool:
     return candidate.is_global
 
 
+# 返回进程环境中由 httpx trust_env 使用的第一个代理配置。
+def _environment_proxy() -> str | None:
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
 # 函数职责：校验 public_http_url 对应的数据或流程。
 # 参数关系：url 表示当前步骤使用的 url 值。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
@@ -916,7 +924,8 @@ def web_fetch(
         with httpx.Client(
             follow_redirects=False,
             timeout=httpx.Timeout(timeout),
-            trust_env=False,
+            # 允许 httpx 读取进程级 HTTP_PROXY/HTTPS_PROXY，保证 open 与 search 使用同一出口。
+            trust_env=True,
             headers=headers,
         ) as client:
             for redirect_count in range(MAX_WEB_REDIRECTS + 1):
@@ -925,7 +934,7 @@ def web_fetch(
                 # 变量说明：body 表示当前步骤使用的 body 值。
                 body = bytearray()
                 with client.stream("GET", safe_url) as response:
-                    if not _response_peer_is_public(response):
+                    if not _response_peer_is_public(response, proxy_configured=bool(_environment_proxy())):
                         return ToolResult(_tool_name, False, "连接目标不是公共网络地址", error_code="unsafe_url")
                     if 300 <= response.status_code < 400:
                         # 变量说明：location 表示当前步骤使用的 location 值。
@@ -1171,6 +1180,25 @@ def _bing_rss_results(markup: str, limit: int) -> list[dict[str, Any]]:
     return results
 
 
+def _search_failure(error_code: str, message: str, *, stage: str, **metadata: Any) -> ToolResult:
+    """Return a bounded diagnostic while keeping provider details out of content."""
+
+    return ToolResult(
+        "websearch",
+        False,
+        message,
+        error_code=error_code,
+        metadata={"provider": "bing_rss", "stage": stage, **metadata},
+    )
+
+
+def _bing_search_endpoint(query: str, proxy: str | None) -> str:
+    """Choose a Bing host that does not require an unvalidated redirect."""
+
+    host = "www.bing.com" if proxy else "cn.bing.com"
+    return f"https://{host}/search?format=rss&q={quote_plus(query)}"
+
+
 # 函数职责：完成 web_search 对应的业务处理。
 # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；query 表示当前步骤使用的 query 值；limit 表示当前步骤使用的 limit 值。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
@@ -1209,18 +1237,9 @@ def web_search(
     if domain_filters:
         provider_query = f"{search_query} ({' OR '.join(f'site:{domain}' for domain in sorted(domain_filters))})"
     try:
-        search_url, _host = _validate_public_http_url(
-            f"https://www.bing.com/search?format=rss&q={quote_plus(provider_query)}"
-        )
-        proxy = (
-            settings.web_proxy
-            or os.getenv("HTTPS_PROXY")
-            or os.getenv("https_proxy")
-            or os.getenv("HTTP_PROXY")
-            or os.getenv("http_proxy")
-        )
-        with httpx.Client(timeout=httpx.Timeout(15), follow_redirects=False, trust_env=False,
-                          proxy=proxy or None,
+        proxy = _environment_proxy()
+        search_url, _host = _validate_public_http_url(_bing_search_endpoint(provider_query, proxy))
+        with httpx.Client(timeout=httpx.Timeout(15), follow_redirects=False, trust_env=True,
                           headers={"User-Agent": "PGAgent/0.1 (+local search)"}) as client:
             with client.stream("GET", search_url) as response:
                 if not _response_peer_is_public(response, proxy_configured=bool(proxy)):
@@ -1237,10 +1256,29 @@ def web_search(
                 encoding = response.encoding or "utf-8"
                 status_code = response.status_code
             markup = bytes(body).decode(encoding, errors="replace")
-    except (UnsafeWebUrlError, WebHostResolutionError, httpx.HTTPError, ValueError):
-        return ToolResult("websearch", False, "搜索服务当前不可用", error_code="search_provider_unavailable", metadata={"provider": "bing_rss"})
+    except UnsafeWebUrlError:
+        return _search_failure("search_unsafe_url", "搜索目标未通过公共网络校验", stage="validation")
+    except WebHostResolutionError:
+        return _search_failure("search_dns_error", "搜索主机解析失败", stage="dns")
+    except httpx.TimeoutException:
+        return _search_failure("search_timeout", "搜索请求超时", stage="request")
+    except httpx.ProxyError:
+        return _search_failure("search_proxy_error", "搜索代理连接失败", stage="proxy")
+    except httpx.ConnectError:
+        return _search_failure("search_connection_error", "搜索服务连接失败", stage="connect")
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        return _search_failure("search_http_error", "搜索服务返回 HTTP 错误", stage="response", status_code=status_code)
+    except httpx.HTTPError:
+        return _search_failure("search_request_error", "搜索请求失败", stage="request")
+    except (UnicodeError, ValueError):
+        return _search_failure("search_response_error", "搜索响应无法解码", stage="response")
     # 变量说明：results 表示批量处理结果集合。
     # 先多取一些候选，再应用来源和时效过滤，避免前几条无关结果导致空集。
+    try:
+        ET.fromstring(markup)
+    except ET.ParseError:
+        return _search_failure("search_parse_error", "搜索响应不是有效 RSS/XML", stage="parse")
     results = _bing_rss_results(markup, max(result_limit, 20))
     if domain_filters:
         results = [
@@ -1267,12 +1305,12 @@ def web_search(
         results = recent
     results = results[:result_limit]
     if not results:
-        return ToolResult(
-            "websearch",
-            False,
-            "搜索服务未返回可解析的公开结果；没有伪造搜索结果。",
-            error_code="search_provider_unavailable",
-            metadata={"provider": "bing_rss", "source_status": status_code},
+        return _search_failure(
+            "search_empty_results",
+            "搜索响应有效，但没有符合当前查询或过滤条件的结果。",
+            stage="filter",
+            source_status=status_code,
+            filtered=bool(domain_filters or recency_days is not None),
         )
     # 变量说明：lines 表示当前流程使用的 lines 集合。
     lines = [
@@ -1304,10 +1342,10 @@ def _public_json(url: str, *, params: Mapping[str, Any] | None = None) -> tuple[
     try:
         # 变量说明：safe_url 表示safe 的访问地址；_ 表示当前步骤使用的 _ 值。
         safe_url, _ = _validate_public_http_url(url)
-        with httpx.Client(timeout=httpx.Timeout(15), trust_env=False, headers={"User-Agent": "PGAgent/0.1"}) as client:
+        with httpx.Client(timeout=httpx.Timeout(15), trust_env=True, headers={"User-Agent": "PGAgent/0.1"}) as client:
             # 变量说明：response 表示下游返回的响应。
             response = client.get(safe_url, params=dict(params or {}))
-            if not _response_peer_is_public(response):
+            if not _response_peer_is_public(response, proxy_configured=bool(_environment_proxy())):
                 return None, "unsafe_url"
             response.raise_for_status()
             # 变量说明：payload 表示跨层传递的数据载荷。
@@ -1441,8 +1479,8 @@ def web_run(
     # 变量说明：source_url 表示本轮结果中可安全展示的来源地址。
     source_url: str | None = None
     search_items = list(search_query or [])
-    if len(search_items) > 4:
-        return ToolResult("web_run", False, "一次 web_run 最多包含 4 个 search_query", error_code="invalid_command")
+    if len(search_items) > 5:
+        return ToolResult("web_run", False, "一次 web_run 最多包含 5 个 search_query", error_code="invalid_command")
 
     # 先规范化并去重查询，再并发请求；这样可避免模型在同一轮重复消耗搜索配额。
     unique_searches: list[tuple[str, Mapping[str, Any]]] = []
@@ -1474,7 +1512,8 @@ def web_run(
             domains=domains,
         )
         # 严格来源/时效过滤在 RSS 上容易造成空召回；保留原查询并放宽过滤重试一次。
-        if not result.ok and result.error_code == "search_provider_unavailable" and (domains or item.get("recency") is not None):
+        filter_relaxable_errors = {"search_provider_unavailable", "search_empty_results"}
+        if not result.ok and result.error_code in filter_relaxable_errors and (domains or item.get("recency") is not None):
             fallback = web_search(
                 sandbox,
                 query,
@@ -1486,9 +1525,33 @@ def web_run(
                 fallback.metadata["fallback"] = "relaxed_filters"
                 fallback.metadata["initial_error_code"] = result.error_code
                 return query, fallback
+            result = fallback
+        # 代理或上游搜索服务偶发连接失败时，立即重试一次同一查询；不把
+        # 瞬时网络抖动暴露为整轮搜索失败，也不伪造任何结果。
+        retryable_errors = {
+            "search_provider_unavailable",
+            "search_timeout",
+            "search_proxy_error",
+            "search_connection_error",
+            "search_request_error",
+            "search_http_error",
+        }
+        if not result.ok and result.error_code in retryable_errors and not (domains or item.get("recency") is not None):
+            retry = web_search(
+                sandbox,
+                query,
+                limit=int(item.get("limit") or 5),
+                recency=None,
+                domains=None,
+            )
+            if retry.ok:
+                retry.metadata["retry"] = "transient_provider_failure"
+                retry.metadata["initial_error_code"] = result.error_code
+                return query, retry
         return query, result
 
-    with ThreadPoolExecutor(max_workers=max(1, len(unique_searches))) as executor:
+    # 限制为 5 个并发请求，既利用代理连接池，也避免按查询数量无限扩张。
+    with ThreadPoolExecutor(max_workers=min(5, max(1, len(unique_searches)))) as executor:
         search_results = list(executor.map(run_search, unique_searches))
     existing_search_numbers = [
         int(str(key)[6:]) for key in stored_pages
