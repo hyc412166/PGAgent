@@ -111,6 +111,12 @@ _HOSTED_OUTPUT_ITEMS = {
     "code_interpreter_call",
     "image_generation_call",
 }
+_INTERNAL_OUTPUT_INDEX = "_pgagent_output_index"
+
+
+def _provider_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove adapter-only correlation fields before provider/history use."""
+    return {key: value for key, value in item.items() if key != _INTERNAL_OUTPUT_INDEX}
 
 # Responses 可能在已建立的事件流内报告临时服务故障；这些错误没有 HTTP
 # 状态码可供外层重试器判断，因此只对明确的服务过载类型开放流式重试。
@@ -188,12 +194,19 @@ def project_items(items: list[dict[str, Any]], usage: Mapping[str, Any] | None =
             raise IncompleteResponse(f"模型返回了未授权的输出项类型：{kind}")
     return {"content": "".join(text), "reasoning_content": "".join(summaries),
             "tool_calls": calls, "usage": dict(usage or {}),
-            "_pgagent_provider": {"protocol": "responses", "items": items}}
+            "_pgagent_provider": {
+                "protocol": "responses",
+                "items": [_provider_item(item) for item in items],
+            }}
 
 
 def _item_key(item: Mapping[str, Any], fallback_index: int) -> tuple[str, Any]:
     """Use provider identity first; index keeps anonymous SDK items stable."""
-    return ("id", item["id"]) if item.get("id") else ("index", item.get("output_index", fallback_index))
+    return (
+        ("id", item["id"])
+        if item.get("id")
+        else ("index", item.get("output_index", item.get(_INTERNAL_OUTPUT_INDEX, fallback_index)))
+    )
 
 
 def _merge_items(done_items: list[dict[str, Any]], final_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -244,7 +257,7 @@ def _normalize_item(item: Mapping[str, Any], response_id: str | None, output_ind
     common = {
         "response_id": response_id,
         "item_id": str(item["id"]) if item.get("id") else None,
-        "output_index": item.get("output_index", output_index),
+        "output_index": item.get("output_index", item.get(_INTERNAL_OUTPUT_INDEX, output_index)),
     }
     if kind == "message":
         text = []
@@ -290,8 +303,9 @@ def normalize_response(response: Mapping[str, Any]) -> NormalizedModelResponse:
     """Convert a completed native Responses object into the shared model."""
     raw = dict(response)
     response_id = str(raw["id"]) if raw.get("id") else None
-    items = [dict(item) for item in raw.get("output") or []]
-    normalized_items = [_normalize_item(item, response_id, index) for index, item in enumerate(items)]
+    raw_items = [dict(item) for item in raw.get("output") or []]
+    normalized_items = [_normalize_item(item, response_id, index) for index, item in enumerate(raw_items)]
+    items = [_provider_item(item) for item in raw_items]
     status = ResponseStatus(str(raw.get("status") or "unknown"))
     return NormalizedModelResponse(
         response_id=response_id, items=normalized_items, status=status,
@@ -386,6 +400,14 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
             elif kind == "response.output_item.done":
                 # 变量说明：item 表示当前步骤使用的 item 值。
                 item = _as_mapping(event["item"])
+                if (
+                    not item.get("id")
+                    and item.get("output_index") is None
+                    and event.get("output_index") is not None
+                ):
+                    # SDK 把 output_index 放在 done event 上；内部保留它以便
+                    # 多次断流合并，发送给 provider 前由 _provider_item 剥离。
+                    item[_INTERNAL_OUTPUT_INDEX] = event["output_index"]
                 if item.get("status") not in {"incomplete", "in_progress"}:
                     key = (
                         ("id", item["id"])

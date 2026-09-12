@@ -236,6 +236,38 @@ async def test_responses_deduplicates_same_completed_item_across_repeated_interr
 
 
 @pytest.mark.asyncio
+async def test_responses_deduplicates_anonymous_item_by_done_output_index_across_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anonymous = {"type": "reasoning", "status": "completed", "summary": []}
+    message = {
+        "type": "message", "id": "msg-1", "status": "completed", "role": "assistant",
+        "content": [{"type": "output_text", "text": "完成", "annotations": []}],
+    }
+
+    async def interrupted() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.output_item.done", "output_index": 0, "item": anonymous}
+        raise StreamInterrupted("socket closed")
+
+    async def recovered() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.output_item.done", "output_index": 0, "item": message}
+        yield {"type": "response.completed", "response": {
+            "status": "completed", "output": [message], "usage": {},
+        }}
+
+    fake = install_fake_client(monkeypatch, [interrupted, interrupted, recovered])
+    response = await build_model_call(responses_config())(
+        messages=[{"role": "user", "content": "继续"}], tools=[], mode="auto",
+    )
+
+    assert len(fake.requests) == 3
+    assert fake.requests[2]["input"].count({"type": "reasoning", "summary": []}) == 1
+    assert all("_pgagent_output_index" not in item for item in fake.requests[2]["input"])
+    assert response["_pgagent_provider"]["items"] == [anonymous, message]
+    assert response["_pgagent_normalized_response"].provider_payload["items"] == [anonymous, message]
+
+
+@pytest.mark.asyncio
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_returns_completed_tool_call_without_resampling 精确标识本用例的具体条件。
 async def test_responses_returns_completed_tool_call_without_resampling(
     monkeypatch: pytest.MonkeyPatch,
