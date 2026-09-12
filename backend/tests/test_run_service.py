@@ -38,7 +38,7 @@ from src.runs.continuation import RunContinuationCodec
 from src.runs import lifecycle as lifecycle_service
 from src.tasks.state import sync_todos_for_run
 from src.context import instructions as instruction_service
-from src.agent import AgentRuntime, decide_deterministic_completion
+from src.agent import AgentRuntime
 from src.model.gateway import ModelConfigurationError
 from src.tools import create_default_registry
 
@@ -578,14 +578,14 @@ def test_every_terminal_root_turn_has_one_delivered_terminal_message(
         assert replies[0].turn_id == turn.id
 
 
-# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_main_agent_installs_deterministic_gate_without_model_or_task_anchor 精确标识本用例的具体条件。
-def test_main_agent_installs_deterministic_gate_without_model_or_task_anchor(tmp_path: Path) -> None:
+# 测试场景：默认生命周期不再安装完成验收器，TurnLedger 负责结构化终态边界。
+def test_main_agent_does_not_install_completion_verifier_by_default(tmp_path: Path) -> None:
     runtime = AgentRuntime(
         model_call=lambda **_kwargs: None,
         tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
     )
     RunCoordinator._install_completion_verifier(runtime, {"runtime_binding": {}})
-    assert runtime.completion_verifier is decide_deterministic_completion
+    assert runtime.completion_verifier is None
 
 
 # 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_rejected_candidates_are_not_persisted_as_chat_messages 精确标识本用例的具体条件。

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
@@ -18,7 +19,7 @@ from fastapi import HTTPException
 from src.persistence import database
 from src.api.routes import delete_session, list_session_background_jobs
 from src.persistence.database import Agent, BackgroundJob, Base, CollaborationEvent, PlanStep, Run, Session, Workspace
-from src.agent import AgentRuntime, RunOutcome
+from src.agent import AgentRuntime, CompletionDecision, ModelTurn, RunOutcome
 from src.tasks import background as background_job_service
 from src.tasks.background import BackgroundJobManager, BackgroundJobToolStore
 from src.runs.service import RunCoordinator
@@ -371,10 +372,16 @@ def test_completion_verifier_rejects_unobserved_background_job(tmp_path: Path) -
         model_call=lambda **_kwargs: None,
         tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
     )
-    RunCoordinator._install_completion_verifier(
-        runtime,
-        {"runtime_binding": {}, "background_store": store},
-    )
+    # Legacy verifier behavior remains testable only when explicitly injected.
+    def legacy_verifier(_candidate):
+        active = store.active_jobs()
+        if active:
+            registered = store.register_waiter()
+            if registered:
+                return CompletionDecision(False, "waiting", {"background_jobs": active}, defer_until_event=True)
+        return CompletionDecision(True, "done")
+
+    runtime.completion_verifier = legacy_verifier
     candidate = {
         "output": "done",
         "messages": [{"role": "assistant", "content": "done"}],
@@ -412,9 +419,16 @@ def test_completion_verifier_consumes_terminal_race_instead_of_dead_waiting(tmp_
         model_call=lambda **_kwargs: None,
         tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
     )
-    RunCoordinator._install_completion_verifier(
-        runtime,
-        {"runtime_binding": {}, "background_store": Store()},
+    store = Store()
+    runtime.completion_verifier = lambda _candidate: CompletionDecision(
+        False,
+        "terminal result pending",
+        {
+            "background_jobs": [
+                {"id": item["id"], "status": item["status"]}
+                for item in store.observe_terminal_results()
+            ]
+        },
     )
     decision = runtime.completion_verifier({
         "output": "done",
@@ -436,6 +450,26 @@ def test_default_lifecycle_does_not_install_completion_verifier(tmp_path: Path) 
     )
     RunCoordinator._install_completion_verifier(runtime, {"runtime_binding": {}})
     assert runtime.completion_verifier is None
+
+
+# 测试场景：默认运行遇到仍在执行的后台作业时必须进入 waiting_background，不能交付模型正文。
+def test_default_runtime_waits_for_background_job_before_completion(tmp_path: Path) -> None:
+    async def model_call(**_kwargs) -> ModelTurn:
+        return ModelTurn(content="premature answer")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+        background_wait_provider=lambda: [{"id": "job-1", "status": "running"}],
+    )
+    outcome = asyncio.run(runtime.run(
+        system_prompt="safe",
+        recent_messages=[{"role": "user", "content": "wait"}],
+    ))
+    assert outcome.status == "stopped"
+    assert outcome.stop_reason == "waiting_background"
+    assert outcome.output is None
+    assert outcome.output_ledger.decision().reason == "background_wait"
 
 
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_terminal_job_writes_durable_collaboration_event 精确标识本用例的具体条件。
