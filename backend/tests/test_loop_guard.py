@@ -17,6 +17,7 @@ from src.context.assembly import COMPACTION_SECTION_TITLES, ConversationCompacto
 from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage, normalize_usage, provider_web_search_calls
 from src.agent.errors import APIErrorKind, call_with_retry, classify_api_error
 from src.agent.guards import LoopGuard
+from src.model.output import AssistantMessageItem, LocalToolCallItem, NormalizedModelResponse
 from src.tools import create_default_registry
 from src.tools.types import ToolResult
 
@@ -1611,6 +1612,102 @@ async def test_runtime_keeps_legacy_model_callable_without_delta_keyword_compati
     outcome = await runtime.run(system_prompt="safe", recent_messages=[])
     assert outcome.status == "completed"
     assert outcome.output == "compatible"
+
+
+@pytest.mark.asyncio
+async def test_runtime_consumes_normalized_sidecar_for_follow_up_and_local_dispatch(tmp_path) -> None:
+    calls = 0
+
+    async def model_call(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            normalized = NormalizedModelResponse(
+                response_id="resp-tools",
+                status="completed",
+                items=[
+                    AssistantMessageItem(
+                        response_id="resp-tools",
+                        item_id="msg-progress",
+                        output_index=0,
+                        content="正在检查。",
+                        phase="commentary",
+                    ),
+                    LocalToolCallItem(
+                        response_id="resp-tools",
+                        item_id="tool-1",
+                        output_index=1,
+                        call_id="read-1",
+                        tool_name="glob",
+                        arguments={"path": "."},
+                    ),
+                ],
+            )
+            return {
+                "content": "不应从旧扁平字段决定正文",
+                "tool_calls": [{"id": "wrong", "function": {"name": "missing", "arguments": "{}"}}],
+                "_pgagent_normalized_response": normalized,
+            }
+        return {
+            "content": "旧字段也不应覆盖 sidecar",
+            "_pgagent_normalized_response": NormalizedModelResponse(
+                response_id="resp-final",
+                status="completed",
+                items=[AssistantMessageItem(
+                    response_id="resp-final",
+                    item_id="msg-final",
+                    content="检查完成。",
+                    phase="final_answer",
+                    end_turn=True,
+                )],
+            ),
+        }
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert calls == 2
+    assert outcome.status == "completed"
+    assert outcome.output == "检查完成。"
+    assert outcome.tool_calls == 1
+    assert any(message.get("tool_call_id") == "read-1" for message in outcome.messages)
+    assert not any(message.get("tool_call_id") == "wrong" for message in outcome.messages)
+
+
+@pytest.mark.asyncio
+async def test_runtime_follows_up_on_explicit_end_turn_false_without_tool(tmp_path) -> None:
+    calls = 0
+
+    async def model_call(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        end_turn = False if calls == 1 else True
+        return {
+            "content": "legacy",
+            "_pgagent_normalized_response": NormalizedModelResponse(
+                response_id=f"resp-{calls}",
+                status="completed",
+                items=[AssistantMessageItem(
+                    response_id=f"resp-{calls}",
+                    item_id=f"msg-{calls}",
+                    content="继续处理" if calls == 1 else "最终结果",
+                    end_turn=end_turn,
+                )],
+            ),
+        }
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert calls == 2
+    assert outcome.status == "completed"
+    assert outcome.output == "最终结果"
 
 
 # 辅助函数：_completed 封装本组测试重复使用的输入准备、状态查询或测试替身行为。

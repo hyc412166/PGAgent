@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
+
+if TYPE_CHECKING:
+    from .turn import TurnLedger
 
 
 # 运行状态不是业务会话本身；它同时携带模型消息、工具轨迹、压缩记录和终止原因。
@@ -66,3 +69,5 @@ class RunState(TypedDict, total=False):
     # 模型服务端托管工具调用数量，与本地注册工具计数分开记录。
     # 变量说明：hosted_tool_calls 表示hosted_tool_calls 集合。
     hosted_tool_calls: int
+    # response/item 账本只保存运行内结构化事实；持久化与恢复由 lifecycle 层负责。
+    output_ledger: TurnLedger

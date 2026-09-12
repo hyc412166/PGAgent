@@ -14,7 +14,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from src.context.window import ContextManager, message_tokens
@@ -39,9 +39,13 @@ from .guards import GuardDecision, LoopGuard
 from .step_context import AgentStepContext
 from .loop import run_agent_loop
 from .state import RunState
+from .turn import TurnLedger, TurnStatus
 from ..tools import ToolRegistry
 from ..tools.builtins import MAX_PARALLEL_DELEGATED_TASKS, normalize_delegate_requests
 from ..tools.types import ToolResult
+
+if TYPE_CHECKING:
+    from src.model.output import NormalizedModelResponse
 
 
 # 变量说明：logger 表示日志记录器。
@@ -535,12 +539,21 @@ class ModelTurn:
     usage: dict[str, Any] = field(default_factory=dict)
     # 变量说明：provider_payload 表示当前步骤使用的 provider_payload 值。
     provider_payload: dict[str, Any] = field(default_factory=dict)
+    # 新协议路径保留 adapter 的结构化 response；旧调用方仍可只构造 ModelTurn。
+    normalized_response: NormalizedModelResponse | None = None
 
     # 函数职责：完成 from_response 对应的智能体处理。
     # 参数关系：response 表示下游响应。
     # 返回关系：结果用于更新运行状态、形成模型输入或发送给上层调用方。
     @classmethod
     def from_response(cls, response: Any) -> "ModelTurn":
+        from src.model.output import (
+            AssistantMessageItem,
+            LocalToolCallItem,
+            NormalizedModelResponse,
+            ReasoningItem,
+        )
+
         if isinstance(response, cls):
             return response
         if not isinstance(response, Mapping):
@@ -553,6 +566,50 @@ class ModelTurn:
 
         # 变量说明：response_payload 表示当前步骤使用的 response_payload 值。
         response_payload: Mapping[str, Any] = response
+        normalized_response = response_payload.get("_pgagent_normalized_response")
+        if normalized_response is not None:
+            if not isinstance(normalized_response, NormalizedModelResponse):
+                raise TypeError("_pgagent_normalized_response 必须是 NormalizedModelResponse")
+            assistant_content = "".join(
+                item.content
+                for item in normalized_response.items
+                if isinstance(item, AssistantMessageItem)
+            )
+            reasoning_content = "".join(
+                item.summary
+                for item in normalized_response.items
+                if isinstance(item, ReasoningItem) and isinstance(item.summary, str)
+            )
+            normalized_calls: list[ModelToolCall] = []
+            for item in normalized_response.items:
+                if not isinstance(item, LocalToolCallItem):
+                    continue
+                arguments = item.arguments
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        arguments = {"_invalid_json": True, "_argument_chars": len(arguments)}
+                if not isinstance(arguments, Mapping):
+                    arguments = {"_invalid_json": True, "_argument_chars": 0}
+                normalized_calls.append(ModelToolCall(
+                    id=item.call_id,
+                    name=item.tool_name,
+                    arguments=dict(arguments),
+                ))
+            provider_payload = (
+                dict(normalized_response.provider_payload)
+                if isinstance(normalized_response.provider_payload, Mapping)
+                else {}
+            )
+            return cls(
+                content=assistant_content,
+                reasoning_content=reasoning_content,
+                tool_calls=normalized_calls,
+                usage=dict(normalized_response.usage),
+                provider_payload=provider_payload,
+                normalized_response=normalized_response,
+            )
         # 变量说明：raw 表示当前步骤使用的 raw 值。
         raw: Mapping[str, Any] = response_payload
         if raw.get("choices"):
@@ -599,6 +656,49 @@ class ModelTurn:
             tool_calls=calls,
             usage=dict(response_payload.get("usage") or {}),
             provider_payload=dict(response_payload.get("_pgagent_provider") or {}),
+        )
+
+    def to_normalized_response(self, *, response_id: str) -> NormalizedModelResponse:
+        """Project a legacy ModelTurn into the same runtime ledger shape."""
+
+        from src.model.output import (
+            AssistantMessageItem,
+            LocalToolCallItem,
+            NormalizedModelResponse,
+            ReasoningItem,
+            ResponseStatus,
+        )
+
+        items: list[Any] = []
+        if self.content or not self.tool_calls:
+            items.append(AssistantMessageItem(
+                response_id=response_id,
+                item_id=f"{response_id}-message",
+                output_index=len(items),
+                content=self.content,
+            ))
+        if self.reasoning_content:
+            items.append(ReasoningItem(
+                response_id=response_id,
+                item_id=f"{response_id}-reasoning",
+                output_index=len(items),
+                summary=self.reasoning_content,
+            ))
+        for call in self.tool_calls:
+            items.append(LocalToolCallItem(
+                response_id=response_id,
+                item_id=f"{response_id}-{call.id}",
+                output_index=len(items),
+                call_id=call.id,
+                tool_name=call.name,
+                arguments=call.arguments,
+            ))
+        return NormalizedModelResponse(
+            response_id=response_id,
+            items=items,
+            status=ResponseStatus.COMPLETED,
+            provider_payload=dict(self.provider_payload),
+            usage=dict(self.usage),
         )
 
 
@@ -1726,8 +1826,33 @@ class AgentRuntime:
                             raise
                         # 变量说明：state 表示当前运行状态。
                         state = recovered
-                # 变量说明：turn 表示当前步骤使用的 turn 值。
+                # adapter sidecar 是新 Turn 状态机的唯一结构化输入；旧 ModelTurn
+                # 通过等价投影继续兼容现有测试、脚本和 transcript。
                 turn = ModelTurn.from_response(response)
+                output_ledger = (
+                    state.get("output_ledger")
+                    if turn.normalized_response is not None
+                    else None
+                )
+                if output_ledger is None:
+                    output_ledger = TurnLedger()
+                hosted_before = output_ledger.hosted_tool_count
+                normalized_response = turn.normalized_response or turn.to_normalized_response(
+                    response_id=f"legacy-response-{guard.steps}"
+                )
+                output_ledger.accept_response(normalized_response)
+                local_items = output_ledger.take_local_calls()
+                parsed_calls = {call.id: call for call in turn.tool_calls}
+                turn.tool_calls = [
+                    ModelToolCall(
+                        id=item.call_id,
+                        name=item.tool_name,
+                        arguments=dict(parsed_calls[item.call_id].arguments),
+                    )
+                    for item in local_items
+                ]
+                turn_decision = output_ledger.decision()
+                hosted_call_delta = output_ledger.hosted_tool_count - hosted_before
             except RunTimeLimitExceeded:
                 # 变量说明：decision 表示当前步骤使用的 decision 值。
                 decision = self._run_time_decision(active_elapsed_base, active_started_at)
@@ -1774,6 +1899,7 @@ class AgentRuntime:
                 **state,
                 "usage": merge_usage(state.get("usage"), turn.usage),
                 "stagnation_recovery_prompt": "",
+                "output_ledger": output_ledger,
             }
             turn_usage = normalize_usage(turn.usage)
             state["events"] = await self._publish(
@@ -1786,8 +1912,10 @@ class AgentRuntime:
             )
             # 变量说明：hosted_calls 表示hosted_calls 集合。
             hosted_calls = provider_web_search_calls(turn.provider_payload)
-            if hosted_calls:
-                state["hosted_tool_calls"] = int(state.get("hosted_tool_calls") or 0) + len(hosted_calls)
+            if hosted_call_delta or (turn.normalized_response is None and hosted_calls):
+                state["hosted_tool_calls"] = int(state.get("hosted_tool_calls") or 0) + (
+                    hosted_call_delta if turn.normalized_response is not None else len(hosted_calls)
+                )
             for hosted_call in hosted_calls:
                 # 变量说明：hosted_started_at 表示当前步骤使用的 hosted_started_at 值。
                 hosted_started_at = self.clock()
@@ -1810,6 +1938,19 @@ class AgentRuntime:
                     source_count=hosted_call["source_count"],
                     duration_ms=round((self.clock() - hosted_started_at) * 1000),
                 )
+            if turn_decision.status in {TurnStatus.FAILED, TurnStatus.STOPPED}:
+                failed = {
+                    **state,
+                    "status": turn_decision.status.value,
+                    "error": turn_decision.reason,
+                }
+                failed["events"] = await self._publish(
+                    failed,
+                    "model_failed",
+                    error_type="IncompleteModelResponse",
+                    error_kind="provider",
+                )
+                return failed
             # 变量说明：token_decision 表示当前步骤使用的 token_decision 值。
             token_decision = self._task_token_decision(state.get("usage"))
             if turn.tool_calls and token_decision.stop:
@@ -1861,7 +2002,7 @@ class AgentRuntime:
                 assistant_message["_pgagent_provider"] = dict(turn.provider_payload)
             # 变量说明：messages 表示模型消息序列。
             messages = [*state.get("messages", []), assistant_message]
-            if turn.tool_calls and visible_content.strip():
+            if turn.tool_calls and visible_content.strip() and turn.normalized_response is None:
                 # This is the model's visible pre-tool progress text, not a
                 # provider reasoning field.  Keep it bounded and expose it as
                 # a safe activity summary so it does not become a chat bubble.
@@ -1872,6 +2013,23 @@ class AgentRuntime:
                     summary=_safe_event_text(visible_content, 480),
                     phase="model",
                 )
+            if not turn.tool_calls and turn_decision.follow_up:
+                # ``end_turn=false`` 是 provider 的结构化 follow-up 提示。
+                # 正文照常留在 Assistant transcript，不迁移为 thought，也不交给文案验收决定。
+                return {
+                    **state,
+                    "status": TurnStatus.OBSERVING.value,
+                    "messages": messages,
+                    "transcript_delta": [
+                        *state.get("transcript_delta", []),
+                        dict(assistant_message),
+                    ],
+                    "verification_trace": [
+                        *state.get("verification_trace", []),
+                        dict(assistant_message),
+                    ],
+                    "current_made_progress": True,
+                }
             if not turn.tool_calls:
                 if self.completion_verifier is not None:
                     # 变量说明：attempt 表示当前步骤使用的 attempt 值。
@@ -2127,6 +2285,7 @@ class AgentRuntime:
                             reason=call_decision.reason,
                         )
                         return stopped
+                    output_ledger.mark_local_running(call.id)
                     # 变量说明：tool_started_at 表示当前步骤使用的 tool_started_at 值。
                     tool_started_at = self.clock()
                     parallel_tool_started[call.id] = tool_started_at
@@ -2197,6 +2356,7 @@ class AgentRuntime:
                         stopped["events"] = await self._publish(stopped, "run_stopped", code=call_decision.code, reason=call_decision.reason)
                         return stopped
 
+                    output_ledger.mark_local_running(call.id)
                     # 变量说明：tool_started_at 表示当前步骤使用的 tool_started_at 值。
                     tool_started_at = self.clock()
                     state["events"] = await self._publish(
@@ -2321,6 +2481,8 @@ class AgentRuntime:
                     "verification_trace": [*state.get("verification_trace", []), dict(tool_message)],
                     "context_artifact_refs": artifact_refs,
                 }
+                # 工具结果进入 provider transcript 后才算 commit；账本会拒绝名称错配和重复提交。
+                output_ledger.commit_local_result(call.id, tool_name=call.name)
                 if result.metadata.get("force_compaction"):
                     # 变量说明：state 的索引项 表示该语句创建或更新的目标数据。
                     state["force_compaction_reason"] = str(
@@ -2565,6 +2727,7 @@ class AgentRuntime:
             "acceptance_report": dict(prior_acceptance_report or {}),
             "memory_citation": {},
             "stagnation_recovery_prompt": "",
+            "output_ledger": TurnLedger(),
         }
         # 变量说明：final 表示当前步骤使用的 final 值。
         final = await run_agent_loop(
