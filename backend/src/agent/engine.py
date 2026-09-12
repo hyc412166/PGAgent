@@ -178,7 +178,7 @@ def safe_tool_argument_summary(tool_name: str, arguments: Mapping[str, Any] | No
             for item in value[:3]:
                 if not isinstance(item, Mapping):
                     continue
-                fields = ("location", "city", "q", "query", "url", "ref_id", "pattern", "id")
+                fields = ("location", "city", "q", "query", "url", "ref_id", "ref", "pattern", "id")
                 detail = next((item.get(field) for field in fields if item.get(field)), "")
                 if detail:
                     items.append(_safe_argument_text(detail, 320))
@@ -221,9 +221,24 @@ def safe_tool_result_summary(tool_name: str, content: object, metadata: Mapping[
                 if command_type == "search_query":
                     results = command.get("results")
                     count = len(results) if isinstance(results, list) else 0
-                    summaries.append(f"搜索完成（{count} 条结果）")
+                    if command.get("ok") is True:
+                        summaries.append(f"搜索完成（{count} 条结果）")
+                    else:
+                        error_code = str(command.get("error_code") or "search_failed")
+                        summaries.append(f"搜索失败（{error_code}）")
                 elif command_type == "open":
-                    summaries.append("打开完成" if command.get("ok") is True else "打开失败")
+                    target = command.get("url") or command.get("ref_id") or command.get("ref")
+                    if command.get("ok") is True and isinstance(target, str) and target:
+                        try:
+                            parsed_target = urlsplit(target)
+                            if parsed_target.scheme in {"http", "https"} and parsed_target.netloc:
+                                target = parsed_target._replace(query="", fragment="").geturl()
+                        except ValueError:
+                            target = ""
+                    summaries.append(
+                        f"打开完成：{target}" if command.get("ok") is True and target else
+                        ("打开完成" if command.get("ok") is True else "打开失败")
+                    )
                 elif command_type == "weather":
                     summaries.append("天气查询完成" if command.get("ok") is True else "天气查询失败")
                 elif command_type:

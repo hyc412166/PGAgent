@@ -30,6 +30,7 @@ import { PenguinMark } from '../../components/penguin'
 import { presentRunEvent } from '../../runEventPresentation'
 import { MarkdownContent } from './MarkdownContent'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
+import { formatApprovalArguments } from './approvalPresentation'
 
 // LiveRunView 是运输状态到实时回复组件之间的最小只读接口。
 export type LiveRunView = {
@@ -369,13 +370,13 @@ export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun
 })
 
 // ApprovalCard 展示待执行动作及风险信息，并将批准/拒绝决策回传会话协调器。
-export const ApprovalCard = memo(function ApprovalCard({ approval, deciding, onDecision }: { approval: Approval; deciding: boolean; onDecision: (id: string, decision: 'approve' | 'reject', runId: string) => void }) {
+export const ApprovalCard = memo(function ApprovalCard({ approval, deciding, onDecision, embedded = false }: { approval: Approval; deciding: boolean; onDecision: (id: string, decision: 'approve' | 'reject', runId: string) => void; embedded?: boolean }) {
   const runId = typeof approval.run_id === 'string' || typeof approval.run_id === 'number' ? String(approval.run_id) : ''
-  const argumentCount = approval.arguments && typeof approval.arguments === 'object' ? Object.keys(approval.arguments).length : 0
+  const formattedArguments = formatApprovalArguments(approval.tool_name, approval.arguments)
   return (
-    <article className="approval-card">
+    <article className={`approval-card${embedded ? ' approval-card-embedded' : ''}`}>
       <header><span><ShieldCheck size={17} /></span><div><strong>需要你的批准</strong><p>Agent 请求执行有副作用的工具</p></div><StatusBadge status={approval.status || 'pending'} /></header>
-      <div className="approval-command"><span>{approval.tool_name || 'unknown_tool'}</span><p>{argumentCount ? `已准备 ${argumentCount} 项参数` : '本次调用不含可展示参数'}</p></div>
+      <div className="approval-command"><span>{approval.tool_name || 'unknown_tool'}</span><pre>{formattedArguments}</pre></div>
       {approval.reason && <p className="approval-reason">理由：{approval.reason}</p>}
       <footer><button className="button button-danger" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'reject', runId)}><XCircle size={15} />拒绝</button><button className="button button-primary" disabled={deciding || !runId} onClick={() => onDecision(approval.id, 'approve', runId)}>{deciding ? <LoaderCircle className="spin" size={15} /> : <CheckCircle2 size={15} />}允许本次</button></footer>
     </article>

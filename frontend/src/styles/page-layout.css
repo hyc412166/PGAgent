@@ -56,7 +56,7 @@
   place-items: center;
   overflow: hidden;
   border: 1px solid rgb(255 255 255 / 82%);
-  border-radius: 18px 18px 18px 8px;
+  border-radius: 18px;
   color: var(--penguin);
   background: var(--glass);
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 75%), var(--shadow-sm);
@@ -82,7 +82,7 @@
   min-height: 37px;
   gap: 7px;
   padding: 0 14px;
-  border-radius: 12px 12px 12px 6px;
+  border-radius: 12px;
   font-size: 0.6875rem;
   font-weight: 800;
 }
@@ -134,7 +134,7 @@
 .skill-market-section,
 .run-table-card {
   border-color: var(--line);
-  border-radius: 17px 17px 17px 7px;
+  border-radius: 17px;
   background: var(--surface);
   box-shadow: var(--shadow-sm);
 }
