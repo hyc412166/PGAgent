@@ -173,7 +173,10 @@ def create_model_call(config: ProviderConfig, *, credentials):
                     legacy_response["_pgagent_normalized_response"] = normalized_response
                     return legacy_response
                 except StreamInterrupted as exc:
-                    completed.extend(exc.completed_items)
+                    completed = responses.merge_replayed_items(
+                        completed,
+                        [dict(item) for item in exc.completed_items],
+                    )
                     # 已完成的工具调用先交给执行器，绝不以缺失工具结果的历史重新采样。
                     if any(item.get("type") == "function_call" for item in completed):
                         # 变量说明：payload 表示跨层传递的数据载荷。
