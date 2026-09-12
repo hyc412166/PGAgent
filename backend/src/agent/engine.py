@@ -1841,7 +1841,12 @@ class AgentRuntime:
                     response_id=f"legacy-response-{guard.steps}"
                 )
                 output_ledger.accept_response(normalized_response)
-                local_items = output_ledger.take_local_calls()
+                turn_decision = output_ledger.decision()
+                local_items = (
+                    output_ledger.take_local_calls()
+                    if turn_decision.status is TurnStatus.DRAINING_TOOLS
+                    else []
+                )
                 parsed_calls = {call.id: call for call in turn.tool_calls}
                 turn.tool_calls = [
                     ModelToolCall(
@@ -1851,7 +1856,6 @@ class AgentRuntime:
                     )
                     for item in local_items
                 ]
-                turn_decision = output_ledger.decision()
                 hosted_call_delta = output_ledger.hosted_tool_count - hosted_before
             except RunTimeLimitExceeded:
                 # 变量说明：decision 表示当前步骤使用的 decision 值。
@@ -2400,6 +2404,25 @@ class AgentRuntime:
                     result = parallel_results[call_index]
                     # 变量说明：tool_started_at 表示当前步骤使用的 tool_started_at 值。
                     tool_started_at = parallel_tool_started.get(call.id, self.clock())
+                if result.tool_name != call.name:
+                    failed = {
+                        **state,
+                        "status": "failed",
+                        "messages": messages,
+                        "error": "ToolResultMismatch",
+                    }
+                    failed["events"] = await self._publish(
+                        failed,
+                        "tool_finished",
+                        tool_name=call.name,
+                        tool_call_id=call.id,
+                        ok=False,
+                        changed=False,
+                        error_code="tool_result_mismatch",
+                        duration_ms=round((self.clock() - tool_started_at) * 1000),
+                        elapsed_ms=round((self.clock() - active_started_at) * 1000),
+                    )
+                    return failed
                 if result.approval_required:
                     state["events"] = await self._publish(
                         {**state, "messages": messages},
@@ -2466,6 +2489,8 @@ class AgentRuntime:
                 )
                 active_started_at += background_wait_seconds
 
+                # 先用真实结果名称完成归属校验，再构造 provider transcript。
+                output_ledger.commit_local_result(call.id, tool_name=result.tool_name)
                 # 变量说明：tool_message 表示当前步骤使用的 tool_message 值；artifact_refs 表示artifact_refs 集合。
                 tool_message, artifact_refs = self._prepare_tool_result_message(
                     tool_call_id=call.id,
@@ -2481,8 +2506,6 @@ class AgentRuntime:
                     "verification_trace": [*state.get("verification_trace", []), dict(tool_message)],
                     "context_artifact_refs": artifact_refs,
                 }
-                # 工具结果进入 provider transcript 后才算 commit；账本会拒绝名称错配和重复提交。
-                output_ledger.commit_local_result(call.id, tool_name=call.name)
                 if result.metadata.get("force_compaction"):
                     # 变量说明：state 的索引项 表示该语句创建或更新的目标数据。
                     state["force_compaction_reason"] = str(

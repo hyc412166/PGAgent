@@ -1710,6 +1710,112 @@ async def test_runtime_follows_up_on_explicit_end_turn_false_without_tool(tmp_pa
     assert outcome.output == "最终结果"
 
 
+@pytest.mark.asyncio
+async def test_runtime_does_not_dispatch_local_item_from_incomplete_response(tmp_path) -> None:
+    dispatched = 0
+
+    async def model_call(**_kwargs):  # type: ignore[no-untyped-def]
+        return {
+            "_pgagent_normalized_response": NormalizedModelResponse(
+                response_id="resp-incomplete",
+                status="in_progress",
+                items=[LocalToolCallItem(
+                    response_id="resp-incomplete",
+                    item_id="tool-incomplete",
+                    call_id="write-incomplete",
+                    tool_name="apply_patch",
+                    arguments={"patch": "must not run"},
+                )],
+            ),
+        }
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+
+    async def dispatch(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal dispatched
+        dispatched += 1
+        return ToolResult("apply_patch", True, "unexpected")
+
+    runtime._dispatch_tool = dispatch  # type: ignore[method-assign]
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "failed"
+    assert outcome.error == "model_response_incomplete"
+    assert outcome.tool_calls == 0
+    assert dispatched == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_empty_hosted_only_response_without_run_completed(tmp_path) -> None:
+    from src.model.output import HostedToolItem
+
+    async def model_call(**_kwargs):  # type: ignore[no-untyped-def]
+        return {
+            "_pgagent_normalized_response": NormalizedModelResponse(
+                response_id="resp-hosted-only",
+                status="completed",
+                items=[HostedToolItem(
+                    response_id="resp-hosted-only",
+                    item_id="hosted-only",
+                    call_id="hosted-call",
+                    tool_name="web_search",
+                )],
+            ),
+        }
+
+    outcome = await AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    ).run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "failed"
+    assert outcome.error == "empty_model_output"
+    assert not any(event["type"] == "run_completed" for event in outcome.events)
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_tool_result_name_mismatch_before_transcript_commit(tmp_path) -> None:
+    turns = 0
+
+    async def model_call(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal turns
+        turns += 1
+        if turns > 1:
+            return ModelTurn(content="must not reach follow-up")
+        return {
+            "_pgagent_normalized_response": NormalizedModelResponse(
+                response_id="resp-tool",
+                status="completed",
+                items=[LocalToolCallItem(
+                    response_id="resp-tool",
+                    item_id="tool-read",
+                    call_id="read-1",
+                    tool_name="glob",
+                    arguments={"path": "."},
+                )],
+            ),
+        }
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+
+    async def wrong_result(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return ToolResult("apply_patch", True, "wrong tool result")
+
+    runtime._dispatch_tool = wrong_result  # type: ignore[method-assign]
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "failed"
+    assert outcome.error == "ToolResultMismatch"
+    assert turns == 1
+    assert not any(message.get("role") == "tool" for message in outcome.messages)
+
+
 # 辅助函数：_completed 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 async def _completed() -> None:
     return None

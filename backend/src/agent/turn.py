@@ -133,6 +133,9 @@ class TurnLedger:
     def take_local_calls(self) -> list[LocalToolCallItem]:
         """Take each completed local call once for the existing safety router."""
 
+        # 未关闭的 provider response 不能释放副作用调用。
+        if self.decision().status is not TurnStatus.DRAINING_TOOLS:
+            return []
         calls: list[LocalToolCallItem] = []
         for call_id, record in self._local_calls.items():
             if (
@@ -202,7 +205,7 @@ class TurnLedger:
         if response_status in {"failed", "incomplete"}:
             return TurnDecision(TurnStatus.FAILED, False, "model_response_failed", **base)
         if response_status != "completed":
-            return TurnDecision(TurnStatus.ACTING, True, "model_response_incomplete", **base)
+            return TurnDecision(TurnStatus.FAILED, False, "model_response_incomplete", **base)
 
         active_calls = [
             record
@@ -229,6 +232,8 @@ class TurnLedger:
                 "provider_requested_follow_up",
                 **base,
             )
+        if not assistant_text.strip():
+            return TurnDecision(TurnStatus.FAILED, False, "empty_model_output", **base)
         return TurnDecision(TurnStatus.COMPLETED, False, None, **base)
 
     def _local_record(self, call_id: str) -> _LocalToolRecord:
