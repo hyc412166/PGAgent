@@ -203,6 +203,39 @@ async def test_responses_replays_only_completed_items_after_stream_disconnect(
 
 
 @pytest.mark.asyncio
+async def test_responses_deduplicates_same_completed_item_across_repeated_interruptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reasoning_item = {
+        "type": "reasoning", "id": "rs-1", "status": "completed",
+        "summary": [], "encrypted_content": "opaque",
+    }
+    message_item = {
+        "type": "message", "id": "msg-1", "status": "completed", "role": "assistant",
+        "content": [{"type": "output_text", "text": "最终完成", "annotations": []}],
+    }
+
+    async def interrupted() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.output_item.done", "item": reasoning_item}
+        raise StreamInterrupted("socket closed")
+
+    async def recovered() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.output_item.done", "item": message_item}
+        yield {"type": "response.completed", "response": {
+            "status": "completed", "output": [message_item], "usage": {},
+        }}
+
+    fake = install_fake_client(monkeypatch, [interrupted, interrupted, recovered])
+    response = await build_model_call(responses_config())(
+        messages=[{"role": "user", "content": "继续"}], tools=[], mode="auto",
+    )
+
+    assert len(fake.requests) == 3
+    assert fake.requests[2]["input"].count({key: value for key, value in reasoning_item.items() if key != "status"}) == 1
+    assert response["_pgagent_provider"]["items"] == [reasoning_item, message_item]
+
+
+@pytest.mark.asyncio
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_responses_returns_completed_tool_call_without_resampling 精确标识本用例的具体条件。
 async def test_responses_returns_completed_tool_call_without_resampling(
     monkeypatch: pytest.MonkeyPatch,

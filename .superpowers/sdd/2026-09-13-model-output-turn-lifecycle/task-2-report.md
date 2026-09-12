@@ -86,3 +86,17 @@ E:\\anaconda3\\envs\\agent_dock\\python.exe -m pytest tests/test_model_protocol_
 ```
 
 结果：`107 passed`。`compileall -q src/model` 和 `git diff --check` 通过。pytest 结束时仍有本机临时目录清理 `PermissionError`（所有测试已完成且为通过状态），与被测代码无关。
+
+## Retry 累积复查修复
+
+复查发现 request 在多次 Responses 中断时直接 `extend()` 已完成 items，同一 provider item 会跨重试累积，最终成功 response 构造标准模型时触发重复 ID。现改为每次中断都使用 `merge_replayed_items()` 合并先前与本次已完成 items；相同 provider item 只保留一次，续接请求、工具提前交付和最终 response 投影都使用去重后的集合。
+
+RED：
+
+```text
+E:\\anaconda3\\envs\\agent_dock\\python.exe -m pytest tests/test_model_responses.py::test_responses_deduplicates_same_completed_item_across_repeated_interruptions -q
+```
+
+关键输出：`ValueError: duplicate item id: rs-1`，发生在第三次请求成功后的 normalized response 构造阶段。
+
+GREEN：同一聚焦用例 `1 passed`；完整 Task 2 + loop guard 聚焦回归 `108 passed`。pytest 结束后仍仅有已记录的 Windows 临时目录清理警告。
