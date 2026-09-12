@@ -9,8 +9,12 @@ import httpx
 from src.model.config import ProviderConfig
 from src.model.streaming import IncompleteResponse, StreamInterrupted, stream_events
 from src.model.protocols.common import (
-    PartialModelStreamError, _as_mapping, _litellm_model, _streaming_unsupported, _text_fragment,
+    DeltaCallback, ActivityCallback, PartialModelStreamError, _as_mapping, _litellm_model, _streaming_unsupported, _text_fragment,
     _reasoning_fragment, _tool_call_fragments, _raw_usage, _emit_delta, _emit_activity,
+)
+from src.model.output import (
+    AssistantMessageItem, EndTurn, LocalToolCallItem, NormalizedModelResponse,
+    OutputPhase, ReasoningItem, ResponseStatus,
 )
 
 # 函数职责：异步完成 consume 对应的业务处理。
@@ -25,7 +29,9 @@ async def consume(
     on_delta: DeltaCallback | None,
     on_thought_delta: DeltaCallback | None,
     on_activity: ActivityCallback | None,
-) -> dict[str, Any]:
+    on_assistant_item: Any | None = None,
+    on_item: Any | None = None,
+) -> NormalizedModelResponse:
     # 变量说明：content_parts 表示当前流程使用的 content_parts 集合。
     content_parts: list[str] = []
     # 变量说明：reasoning_parts 表示当前流程使用的 reasoning_parts 集合。
@@ -40,16 +46,23 @@ async def consume(
     visible_output = False
     # 变量说明：finished 表示当前步骤使用的 finished 值。
     finished = False
+    response_id: str | None = None
+    finish_reason: str | None = None
+    assistant_callback = on_assistant_item or on_item
     try:
         async for raw_chunk in stream_events(response, idle_seconds):
             chunk_count += 1
             await _emit_activity(on_activity)
             # 变量说明：chunk 表示当前步骤使用的 chunk 值。
             chunk = _as_mapping(raw_chunk)
+            if chunk.get("id"):
+                response_id = str(chunk["id"])
             # 变量说明：choices 表示当前流程使用的 choices 集合。
             choices = chunk.get("choices") or []
             # 变量说明：finish 表示当前步骤使用的 finish 值。
             finish = choices[0].get("finish_reason") if choices else None
+            if finish:
+                finish_reason = str(finish)
             if finish in {"length", "content_filter"}:
                 provider_error_code = "max_output_tokens" if finish == "length" else "content_filter"
                 raise IncompleteResponse(
@@ -63,6 +76,15 @@ async def consume(
             if fragment:
                 content_parts.append(fragment)
                 await _emit_delta(on_delta, fragment)
+                if assistant_callback is not None:
+                    item = AssistantMessageItem(
+                        response_id=response_id, item_id="message-0",
+                        content="".join(content_parts), phase=OutputPhase.UNKNOWN,
+                        end_turn=EndTurn.UNKNOWN,
+                    )
+                    callback_result = assistant_callback(item)
+                    if asyncio.iscoroutine(callback_result):
+                        await callback_result
                 # 变量说明：visible_output 表示当前步骤使用的 visible_output 值。
                 visible_output = True
             # 变量说明：reasoning_fragment 表示当前步骤使用的 reasoning_fragment 值。
@@ -154,7 +176,79 @@ async def consume(
         }],
         "usage": usage,
     }
-    return payload
+    items: list[Any] = []
+    if content_parts:
+        items.append(AssistantMessageItem(
+            response_id=response_id, item_id="message-0", output_index=0,
+            content="".join(content_parts), phase=OutputPhase.UNKNOWN,
+            end_turn=EndTurn.UNKNOWN,
+        ))
+    if reasoning_parts:
+        items.append(ReasoningItem(
+            response_id=response_id, item_id="reasoning-0", output_index=len(items),
+            summary="".join(reasoning_parts),
+        ))
+    for index, item in enumerate(assembled_calls, start=len(items)):
+        items.append(LocalToolCallItem(
+            response_id=response_id, item_id=item["id"], output_index=index,
+            call_id=item["id"], tool_name=item["function"].get("name") or "",
+            arguments=item["function"].get("arguments") or "",
+        ))
+    return NormalizedModelResponse(
+        response_id=response_id,
+        items=items,
+        status=ResponseStatus.COMPLETED,
+        provider_payload={"protocol": "chat_completions", "payload": payload},
+        usage=usage,
+        finish_reason=finish_reason,
+    )
+
+
+def to_legacy_payload(response: NormalizedModelResponse) -> dict[str, Any]:
+    native = response.provider_payload if isinstance(response.provider_payload, Mapping) else {}
+    payload = native.get("payload")
+    return dict(payload) if isinstance(payload, Mapping) else {
+        "choices": [{"message": {"role": "assistant", "content": "", "tool_calls": []}}],
+        "usage": dict(response.usage),
+    }
+
+
+def normalize_response(payload: Mapping[str, Any], *, model: str | None = None) -> NormalizedModelResponse:
+    """Normalize a non-stream Chat Completions response using the same path."""
+    choices = payload.get("choices") or []
+    message = (choices[0] if choices else {}).get("message") or {}
+    if not isinstance(message, Mapping):
+        message = _as_mapping(message)
+    response_id = str(payload["id"]) if payload.get("id") else None
+    items: list[Any] = []
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        items.append(AssistantMessageItem(
+            response_id=response_id, item_id="message-0", output_index=0,
+            content=content, phase=OutputPhase.UNKNOWN, end_turn=EndTurn.UNKNOWN,
+        ))
+    reasoning = next((message.get(key) for key in ("reasoning_content", "reasoning", "thinking")
+                      if isinstance(message.get(key), str)), "")
+    if reasoning:
+        items.append(ReasoningItem(response_id=response_id, item_id="reasoning-0",
+                                   output_index=len(items), summary=reasoning))
+    for index, raw_call in enumerate(message.get("tool_calls") or [], start=len(items)):
+        call = raw_call if isinstance(raw_call, Mapping) else _as_mapping(raw_call)
+        function = call.get("function") or {}
+        function = function if isinstance(function, Mapping) else _as_mapping(function)
+        call_id = str(call.get("id") or f"call-{index + 1}")
+        items.append(LocalToolCallItem(
+            response_id=response_id, item_id=call_id, output_index=index,
+            call_id=call_id, tool_name=str(function.get("name") or ""),
+            arguments=function.get("arguments") or "",
+        ))
+    finish_reason = (choices[0] if choices else {}).get("finish_reason")
+    return NormalizedModelResponse(
+        response_id=response_id, items=items,
+        status=ResponseStatus.COMPLETED if finish_reason in {"stop", "tool_calls", "function_call"} else ResponseStatus.UNKNOWN,
+        provider_payload={"protocol": "chat_completions", "payload": dict(payload)},
+        usage=dict(payload.get("usage") or {}), finish_reason=finish_reason,
+    )
 
 
 

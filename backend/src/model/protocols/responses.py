@@ -8,6 +8,16 @@ import json
 from typing import Any, Mapping
 
 from src.model.protocols.common import _as_mapping, _emit_activity, _emit_delta
+from src.model.output import (
+    AssistantMessageItem,
+    EndTurn,
+    HostedToolItem,
+    LocalToolCallItem,
+    NormalizedModelResponse,
+    OutputPhase,
+    ReasoningItem,
+    ResponseStatus,
+)
 from src.model.streaming import IncompleteResponse, StreamInterrupted, stream_events
 
 
@@ -181,16 +191,114 @@ def project_items(items: list[dict[str, Any]], usage: Mapping[str, Any] | None =
             "_pgagent_provider": {"protocol": "responses", "items": items}}
 
 
+def _item_key(item: Mapping[str, Any], fallback_index: int) -> tuple[str, Any]:
+    """Use provider identity first; index keeps anonymous SDK items stable."""
+    return ("id", item["id"]) if item.get("id") else ("index", item.get("output_index", fallback_index))
+
+
+def _merge_items(done_items: list[dict[str, Any]], final_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge output_item.done with response.completed without replaying side effects."""
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, Any]] = set()
+    # completed output is authoritative when the provider repeats an item in
+    # response.completed; final-only items are appended in provider order.
+    for index, item in enumerate(final_items):
+        current = dict(item)
+        key = _item_key(current, index)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(current)
+    for index, item in enumerate(done_items):
+        current = dict(item)
+        key = _item_key(current, index)
+        if key not in seen:
+            seen.add(key)
+            merged.append(current)
+    return merged
+
+
+def _normalize_item(item: Mapping[str, Any], response_id: str | None, output_index: int) -> Any:
+    kind = str(item.get("type") or "")
+    common = {
+        "response_id": response_id,
+        "item_id": str(item["id"]) if item.get("id") else None,
+        "output_index": item.get("output_index", output_index),
+    }
+    if kind == "message":
+        text = []
+        for part in item.get("content") or []:
+            part = _as_mapping(part)
+            if part.get("type") == "output_text":
+                text.append(str(part.get("text") or ""))
+            elif part.get("type") == "refusal":
+                text.append(str(part.get("refusal") or ""))
+        return AssistantMessageItem(
+            **common, content="".join(text),
+            phase=item.get("phase", OutputPhase.UNKNOWN),
+            end_turn=item.get("end_turn", EndTurn.UNKNOWN),
+        )
+    if kind == "reasoning":
+        return ReasoningItem(
+            **common, summary=item.get("summary"),
+            encrypted_content=item.get("encrypted_content"),
+            provider_data=dict(item),
+        )
+    if kind == "function_call":
+        arguments: Any = item.get("arguments", "")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                pass
+        return LocalToolCallItem(
+            **common, call_id=str(item.get("call_id") or item.get("id") or "call"),
+            tool_name=str(item.get("name") or ""), arguments=arguments,
+        )
+    if kind in _HOSTED_OUTPUT_ITEMS:
+        return HostedToolItem(
+            **common, tool_name=kind.removesuffix("_call"),
+            status=str(item.get("status") or "completed"),
+            call_id=str(item["call_id"]) if item.get("call_id") else None,
+            details=dict(item),
+        )
+    raise IncompleteResponse(f"模型返回了未授权的输出项类型：{kind}")
+
+
+def normalize_response(response: Mapping[str, Any]) -> NormalizedModelResponse:
+    """Convert a completed native Responses object into the shared model."""
+    raw = dict(response)
+    response_id = str(raw["id"]) if raw.get("id") else None
+    items = [dict(item) for item in raw.get("output") or []]
+    normalized_items = [_normalize_item(item, response_id, index) for index, item in enumerate(items)]
+    status = ResponseStatus(str(raw.get("status") or "unknown"))
+    return NormalizedModelResponse(
+        response_id=response_id, items=normalized_items, status=status,
+        provider_payload={"protocol": "responses", "items": items},
+        usage=dict(raw.get("usage") or {}),
+    )
+
+
+def to_legacy_payload(response: NormalizedModelResponse) -> dict[str, Any]:
+    native = response.provider_payload if isinstance(response.provider_payload, Mapping) else {}
+    items = [dict(item) for item in native.get("items") or []]
+    return project_items(items, response.usage)
+
+
 # 函数职责：异步完成 consume 对应的业务处理。
 # 参数关系：stream 表示当前步骤使用的 stream 值；idle_seconds 表示当前流程使用的 idle_seconds 集合；on_delta 表示当前步骤使用的 on_delta 值；on_thought_delta 表示当前步骤使用的 on_thought_delta 值；on_activity 表示当前步骤使用的 on_activity 值。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought_delta=None, on_activity=None) -> dict[str, Any]:
+async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought_delta=None,
+                  on_activity=None, on_assistant_item=None, on_item=None) -> NormalizedModelResponse:
     # 变量说明：completed 表示当前步骤使用的 completed 值。
     completed: list[dict[str, Any]] = []
     # 变量说明：finished 表示当前步骤使用的 finished 值。
     finished: dict[str, Any] | None = None
     # 变量说明：summary_lengths 表示当前流程使用的 summary_lengths 集合。
     summary_lengths: dict[tuple[str, int], int] = {}
+    response_id: str | None = None
+    assistant_contents: dict[str, str] = {}
+    assistant_callback = on_assistant_item or on_item
 
     # 函数职责：异步发送 summary 对应的数据或流程。
     # 参数关系：item_id 表示item 对象的唯一标识；index 表示当前元素的位置索引；text 表示当前步骤使用的 text 值。
@@ -220,8 +328,18 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
             await _emit_activity(on_activity)
             # 变量说明：kind 表示当前步骤使用的 kind 值。
             kind = event.get("type")
+            if event.get("response_id"):
+                response_id = str(event["response_id"])
             if kind == "response.output_text.delta":
-                await _emit_delta(on_delta, str(event.get("delta") or ""))
+                delta = str(event.get("delta") or "")
+                await _emit_delta(on_delta, delta)
+                item_id = str(event.get("item_id") or "message-0")
+                assistant_contents[item_id] = assistant_contents.get(item_id, "") + delta
+                if assistant_callback is not None:
+                    await _emit_assistant_item(assistant_callback, AssistantMessageItem(
+                        response_id=response_id, item_id=item_id,
+                        content=assistant_contents[item_id],
+                    ))
             elif kind == "response.reasoning_summary_text.delta":
                 # 变量说明：delta 表示当前步骤使用的 delta 值。
                 delta = str(event.get("delta") or "")
@@ -238,9 +356,15 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
                 if item.get("status") not in {"incomplete", "in_progress"}:
                     completed.append(item)
                     await emit_item_summary(item)
+                    if item.get("type") == "message" and assistant_callback is not None:
+                        await _emit_assistant_item(
+                            assistant_callback,
+                            _normalize_item(item, response_id, len(completed) - 1),
+                        )
             elif kind == "response.completed":
                 # 变量说明：finished 表示当前步骤使用的 finished 值。
                 finished = _as_mapping(event["response"])
+                response_id = str(finished["id"]) if finished.get("id") else response_id
                 break
             elif kind in {"response.failed", "response.incomplete", "error"}:
                 # 变量说明：response 表示下游返回的响应。
@@ -260,7 +384,20 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
     if finished is None:
         raise StreamInterrupted("模型流在 response.completed 之前关闭", completed_items=completed)
     # 变量说明：items 表示待处理的元素集合。
-    items = list(finished.get("output") or completed)
+    items = _merge_items(completed, [dict(item) for item in finished.get("output") or []])
     for item in items:
         await emit_item_summary(item)
-    return project_items(items, finished.get("usage"))
+    normalized = NormalizedModelResponse(
+        response_id=response_id,
+        items=[_normalize_item(item, response_id, index) for index, item in enumerate(items)],
+        status=ResponseStatus(str(finished.get("status") or "completed")),
+        provider_payload={"protocol": "responses", "items": items},
+        usage=dict(finished.get("usage") or {}),
+    )
+    return normalized
+
+
+async def _emit_assistant_item(callback: Any, item: AssistantMessageItem) -> None:
+    result = callback(item)
+    if asyncio.iscoroutine(result):
+        await result

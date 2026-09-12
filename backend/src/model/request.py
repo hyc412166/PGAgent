@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import Any
 
 import httpx
@@ -32,7 +33,7 @@ def create_model_call(config: ProviderConfig, *, credentials):
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     async def call(*, messages: list[dict], tools: list[dict], mode: str,
                    on_delta=None, on_thought_delta=None, on_activity=None,
-                   prompt_cache_key=None, on_retry=None):
+                   prompt_cache_key=None, on_retry=None, on_assistant_item=None, on_item=None):
         # 变量说明：api_key 表示当前步骤使用的 api_key 值。
         api_key = credentials(config.secret_ref)
         if not api_key:
@@ -102,21 +103,34 @@ def create_model_call(config: ProviderConfig, *, credentials):
                                     f"response.{str(raw.get('status') or 'unknown')}",
                                 )
                             # 变量说明：payload 表示跨层传递的数据载荷。
-                            payload = responses.project_items(raw.get("output") or [], raw.get("usage"))
+                            normalized = responses.normalize_response(raw)
+                            payload = responses.to_legacy_payload(normalized)
                             await _emit_delta(on_thought_delta, payload["reasoning_content"])
+                            callback = on_assistant_item or on_item
+                            if callback is not None:
+                                for item in normalized.items:
+                                    if item.item_type == "assistant_message":
+                                        result = callback(item)
+                                        if inspect.isawaitable(result):
+                                            await result
                         else:
                             # 变量说明：payload 表示跨层传递的数据载荷。
-                            payload = await responses.consume(stream, idle_seconds=settings.model_timeout_seconds,
-                                on_delta=on_delta, on_thought_delta=on_thought_delta, on_activity=on_activity)
+                            normalized = await responses.consume(stream, idle_seconds=settings.model_timeout_seconds,
+                                on_delta=on_delta, on_thought_delta=on_thought_delta,
+                                on_activity=on_activity, on_assistant_item=on_assistant_item,
+                                on_item=on_item)
+                            payload = responses.to_legacy_payload(normalized)
                         # 变量说明：items 表示待处理的元素集合。
                         items = [*completed, *payload["_pgagent_provider"]["items"]]
                         # 变量说明：payload 表示跨层传递的数据载荷。
                         payload = responses.project_items(items, payload.get("usage"))
                     elif hasattr(stream, "__aiter__"):
                         # 变量说明：payload 表示跨层传递的数据载荷。
-                        payload = await chat_completions.consume(stream, config=config, model=config.model_id,
+                        normalized = await chat_completions.consume(stream, config=config, model=config.model_id,
                             idle_seconds=settings.model_timeout_seconds, on_delta=on_delta,
-                            on_thought_delta=on_thought_delta, on_activity=on_activity)
+                            on_thought_delta=on_thought_delta, on_activity=on_activity,
+                            on_assistant_item=on_assistant_item, on_item=on_item)
+                        payload = chat_completions.to_legacy_payload(normalized)
                     else:
                         # 变量说明：payload 表示跨层传递的数据载荷。
                         payload = _as_mapping(stream)
@@ -130,6 +144,15 @@ def create_model_call(config: ProviderConfig, *, credentials):
                                 f"模型响应未完整结束：{finish}",
                                 provider_error_code=provider_error_code,
                             )
+                        normalized = chat_completions.normalize_response(payload, model=config.model_id)
+                        callback = on_assistant_item or on_item
+                        if callback is not None:
+                            for item in normalized.items:
+                                if item.item_type == "assistant_message":
+                                    result = callback(item)
+                                    if inspect.isawaitable(result):
+                                        await result
+                        payload = chat_completions.to_legacy_payload(normalized)
                         await _emit_delta(on_thought_delta, _assistant_reasoning(payload))
                         await _emit_delta(on_delta, _assistant_content(payload))
                     # 变量说明：normalized 表示当前步骤使用的 normalized 值。
