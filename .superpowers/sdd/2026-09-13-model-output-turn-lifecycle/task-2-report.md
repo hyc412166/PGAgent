@@ -100,3 +100,22 @@ E:\\anaconda3\\envs\\agent_dock\\python.exe -m pytest tests/test_model_responses
 关键输出：`ValueError: duplicate item id: rs-1`，发生在第三次请求成功后的 normalized response 构造阶段。
 
 GREEN：同一聚焦用例 `1 passed`；完整 Task 2 + loop guard 聚焦回归 `108 passed`。pytest 结束后仍仅有已记录的 Windows 临时目录清理警告。
+
+## Anonymous item output index 复查修复
+
+无 id 的 Responses item 原先在不同中断批次用累计列表长度作为 fallback key，相同 done item 的 key 会从 0 变成 1，无法去重。现从 `response.output_item.done.output_index` 捕获稳定序号，作为仅 adapter/request accumulator 使用的 `_pgagent_output_index`：
+
+- 多次中断合并使用该稳定序号去重 anonymous item；
+- `project_items()` 在构造续接 input 与旧 `_pgagent_provider.items` 前剥离内部字段；
+- `normalize_response()` 用序号建立标准 item 顺序，但其 `provider_payload.items` 只保存清理后的原生 payload；
+- 有 provider item id 时仍优先使用 id，不额外写内部字段。
+
+RED：
+
+```text
+E:\\anaconda3\\envs\\agent_dock\\python.exe -m pytest tests/test_model_responses.py::test_responses_deduplicates_anonymous_item_by_done_output_index_across_retries -q
+```
+
+关键输出：第三次请求 input 中相同 anonymous reasoning item 计数为 2，断言失败。
+
+GREEN：同一用例 `1 passed`。完整 Task 2 + loop guard 聚焦回归 `109 passed`；测试同时断言内部 index 不出现在 provider input、旧 provider payload 或 normalized sidecar provider payload。`compileall -q src/model` 通过。
