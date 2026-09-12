@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     context_limit_tokens: int = 200_000
     # 变量说明：compact_threshold_tokens 表示当前流程使用的 compact_threshold_tokens 集合。
     compact_threshold_tokens: int = 180_000
+    # 仅供显式工作流读取；默认生命周期不安装 completion verifier。
     # 变量说明：completion_verification_max_attempts 表示当前流程使用的 completion_verification_max_attempts 集合。
     completion_verification_max_attempts: int = 3
     # 变量说明：mcp_config_path 表示mcp_config_path 对应的文件系统位置。

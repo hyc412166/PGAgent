@@ -48,10 +48,8 @@ from src.persistence.database import (
 )
 from src.agent import (
     AgentRuntime,
-    CompletionDecision,
     RunOutcome,
     RuntimeConfig,
-    decide_deterministic_completion,
     normalize_usage,
 )
 from src.tools.registry import TOOL_SCHEMAS

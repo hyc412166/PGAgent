@@ -34,12 +34,36 @@ from src.persistence.database import (
 )
 from src.agent import RunOutcome
 from src.runs.service import RunCoordinator, _prepare_session_history
+from src.runs.continuation import RunContinuationCodec
 from src.runs import lifecycle as lifecycle_service
 from src.tasks.state import sync_todos_for_run
 from src.context import instructions as instruction_service
 from src.agent import AgentRuntime, decide_deterministic_completion
 from src.model.gateway import ModelConfigurationError
 from src.tools import create_default_registry
+
+
+# 测试场景：旧 runtime_snapshot 没有 output_ledger 时仍应恢复最小 RunOutcome，而不因新字段缺失崩溃。
+def test_legacy_snapshot_without_output_ledger_is_restored() -> None:
+    restored = RunContinuationCodec.restore({
+        "status": "awaiting_approval",
+        "output": None,
+        "messages": [],
+        "events": [],
+        "steps": 1,
+        "tool_calls": 1,
+        "pending_approval": {
+            "id": "call-legacy",
+            "tool_name": "write_file",
+            "arguments": {"path": "notes.txt", "content": "ok"},
+        },
+        "verification_trace": [{"role": "assistant", "content": "legacy"}],
+        "acceptance_report": {"passed": False},
+    })
+    assert restored.status == "awaiting_approval"
+    assert restored.pending_approval["id"] == "call-legacy"
+    assert restored.verification_trace[0]["content"] == "legacy"
+    assert restored.acceptance_report == {"passed": False}
 
 
 @pytest.mark.asyncio

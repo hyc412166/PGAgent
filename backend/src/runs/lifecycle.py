@@ -51,9 +51,7 @@ from src.persistence.database import (
 from src.persistence.run_events import append_run_event
 from src.agent import (
     AgentRuntime,
-    CompletionDecision,
     RunOutcome,
-    decide_deterministic_completion,
     normalize_usage,
 )
 from src.context.window import message_tokens
@@ -2935,115 +2933,13 @@ class RunCoordinator:
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     @staticmethod
     def _install_completion_verifier(runtime: AgentRuntime, context: Mapping[str, Any]) -> None:
-        """Attach the main-agent-only completion gate to a resolved runtime."""
+        """Compatibility hook; default lifecycle runs do not install a verifier.
 
-        # 变量说明：binding 表示当前步骤使用的 binding 值。
-        binding = context.get("runtime_binding")
-        # 变量说明：background_store 表示当前步骤使用的 background_store 值。
-        background_store = context.get("background_store")
-        # 变量说明：max_completion_verification_attempts 表示当前流程使用的 max_completion_verification_attempts 集合。
-        runtime.config.max_completion_verification_attempts = max(
-            1,
-            int(settings.completion_verification_max_attempts or 1),
-        )
-        if isinstance(binding, Mapping) and binding.get("delegation_version"):
-            # Child agents never produce the user-facing final answer. Their
-            # settled task observation is part of the parent's gated trace.
-            if background_store is None:
-                # 变量说明：completion_verifier 表示当前步骤使用的 completion_verifier 值。
-                runtime.completion_verifier = None
-            else:
-                # 函数职责：完成 verify_child_background 对应的业务处理。
-                # 参数关系：_candidate 表示当前步骤使用的 _candidate 值。
-                # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-                def verify_child_background(_candidate: Mapping[str, Any]) -> CompletionDecision:
-                    # 变量说明：active 表示当前步骤使用的 active 值。
-                    active = background_store.active_jobs()
-                    if active:
-                        # 变量说明：registered 表示当前步骤使用的 registered 值。
-                        registered = background_store.register_waiter()
-                        if registered:
-                            return CompletionDecision(
-                                False,
-                                "后台作业仍在运行；本次执行将暂停，并在终态事件到达后自动恢复。",
-                                {"background_jobs": [
-                                    {"id": item["id"], "status": item["status"]} for item in active
-                                    if item["id"] in registered
-                                ]},
-                                defer_until_event=True,
-                            )
-                    # 变量说明：terminal_results 表示当前流程使用的 terminal_results 集合。
-                    terminal_results = background_store.observe_terminal_results()
-                    if terminal_results:
-                        return CompletionDecision(
-                            False,
-                            "后台作业已结束。请根据以下终态事件完成当前子任务：\n"
-                            + json.dumps(terminal_results, ensure_ascii=False)[:8_000],
-                            {"background_jobs": [
-                                {"id": item["id"], "status": item["status"]} for item in terminal_results
-                            ]},
-                        )
-                    return CompletionDecision(True, "子 Agent 后台作业均已结束并读取")
-
-                # 变量说明：completion_verifier 表示当前步骤使用的 completion_verifier 值。
-                runtime.completion_verifier = verify_child_background
-            return
-        if background_store is None:
-            # 变量说明：completion_verifier 表示当前步骤使用的 completion_verifier 值。
-            runtime.completion_verifier = decide_deterministic_completion
-            return
-
-        # 函数职责：完成 verify 对应的业务处理。
-        # 参数关系：candidate 表示当前步骤使用的 candidate 值。
-        # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-        def verify(candidate: Mapping[str, Any]):
-            # 变量说明：decision 表示当前步骤使用的 decision 值。
-            decision = decide_deterministic_completion(candidate)
-            # 变量说明：active 表示当前步骤使用的 active 值。
-            active = background_store.active_jobs() if background_store is not None else []
-            if decision.accepted and active:
-                # 变量说明：registered 表示当前步骤使用的 registered 值。
-                registered = background_store.register_waiter()
-                if registered:
-                    # 变量说明：accepted 表示当前步骤使用的 accepted 值。
-                    decision.accepted = False
-                    # 变量说明：defer_until_event 表示当前步骤使用的 defer_until_event 值。
-                    decision.defer_until_event = True
-                    # 变量说明：reason 表示当前步骤使用的 reason 值。
-                    decision.reason = "后台作业仍在运行；本次执行将暂停，并在终态事件到达后自动恢复。"
-                    # 变量说明：report 表示当前步骤使用的 report 值。
-                    decision.report = {
-                        **dict(decision.report or {}),
-                        "background_jobs": [
-                            {"id": item["id"], "status": item["status"]} for item in active
-                            if item["id"] in registered
-                        ],
-                    }
-                else:
-                    # 变量说明：active 表示当前步骤使用的 active 值。
-                    active = []
-            if decision.accepted and not active and background_store is not None:
-                # 变量说明：terminal_results 表示当前流程使用的 terminal_results 集合。
-                terminal_results = background_store.observe_terminal_results()
-                if terminal_results:
-                    # 变量说明：accepted 表示当前步骤使用的 accepted 值。
-                    decision.accepted = False
-                    # 变量说明：reason 表示当前步骤使用的 reason 值。
-                    decision.reason = (
-                        "后台作业已结束。请根据以下终态事件更新结论，不需要再次轮询：\n"
-                        + json.dumps(terminal_results, ensure_ascii=False)[:8_000]
-                    )
-                    # 变量说明：report 表示当前步骤使用的 report 值。
-                    decision.report = {
-                        **dict(decision.report or {}),
-                        "background_jobs": [
-                            {"id": item["id"], "status": item["status"]} for item in terminal_results
-                        ],
-                    }
-            return decision
-
-        # 变量说明：completion_verifier 表示当前步骤使用的 completion_verifier 值。
-        runtime.completion_verifier = verify
+        TurnLedger owns completion, approval, and tool-drain boundaries. An
+        upper-level workflow may still provide an explicit verifier when it
+        constructs AgentRuntime; this hook intentionally leaves it alone.
+        """
+        return None
 
     # 函数职责：完成 persist_failure 对应的业务处理。
     # 参数关系：run_id 表示当前运行标识；error 表示当前捕获或准备上报的错误。
