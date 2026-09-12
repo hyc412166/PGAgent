@@ -19,12 +19,14 @@ from fastapi import HTTPException
 from src.persistence import database
 from src.api.routes import delete_session, list_session_background_jobs
 from src.persistence.database import Agent, BackgroundJob, Base, CollaborationEvent, PlanStep, Run, Session, Workspace
-from src.agent import AgentRuntime, CompletionDecision, ModelTurn, RunOutcome
+from src.agent import AgentRuntime, ModelTurn, RunOutcome
 from src.tasks import background as background_job_service
 from src.tasks.background import BackgroundJobManager, BackgroundJobToolStore
 from src.runs.service import RunCoordinator
 from src.tasks.state import sync_todos_for_run
 from src.tools import create_default_registry
+from src.agent.turn import TurnStatus
+from src.model.output import AssistantMessageItem, NormalizedModelResponse, ResponseStatus
 
 
 # 辅助函数：_wait_for_job_status 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
@@ -344,104 +346,6 @@ def test_shutdown_marks_started_job_failed_instead_of_replaying_it(background_st
         assert db.query(CollaborationEvent).filter_by(source_id=job_id).count() == 1
 
 
-# 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_completion_verifier_rejects_unobserved_background_job 精确标识本用例的具体条件。
-def test_completion_verifier_rejects_unobserved_background_job(tmp_path: Path) -> None:
-    # 测试替身类：Store 保存该局部场景的可控状态。
-    class Store:
-        active = [{"id": "job-1", "status": "running"}]
-        terminal = []
-        registered = False
-
-        # 辅助方法：active_jobs 实现测试替身在此调用阶段需要的最小行为。
-        def active_jobs(self):
-            return list(self.active)
-
-        # 辅助方法：register_waiter 实现测试替身在此调用阶段需要的最小行为。
-        def register_waiter(self):
-            self.registered = True
-            return ["job-1"]
-
-        # 辅助方法：observe_terminal_results 实现测试替身在此调用阶段需要的最小行为。
-        def observe_terminal_results(self):
-            results = list(self.terminal)
-            self.terminal = []
-            return results
-
-    store = Store()
-    runtime = AgentRuntime(
-        model_call=lambda **_kwargs: None,
-        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
-    )
-    # Legacy verifier behavior remains testable only when explicitly injected.
-    def legacy_verifier(_candidate):
-        active = store.active_jobs()
-        if active:
-            registered = store.register_waiter()
-            if registered:
-                return CompletionDecision(False, "waiting", {"background_jobs": active}, defer_until_event=True)
-        return CompletionDecision(True, "done")
-
-    runtime.completion_verifier = legacy_verifier
-    candidate = {
-        "output": "done",
-        "messages": [{"role": "assistant", "content": "done"}],
-        "tool_calls": 0,
-        "pending_approval": None,
-    }
-
-    rejected = runtime.completion_verifier(candidate)
-    assert rejected.accepted is False
-    assert rejected.defer_until_event is True
-    assert store.registered is True
-    assert rejected.report["background_jobs"] == [{"id": "job-1", "status": "running"}]
-
-    store.active = []
-    assert runtime.completion_verifier(candidate).accepted is True
-
-
-# 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_completion_verifier_consumes_terminal_race_instead_of_dead_waiting 精确标识本用例的具体条件。
-def test_completion_verifier_consumes_terminal_race_instead_of_dead_waiting(tmp_path: Path) -> None:
-    # 测试替身类：Store 保存该局部场景的可控状态。
-    class Store:
-        # 辅助方法：active_jobs 实现测试替身在此调用阶段需要的最小行为。
-        def active_jobs(self):
-            return [{"id": "job-race", "status": "running"}]
-
-        # 辅助方法：register_waiter 实现测试替身在此调用阶段需要的最小行为。
-        def register_waiter(self):
-            return []
-
-        # 辅助方法：observe_terminal_results 实现测试替身在此调用阶段需要的最小行为。
-        def observe_terminal_results(self):
-            return [{"id": "job-race", "status": "completed", "output_preview": "ready"}]
-
-    runtime = AgentRuntime(
-        model_call=lambda **_kwargs: None,
-        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
-    )
-    store = Store()
-    runtime.completion_verifier = lambda _candidate: CompletionDecision(
-        False,
-        "terminal result pending",
-        {
-            "background_jobs": [
-                {"id": item["id"], "status": item["status"]}
-                for item in store.observe_terminal_results()
-            ]
-        },
-    )
-    decision = runtime.completion_verifier({
-        "output": "done",
-        "messages": [{"role": "assistant", "content": "done"}],
-        "tool_calls": 0,
-        "pending_approval": None,
-    })
-
-    assert decision.accepted is False
-    assert decision.defer_until_event is False
-    assert decision.report["background_jobs"] == [{"id": "job-race", "status": "completed"}]
-
-
 # 测试场景：默认生命周期不应安装旧验收器，完成边界由 TurnLedger 决定；显式工作流仍可自行注入 verifier。
 def test_default_lifecycle_does_not_install_completion_verifier(tmp_path: Path) -> None:
     runtime = AgentRuntime(
@@ -495,13 +399,21 @@ def test_runtime_consumes_terminal_background_race_and_follows_up(background_sto
 
     calls = 0
 
-    async def model_call(**kwargs) -> ModelTurn:
+    async def model_call(**kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
-            return ModelTurn(content="premature")
+            return {"_pgagent_normalized_response": NormalizedModelResponse(
+                response_id="background-before",
+                status=ResponseStatus.COMPLETED,
+                items=[AssistantMessageItem(content="premature")],
+            )}
         assert "job-race" in str(kwargs["messages"])
-        return ModelTurn(content="final after background")
+        return {"_pgagent_normalized_response": NormalizedModelResponse(
+            response_id="background-after",
+            status=ResponseStatus.COMPLETED,
+            items=[AssistantMessageItem(content="final after background")],
+        )}
 
     runtime = AgentRuntime(
         model_call=model_call,
@@ -517,6 +429,38 @@ def test_runtime_consumes_terminal_background_race_and_follows_up(background_sto
     assert outcome.status == "completed"
     assert outcome.output == "final after background"
     assert store.delivered_terminal_ids() == ["job-race"]
+    assert outcome.output_ledger.decision().status is TurnStatus.COMPLETED
+    event_types = [event["type"] for event in outcome.events]
+    assert event_types.count("model_step_started") == event_types.count("model_step_finished")
+
+
+def test_background_resume_clears_satisfied_wait_in_normalized_ledger(tmp_path: Path) -> None:
+    boundary = {"status": "waiting", "jobs": [{"id": "job-1", "status": "running"}]}
+
+    async def model_call(**_kwargs):
+        return {"_pgagent_normalized_response": NormalizedModelResponse(
+            response_id=f"response-{boundary['status']}",
+            status=ResponseStatus.COMPLETED,
+            items=[AssistantMessageItem(content="done")],
+        )}
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+        background_wait_provider=lambda: boundary,
+    )
+    waiting = asyncio.run(runtime.run(system_prompt="safe", recent_messages=[]))
+    boundary.clear()
+    boundary["status"] = "clear"
+    resumed = asyncio.run(runtime.run(
+        system_prompt="safe",
+        recent_messages=[],
+        prepared_messages=waiting.messages,
+        prior_output_ledger=waiting.output_ledger,
+    ))
+
+    assert resumed.status == "completed"
+    assert resumed.output_ledger.decision().status is TurnStatus.COMPLETED
 
 
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_terminal_job_writes_durable_collaboration_event 精确标识本用例的具体条件。

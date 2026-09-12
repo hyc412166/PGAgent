@@ -33,6 +33,8 @@ from src.persistence.database import (
     Workspace,
 )
 from src.agent import RunOutcome
+from src.agent.turn import TurnLedger
+from src.model.output import LocalToolCallItem, NormalizedModelResponse, ResponseStatus
 from src.runs.service import RunCoordinator, _prepare_session_history
 from src.runs.continuation import RunContinuationCodec
 from src.runs import lifecycle as lifecycle_service
@@ -80,6 +82,82 @@ def test_new_snapshot_with_malformed_output_ledger_fails_closed() -> None:
                 "local_calls": [],
             },
         })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resume_method", "status", "stop_reason", "error_fragment"),
+    [
+        ("_resume_bound", "awaiting_approval", None, "running 工具"),
+        (
+            "_resume_delegated_child_bound",
+            "stopped",
+            "delegated_child_awaiting_approval",
+            "ambiguous running tool",
+        ),
+    ],
+)
+async def test_recovery_rejects_running_side_effect_before_runtime_resolution(
+    seeded_run: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    resume_method: str,
+    status: str,
+    stop_reason: str | None,
+    error_fragment: str,
+) -> None:
+    run_id, _session_id = seeded_run
+    ledger = TurnLedger()
+    ledger.accept_response(NormalizedModelResponse(
+        response_id="running-response",
+        status=ResponseStatus.COMPLETED,
+        items=[LocalToolCallItem(
+            call_id="running-write",
+            tool_name="write_file",
+            arguments={"path": "must-not-run.txt", "content": "unsafe"},
+        )],
+    ))
+    assert [item.call_id for item in ledger.take_local_calls()] == ["running-write"]
+    ledger.mark_local_running("running-write")
+    snapshot = RunContinuationCodec.snapshot(RunOutcome(
+        status=status,
+        output=None,
+        messages=[],
+        events=[],
+        steps=1,
+        tool_calls=1,
+        stop_reason=stop_reason,
+        runtime_binding={"workspace_root": "frozen"},
+        output_ledger=ledger,
+    ))
+    with database.SessionLocal() as db:
+        db.add(RunEvent(
+            run_id=run_id,
+            event_type="runtime_snapshot",
+            payload=snapshot,
+        ))
+        db.commit()
+
+    runtime_resolved = False
+
+    def forbidden_runtime_resolution(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal runtime_resolved
+        runtime_resolved = True
+        raise AssertionError("running side effect reached runtime resolution")
+
+    coordinator = RunCoordinator()
+    monkeypatch.setattr(coordinator, "_resolve_runtime", forbidden_runtime_resolution)
+    await getattr(coordinator, resume_method)(run_id)
+
+    assert runtime_resolved is False
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        failure = db.scalar(select(RunEvent).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "integration_failed",
+        ))
+        assert run is not None and run.status == "failed"
+        assert failure is not None
+        assert error_fragment in failure.payload["internal_error"]
 
 
 @pytest.mark.asyncio
