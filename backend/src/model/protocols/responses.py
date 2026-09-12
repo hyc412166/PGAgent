@@ -254,6 +254,7 @@ def merge_replayed_items(
 
 def _normalize_item(item: Mapping[str, Any], response_id: str | None, output_index: int) -> Any:
     kind = str(item.get("type") or "")
+    public_item = _provider_item(item)
     common = {
         "response_id": response_id,
         "item_id": str(item["id"]) if item.get("id") else None,
@@ -276,7 +277,7 @@ def _normalize_item(item: Mapping[str, Any], response_id: str | None, output_ind
         return ReasoningItem(
             **common, summary=item.get("summary"),
             encrypted_content=item.get("encrypted_content"),
-            provider_data=dict(item),
+            provider_data=public_item,
         )
     if kind == "function_call":
         arguments: Any = item.get("arguments", "")
@@ -294,7 +295,7 @@ def _normalize_item(item: Mapping[str, Any], response_id: str | None, output_ind
             **common, tool_name=kind.removesuffix("_call"),
             status=str(item.get("status") or "completed"),
             call_id=str(item["call_id"]) if item.get("call_id") else None,
-            details=dict(item),
+            details=public_item,
         )
     raise IncompleteResponse(f"模型返回了未授权的输出项类型：{kind}")
 
@@ -445,13 +446,17 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
         if finished is not None:
             # response.completed is the provider boundary; a timeout while
             # draining an optional tail must not discard the completed reply.
+            merged_items = _merge_items(
+                completed, [dict(item) for item in finished.get("output") or []]
+            )
             return NormalizedModelResponse(
                 response_id=response_id,
-                items=[_normalize_item(item, response_id, index) for index, item in enumerate(
-                    _merge_items(completed, [dict(item) for item in finished.get("output") or []])
-                )],
+                items=[_normalize_item(item, response_id, index) for index, item in enumerate(merged_items)],
                 status=ResponseStatus(str(finished.get("status") or "completed")),
-                provider_payload={"protocol": "responses", "items": _merge_items(completed, [dict(item) for item in finished.get("output") or []])},
+                provider_payload={
+                    "protocol": "responses",
+                    "items": [_provider_item(item) for item in merged_items],
+                },
                 usage=dict(finished.get("usage") or {}),
             )
         exc.completed_items = list(completed)
@@ -473,7 +478,10 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
         response_id=response_id,
         items=[_normalize_item(item, response_id, index) for index, item in enumerate(items)],
         status=ResponseStatus(str(finished.get("status") or "completed")),
-        provider_payload={"protocol": "responses", "items": items},
+        provider_payload={
+            "protocol": "responses",
+            "items": [_provider_item(item) for item in items],
+        },
         usage=dict(finished.get("usage") or {}),
     )
     return normalized

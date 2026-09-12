@@ -75,6 +75,24 @@ async def test_responses_interruption_keeps_only_completed_items() -> None:
 
 
 @pytest.mark.asyncio
+async def test_responses_direct_keeps_anonymous_index_internal_to_direct_consume() -> None:
+    reasoning = {"type": "reasoning", "status": "completed", "summary": []}
+
+    async def stream() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.output_item.done", "output_index": 7, "item": reasoning}
+        yield {"type": "response.completed", "response": {
+            "id": "resp-1", "status": "completed", "output": [], "usage": {},
+        }}
+
+    result = await responses.consume(stream(), idle_seconds=1)
+    serialized = result.to_dict()
+    assert result.items[0].output_index == 7
+    assert result.provider_payload["items"] == [reasoning]
+    assert result.items[0].provider_data == reasoning
+    assert "_pgagent_output_index" not in repr(serialized)
+
+
+@pytest.mark.asyncio
 async def test_responses_interruption_preserves_completed_item_and_rejects_duplicate_done() -> None:
     local = {"type": "function_call", "id": "fn-1", "call_id": "call-1", "name": "bash", "arguments": "{}", "status": "completed"}
 
