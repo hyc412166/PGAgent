@@ -100,3 +100,15 @@ E:\anaconda3\envs\agent_dock\python.exe -m pytest tests/test_model_output.py tes
 Review RED（6 个聚焦场景）关键结果：`5 failed, 1 passed`。失败分别为未完成 response 返回 acting 并释放调用、hosted-only 被判 completed、engine 执行未完成 local item、空 hosted response 发布完成、错配 ToolResult 被接受。
 
 Review GREEN：同一 6 个场景 `6 passed`；完整 Task 3 聚焦 `70 passed`；engine/lifecycle 较宽兼容回归 `147 passed`。
+
+## Review 修复 round 2/5
+
+复审故障注入确认：engine 原先在 `_prepare_tool_result_message()` 构造 observation 之前就调用 `commit_local_result()`。当 transcript 构造抛出 `TypeError` 时，调用并未进入 `messages/transcript_delta`，ledger 却已变成 `result_committed`。
+
+RED：新增真实 runtime 回归，将 `_prepare_tool_result_message()` 替换为抛出 `TypeError("transcript construction failed")` 的故障点，并检查同一实际 ledger。结果 `1 failed`：预期 `running`，实际为 `result_committed`。
+
+最小修复：保留上一轮的真实 `ToolResult.tool_name` 匹配校验；仅把 `commit_local_result(call.id, tool_name=result.tool_name)` 移到 tool observation 已成功构造、追加到 `messages`，并写入 `transcript_delta/verification_trace` 之后。构造或追加过程中的任何异常都不会留下假提交。
+
+GREEN：故障注入与名称错配相邻测试 `2 passed`；完整 Task 3 聚焦 `71 passed`；engine/lifecycle 必要兼容回归 `148 passed`；`py_compile` 与 `git diff --check` 通过。
+
+修改文件：`backend/src/agent/engine.py`、`backend/tests/test_loop_guard.py` 与本报告。自审确认没有改变工具执行、审批、事件或 transcript 内容，只修正 ledger 提交时序；未修改 lifecycle/delivery、历史日志、spec 或 plan。

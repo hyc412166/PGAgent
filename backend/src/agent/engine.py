@@ -2489,8 +2489,6 @@ class AgentRuntime:
                 )
                 active_started_at += background_wait_seconds
 
-                # 先用真实结果名称完成归属校验，再构造 provider transcript。
-                output_ledger.commit_local_result(call.id, tool_name=result.tool_name)
                 # 变量说明：tool_message 表示当前步骤使用的 tool_message 值；artifact_refs 表示artifact_refs 集合。
                 tool_message, artifact_refs = self._prepare_tool_result_message(
                     tool_call_id=call.id,
@@ -2506,6 +2504,8 @@ class AgentRuntime:
                     "verification_trace": [*state.get("verification_trace", []), dict(tool_message)],
                     "context_artifact_refs": artifact_refs,
                 }
+                # 只有 observation 已成功进入 messages 与 transcript 后，结果才算完成提交。
+                output_ledger.commit_local_result(call.id, tool_name=result.tool_name)
                 if result.metadata.get("force_compaction"):
                     # 变量说明：state 的索引项 表示该语句创建或更新的目标数据。
                     state["force_compaction_reason"] = str(
