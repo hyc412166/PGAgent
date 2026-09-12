@@ -900,6 +900,55 @@ class BackgroundJobToolStore:
             db.commit()
             return [job.id for job in jobs]
 
+    def completion_boundary(self) -> dict[str, Any]:
+        """Atomically choose waiting, terminal observation, or clear completion.
+
+        The write transaction closes the race where a job could finish after
+        an active read but before waiter registration, leaving the Run asleep
+        without a terminal notification.
+        """
+
+        with database_module.SessionLocal() as db:
+            if db.get_bind().dialect.name == "sqlite":
+                db.execute(text("BEGIN IMMEDIATE"))
+            active = list(db.scalars(
+                select(BackgroundJob)
+                .where(
+                    self._ownership_clause(),
+                    BackgroundJob.status.in_({"queued", "running"}),
+                )
+                .order_by(BackgroundJob.created_at.asc(), BackgroundJob.id.asc())
+                .with_for_update()
+            ))
+            if active:
+                for job in active:
+                    job.waiting_run_id = self.run_id
+                payloads = [background_job_payload(job) for job in active]
+                db.commit()
+                return {"status": "waiting", "jobs": payloads}
+
+            terminal_query = (
+                select(BackgroundJob)
+                .where(
+                    self._ownership_clause(),
+                    BackgroundJob.status.in_(TERMINAL_BACKGROUND_STATUSES),
+                    BackgroundJob.observed_at.is_(None),
+                )
+                .order_by(BackgroundJob.created_at.asc(), BackgroundJob.id.asc())
+                .with_for_update()
+            )
+            if self._delivered_terminal_ids:
+                terminal_query = terminal_query.where(
+                    BackgroundJob.id.not_in(self._delivered_terminal_ids)
+                )
+            terminal = list(db.scalars(terminal_query))
+            payloads = [background_job_payload(job) for job in terminal]
+            db.commit()
+        if terminal:
+            self.track_terminal_deliveries([job.id for job in terminal])
+            return {"status": "observe", "results": payloads}
+        return {"status": "clear"}
+
     # 函数职责：完成 track_terminal_deliveries 对应的业务处理。
     # 参数关系：job_ids 表示job 对象标识集合。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。

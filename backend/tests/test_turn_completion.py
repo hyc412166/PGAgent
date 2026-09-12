@@ -256,3 +256,33 @@ def test_anonymous_responses_scope_synthetic_item_ids_per_response() -> None:
 
     assert ledger.decision().status is TurnStatus.COMPLETED
     assert ledger.decision().assistant_text == "完成"
+
+
+def test_ledger_snapshot_roundtrip_preserves_committed_and_running_states() -> None:
+    ledger = TurnLedger()
+    first = LocalToolCallItem(call_id="done", tool_name="read", arguments={"path": "a"})
+    second = LocalToolCallItem(call_id="running", tool_name="write", arguments={"path": "b"})
+    ledger.accept_response(_response("resp-ledger", first, second))
+    ledger.take_local_calls()
+    ledger.mark_local_running("done")
+    ledger.commit_local_result("done", tool_name="read")
+    ledger.mark_local_running("running")
+
+    restored = TurnLedger.from_snapshot(ledger.to_snapshot())
+
+    assert restored.local_status("done") is LocalToolStatus.RESULT_COMMITTED
+    assert restored.local_status("running") is LocalToolStatus.RUNNING
+    assert restored.take_local_calls() == []
+
+
+def test_ledger_snapshot_rejects_contradictory_call_identity() -> None:
+    ledger = TurnLedger()
+    ledger.accept_response(_response(
+        "resp-ledger",
+        LocalToolCallItem(call_id="call-1", tool_name="write", arguments={"path": "a"}),
+    ))
+    snapshot = ledger.to_snapshot()
+    snapshot["local_calls"][0]["tool_name"] = "delete"
+
+    with pytest.raises(ValueError, match="ledger snapshot"):
+        TurnLedger.from_snapshot(snapshot)

@@ -66,6 +66,22 @@ def test_legacy_snapshot_without_output_ledger_is_restored() -> None:
     assert restored.acceptance_report == {"passed": False}
 
 
+def test_new_snapshot_with_malformed_output_ledger_fails_closed() -> None:
+    with pytest.raises(ValueError, match="ledger snapshot"):
+        RunContinuationCodec.restore({
+            "status": "awaiting_approval",
+            "pending_approval": {
+                "id": "call-1",
+                "tool_name": "write_file",
+                "arguments": {"path": "x.txt", "content": "x"},
+            },
+            "output_ledger": {
+                "responses": "not-a-list",
+                "local_calls": [],
+            },
+        })
+
+
 @pytest.mark.asyncio
 # 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_coordinator_start_and_shutdown_bind_the_active_event_loop 精确标识本用例的具体条件。
 async def test_coordinator_start_and_shutdown_bind_the_active_event_loop() -> None:

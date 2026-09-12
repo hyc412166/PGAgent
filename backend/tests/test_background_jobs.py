@@ -460,7 +460,10 @@ def test_default_runtime_waits_for_background_job_before_completion(tmp_path: Pa
     runtime = AgentRuntime(
         model_call=model_call,
         tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
-        background_wait_provider=lambda: [{"id": "job-1", "status": "running"}],
+        background_wait_provider=lambda: {
+            "status": "waiting",
+            "jobs": [{"id": "job-1", "status": "running"}],
+        },
     )
     outcome = asyncio.run(runtime.run(
         system_prompt="safe",
@@ -470,6 +473,50 @@ def test_default_runtime_waits_for_background_job_before_completion(tmp_path: Pa
     assert outcome.stop_reason == "waiting_background"
     assert outcome.output is None
     assert outcome.output_ledger.decision().reason == "background_wait"
+
+
+def test_runtime_consumes_terminal_background_race_and_follows_up(background_store) -> None:
+    store, _manager = background_store
+    with database.SessionLocal() as db:
+        db.add(BackgroundJob(
+            id="job-race",
+            run_id=store.run_id,
+            session_id=store.session_id,
+            workspace_id=store.workspace_id,
+            workspace_root=store.workspace_root,
+            command="Write-Output ready",
+            shell="powershell",
+            status="completed",
+            timeout_seconds=30,
+            output_preview="ready",
+            exit_code=0,
+        ))
+        db.commit()
+
+    calls = 0
+
+    async def model_call(**kwargs) -> ModelTurn:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelTurn(content="premature")
+        assert "job-race" in str(kwargs["messages"])
+        return ModelTurn(content="final after background")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(store.workspace_root, allowed_tool_names=[]),
+        background_wait_provider=store.completion_boundary,
+    )
+    outcome = asyncio.run(runtime.run(
+        system_prompt="safe",
+        recent_messages=[{"role": "user", "content": "run"}],
+    ))
+
+    assert calls == 2
+    assert outcome.status == "completed"
+    assert outcome.output == "final after background"
+    assert store.delivered_terminal_ids() == ["job-race"]
 
 
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_terminal_job_writes_durable_collaboration_event 精确标识本用例的具体条件。

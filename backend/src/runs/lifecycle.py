@@ -2811,6 +2811,8 @@ class RunCoordinator:
                 prior = self._outcome_from_snapshot(snapshot.payload)
             if not prior.runtime_binding:
                 raise RuntimeError("运行快照缺少冻结配置，已拒绝在可变环境中续跑")
+            if prior.output_ledger is not None and prior.output_ledger.has_running_calls():
+                raise RuntimeError("运行快照包含状态不明确的 running 工具，禁止自动重试")
             # 变量说明：runtime 表示当前步骤使用的 runtime 值；context 表示当前步骤使用的 context 值。
             runtime, context = self._resolve_runtime(
                 run_id,
@@ -2847,6 +2849,7 @@ class RunCoordinator:
                     prior_verification_trace=prior.verification_trace,
                     prior_completion_verification_attempts=prior.completion_verification_attempts,
                     prior_acceptance_report=prior.acceptance_report,
+                    prior_output_ledger=prior.output_ledger,
                 )
             else:
                 # 变量说明：outcome 表示当前步骤使用的 outcome 值。
@@ -2895,6 +2898,8 @@ class RunCoordinator:
                 prior = self._outcome_from_snapshot(snapshot.payload)
             if not prior.runtime_binding:
                 raise RuntimeError("delegated child continuation is missing the frozen parent binding")
+            if prior.output_ledger is not None and prior.output_ledger.has_running_calls():
+                raise RuntimeError("delegated child snapshot contains an ambiguous running tool")
             # 变量说明：runtime 表示当前步骤使用的 runtime 值；context 表示当前步骤使用的 context 值。
             runtime, context = self._resolve_runtime(
                 run_id,

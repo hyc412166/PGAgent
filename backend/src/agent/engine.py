@@ -39,7 +39,7 @@ from .guards import GuardDecision, LoopGuard
 from .step_context import AgentStepContext
 from .loop import run_agent_loop
 from .state import RunState
-from .turn import LocalToolStatus, TurnLedger, TurnStatus
+from .turn import TurnLedger, TurnStatus
 from ..tools import ToolRegistry
 from ..tools.builtins import MAX_PARALLEL_DELEGATED_TASKS, normalize_delegate_requests
 from ..tools.types import ToolResult
@@ -795,7 +795,7 @@ class RunOutcome:
     # 变量说明：memory_citation 表示当前步骤使用的 memory_citation 值。
     memory_citation: dict[str, Any] = field(default_factory=dict)
     # 当前 Turn 的结构化响应/工具账本，用于跨进程恢复；旧调用方可省略。
-    output_ledger: TurnLedger = field(default_factory=TurnLedger)
+    output_ledger: TurnLedger | None = None
 
 
 # 变量说明：ModelCall 表示当前步骤使用的 ModelCall 值。
@@ -830,7 +830,7 @@ class AgentRuntime:
         conversation_compactor: ConversationCompactor | None = None,
         artifact_store: ArtifactStore | None = None,
         completion_verifier: CompletionVerifier | None = None,
-        background_wait_provider: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
+        background_wait_provider: Callable[[], Mapping[str, Any]] | None = None,
         task_state_provider: TaskStateProvider | None = None,
     ) -> None:
         # 变量说明：model_call 表示当前步骤使用的 model_call 值。
@@ -1851,8 +1851,9 @@ class AgentRuntime:
                 if turn_decision.status is TurnStatus.COMPLETED and self.background_wait_provider is not None:
                     # 后台作业属于 Turn 的结构化等待事实；不再通过 completion
                     # verifier 拒绝候选文本，直接阻止终态交付并等待事件恢复。
-                    active_background = list(self.background_wait_provider() or ())
-                    if active_background:
+                    background_boundary = dict(self.background_wait_provider() or {})
+                    boundary_status = str(background_boundary.get("status") or "clear")
+                    if boundary_status == "waiting":
                         output_ledger.set_waiting(background=True)
                         waiting = {
                             **state,
@@ -1870,6 +1871,25 @@ class AgentRuntime:
                             reason="后台作业仍在运行；等待终态事件后恢复。",
                         )
                         return waiting
+                    if boundary_status == "observe":
+                        terminal_results = list(background_boundary.get("results") or [])
+                        output_ledger.set_waiting(background=False)
+                        return {
+                            **state,
+                            "status": "observing",
+                            "messages": [
+                                *state.get("messages", []),
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[后台终态事件，不是新的用户请求]\n"
+                                        + json.dumps(terminal_results, ensure_ascii=False)[:20_000]
+                                    ),
+                                },
+                            ],
+                            "current_made_progress": True,
+                            "output_ledger": output_ledger,
+                        }
                 local_items = (
                     output_ledger.take_local_calls()
                     if turn_decision.status is TurnStatus.DRAINING_TOOLS
@@ -2452,6 +2472,7 @@ class AgentRuntime:
                     )
                     return failed
                 if result.approval_required:
+                    output_ledger.mark_local_awaiting_approval(call.id)
                     state["events"] = await self._publish(
                         {**state, "messages": messages},
                         "tool_finished",
@@ -2850,6 +2871,14 @@ class AgentRuntime:
         arguments = dict(pending.get("arguments") or {})
         if not call_id or not tool_name:
             raise ValueError("审批请求缺少 id 或 tool_name")
+        if prior.output_ledger is not None:
+            # 新快照必须在副作用边界前与账本完全一致；旧快照无账本时继续
+            # 使用持久化 pending call，保持历史恢复兼容。
+            prior.output_ledger.validate_approval_resume(
+                call_id=call_id,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
 
         # 函数职责：完成 elapsed_ms 对应的智能体处理。
         # 返回关系：结果用于更新运行状态、形成模型输入或发送给上层调用方。
@@ -2936,6 +2965,9 @@ class AgentRuntime:
             **safe_tool_argument_summary(tool_name, arguments),
             elapsed_ms=elapsed_ms(),
         )
+        if prior.output_ledger is not None:
+            prior.output_ledger.mark_local_running(call_id)
+            prior.output_ledger.set_waiting(approval=False)
         # 变量说明：result 表示本步骤处理结果。
         result = await self._dispatch_tool(
             tool_name,
@@ -2952,13 +2984,8 @@ class AgentRuntime:
         )
         # 变量说明：messages 表示模型消息序列。
         messages = [*prior.messages, approved_tool_message]
-        try:
-            # 审批恢复沿用快照中的 call id；账本缺失时保留旧快照兼容，不猜测其它调用。
-            if prior.output_ledger.local_status(call_id) is LocalToolStatus.SCHEDULED:
-                prior.output_ledger.mark_local_running(call_id)
+        if prior.output_ledger is not None:
             prior.output_ledger.commit_local_result(call_id, tool_name=result.tool_name)
-        except (ValueError, KeyError):
-            pass
         resume_transcript_delta.append(dict(approved_tool_message))
         resume_verification_trace.append(dict(approved_tool_message))
         # 变量说明：events 表示events 集合。
@@ -3619,4 +3646,5 @@ class AgentRuntime:
             prior_verification_trace=delegated_verification_trace,
             prior_completion_verification_attempts=prior.completion_verification_attempts,
             prior_acceptance_report=prior.acceptance_report,
+            prior_output_ledger=prior.output_ledger,
         )
