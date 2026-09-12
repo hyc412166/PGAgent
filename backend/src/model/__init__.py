@@ -6,6 +6,7 @@ from .gateway import ModelConfigurationError, PartialModelStreamError, ProviderC
 from .output import (
     AssistantMessageItem,
     EndTurn,
+    EndTurnInput,
     EndTurnValue,
     HostedToolItem,
     LocalToolCallItem,
@@ -17,6 +18,7 @@ from .output import (
     OutputPhase,
     ReasoningItem,
     ResponseStatus,
+    normalize_end_turn,
 )
 
 # 变量说明：__all__ 表示当前步骤使用的 __all__ 值。
@@ -27,6 +29,7 @@ __all__ = [
     "build_model_call",
     "AssistantMessageItem",
     "EndTurn",
+    "EndTurnInput",
     "EndTurnValue",
     "HostedToolItem",
     "LocalToolCallItem",
@@ -38,4 +41,5 @@ __all__ = [
     "OutputPhase",
     "ReasoningItem",
     "ResponseStatus",
+    "normalize_end_turn",
 ]

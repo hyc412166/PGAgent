@@ -6,12 +6,14 @@ import pytest
 
 from src.model import (
     AssistantMessageItem,
+    EndTurn,
     HostedToolItem,
     LocalToolCallItem,
     NormalizedModelResponse,
     OutputPhase,
     ReasoningItem,
     ResponseStatus,
+    normalize_end_turn,
 )
 
 
@@ -120,6 +122,32 @@ def test_missing_phase_and_end_turn_are_unknown_without_inference() -> None:
     assert item.end_turn == "unknown"
     assert item.to_dict()["phase"] == "unknown"
     assert item.to_dict()["end_turn"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        (True, EndTurn.TRUE),
+        (False, EndTurn.FALSE),
+        ("true", EndTurn.TRUE),
+        ("false", EndTurn.FALSE),
+        (None, EndTurn.UNKNOWN),
+    ],
+)
+def test_end_turn_uses_one_enum_representation_and_unknown_is_not_truthy(
+    raw_value: object,
+    expected: EndTurn,
+) -> None:
+    item = AssistantMessageItem(
+        response_id="resp-1",
+        item_id="message-0",
+        output_index=0,
+        end_turn=raw_value,  # type: ignore[arg-type]
+    )
+
+    assert item.end_turn is expected
+    assert bool(item.end_turn) is (expected is EndTurn.TRUE)
+    assert normalize_end_turn(raw_value) is expected
 
 
 def test_duplicate_item_id_is_rejected_before_response_is_accepted() -> None:

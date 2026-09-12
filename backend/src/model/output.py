@@ -35,14 +35,38 @@ class EndTurn(StrEnum):
     FALSE = "false"
     UNKNOWN = "unknown"
 
+    def __bool__(self) -> bool:
+        # unknown/false must never enter an ``if`` branch intended only for true.
+        return self is EndTurn.TRUE
+
 
 # end_turn 是 provider 的提示值；缺少该元数据时必须保留 unknown，不能从正文或工具调用猜测。
-EndTurnValue = bool | EndTurn
+EndTurnValue = EndTurn
+EndTurnInput = bool | str | EndTurn | None
+
+
+def normalize_end_turn(value: object) -> EndTurn:
+    """Normalize wire booleans and the unknown sentinel to one enum type."""
+
+    if value is None:
+        return EndTurn.UNKNOWN
+    if isinstance(value, EndTurn):
+        return value
+    if isinstance(value, bool):
+        return EndTurn.TRUE if value else EndTurn.FALSE
+    try:
+        return EndTurn(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unsupported end_turn value: {value!r}") from exc
 
 
 def _serializable(value: Any) -> Any:
     """Convert nested enums and dataclass values to ordinary JSON values."""
 
+    if isinstance(value, EndTurn):
+        if value is EndTurn.UNKNOWN:
+            return EndTurn.UNKNOWN.value
+        return value is EndTurn.TRUE
     if isinstance(value, StrEnum):
         return value.value
     if isinstance(value, Mapping):
@@ -92,7 +116,7 @@ class AssistantMessageItem(OutputItem):
 
     content: str = ""
     phase: OutputPhase | str = OutputPhase.UNKNOWN
-    end_turn: EndTurnValue | None = EndTurn.UNKNOWN
+    end_turn: EndTurnInput = EndTurn.UNKNOWN
     item_type: ClassVar[str] = "assistant_message"
 
     def __post_init__(self) -> None:
@@ -105,16 +129,7 @@ class AssistantMessageItem(OutputItem):
             self.phase = OutputPhase(self.phase)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"unsupported assistant message phase: {self.phase!r}") from exc
-        if self.end_turn is None:
-            self.end_turn = EndTurn.UNKNOWN
-        elif isinstance(self.end_turn, bool):
-            pass
-        elif self.end_turn in {EndTurn.TRUE, EndTurn.FALSE}:
-            self.end_turn = self.end_turn == EndTurn.TRUE
-        elif self.end_turn == EndTurn.UNKNOWN:
-            self.end_turn = EndTurn.UNKNOWN
-        else:
-            raise ValueError(f"unsupported end_turn value: {self.end_turn!r}")
+        self.end_turn = normalize_end_turn(self.end_turn)
 
 
 @dataclass(slots=True)
@@ -270,6 +285,7 @@ NormalizedResponse = NormalizedModelResponse
 __all__ = [
     "AssistantMessageItem",
     "EndTurn",
+    "EndTurnInput",
     "EndTurnValue",
     "HostedToolItem",
     "LocalToolCallItem",
@@ -281,4 +297,5 @@ __all__ = [
     "OutputPhase",
     "ReasoningItem",
     "ResponseStatus",
+    "normalize_end_turn",
 ]
