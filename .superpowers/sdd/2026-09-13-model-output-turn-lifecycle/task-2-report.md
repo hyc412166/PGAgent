@@ -59,3 +59,30 @@ E:\\anaconda3\\envs\\agent_dock\\python.exe -m pytest tests/test_model_gateway.p
 - Chat Completions 没有 phase/end_turn 来源，adapter 不根据文本、finish reason 或工具数量推断，始终为 `unknown`。
 - 响应重复 item 以 id（无 id 时以 output index）去重；不同 item id 但重复 call id 仍由 `NormalizedModelResponse` 拒绝，防止副作用重复调度。
 - 当前断流异常的 `completed_items` 保持原生 dict 形态，这是 request 兼容路径所需；完整 response 返回标准 item，后续 Turn ledger 可直接消费。
+
+## Review 修复
+
+Important review 项已按 TDD 修复：
+
+- `StreamInterrupted` 重新抛出前显式附加当前已完成 items；普通连接异常也继续转换为携带相同 items 的中断异常。
+- `output_item.done` 以 provider item id/output index 去重；相同 completed 事件只接受一次，不会把重复工具带入 request 的中断交付路径。不同 item 复用 call id 会作为确定性 `ValueError` 暴露，不包装成可重试断流。
+- `response.completed.output` 内部的重复 item id 不再静默丢弃，而是在接受 response 前拒绝；同一 item 在 done 与 completed 各出现一次仍正常合并。
+- Assistant item callback 采用“累计正文状态变化才发送”的语义；done/completed 重带同一正文不重复回调。最终 phase/end_turn 始终可从 normalized response 读取，reasoning 不进入 Assistant callback。
+- request 使用独立的 `normalized_response` 与 `legacy_response` 变量，旧 mapping 新增 `_pgagent_normalized_response` sidecar；Responses hosted/message、Chat unknown hints 和中断完成工具都可被后续 Turn ledger 直接读取。
+- Chat Completions 到达合法 finish reason 后若 usage 尾流中断，保留已确认完成的标准 response，并记录 `_stream_tail_error` 用量元数据。
+
+修复 RED（`backend` cwd）：
+
+```text
+E:\\anaconda3\\envs\\agent_dock\\python.exe -m pytest tests/test_model_protocol_output.py -q
+```
+
+关键输出：`3 failed, 3 passed`。失败分别为 duplicate done 被保留两次、final output 重复 id 未拒绝、Assistant done 回调重复同一正文状态；request sidecar 的变量覆盖由 review 静态复核确认。
+
+修复 GREEN 与聚焦回归：
+
+```text
+E:\\anaconda3\\envs\\agent_dock\\python.exe -m pytest tests/test_model_protocol_output.py tests/test_model_gateway.py tests/test_model_responses.py tests/test_loop_guard.py -q
+```
+
+结果：`107 passed`。`compileall -q src/model` 和 `git diff --check` 通过。pytest 结束时仍有本机临时目录清理 `PermissionError`（所有测试已完成且为通过状态），与被测代码无关。

@@ -15,6 +15,7 @@ from src.model.output import (
 )
 from src.model.protocols import chat_completions, responses
 from src.model.config import ProviderConfig
+from src.model.streaming import StreamInterrupted
 
 
 def _config() -> ProviderConfig:
@@ -74,6 +75,48 @@ async def test_responses_interruption_keeps_only_completed_items() -> None:
 
 
 @pytest.mark.asyncio
+async def test_responses_interruption_preserves_completed_item_and_rejects_duplicate_done() -> None:
+    local = {"type": "function_call", "id": "fn-1", "call_id": "call-1", "name": "bash", "arguments": "{}", "status": "completed"}
+
+    async def interrupted() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.output_item.done", "item": local}
+        yield {"type": "response.output_item.done", "item": local}
+        raise StreamInterrupted("closed")
+
+    with pytest.raises(Exception) as captured:
+        await responses.consume(interrupted(), idle_seconds=1)
+    assert getattr(captured.value, "completed_items", []) == [local]
+
+
+@pytest.mark.asyncio
+async def test_responses_rejects_duplicate_ids_inside_completed_output() -> None:
+    item = {"type": "message", "id": "msg-1", "status": "completed", "content": []}
+
+    async def stream() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.completed", "response": {
+            "id": "resp-1", "status": "completed", "output": [item, item],
+        }}
+
+    with pytest.raises(ValueError, match="duplicate item id"):
+        await responses.consume(stream(), idle_seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_assistant_item_callback_emits_each_content_state_once() -> None:
+    item = {"type": "message", "id": "msg-1", "status": "completed", "content": [{"type": "output_text", "text": "ab"}]}
+
+    async def stream() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.output_text.delta", "item_id": "msg-1", "delta": "a"}
+        yield {"type": "response.output_text.delta", "item_id": "msg-1", "delta": "b"}
+        yield {"type": "response.output_item.done", "item": item}
+        yield {"type": "response.completed", "response": {"status": "completed", "output": [item]}}
+
+    seen: list[str] = []
+    await responses.consume(stream(), idle_seconds=1, on_assistant_item=lambda value: seen.append(value.content))
+    assert seen == ["a", "ab"]
+
+
+@pytest.mark.asyncio
 async def test_chat_completions_normalizes_content_and_tool_fragments_with_unknown_hints() -> None:
     async def stream() -> AsyncIterator[dict[str, Any]]:
         yield {"id": "chat-1", "choices": [{"delta": {"content": "答"}}]}
@@ -94,3 +137,18 @@ async def test_chat_completions_normalizes_content_and_tool_fragments_with_unkno
     assert assistant.end_turn is EndTurn.UNKNOWN
     assert any(isinstance(item, LocalToolCallItem) for item in result.items)
 
+
+@pytest.mark.asyncio
+async def test_chat_completions_preserves_confirmed_finish_when_usage_tail_breaks() -> None:
+    async def stream() -> AsyncIterator[dict[str, Any]]:
+        yield {"id": "chat-1", "choices": [{"delta": {"content": "完成"}}]}
+        yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+        raise ConnectionError("usage tail closed")
+
+    result = await chat_completions.consume(
+        stream(), config=_config(), model="gpt-test", idle_seconds=1,
+        on_delta=None, on_thought_delta=None, on_activity=None,
+    )
+    assert result.status is ResponseStatus.COMPLETED
+    assert result.finish_reason == "stop"
+    assert result.items[0].content == "完成"

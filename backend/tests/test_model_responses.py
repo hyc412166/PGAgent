@@ -312,6 +312,10 @@ async def test_responses_keeps_hosted_web_search_call_out_of_local_dispatch(
     assert response["content"] == "检索完成。"
     assert response["tool_calls"] == []
     assert response["_pgagent_provider"]["items"] == [web_search_call, message]
+    normalized = response["_pgagent_normalized_response"]
+    assert [item.item_type for item in normalized.items] == ["hosted_tool", "assistant_message"]
+    assert normalized.items[1].phase.value == "unknown"
+    assert normalized.items[1].end_turn.value == "unknown"
     assert input_items([{
         "role": "assistant",
         "content": response["content"],

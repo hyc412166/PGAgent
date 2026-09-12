@@ -103,34 +103,43 @@ def create_model_call(config: ProviderConfig, *, credentials):
                                     f"response.{str(raw.get('status') or 'unknown')}",
                                 )
                             # 变量说明：payload 表示跨层传递的数据载荷。
-                            normalized = responses.normalize_response(raw)
-                            payload = responses.to_legacy_payload(normalized)
+                            normalized_response = responses.normalize_response(raw)
+                            payload = responses.to_legacy_payload(normalized_response)
                             await _emit_delta(on_thought_delta, payload["reasoning_content"])
                             callback = on_assistant_item or on_item
                             if callback is not None:
-                                for item in normalized.items:
+                                for item in normalized_response.items:
                                     if item.item_type == "assistant_message":
                                         result = callback(item)
                                         if inspect.isawaitable(result):
                                             await result
                         else:
                             # 变量说明：payload 表示跨层传递的数据载荷。
-                            normalized = await responses.consume(stream, idle_seconds=settings.model_timeout_seconds,
+                            normalized_response = await responses.consume(stream, idle_seconds=settings.model_timeout_seconds,
                                 on_delta=on_delta, on_thought_delta=on_thought_delta,
                                 on_activity=on_activity, on_assistant_item=on_assistant_item,
                                 on_item=on_item)
-                            payload = responses.to_legacy_payload(normalized)
+                            payload = responses.to_legacy_payload(normalized_response)
                         # 变量说明：items 表示待处理的元素集合。
-                        items = [*completed, *payload["_pgagent_provider"]["items"]]
+                        items = responses.merge_replayed_items(
+                            completed,
+                            [dict(item) for item in payload["_pgagent_provider"]["items"]],
+                        )
                         # 变量说明：payload 表示跨层传递的数据载荷。
                         payload = responses.project_items(items, payload.get("usage"))
+                        normalized_response = responses.normalize_response({
+                            "id": normalized_response.response_id,
+                            "status": "completed",
+                            "output": items,
+                            "usage": payload.get("usage") or {},
+                        })
                     elif hasattr(stream, "__aiter__"):
                         # 变量说明：payload 表示跨层传递的数据载荷。
-                        normalized = await chat_completions.consume(stream, config=config, model=config.model_id,
+                        normalized_response = await chat_completions.consume(stream, config=config, model=config.model_id,
                             idle_seconds=settings.model_timeout_seconds, on_delta=on_delta,
                             on_thought_delta=on_thought_delta, on_activity=on_activity,
                             on_assistant_item=on_assistant_item, on_item=on_item)
-                        payload = chat_completions.to_legacy_payload(normalized)
+                        payload = chat_completions.to_legacy_payload(normalized_response)
                     else:
                         # 变量说明：payload 表示跨层传递的数据载荷。
                         payload = _as_mapping(stream)
@@ -144,21 +153,25 @@ def create_model_call(config: ProviderConfig, *, credentials):
                                 f"模型响应未完整结束：{finish}",
                                 provider_error_code=provider_error_code,
                             )
-                        normalized = chat_completions.normalize_response(payload, model=config.model_id)
+                        normalized_response = chat_completions.normalize_response(payload, model=config.model_id)
                         callback = on_assistant_item or on_item
                         if callback is not None:
-                            for item in normalized.items:
+                            for item in normalized_response.items:
                                 if item.item_type == "assistant_message":
                                     result = callback(item)
                                     if inspect.isawaitable(result):
                                         await result
-                        payload = chat_completions.to_legacy_payload(normalized)
+                        payload = chat_completions.to_legacy_payload(normalized_response)
                         await _emit_delta(on_thought_delta, _assistant_reasoning(payload))
                         await _emit_delta(on_delta, _assistant_content(payload))
                     # 变量说明：normalized 表示当前步骤使用的 normalized 值。
-                    normalized = _normalized_payload(payload, config)
-                    normalized["usage"]["request_count"] = requests
-                    return normalized
+                    legacy_response = _normalized_payload(payload, config)
+                    legacy_response["usage"]["request_count"] = requests
+                    # 旧 engine 继续读取 mapping；新 Turn ledger 可直接消费
+                    # adapter 的结构化响应，不需要从扁平文本反推 item。
+                    normalized_response.usage = dict(legacy_response["usage"])
+                    legacy_response["_pgagent_normalized_response"] = normalized_response
+                    return legacy_response
                 except StreamInterrupted as exc:
                     completed.extend(exc.completed_items)
                     # 已完成的工具调用先交给执行器，绝不以缺失工具结果的历史重新采样。
@@ -166,6 +179,13 @@ def create_model_call(config: ProviderConfig, *, credentials):
                         # 变量说明：payload 表示跨层传递的数据载荷。
                         payload = _normalized_payload(responses.project_items(completed), config)
                         payload["usage"]["request_count"] = requests
+                        interrupted_response = responses.normalize_response({
+                            "status": "incomplete",
+                            "output": completed,
+                            "usage": payload["usage"],
+                        })
+                        interrupted_response.usage = dict(payload["usage"])
+                        payload["_pgagent_normalized_response"] = interrupted_response
                         return payload
                     if retries >= settings.model_stream_retries:
                         # 变量说明：completed_items 表示当前流程使用的 completed_items 集合。
