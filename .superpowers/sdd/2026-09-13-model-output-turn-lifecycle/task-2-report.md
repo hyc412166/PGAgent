@@ -119,3 +119,11 @@ E:\\anaconda3\\envs\\agent_dock\\python.exe -m pytest tests/test_model_responses
 关键输出：第三次请求 input 中相同 anonymous reasoning item 计数为 2，断言失败。
 
 GREEN：同一用例 `1 passed`。完整 Task 2 + loop guard 聚焦回归 `109 passed`；测试同时断言内部 index 不出现在 provider input、旧 provider payload 或 normalized sidecar provider payload。`compileall -q src/model` 通过。
+
+## Direct consume 私有 index 泄漏复查修复
+
+复查发现直接调用 streaming `responses.consume()` 时，正常返回和已确认完成的 tail 分支会把内部 accumulator item 原样放入 `NormalizedModelResponse.provider_payload`；reasoning/provider-hosted item 的 `provider_data/details` 也沿用了同一原始 mapping。现统一用 `_provider_item()` 清理副本构造这三个公开/续接字段，同时标准 item 的 `output_index` 仍从内部标识读取，兼顾有序账本与 provider payload 纯净性。
+
+RED：anonymous reasoning item 使用 `response.output_item.done.output_index=7`，direct consume 后 `provider_payload.items` 出现 `_pgagent_output_index: 7`，断言失败。
+
+GREEN：direct consume 聚焦回归 `1 passed`；完整 Task 2 + loop guard 聚焦回归 `110 passed`；`compileall -q src/model` 通过。测试断言标准 item 保留 `output_index=7`，而 provider payload、ReasoningItem.provider_data 和完整 `to_dict()` 均无 adapter 私有字段。
