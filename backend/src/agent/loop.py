@@ -7,6 +7,7 @@ import inspect
 from typing import Awaitable, Callable
 
 from .state import RunState
+from .turn import TurnStatus
 
 
 # 节点接受当前运行状态，允许同步返回或异步更新；调度器统一处理两种实现。
@@ -41,10 +42,10 @@ async def run_agent_loop(
 
     # 变量说明：state 表示当前运行状态。
     state = await _invoke(prepare_context, initial)
-    while state.get("status") == "acting":
+    while state.get("status") == TurnStatus.ACTING.value:
         # 变量说明：state 表示当前运行状态。
         state = await _invoke(act, state)
-        if state.get("status") != "observing":
+        if state.get("status") != TurnStatus.OBSERVING.value:
             break
         # 变量说明：state 表示当前运行状态。
         state = await _invoke(observe, state)
