@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+import json
 from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
@@ -173,6 +174,37 @@ class TurnLedger:
         self._awaiting_approval = approval
         self._background_wait = background
 
+    def mark_local_awaiting_approval(self, call_id: str) -> None:
+        """Record that policy stopped the call before its side effect executed."""
+
+        record = self._local_record(call_id)
+        if record.status is LocalToolStatus.RESULT_COMMITTED:
+            raise ValueError(f"local tool result already committed: {call_id}")
+        record.status = LocalToolStatus.SCHEDULED
+        self._awaiting_approval = True
+
+    def validate_approval_resume(
+        self,
+        *,
+        call_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Reject a changed or ambiguous approval before dispatching its tool."""
+
+        if not self._awaiting_approval:
+            raise ValueError("approval ledger is not awaiting approval")
+        record = self._local_record(call_id)
+        if record.status is not LocalToolStatus.SCHEDULED:
+            raise ValueError(f"approval ledger call is ambiguous: {call_id}={record.status.value}")
+        expected_arguments = json.dumps(record.item.arguments, sort_keys=True, separators=(",", ":"))
+        actual_arguments = json.dumps(dict(arguments), sort_keys=True, separators=(",", ":"))
+        if record.item.tool_name != tool_name or expected_arguments != actual_arguments:
+            raise ValueError("approval request does not match output ledger")
+
+    def has_running_calls(self) -> bool:
+        return any(record.status is LocalToolStatus.RUNNING for record in self._local_calls.values())
+
     def mark_stopped(self) -> None:
         self._stopped = True
 
@@ -204,11 +236,11 @@ class TurnLedger:
 
     @classmethod
     def from_snapshot(cls, payload: Mapping[str, Any] | None) -> "TurnLedger":
-        """Restore a ledger conservatively; malformed optional data is ignored."""
+        """Restore an exact ledger or reject a contradictory current snapshot."""
 
-        ledger = cls()
         if not isinstance(payload, Mapping):
-            return ledger
+            raise ValueError("ledger snapshot must be an object")
+        ledger = cls()
         # Responses are validated through the same constructor used on the
         # live path, so corrupt snapshots fail closed instead of executing a
         # potentially ambiguous side-effect call.
@@ -227,17 +259,22 @@ class TurnLedger:
                 "local_tool_call": LocalToolCallItem,
                 "hosted_tool": HostedToolItem,
             }
-            for raw_response in payload.get("responses") or []:
+            raw_responses = payload.get("responses")
+            raw_calls = payload.get("local_calls")
+            raw_taken = payload.get("taken_local_call_ids")
+            if not isinstance(raw_responses, list) or not isinstance(raw_calls, list) or not isinstance(raw_taken, list):
+                raise ValueError("ledger snapshot collections must be lists")
+            for raw_response in raw_responses:
                 if not isinstance(raw_response, Mapping):
-                    continue
+                    raise ValueError("ledger snapshot response must be an object")
                 items = []
                 for raw_item in raw_response.get("items") or []:
                     if not isinstance(raw_item, Mapping):
-                        continue
+                        raise ValueError("ledger snapshot item must be an object")
                     item_type = str(raw_item.get("type") or raw_item.get("item_type") or "")
                     item_cls = item_types.get(item_type)
                     if item_cls is None:
-                        continue
+                        raise ValueError(f"ledger snapshot item type is unsupported: {item_type}")
                     values = dict(raw_item)
                     values.pop("type", None)
                     values.pop("item_type", None)
@@ -251,33 +288,42 @@ class TurnLedger:
                     usage=dict(raw_response.get("usage") or {}),
                     finish_reason=raw_response.get("finish_reason"),
                 ))
-        except (TypeError, ValueError, KeyError):
-            return cls()
-        ledger._taken_local_call_ids = {
-            str(call_id) for call_id in payload.get("taken_local_call_ids") or [] if str(call_id)
-        }
-        for raw_call in payload.get("local_calls") or []:
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError(f"invalid ledger snapshot: {exc}") from exc
+
+        declared_call_ids = set(ledger._local_calls)
+        persisted_call_ids: set[str] = set()
+        for raw_call in raw_calls:
             if not isinstance(raw_call, Mapping):
-                continue
+                raise ValueError("invalid ledger snapshot local call")
             call_id = str(raw_call.get("call_id") or "")
-            if not call_id or call_id in ledger._local_calls:
-                continue
+            if not call_id or call_id in persisted_call_ids:
+                raise ValueError("invalid ledger snapshot local call id")
+            persisted_call_ids.add(call_id)
             try:
-                from src.model.output import LocalToolCallItem
-                item = LocalToolCallItem(
-                    call_id=call_id,
-                    tool_name=str(raw_call.get("tool_name") or ""),
-                    arguments=dict(raw_call.get("arguments") or {}),
-                )
                 status = LocalToolStatus(str(raw_call.get("status") or LocalToolStatus.SCHEDULED.value))
-            except (TypeError, ValueError):
-                continue
-            ledger._local_calls[call_id] = _LocalToolRecord(
-                item=item,
-                status=status,
-                observed_by_model=bool(raw_call.get("observed_by_model")),
-            )
-        ledger._hosted_tool_count = max(0, int(payload.get("hosted_tool_count") or ledger._hosted_tool_count))
+                record = ledger._local_record(call_id)
+                expected_arguments = json.dumps(record.item.arguments, sort_keys=True, separators=(",", ":"))
+                persisted_arguments = json.dumps(raw_call.get("arguments"), sort_keys=True, separators=(",", ":"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid ledger snapshot local call: {call_id}") from exc
+            if record.item.tool_name != str(raw_call.get("tool_name") or "") or expected_arguments != persisted_arguments:
+                raise ValueError(f"ledger snapshot call identity mismatch: {call_id}")
+            record.status = status
+            record.observed_by_model = bool(raw_call.get("observed_by_model"))
+        if persisted_call_ids != declared_call_ids:
+            raise ValueError("ledger snapshot call set does not match responses")
+        ledger._taken_local_call_ids = {str(call_id) for call_id in raw_taken if str(call_id)}
+        if not ledger._taken_local_call_ids.issubset(declared_call_ids):
+            raise ValueError("ledger snapshot taken call is unknown")
+        if any(
+            record.status is not LocalToolStatus.SCHEDULED and call_id not in ledger._taken_local_call_ids
+            for call_id, record in ledger._local_calls.items()
+        ):
+            raise ValueError("ledger snapshot active call was never taken")
+        persisted_hosted_count = max(0, int(payload.get("hosted_tool_count") or 0))
+        if persisted_hosted_count != ledger._hosted_tool_count:
+            raise ValueError("ledger snapshot hosted tool count mismatch")
         ledger._awaiting_approval = bool(payload.get("awaiting_approval"))
         ledger._background_wait = bool(payload.get("background_wait"))
         ledger._stopped = bool(payload.get("stopped"))

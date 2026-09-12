@@ -113,5 +113,9 @@ class RunContinuationCodec:
                 int(payload.get("completion_verification_attempts") or 0),
             ),
             memory_citation=dict(payload.get("memory_citation") or {}),
-            output_ledger=TurnLedger.from_snapshot(payload.get("output_ledger")),
+            output_ledger=(
+                TurnLedger.from_snapshot(payload["output_ledger"])
+                if "output_ledger" in payload
+                else None
+            ),
         )

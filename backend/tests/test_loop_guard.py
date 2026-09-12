@@ -1246,6 +1246,25 @@ async def test_resume_guard_stop_is_published_to_event_sink(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_approval_resume_rejects_ledger_mismatch_before_dispatch(tmp_path) -> None:
+    async def model_call(**_kwargs) -> ModelTurn:
+        return ModelTurn(tool_calls=[write_call("write-call", "allowed.txt", "safe")])
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="ask"),
+    )
+    waiting = await runtime.run(system_prompt="safe", recent_messages=[])
+    waiting.pending_approval["arguments"] = {"path": "tampered.txt", "content": "unsafe"}
+
+    with pytest.raises(ValueError, match="approval.*ledger"):
+        await runtime.resume_after_approval(waiting)
+
+    assert not (tmp_path / "allowed.txt").exists()
+    assert not (tmp_path / "tampered.txt").exists()
+
+
+@pytest.mark.asyncio
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_aggregates_usage_across_all_model_turns 精确标识本用例的具体条件。
 async def test_runtime_aggregates_usage_across_all_model_turns(tmp_path) -> None:
     turn = 0
