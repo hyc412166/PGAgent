@@ -428,6 +428,16 @@ def test_completion_verifier_consumes_terminal_race_instead_of_dead_waiting(tmp_
     assert decision.report["background_jobs"] == [{"id": "job-race", "status": "completed"}]
 
 
+# 测试场景：默认生命周期不应安装旧验收器，完成边界由 TurnLedger 决定；显式工作流仍可自行注入 verifier。
+def test_default_lifecycle_does_not_install_completion_verifier(tmp_path: Path) -> None:
+    runtime = AgentRuntime(
+        model_call=lambda **_kwargs: None,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+    )
+    RunCoordinator._install_completion_verifier(runtime, {"runtime_binding": {}})
+    assert runtime.completion_verifier is None
+
+
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_terminal_job_writes_durable_collaboration_event 精确标识本用例的具体条件。
 def test_terminal_job_writes_durable_collaboration_event(background_store) -> None:
     store, _manager = background_store

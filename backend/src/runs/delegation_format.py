@@ -49,10 +49,8 @@ from src.persistence.database import (
 from .configuration import _enabled_connection_models
 from src.agent import (
     AgentRuntime,
-    CompletionDecision,
     RunOutcome,
     RuntimeConfig,
-    decide_deterministic_completion,
     normalize_usage,
 )
 

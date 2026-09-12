@@ -1,7 +1,7 @@
-"""Deterministic completion checks shared by production and parity tests.
+"""Legacy deterministic completion helpers.
 
-The checks in this module deliberately avoid model judgement. They are the
-complete main-agent completion gate: no secondary LLM evaluator is involved.
+The default runtime no longer installs or invokes these checks.  They remain
+available for explicit workflow policies and for reading historical reports.
 """
 # 文件职责：负责智能体状态机、模型行动、工具观察与完成判定。
 # 逻辑关系：本模块接收上层运行服务的输入，推进智能体执行后把状态、事件或结果返回调用层。

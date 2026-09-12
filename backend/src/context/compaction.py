@@ -49,10 +49,8 @@ from src.persistence.database import (
 from src.persistence.run_events import append_run_event
 from src.agent import (
     AgentRuntime,
-    CompletionDecision,
     RunOutcome,
     RuntimeConfig,
-    decide_deterministic_completion,
     normalize_usage,
 )
 from src.context import ContextManager, FilesystemArtifactStore

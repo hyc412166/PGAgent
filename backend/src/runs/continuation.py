@@ -46,7 +46,7 @@ class RunContinuationCodec:
     def snapshot(outcome: RunOutcome) -> dict[str, Any]:
         # 变量说明：messages 表示发送给模型或客户端的消息序列。
         messages = [] if outcome.stop_reason == "acceptance_failed" else outcome.messages
-        return _json_safe({
+        snapshot = _json_safe({
             "status": outcome.status,
             "output": outcome.output,
             "messages": messages,
@@ -69,6 +69,12 @@ class RunContinuationCodec:
             "completion_verification_attempts": outcome.completion_verification_attempts,
             "memory_citation": outcome.memory_citation,
         })
+        # 新版运行时可提供已经投影为 mapping 的账本；旧 RunOutcome 没有
+        # 该属性时保持原快照形状，恢复路径不会因字段缺失而失败。
+        output_ledger = getattr(outcome, "output_ledger", None)
+        if isinstance(output_ledger, dict):
+            snapshot["output_ledger"] = _json_safe(output_ledger)
+        return snapshot
 
     # 函数职责：完成 restore 对应的业务处理。
     # 参数关系：payload 表示跨层传递的数据载荷。
