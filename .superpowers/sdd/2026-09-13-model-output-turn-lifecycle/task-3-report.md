@@ -86,3 +86,17 @@ E:\anaconda3\envs\agent_dock\python.exe -m pytest tests/test_model_output.py tes
 - ledger 的快照序列化与审批恢复所有权属于 Task 4。本任务只保存运行内对象；Task 4 必须连同 scheduled/running/result_committed、taken 集合和精确 pending call 一起恢复，不能自动重试状态不明确的副作用调用。
 - 为兼容历史 `ModelTurn` 测试中跨 response 复用 call id 的行为，旧 `ModelTurn` 投影每个 response 使用独立 ledger，重复行为仍由既有 LoopGuard 截止；adapter sidecar 新路径在整个 Turn 内严格拒绝重复 call id。
 - completion verifier、持久终态发布顺序和新 SSE/RunEvent 不属于 Task 3，分别保留给 Task 4/5；本任务没有修改 lifecycle/delivery 文件。
+
+## Review 修复
+
+独立审查复现的三个 Important 问题已按 TDD 修复：
+
+1. `take_local_calls()` 原先在 engine 检查 response 状态之前执行，使 `in_progress/unknown` response 中的 local item 可能越过完成边界。本轮先用 ledger 与 engine 测试复现；现在未完成 response 产生 `model_response_incomplete` 失败决定，且 take 仅在决定为 `draining_tools` 时释放调用。
+2. hosted-only/空 Assistant response 原先会产生 `completed`。现在只有非空 Assistant 正文才允许 Turn 完成；空成功输出稳定收敛为 `failed + empty_model_output`，不发布虚假 `run_completed`。带 local tool 的 response 仍先 drain，显式 `end_turn=false` 仍可请求 follow-up。
+3. 结果提交原先把 invocation 的 `call.name` 同时作为预期名和实际名。现在 engine 先比较真实 `ToolResult.tool_name` 与 invocation 名称；错配返回可观察的 `ToolResultMismatch/tool_result_mismatch`，不提交 ledger、不构造 tool transcript，也不发起后续模型调用。名称匹配后，ledger 使用真实结果名完成单次 commit。
+
+审批批次回归同时确认：`take_local_calls()` 只预留批次；首个调用真实 dispatch 后为 `running`，未 dispatch 的 remaining calls 保持 `scheduled`。
+
+Review RED（6 个聚焦场景）关键结果：`5 failed, 1 passed`。失败分别为未完成 response 返回 acting 并释放调用、hosted-only 被判 completed、engine 执行未完成 local item、空 hosted response 发布完成、错配 ToolResult 被接受。
+
+Review GREEN：同一 6 个场景 `6 passed`；完整 Task 3 聚焦 `70 passed`；engine/lifecycle 较宽兼容回归 `147 passed`。

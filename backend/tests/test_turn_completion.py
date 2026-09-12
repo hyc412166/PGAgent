@@ -154,6 +154,71 @@ def test_hosted_tools_are_counted_but_excluded_from_local_drain() -> None:
     assert ledger.decision().reason == "local_tool_results"
 
 
+def test_incomplete_response_does_not_release_completed_local_item() -> None:
+    ledger = TurnLedger()
+    ledger.accept_response(NormalizedModelResponse(
+        response_id="resp-in-progress",
+        status="in_progress",
+        items=[LocalToolCallItem(
+            response_id="resp-in-progress",
+            item_id="tool-pending",
+            call_id="call-pending",
+            tool_name="apply_patch",
+            arguments={"patch": "must not run"},
+        )],
+    ))
+
+    decision = ledger.decision()
+    assert decision.status is TurnStatus.FAILED
+    assert decision.reason == "model_response_incomplete"
+    assert ledger.take_local_calls() == []
+    assert ledger.local_status("call-pending") is LocalToolStatus.SCHEDULED
+
+
+def test_hosted_only_response_without_assistant_text_is_not_completed() -> None:
+    ledger = TurnLedger()
+    ledger.accept_response(_response(
+        "resp-hosted",
+        HostedToolItem(
+            response_id="resp-hosted",
+            item_id="hosted-only",
+            call_id="hosted-call",
+            tool_name="web_search",
+        ),
+    ))
+
+    decision = ledger.decision()
+    assert decision.status is TurnStatus.FAILED
+    assert decision.reason == "empty_model_output"
+
+
+def test_approval_pause_keeps_undispatched_calls_scheduled() -> None:
+    ledger = TurnLedger()
+    first = LocalToolCallItem(
+        response_id="resp-batch",
+        item_id="first",
+        call_id="first",
+        tool_name="apply_patch",
+        arguments={"patch": "first"},
+    )
+    second = LocalToolCallItem(
+        response_id="resp-batch",
+        item_id="second",
+        call_id="second",
+        tool_name="apply_patch",
+        arguments={"patch": "second"},
+    )
+    ledger.accept_response(_response("resp-batch", first, second))
+    assert ledger.take_local_calls() == [first, second]
+
+    ledger.mark_local_running("first")
+    ledger.set_waiting(approval=True)
+
+    assert ledger.local_status("first") is LocalToolStatus.RUNNING
+    assert ledger.local_status("second") is LocalToolStatus.SCHEDULED
+    assert ledger.decision().status is TurnStatus.AWAITING_APPROVAL
+
+
 def test_duplicate_local_call_id_is_rejected_before_second_dispatch() -> None:
     ledger = TurnLedger()
     first = LocalToolCallItem(
