@@ -263,6 +263,10 @@ async def test_gateway_aggregates_streamed_text_and_usage(monkeypatch: pytest.Mo
     assert response["usage"]["output_tokens"] == 2
     assert response["usage"]["cost_usd"] == 0.01
     assert deltas == ["hello ", "world"]
+    normalized = response["_pgagent_normalized_response"]
+    assert normalized.items[0].content == "hello world"
+    assert normalized.items[0].phase.value == "unknown"
+    assert normalized.items[0].end_turn.value == "unknown"
 
 
 @pytest.mark.asyncio

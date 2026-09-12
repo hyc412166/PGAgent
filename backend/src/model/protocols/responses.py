@@ -206,12 +206,33 @@ def _merge_items(done_items: list[dict[str, Any]], final_items: list[dict[str, A
         current = dict(item)
         key = _item_key(current, index)
         if key in seen:
-            continue
+            label = "item id" if key[0] == "id" else "output_index"
+            raise ValueError(f"duplicate {label}: {key[1]}")
         seen.add(key)
         merged.append(current)
     for index, item in enumerate(done_items):
         current = dict(item)
         key = _item_key(current, index)
+        if key not in seen:
+            seen.add(key)
+            merged.append(current)
+    return merged
+
+
+def merge_replayed_items(
+    prior_items: list[dict[str, Any]], current_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep replay history first while suppressing a provider repeat once."""
+    merged = [dict(item) for item in prior_items]
+    seen = {_item_key(item, index) for index, item in enumerate(merged)}
+    current_seen: set[tuple[str, Any]] = set()
+    for index, item in enumerate(current_items):
+        current = dict(item)
+        key = _item_key(current, len(merged) + index)
+        if key in current_seen:
+            label = "item id" if key[0] == "id" else "output_index"
+            raise ValueError(f"duplicate {label}: {key[1]}")
+        current_seen.add(key)
         if key not in seen:
             seen.add(key)
             merged.append(current)
@@ -292,13 +313,25 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
                   on_activity=None, on_assistant_item=None, on_item=None) -> NormalizedModelResponse:
     # 变量说明：completed 表示当前步骤使用的 completed 值。
     completed: list[dict[str, Any]] = []
+    completed_keys: set[tuple[str, Any]] = set()
+    completed_call_ids: set[str] = set()
     # 变量说明：finished 表示当前步骤使用的 finished 值。
     finished: dict[str, Any] | None = None
     # 变量说明：summary_lengths 表示当前流程使用的 summary_lengths 集合。
     summary_lengths: dict[tuple[str, int], int] = {}
     response_id: str | None = None
     assistant_contents: dict[str, str] = {}
+    assistant_emitted_content: dict[str, str] = {}
     assistant_callback = on_assistant_item or on_item
+
+    async def emit_assistant(item: AssistantMessageItem) -> None:
+        if assistant_callback is None:
+            return
+        key = item.item_id or f"index:{item.output_index}"
+        if assistant_emitted_content.get(key) == item.content:
+            return
+        assistant_emitted_content[key] = item.content
+        await _emit_assistant_item(assistant_callback, item)
 
     # 函数职责：异步发送 summary 对应的数据或流程。
     # 参数关系：item_id 表示item 对象的唯一标识；index 表示当前元素的位置索引；text 表示当前步骤使用的 text 值。
@@ -336,7 +369,7 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
                 item_id = str(event.get("item_id") or "message-0")
                 assistant_contents[item_id] = assistant_contents.get(item_id, "") + delta
                 if assistant_callback is not None:
-                    await _emit_assistant_item(assistant_callback, AssistantMessageItem(
+                    await emit_assistant(AssistantMessageItem(
                         response_id=response_id, item_id=item_id,
                         content=assistant_contents[item_id],
                     ))
@@ -354,13 +387,21 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
                 # 变量说明：item 表示当前步骤使用的 item 值。
                 item = _as_mapping(event["item"])
                 if item.get("status") not in {"incomplete", "in_progress"}:
+                    key = (
+                        ("id", item["id"])
+                        if item.get("id")
+                        else ("index", event.get("output_index", len(completed)))
+                    )
+                    if key in completed_keys:
+                        continue
+                    call_id = str(item.get("call_id") or "").strip()
+                    if call_id and call_id in completed_call_ids:
+                        raise ValueError(f"duplicate call id: {call_id}")
+                    completed_keys.add(key)
+                    if call_id:
+                        completed_call_ids.add(call_id)
                     completed.append(item)
                     await emit_item_summary(item)
-                    if item.get("type") == "message" and assistant_callback is not None:
-                        await _emit_assistant_item(
-                            assistant_callback,
-                            _normalize_item(item, response_id, len(completed) - 1),
-                        )
             elif kind == "response.completed":
                 # 变量说明：finished 表示当前步骤使用的 finished 值。
                 finished = _as_mapping(event["response"])
@@ -375,7 +416,23 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
                 raise failure
     except asyncio.CancelledError:
         raise
-    except StreamInterrupted:
+    except ValueError:
+        # 重复 call id 是确定性协议错误，不能伪装成可重试断流。
+        raise
+    except StreamInterrupted as exc:
+        if finished is not None:
+            # response.completed is the provider boundary; a timeout while
+            # draining an optional tail must not discard the completed reply.
+            return NormalizedModelResponse(
+                response_id=response_id,
+                items=[_normalize_item(item, response_id, index) for index, item in enumerate(
+                    _merge_items(completed, [dict(item) for item in finished.get("output") or []])
+                )],
+                status=ResponseStatus(str(finished.get("status") or "completed")),
+                provider_payload={"protocol": "responses", "items": _merge_items(completed, [dict(item) for item in finished.get("output") or []])},
+                usage=dict(finished.get("usage") or {}),
+            )
+        exc.completed_items = list(completed)
         raise
     except IncompleteResponse:
         raise
@@ -387,6 +444,9 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
     items = _merge_items(completed, [dict(item) for item in finished.get("output") or []])
     for item in items:
         await emit_item_summary(item)
+    for index, item in enumerate(items):
+        if item.get("type") == "message":
+            await emit_assistant(_normalize_item(item, response_id, index))
     normalized = NormalizedModelResponse(
         response_id=response_id,
         items=[_normalize_item(item, response_id, index) for index, item in enumerate(items)],
