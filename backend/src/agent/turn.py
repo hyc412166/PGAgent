@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
     from src.model.output import LocalToolCallItem, NormalizedModelResponse
@@ -178,6 +178,111 @@ class TurnLedger:
 
     def mark_failed(self) -> None:
         self._failed = True
+
+    def to_snapshot(self) -> dict[str, Any]:
+        """Project durable response/tool facts without provider-private data."""
+
+        return {
+            "responses": [response.to_dict() for response in self._responses],
+            "local_calls": [
+                {
+                    "call_id": call_id,
+                    "tool_name": record.item.tool_name,
+                    "arguments": record.item.arguments,
+                    "status": record.status.value,
+                    "observed_by_model": record.observed_by_model,
+                }
+                for call_id, record in self._local_calls.items()
+            ],
+            "taken_local_call_ids": sorted(self._taken_local_call_ids),
+            "hosted_tool_count": self._hosted_tool_count,
+            "awaiting_approval": self._awaiting_approval,
+            "background_wait": self._background_wait,
+            "stopped": self._stopped,
+            "failed": self._failed,
+        }
+
+    @classmethod
+    def from_snapshot(cls, payload: Mapping[str, Any] | None) -> "TurnLedger":
+        """Restore a ledger conservatively; malformed optional data is ignored."""
+
+        ledger = cls()
+        if not isinstance(payload, Mapping):
+            return ledger
+        # Responses are validated through the same constructor used on the
+        # live path, so corrupt snapshots fail closed instead of executing a
+        # potentially ambiguous side-effect call.
+        try:
+            from src.model.output import (
+                AssistantMessageItem,
+                HostedToolItem,
+                LocalToolCallItem,
+                NormalizedModelResponse,
+                ReasoningItem,
+            )
+
+            item_types = {
+                "assistant_message": AssistantMessageItem,
+                "reasoning": ReasoningItem,
+                "local_tool_call": LocalToolCallItem,
+                "hosted_tool": HostedToolItem,
+            }
+            for raw_response in payload.get("responses") or []:
+                if not isinstance(raw_response, Mapping):
+                    continue
+                items = []
+                for raw_item in raw_response.get("items") or []:
+                    if not isinstance(raw_item, Mapping):
+                        continue
+                    item_type = str(raw_item.get("type") or raw_item.get("item_type") or "")
+                    item_cls = item_types.get(item_type)
+                    if item_cls is None:
+                        continue
+                    values = dict(raw_item)
+                    values.pop("type", None)
+                    values.pop("item_type", None)
+                    items.append(item_cls(**values))
+                ledger.accept_response(NormalizedModelResponse(
+                    response_id=raw_response.get("response_id"),
+                    items=items,
+                    status=raw_response.get("status", "unknown"),
+                    provider_payload=raw_response.get("provider_payload"),
+                    provider_reference=raw_response.get("provider_reference"),
+                    usage=dict(raw_response.get("usage") or {}),
+                    finish_reason=raw_response.get("finish_reason"),
+                ))
+        except (TypeError, ValueError, KeyError):
+            return cls()
+        ledger._taken_local_call_ids = {
+            str(call_id) for call_id in payload.get("taken_local_call_ids") or [] if str(call_id)
+        }
+        for raw_call in payload.get("local_calls") or []:
+            if not isinstance(raw_call, Mapping):
+                continue
+            call_id = str(raw_call.get("call_id") or "")
+            if not call_id or call_id in ledger._local_calls:
+                continue
+            try:
+                from src.model.output import LocalToolCallItem
+                item = LocalToolCallItem(
+                    call_id=call_id,
+                    tool_name=str(raw_call.get("tool_name") or ""),
+                    arguments=dict(raw_call.get("arguments") or {}),
+                )
+                status = LocalToolStatus(str(raw_call.get("status") or LocalToolStatus.SCHEDULED.value))
+            except (TypeError, ValueError):
+                continue
+            ledger._local_calls[call_id] = _LocalToolRecord(
+                item=item,
+                status=status,
+                observed_by_model=bool(raw_call.get("observed_by_model")),
+            )
+        ledger._hosted_tool_count = max(0, int(payload.get("hosted_tool_count") or ledger._hosted_tool_count))
+        ledger._awaiting_approval = bool(payload.get("awaiting_approval"))
+        ledger._background_wait = bool(payload.get("background_wait"))
+        ledger._stopped = bool(payload.get("stopped"))
+        ledger._failed = bool(payload.get("failed"))
+        return ledger
 
     def decision(self) -> TurnDecision:
         """Return the next transition without inspecting assistant wording."""

@@ -171,6 +171,13 @@ class RunRuntimeFactory:
             expose_legacy_tools=bool(context.get("expose_legacy_tools")),
         )
         coordinator.register_tool_canceller(run_id, registry.cancel_active)
+        def background_wait_state() -> list[dict[str, Any]]:
+            active = background_store.active_jobs()
+            if active:
+                # 将等待归属持久化，终态事件才能唤醒原 Run；重复注册保持幂等。
+                background_store.register_waiter()
+            return active
+
         # 变量说明：runtime 表示当前步骤使用的 runtime 值。
         runtime = runtime_type(
             model_call=bind_attachment_store(
@@ -186,6 +193,7 @@ class RunRuntimeFactory:
                 if context.get("stream_enabled", True)
                 else None
             ),
+            background_wait_provider=background_wait_state,
             config=RuntimeConfig(
                 max_steps=settings.max_steps,
                 max_tool_calls=settings.max_tool_calls,

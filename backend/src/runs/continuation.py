@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.agent import AgentRuntime, RunOutcome, normalize_usage
+from src.agent.turn import TurnLedger
 from src.context.compaction import _json_safe
 from src.tools.registry import ToolRegistry
 
@@ -72,8 +73,8 @@ class RunContinuationCodec:
         # 新版运行时可提供已经投影为 mapping 的账本；旧 RunOutcome 没有
         # 该属性时保持原快照形状，恢复路径不会因字段缺失而失败。
         output_ledger = getattr(outcome, "output_ledger", None)
-        if isinstance(output_ledger, dict):
-            snapshot["output_ledger"] = _json_safe(output_ledger)
+        if output_ledger is not None and hasattr(output_ledger, "to_snapshot"):
+            snapshot["output_ledger"] = _json_safe(output_ledger.to_snapshot())
         return snapshot
 
     # 函数职责：完成 restore 对应的业务处理。
@@ -112,4 +113,5 @@ class RunContinuationCodec:
                 int(payload.get("completion_verification_attempts") or 0),
             ),
             memory_citation=dict(payload.get("memory_citation") or {}),
+            output_ledger=TurnLedger.from_snapshot(payload.get("output_ledger")),
         )

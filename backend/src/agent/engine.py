@@ -39,7 +39,7 @@ from .guards import GuardDecision, LoopGuard
 from .step_context import AgentStepContext
 from .loop import run_agent_loop
 from .state import RunState
-from .turn import TurnLedger, TurnStatus
+from .turn import LocalToolStatus, TurnLedger, TurnStatus
 from ..tools import ToolRegistry
 from ..tools.builtins import MAX_PARALLEL_DELEGATED_TASKS, normalize_delegate_requests
 from ..tools.types import ToolResult
@@ -794,6 +794,8 @@ class RunOutcome:
     completion_verification_attempts: int = 0
     # 变量说明：memory_citation 表示当前步骤使用的 memory_citation 值。
     memory_citation: dict[str, Any] = field(default_factory=dict)
+    # 当前 Turn 的结构化响应/工具账本，用于跨进程恢复；旧调用方可省略。
+    output_ledger: TurnLedger = field(default_factory=TurnLedger)
 
 
 # 变量说明：ModelCall 表示当前步骤使用的 ModelCall 值。
@@ -828,6 +830,7 @@ class AgentRuntime:
         conversation_compactor: ConversationCompactor | None = None,
         artifact_store: ArtifactStore | None = None,
         completion_verifier: CompletionVerifier | None = None,
+        background_wait_provider: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
         task_state_provider: TaskStateProvider | None = None,
     ) -> None:
         # 变量说明：model_call 表示当前步骤使用的 model_call 值。
@@ -889,6 +892,8 @@ class AgentRuntime:
         self.clock = clock
         # 变量说明：completion_verifier 表示当前步骤使用的 completion_verifier 值。
         self.completion_verifier = completion_verifier
+        # 生命周期层提供后台作业快照；存在未结束作业时，Turn 不得直接交付。
+        self.background_wait_provider = background_wait_provider
         # 变量说明：task_state_provider 表示当前步骤使用的 task_state_provider 值。
         self.task_state_provider = task_state_provider
         # 变量说明：artifact_store 表示当前步骤使用的 artifact_store 值。
@@ -1108,6 +1113,7 @@ class AgentRuntime:
         prior_verification_trace: Sequence[Mapping[str, Any]] = (),
         prior_completion_verification_attempts: int = 0,
         prior_acceptance_report: Mapping[str, Any] | None = None,
+        prior_output_ledger: TurnLedger | None = None,
     ) -> RunOutcome:
         """Execute until a final answer, approval pause, failure or safety stop."""
 
@@ -1842,6 +1848,28 @@ class AgentRuntime:
                 )
                 output_ledger.accept_response(normalized_response)
                 turn_decision = output_ledger.decision()
+                if turn_decision.status is TurnStatus.COMPLETED and self.background_wait_provider is not None:
+                    # 后台作业属于 Turn 的结构化等待事实；不再通过 completion
+                    # verifier 拒绝候选文本，直接阻止终态交付并等待事件恢复。
+                    active_background = list(self.background_wait_provider() or ())
+                    if active_background:
+                        output_ledger.set_waiting(background=True)
+                        waiting = {
+                            **state,
+                            "status": "stopped",
+                            "output": None,
+                            "stop_reason": "waiting_background",
+                            "error": "后台作业仍在运行；等待终态事件后恢复。",
+                            "messages": state.get("messages", []),
+                            "output_ledger": output_ledger,
+                        }
+                        waiting["events"] = await self._publish(
+                            waiting,
+                            "run_stopped",
+                            code="waiting_background",
+                            reason="后台作业仍在运行；等待终态事件后恢复。",
+                        )
+                        return waiting
                 local_items = (
                     output_ledger.take_local_calls()
                     if turn_decision.status is TurnStatus.DRAINING_TOOLS
@@ -2750,7 +2778,7 @@ class AgentRuntime:
             "acceptance_report": dict(prior_acceptance_report or {}),
             "memory_citation": {},
             "stagnation_recovery_prompt": "",
-            "output_ledger": TurnLedger(),
+            "output_ledger": prior_output_ledger or TurnLedger(),
         }
         # 变量说明：final 表示当前步骤使用的 final 值。
         final = await run_agent_loop(
@@ -2780,6 +2808,7 @@ class AgentRuntime:
             acceptance_report=dict(final.get("acceptance_report") or {}),
             completion_verification_attempts=max(0, int(final.get("completion_verification_attempts") or 0)),
             memory_citation=dict(final.get("memory_citation") or {}),
+            output_ledger=final.get("output_ledger") if isinstance(final.get("output_ledger"), TurnLedger) else TurnLedger(),
         )
 
     # 函数职责：异步完成 resume_after_approval 对应的智能体处理。
@@ -2923,6 +2952,13 @@ class AgentRuntime:
         )
         # 变量说明：messages 表示模型消息序列。
         messages = [*prior.messages, approved_tool_message]
+        try:
+            # 审批恢复沿用快照中的 call id；账本缺失时保留旧快照兼容，不猜测其它调用。
+            if prior.output_ledger.local_status(call_id) is LocalToolStatus.SCHEDULED:
+                prior.output_ledger.mark_local_running(call_id)
+            prior.output_ledger.commit_local_result(call_id, tool_name=result.tool_name)
+        except (ValueError, KeyError):
+            pass
         resume_transcript_delta.append(dict(approved_tool_message))
         resume_verification_trace.append(dict(approved_tool_message))
         # 变量说明：events 表示events 集合。
@@ -3303,6 +3339,7 @@ class AgentRuntime:
             prior_verification_trace=resume_verification_trace,
             prior_completion_verification_attempts=prior.completion_verification_attempts,
             prior_acceptance_report=prior.acceptance_report,
+            prior_output_ledger=prior.output_ledger,
         )
 
     # 函数职责：完成 delegated_task_calls_from_messages 对应的智能体处理。
