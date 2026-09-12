@@ -17,6 +17,7 @@ from src.context.assembly import COMPACTION_SECTION_TITLES, ConversationCompacto
 from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, merge_usage, normalize_usage, provider_web_search_calls
 from src.agent.errors import APIErrorKind, call_with_retry, classify_api_error
 from src.agent.guards import LoopGuard
+from src.agent.turn import LocalToolStatus, TurnLedger
 from src.model.output import AssistantMessageItem, LocalToolCallItem, NormalizedModelResponse
 from src.tools import create_default_registry
 from src.tools.types import ToolResult
@@ -1814,6 +1815,47 @@ async def test_runtime_rejects_tool_result_name_mismatch_before_transcript_commi
     assert outcome.error == "ToolResultMismatch"
     assert turns == 1
     assert not any(message.get("role") == "tool" for message in outcome.messages)
+
+
+@pytest.mark.asyncio
+async def test_tool_result_is_not_committed_when_transcript_construction_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import src.agent.engine as agent_engine
+
+    ledger = TurnLedger()
+    monkeypatch.setattr(agent_engine, "TurnLedger", lambda: ledger)
+
+    async def model_call(**_kwargs):  # type: ignore[no-untyped-def]
+        return {
+            "_pgagent_normalized_response": NormalizedModelResponse(
+                response_id="resp-tool-transcript",
+                status="completed",
+                items=[LocalToolCallItem(
+                    response_id="resp-tool-transcript",
+                    item_id="tool-glob",
+                    call_id="glob-1",
+                    tool_name="glob",
+                    arguments={"path": "."},
+                )],
+            ),
+        }
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+
+    def fail_transcript(**_kwargs):  # type: ignore[no-untyped-def]
+        raise TypeError("transcript construction failed")
+
+    runtime._prepare_tool_result_message = fail_transcript  # type: ignore[method-assign]
+
+    with pytest.raises(TypeError, match="transcript construction failed"):
+        await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert ledger.local_status("glob-1") is LocalToolStatus.RUNNING
 
 
 # 辅助函数：_completed 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
