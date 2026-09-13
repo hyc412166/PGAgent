@@ -39,7 +39,7 @@ from .guards import GuardDecision, LoopGuard
 from .step_context import AgentStepContext
 from .loop import run_agent_loop
 from .state import RunState
-from .turn import TurnLedger, TurnStatus
+from .turn import TurnDecision, TurnLedger, TurnStatus
 from ..tools import ToolRegistry
 from ..tools.builtins import MAX_PARALLEL_DELEGATED_TASKS, normalize_delegate_requests
 from ..tools.types import ToolResult
@@ -1841,11 +1841,50 @@ class AgentRuntime:
                 if output_ledger is None:
                     output_ledger = TurnLedger()
                 hosted_before = output_ledger.hosted_tool_count
+                legacy_duplicate_call_ids: set[str] = set()
                 normalized_response = turn.normalized_response or turn.to_normalized_response(
                     response_id=f"legacy-response-{guard.steps}"
                 )
+                if turn.normalized_response is None:
+                    # Legacy callers can repeat a call id while LoopGuard is
+                    # still counting the repetition.  Keep that compatibility
+                    # path visible to the guard, but never weaken strict
+                    # duplicate rejection for normalized sidecar responses.
+                    from src.model.output import LocalToolCallItem
+
+                    existing_call_ids = {
+                        item.call_id
+                        for accepted in output_ledger.responses
+                        for item in accepted.items
+                        if isinstance(item, LocalToolCallItem)
+                    }
+                    legacy_duplicate_call_ids = {
+                        call.id for call in turn.tool_calls if call.id in existing_call_ids
+                    }
+                    if legacy_duplicate_call_ids:
+                        normalized_response.items = [
+                            item
+                            for item in normalized_response.items
+                            if not (
+                                isinstance(item, LocalToolCallItem)
+                                and item.call_id in legacy_duplicate_call_ids
+                            )
+                        ]
                 output_ledger.accept_response(normalized_response)
                 turn_decision = output_ledger.decision()
+                if legacy_duplicate_call_ids:
+                    # The duplicate legacy call is intentionally left for
+                    # LoopGuard to count; an empty projected response must not
+                    # be reclassified as ``empty_model_output`` first.
+                    turn_decision = TurnDecision(
+                        status=TurnStatus.DRAINING_TOOLS,
+                        follow_up=False,
+                        reason="legacy_duplicate_tool_call",
+                        assistant_text=turn.content,
+                        local_call_count=output_ledger.local_call_count,
+                        local_result_count=output_ledger.local_result_count,
+                        hosted_tool_count=output_ledger.hosted_tool_count,
+                    )
                 if (
                     self.background_wait_provider is not None
                     and (
@@ -1929,14 +1968,15 @@ class AgentRuntime:
                     else []
                 )
                 parsed_calls = {call.id: call for call in turn.tool_calls}
-                turn.tool_calls = [
-                    ModelToolCall(
-                        id=item.call_id,
-                        name=item.tool_name,
-                        arguments=dict(parsed_calls[item.call_id].arguments),
-                    )
-                    for item in local_items
-                ]
+                if not legacy_duplicate_call_ids:
+                    turn.tool_calls = [
+                        ModelToolCall(
+                            id=item.call_id,
+                            name=item.tool_name,
+                            arguments=dict(parsed_calls[item.call_id].arguments),
+                        )
+                        for item in local_items
+                    ]
                 hosted_call_delta = output_ledger.hosted_tool_count - hosted_before
             except RunTimeLimitExceeded:
                 # 变量说明：decision 表示当前步骤使用的 decision 值。
@@ -2370,7 +2410,8 @@ class AgentRuntime:
                             reason=call_decision.reason,
                         )
                         return stopped
-                    output_ledger.mark_local_running(call.id)
+                    if call.id not in legacy_duplicate_call_ids:
+                        output_ledger.mark_local_running(call.id)
                     # 变量说明：tool_started_at 表示当前步骤使用的 tool_started_at 值。
                     tool_started_at = self.clock()
                     parallel_tool_started[call.id] = tool_started_at
@@ -2441,7 +2482,8 @@ class AgentRuntime:
                         stopped["events"] = await self._publish(stopped, "run_stopped", code=call_decision.code, reason=call_decision.reason)
                         return stopped
 
-                    output_ledger.mark_local_running(call.id)
+                    if call.id not in legacy_duplicate_call_ids:
+                        output_ledger.mark_local_running(call.id)
                     # 变量说明：tool_started_at 表示当前步骤使用的 tool_started_at 值。
                     tool_started_at = self.clock()
                     state["events"] = await self._publish(
@@ -2587,7 +2629,8 @@ class AgentRuntime:
                     "context_artifact_refs": artifact_refs,
                 }
                 # 只有 observation 已成功进入 messages 与 transcript 后，结果才算完成提交。
-                output_ledger.commit_local_result(call.id, tool_name=result.tool_name)
+                if call.id not in legacy_duplicate_call_ids:
+                    output_ledger.commit_local_result(call.id, tool_name=result.tool_name)
                 if result.metadata.get("force_compaction"):
                     # 变量说明：state 的索引项 表示该语句创建或更新的目标数据。
                     state["force_compaction_reason"] = str(
