@@ -421,6 +421,10 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
                 public["result_summary"] = result_summary
 
     if event_type in {"assistant_message_started", "assistant_message_delta", "assistant_message_completed", "model_response_completed"}:
+        for key in ("response_id", "item_id"):
+            text = _public_event_text(source.get(key), limit=160)
+            if text is not None:
+                public[key] = text
         for key in ("response_id", "item_id", "output_index", "step"):
             value = source.get(key)
             if isinstance(value, int) and not isinstance(value, bool):
