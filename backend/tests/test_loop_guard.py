@@ -1667,6 +1667,44 @@ async def test_runtime_keeps_legacy_model_callable_without_delta_keyword_compati
 
 
 @pytest.mark.asyncio
+async def test_legacy_modelturn_response_reuses_prior_output_ledger(tmp_path) -> None:
+    ledger = TurnLedger()
+    ledger.accept_response(NormalizedModelResponse(
+        response_id="prior-tool-response",
+        status="completed",
+        items=[LocalToolCallItem(
+            response_id="prior-tool-response",
+            item_id="prior-tool",
+            call_id="prior-tool-call",
+            tool_name="glob",
+            arguments={"path": "."},
+        )],
+    ))
+    ledger.take_local_calls()
+    ledger.mark_local_running("prior-tool-call")
+    ledger.commit_local_result("prior-tool-call", tool_name="glob")
+
+    async def model_call(**_kwargs) -> ModelTurn:
+        return ModelTurn(content="legacy final")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+    outcome = await runtime.run(
+        system_prompt="safe",
+        recent_messages=[],
+        prior_output_ledger=ledger,
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.output == "legacy final"
+    assert outcome.output_ledger is ledger
+    assert outcome.output_ledger.local_call_count == 1
+    assert outcome.output_ledger.local_status("prior-tool-call") is LocalToolStatus.RESULT_COMMITTED
+
+
+@pytest.mark.asyncio
 async def test_runtime_consumes_normalized_sidecar_for_follow_up_and_local_dispatch(tmp_path) -> None:
     calls = 0
 
