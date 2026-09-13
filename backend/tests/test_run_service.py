@@ -492,6 +492,35 @@ def test_outcome_backfills_missing_stable_response_without_duplicating_tool_only
         ]
 
 
+def test_outcome_backfills_each_identical_tool_only_response_without_existing_events(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, _session_id = accepted_run
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output=None,
+        messages=[
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call-2"}]},
+        ],
+        events=[{"type": "run_completed"}],
+        steps=2,
+        tool_calls=2,
+    ))
+
+    with database.SessionLocal() as db:
+        completed = list(db.scalars(select(RunEvent).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "model_response_completed",
+        )))
+        response_events = [(
+            event.payload.get("response_id"),
+            event.payload.get("output_chars"),
+            event.payload.get("has_tool_calls"),
+        ) for event in completed]
+        assert response_events == [(None, 0, True), (None, 0, True)]
+
+
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_terminal_stop_without_model_output_still_persists_one_user_reply 精确标识本用例的具体条件。
 def test_terminal_stop_without_model_output_still_persists_one_user_reply(
     accepted_run: tuple[str, str],
