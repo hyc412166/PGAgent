@@ -2588,6 +2588,8 @@ class RunCoordinator:
                 item for item in (outcome.transcript_delta or outcome.messages)
                 if isinstance(item, dict) and item.get("role") == "assistant"
             ]
+            if not assistant_items and str(outcome.output or "").strip():
+                assistant_items = [{"role": "assistant", "content": str(outcome.output)}]
             existing_items = {
                 tuple(sorted((event.payload or {}).items()))
                 for event in db.scalars(select(RunEvent).where(
