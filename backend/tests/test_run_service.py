@@ -300,9 +300,9 @@ def test_completed_outcome_persists_snapshot_and_assistant_message(seeded_run: t
 
 
 def test_completed_outcome_publishes_turn_terminal_after_reply_is_delivered(
-    seeded_run: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+    accepted_run: tuple[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    run_id, session_id = seeded_run
+    run_id, session_id = accepted_run
     published: list[dict] = []
     monkeypatch.setattr(
         "src.runs.lifecycle.run_stream_broker.publish",
@@ -313,6 +313,8 @@ def test_completed_outcome_publishes_turn_terminal_after_reply_is_delivered(
         output="最终答复",
         messages=[{"role": "assistant", "content": "最终答复"}],
         events=[{"type": "run_completed"}],
+        steps=1,
+        tool_calls=0,
     ))
 
     assert any(event["type"] == "turn_completed" for event in published)
@@ -326,13 +328,15 @@ def test_completed_outcome_publishes_turn_terminal_after_reply_is_delivered(
         assert terminal["message_id"] == reply.id
 
 
-def test_outcome_persists_completed_assistant_item_but_not_delta(seeded_run: tuple[str, str]) -> None:
-    run_id, _session_id = seeded_run
+def test_outcome_persists_completed_assistant_item_but_not_delta(accepted_run: tuple[str, str]) -> None:
+    run_id, _session_id = accepted_run
     RunCoordinator._persist_outcome(run_id, RunOutcome(
         status="completed",
         output="可回放答复",
         messages=[{"role": "assistant", "content": "可回放答复", "response_id": "resp-1", "item_id": "item-1"}],
         events=[{"type": "run_completed"}],
+        steps=1,
+        tool_calls=0,
     ))
     with database.SessionLocal() as db:
         completed = db.scalar(select(RunEvent).where(
