@@ -15,8 +15,12 @@
 - 命令：`python -m compileall -q backend/src backend/tests/test_run_service.py backend/tests/test_run_stream.py`。
 - 结果：通过（退出码 0）。
 
+补充验证（正确解释器 `E:\\anaconda3\\envs\\agent_dock\\python.exe`）：
+
+- 命令：`python -m pytest -q tests/test_run_stream.py::test_turn_terminal_events_close_stream_but_model_response_does_not tests/test_run_service.py::test_completed_outcome_publishes_turn_terminal_after_reply_is_delivered tests/test_run_service.py::test_outcome_persists_completed_assistant_item_but_not_delta`。
+- 结果：3 passed；pytest 退出时 Windows 临时目录清理产生既有 `PermissionError` 警告，不影响用例结果。
+
 ## 已知风险
 
 - 当前机器缺少后端测试依赖，pytest 聚焦测试无法运行；需在完整依赖环境重新执行 Task 5 及 Task 3/4 回归。
 - canonical `turn_*` 终态事件成为新 SSE 关闭信号；旧 `run_completed` 仍保留持久读取兼容，但不在终态交付路径中先行发布。
-
