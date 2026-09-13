@@ -796,6 +796,29 @@ async def test_runtime_stops_repeated_model_tool_call(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_legacy_duplicate_call_with_changed_identity_fails_before_dispatch(tmp_path) -> None:
+    turns = 0
+
+    async def model_call(**_kwargs) -> ModelTurn:
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            return ModelTurn(tool_calls=[write_call("same", "first.txt", "safe")])
+        return ModelTurn(tool_calls=[write_call("same", "second.txt", "must-not-run")])
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), permission_mode="full"),
+        config=RuntimeConfig(api_base_delay=0, identical_call_limit=3),
+    )
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status in {"failed", "stopped"}
+    assert (tmp_path / "first.txt").read_text(encoding="utf-8") == "safe\n"
+    assert not (tmp_path / "second.txt").exists()
+
+
+@pytest.mark.asyncio
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_runtime_pauses_before_side_effect 精确标识本用例的具体条件。
 async def test_runtime_pauses_before_side_effect(tmp_path) -> None:
     # 辅助方法：model_call 实现测试替身在此调用阶段需要的最小行为。
