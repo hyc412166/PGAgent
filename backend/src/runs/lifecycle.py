@@ -172,6 +172,7 @@ USER_INTERRUPT_REASONS = frozenset({USER_INTERRUPT_REASON, "parent_user_interrup
 # 变量说明：_PUBLIC_TRANSIENT_STREAM_EVENT_TYPES 表示当前流程使用的 _PUBLIC_TRANSIENT_STREAM_EVENT_TYPES 集合。
 _PUBLIC_TRANSIENT_STREAM_EVENT_TYPES = frozenset({
     "assistant_delta",
+    "assistant_message_started",
     "assistant_message_delta",
     "thought_delta",
     "progress",
@@ -305,7 +306,7 @@ class RunCoordinator:
 
         # 变量说明：event_type 表示当前步骤使用的 event_type 值。
         event_type = str(event.get("type") or "")
-        if event_type == "assistant_delta":
+        if event_type in {"assistant_delta", "assistant_message_delta"}:
             # 变量说明：key 表示用于查找或映射的键。
             key = "output"
             # 变量说明：delta 表示当前步骤使用的 delta 值。
@@ -1447,13 +1448,21 @@ class RunCoordinator:
                 interrupted = run_id in RunCoordinator._interrupt_requested
             if interrupted:
                 return
-            if first_assistant_delta:
-                run_stream_broker.publish(run_id, {"type": "assistant_message_started"})
+            if event_type == "assistant_delta":
+                # 兼容旧 runtime 的 assistant_delta，同时统一投影为带生命周期的
+                # assistant_message_* 事件，避免同一段正文在 SSE 中双发。
+                if first_assistant_delta:
+                    start_payload: dict[str, Any] = {"type": "assistant_message_started"}
+                    for key in ("response_id", "item_id", "step"):
+                        if key in safe_event and safe_event[key] not in (None, ""):
+                            start_payload[key] = safe_event[key]
+                    run_stream_broker.publish(run_id, start_payload)
                 run_stream_broker.publish(run_id, {
                     "type": "assistant_message_delta",
                     "delta": safe_event.get("delta", ""),
                     **({"step": safe_event["step"]} if isinstance(safe_event.get("step"), int) else {}),
                 })
+                return
             run_stream_broker.publish(run_id, safe_event)
 
         return sink
@@ -2381,7 +2390,7 @@ class RunCoordinator:
         persisted = False
         turn_stream_event: dict[str, Any] | None = None
         assistant_stream_events: list[dict[str, Any]] = []
-        response_stream_event: dict[str, Any] | None = None
+        response_stream_events: list[dict[str, Any]] = []
         # 变量说明：parent_bridge_event 表示当前步骤使用的 parent_bridge_event 值。
         parent_bridge_event: dict[str, Any] | None = None
         # 变量说明：extraction_job_id 表示extraction_job 对象的唯一标识。
@@ -2590,46 +2599,110 @@ class RunCoordinator:
             ]
             if not assistant_items and str(outcome.output or "").strip():
                 assistant_items = [{"role": "assistant", "content": str(outcome.output)}]
-            existing_items = {
-                tuple(sorted((event.payload or {}).items()))
-                for event in db.scalars(select(RunEvent).where(
-                    RunEvent.run_id == run_id,
-                    RunEvent.event_type == "assistant_message_completed",
+            existing_item_identities: set[tuple[str, str]] = set()
+            existing_legacy_items: set[tuple[Any, ...]] = set()
+            for event in db.scalars(select(RunEvent).where(
+                RunEvent.run_id == run_id,
+                RunEvent.event_type == "assistant_message_completed",
+            )):
+                payload = event.payload if isinstance(event.payload, dict) else {}
+                response_id = payload.get("response_id")
+                item_id = payload.get("item_id")
+                if isinstance(response_id, str) and response_id and isinstance(item_id, str) and item_id:
+                    existing_item_identities.add((response_id[:160], item_id[:160]))
+                    continue
+                existing_legacy_items.add((
+                    str(payload.get("content") or "")[:100_000],
+                    payload.get("output_index"),
+                    bool(payload.get("has_tool_calls")),
+                    payload.get("phase"),
                 ))
-                if isinstance(event.payload, dict)
-            }
             for output_index, item in enumerate(assistant_items):
                 content = str(item.get("content") or "")[:100_000]
+                identity = item.get("_pgagent_output_item") if isinstance(item.get("_pgagent_output_item"), dict) else {}
+                provider_output_index = identity.get("output_index")
+                if not isinstance(provider_output_index, int) or isinstance(provider_output_index, bool) or provider_output_index < 0:
+                    provider_output_index = output_index
                 item_payload: dict[str, Any] = {
                     "content": content,
-                    "output_index": output_index,
+                    "output_index": provider_output_index,
                     "has_tool_calls": bool(item.get("tool_calls")),
                 }
                 for key in ("response_id", "item_id"):
-                    value = item.get(key)
+                    value = item.get(key) or identity.get(key)
                     if isinstance(value, str) and value:
                         item_payload[key] = value[:160]
-                if tuple(sorted(item_payload.items())) not in existing_items:
-                    append_run_event(
-                        db,
-                        run_id=run_id,
-                        event_type="assistant_message_completed",
-                        step=outcome.steps,
-                        payload=item_payload,
-                    )
-                    assistant_stream_events.append({"type": "assistant_message_completed", **item_payload})
-            if assistant_items:
-                response_payload = {"output_chars": len(str(outcome.output or ""))}
-                response_id = next(
-                    (item.get("response_id") for item in assistant_items if isinstance(item.get("response_id"), str)),
-                    None,
+                phase = item.get("phase") or identity.get("phase")
+                if phase in {"commentary", "final_answer", "unknown"}:
+                    item_payload["phase"] = phase
+                stable_identity = (
+                    (item_payload["response_id"], item_payload["item_id"])
+                    if "response_id" in item_payload and "item_id" in item_payload
+                    else None
                 )
-                if response_id:
-                    response_payload["response_id"] = str(response_id)[:160]
-                if not db.scalar(select(RunEvent.id).where(
+                legacy_identity = (
+                    item_payload["content"],
+                    item_payload["output_index"],
+                    item_payload["has_tool_calls"],
+                    item_payload.get("phase"),
+                )
+                if (
+                    stable_identity in existing_item_identities
+                    if stable_identity is not None
+                    else legacy_identity in existing_legacy_items
+                ):
+                    continue
+                append_run_event(
+                    db,
+                    run_id=run_id,
+                    event_type="assistant_message_completed",
+                    step=outcome.steps,
+                    payload=item_payload,
+                )
+                assistant_stream_events.append({"type": "assistant_message_completed", **item_payload})
+                if stable_identity is not None:
+                    existing_item_identities.add(stable_identity)
+                else:
+                    existing_legacy_items.add(legacy_identity)
+            if assistant_items:
+                existing_response_ids: set[str] = set()
+                existing_legacy_responses: set[tuple[int, bool]] = set()
+                for event in db.scalars(select(RunEvent).where(
                     RunEvent.run_id == run_id,
                     RunEvent.event_type == "model_response_completed",
                 )):
+                    payload = event.payload if isinstance(event.payload, dict) else {}
+                    response_id = payload.get("response_id")
+                    if isinstance(response_id, str) and response_id:
+                        existing_response_ids.add(response_id[:160])
+                        continue
+                    existing_legacy_responses.add((
+                        int(payload.get("output_chars") or 0),
+                        bool(payload.get("has_tool_calls")),
+                    ))
+
+                response_payloads: dict[str, dict[str, Any]] = {}
+                legacy_items: list[dict[str, Any]] = []
+                for item in assistant_items:
+                    identity = item.get("_pgagent_output_item") if isinstance(item.get("_pgagent_output_item"), dict) else {}
+                    response_id = item.get("response_id") or identity.get("response_id")
+                    if not isinstance(response_id, str) or not response_id:
+                        legacy_items.append(item)
+                        continue
+                    bounded_response_id = response_id[:160]
+                    response_payload = response_payloads.setdefault(bounded_response_id, {
+                        "response_id": bounded_response_id,
+                        "output_chars": 0,
+                        "has_tool_calls": False,
+                    })
+                    response_payload["output_chars"] += len(str(item.get("content") or ""))
+                    response_payload["has_tool_calls"] = bool(
+                        response_payload["has_tool_calls"] or item.get("tool_calls")
+                    )
+
+                for response_id, response_payload in response_payloads.items():
+                    if response_id in existing_response_ids:
+                        continue
                     append_run_event(
                         db,
                         run_id=run_id,
@@ -2637,7 +2710,30 @@ class RunCoordinator:
                         step=outcome.steps,
                         payload=response_payload,
                     )
-                    response_stream_event = {"type": "model_response_completed", **response_payload}
+                    response_stream_events.append({"type": "model_response_completed", **response_payload})
+                    existing_response_ids.add(response_id)
+
+                if legacy_items:
+                    legacy_response_payload = {
+                        "output_chars": len(str(outcome.output or "")),
+                        "has_tool_calls": any(bool(item.get("tool_calls")) for item in legacy_items),
+                    }
+                    legacy_identity = (
+                        legacy_response_payload["output_chars"],
+                        legacy_response_payload["has_tool_calls"],
+                    )
+                    if legacy_identity not in existing_legacy_responses:
+                        append_run_event(
+                            db,
+                            run_id=run_id,
+                            event_type="model_response_completed",
+                            step=outcome.steps,
+                            payload=legacy_response_payload,
+                        )
+                        response_stream_events.append({
+                            "type": "model_response_completed",
+                            **legacy_response_payload,
+                        })
             # 变量说明：terminal_provider_message 表示当前步骤使用的 terminal_provider_message 值。
             terminal_provider_message = next(
                 (
@@ -2818,8 +2914,8 @@ class RunCoordinator:
         if persisted:
             for event in assistant_stream_events:
                 run_stream_broker.publish(run_id, event)
-            if response_stream_event is not None:
-                run_stream_broker.publish(run_id, response_stream_event)
+            for event in response_stream_events:
+                run_stream_broker.publish(run_id, event)
             # New Turn terminal events are the sole SSE close signal.  Keep
             # legacy run_* rows for readers, but do not emit them first or a
             # reconnecting client could close before observing turn_*.

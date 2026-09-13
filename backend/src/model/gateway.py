@@ -111,6 +111,8 @@ def bind_attachment_store(model_call: Any, attachment_store: Any | None) -> Any:
 
     # 变量说明：manages_retries 表示当前流程使用的 manages_retries 集合。
     call_with_attachments.manages_retries = getattr(model_call, "manages_retries", False)
+    # 附件包装只转换输入，不能改变 runtime 选择结构化输出回调的能力判断。
+    call_with_attachments.emits_assistant_items = getattr(model_call, "emits_assistant_items", False)
     return call_with_attachments
 
 
