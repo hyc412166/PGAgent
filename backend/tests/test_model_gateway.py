@@ -16,6 +16,17 @@ from src.model.gateway import ModelConfigurationError, ProviderConfig, _litellm_
 from src.model.streaming import IncompleteResponse
 
 
+def test_attachment_binding_preserves_assistant_item_capability() -> None:
+    async def raw_model_call(**_kwargs):  # type: ignore[no-untyped-def]
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    raw_model_call.emits_assistant_items = True  # type: ignore[attr-defined]
+
+    bound_call = bind_attachment_store(raw_model_call, object())
+
+    assert bound_call.emits_assistant_items is True
+
+
 # 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_gateway_keeps_namespaced_openrouter_models_on_openrouter 精确标识本用例的具体条件。
 def test_gateway_keeps_namespaced_openrouter_models_on_openrouter() -> None:
     assert _litellm_model("openrouter", "anthropic/claude-sonnet") == "openrouter/anthropic/claude-sonnet"

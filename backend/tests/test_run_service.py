@@ -351,6 +351,142 @@ def test_outcome_persists_completed_assistant_item_but_not_delta(accepted_run: t
         )) is None
 
 
+def test_completed_assistant_item_preserves_provider_output_index(accepted_run: tuple[str, str]) -> None:
+    run_id, _session_id = accepted_run
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="带稳定索引的答复",
+        messages=[{
+            "role": "assistant",
+            "content": "带稳定索引的答复",
+            "_pgagent_output_item": {
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "output_index": 7,
+                "phase": "final_answer",
+            },
+        }],
+        events=[{"type": "run_completed"}],
+        steps=1,
+        tool_calls=0,
+    ))
+    with database.SessionLocal() as db:
+        completed = db.scalar(select(RunEvent).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "assistant_message_completed",
+        ))
+        assert completed is not None
+        assert completed.payload["output_index"] == 7
+        assert completed.payload["phase"] == "final_answer"
+
+
+def test_outcome_does_not_duplicate_completed_assistant_item_with_runtime_metadata(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, _session_id = accepted_run
+    with database.SessionLocal() as db:
+        db.add(RunEvent(
+            run_id=run_id,
+            event_type="assistant_message_completed",
+            step=2,
+            payload={
+                "content": "最终答复",
+                "output_index": 7,
+                "phase": "final_answer",
+                "has_tool_calls": False,
+                "step": 2,
+                "response_id": "resp-1",
+                "item_id": "item-1",
+            },
+        ))
+        db.commit()
+
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="最终答复",
+        messages=[{
+            "role": "assistant",
+            "content": "最终答复",
+            "_pgagent_output_item": {
+                "response_id": "resp-1",
+                "item_id": "item-1",
+                "output_index": 7,
+                "phase": "final_answer",
+            },
+        }],
+        events=[{"type": "run_completed"}],
+        steps=2,
+        tool_calls=0,
+    ))
+
+    with database.SessionLocal() as db:
+        completed = list(db.scalars(select(RunEvent).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "assistant_message_completed",
+        )))
+        assert len(completed) == 1
+
+
+def test_outcome_backfills_each_missing_model_response_by_response_id(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, _session_id = accepted_run
+    with database.SessionLocal() as db:
+        db.add(RunEvent(
+            run_id=run_id,
+            event_type="model_response_completed",
+            step=1,
+            payload={
+                "response_id": "resp-1",
+                "output_chars": 5,
+                "has_tool_calls": True,
+                "step": 1,
+            },
+        ))
+        db.commit()
+
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="最终答复",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "调用工具中",
+                "tool_calls": [{"id": "call-1"}],
+                "_pgagent_output_item": {
+                    "response_id": "resp-1",
+                    "item_id": "item-1",
+                    "output_index": 0,
+                    "phase": "commentary",
+                },
+            },
+            {
+                "role": "assistant",
+                "content": "最终答复",
+                "_pgagent_output_item": {
+                    "response_id": "resp-2",
+                    "item_id": "item-2",
+                    "output_index": 0,
+                    "phase": "final_answer",
+                },
+            },
+        ],
+        events=[{"type": "run_completed"}],
+        steps=2,
+        tool_calls=1,
+    ))
+
+    with database.SessionLocal() as db:
+        completed = list(db.scalars(select(RunEvent).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "model_response_completed",
+        )))
+        response_ids = [event.payload.get("response_id") for event in completed]
+        assert response_ids.count("resp-1") == 1
+        assert response_ids.count("resp-2") == 1
+        assert len(response_ids) == 2
+
+
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_terminal_stop_without_model_output_still_persists_one_user_reply 精确标识本用例的具体条件。
 def test_terminal_stop_without_model_output_still_persists_one_user_reply(
     accepted_run: tuple[str, str],
