@@ -1852,14 +1852,32 @@ class AgentRuntime:
                     # duplicate rejection for normalized sidecar responses.
                     from src.model.output import LocalToolCallItem
 
-                    existing_call_ids = {
-                        item.call_id
+                    existing_calls = {
+                        item.call_id: item
                         for accepted in output_ledger.responses
                         for item in accepted.items
                         if isinstance(item, LocalToolCallItem)
                     }
+                    for call in turn.tool_calls:
+                        existing = existing_calls.get(call.id)
+                        if existing is None:
+                            continue
+                        expected_arguments = json.dumps(
+                            existing.arguments,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        actual_arguments = json.dumps(
+                            call.arguments,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if existing.tool_name != call.name or expected_arguments != actual_arguments:
+                            raise ValueError(
+                                f"legacy duplicate call identity mismatch: {call.id}"
+                            )
                     legacy_duplicate_call_ids = {
-                        call.id for call in turn.tool_calls if call.id in existing_call_ids
+                        call.id for call in turn.tool_calls if call.id in existing_calls
                     }
                     if legacy_duplicate_call_ids:
                         normalized_response.items = [
