@@ -75,6 +75,40 @@ def test_public_web_clients_mark_proxy_peer_as_allowed(monkeypatch, tmp_path) ->
     assert observed == [True]
 
 
+# 测试场景：本机代理将 Bing 请求的对端判定为非公网地址时，搜索应切换到区域入口直连，避免把代理误报成 unsafe_url。
+def test_web_search_falls_back_to_direct_regional_endpoint_after_proxy_peer_rejection(monkeypatch, tmp_path) -> None:
+    requests: list[tuple[str, bool]] = []
+    peer_checks = iter([False, True])
+    markup = """<?xml version="1.0"?><rss><channel><item>
+      <title>Headline</title><link>https://example.com/story</link>
+      <description>Summary</description>
+    </item></channel></rss>"""
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setattr(builtins, "_response_peer_is_public", lambda _response, **_kwargs: next(peer_checks))
+
+    real_client = httpx.Client
+
+    def client_factory(**kwargs):
+        trust_env = bool(kwargs.get("trust_env"))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((str(request.url), trust_env))
+            return httpx.Response(200, headers={"content-type": "application/rss+xml"}, text=markup)
+
+        transport = httpx.MockTransport(handler)
+        kwargs["transport"] = transport
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(builtins.httpx, "Client", client_factory)
+    result = builtins.web_search(WorkspaceSandbox(tmp_path), "latest news")
+
+    assert result.ok
+    assert len(requests) == 2
+    assert "www.bing.com/search" in requests[0][0] and requests[0][1] is True
+    assert "cn.bing.com/search" in requests[1][0] and requests[1][1] is False
+
+
 # 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_web_address_classifier_rejects_non_global_ranges 精确标识本用例的具体条件。
 def test_web_address_classifier_rejects_non_global_ranges() -> None:
     assert builtins._is_public_ip("8.8.8.8")

@@ -15,7 +15,7 @@ export interface ThoughtToolItem {
  * reasoning summaries remain outside the presentation timeline.
  */
 // ActivityKind/Icon 分别表达活动语义和对应的视觉图标类别。
-export type ThoughtActivityKind = 'thought' | 'tool' | 'context' | 'approval' | 'task' | 'event'
+export type ThoughtActivityKind = 'thought' | 'tool' | 'context' | 'approval' | 'task' | 'event' | 'assistant'
 export type ThoughtActivityIcon = 'think' | 'read' | 'write' | 'edit' | 'search' | 'shell' | 'task' | 'approval' | 'context' | 'generic'
 
 // ThoughtActivityItem 是用户可见的单条推理活动摘要。
@@ -26,6 +26,8 @@ export interface ThoughtActivityItem {
   title: string
   detail: string
   status: 'running' | 'completed' | 'failed'
+  // assistant 条目承载模型明确标记为 commentary/final_answer 的可见正文。
+  phase?: 'commentary' | 'final_answer' | 'unknown' | string
 }
 
 // ThoughtTimelineState 聚合当前运行的思考文本、活动、工具项和计时边界。
@@ -102,7 +104,8 @@ export function thinkingStatusForRun(runId: string): string {
 // 事件类型集合用于识别工具生命周期和整轮终态。
 const toolStartTypes = new Set(['tool_started', 'tool_call'])
 const toolFinishTypes = new Set(['tool_finished', 'tool_result'])
-const terminalTypes = new Set(['run_completed', 'completed', 'run_interrupted', 'run_stopped', 'stopped', 'model_failed', 'integration_failed', 'failed'])
+const assistantEventTypes = new Set(['assistant_message_started', 'assistant_message_delta', 'assistant_message_completed', 'assistant_delta'])
+const terminalTypes = new Set(['turn_completed', 'turn_failed', 'turn_stopped', 'run_completed', 'completed', 'run_interrupted', 'run_stopped', 'stopped', 'model_failed', 'integration_failed', 'failed'])
 const terminalStatuses = new Set(['completed', 'stopped', 'failed', 'cancelled'])
 
 // 以下安全提取函数从不同版本事件结构中读取展示字段，并控制敏感或超长内容。
@@ -266,6 +269,87 @@ function stableDelegationActivityId(event: RunStreamEvent, fallback: string): st
     payload?.child_run_id,
   )
   return key ? `task:${key}` : fallback
+}
+
+function assistantItemIdentity(event: RunStreamEvent, fallbackIndex: number) {
+  const payload = record(event.payload)
+  const responseId = firstString(event.response_id, payload?.response_id)
+  const itemId = firstString(event.item_id, payload?.item_id)
+  const outputIndexValue = event.output_index ?? payload?.output_index
+  const outputIndex = typeof outputIndexValue === 'number' && Number.isInteger(outputIndexValue) && outputIndexValue >= 0
+    ? outputIndexValue
+    : undefined
+  const identity = itemId || (outputIndex === undefined ? `legacy-${fallbackIndex}` : `index-${outputIndex}`)
+  return {
+    id: `${responseId || 'legacy'}:${identity}`,
+    responseId: responseId || undefined,
+    itemId: itemId || undefined,
+    outputIndex,
+  }
+}
+
+function assistantItemMatches(item: ThoughtActivityItem, identity: ReturnType<typeof assistantItemIdentity>) {
+  if (item.kind !== 'assistant') return false
+  if (item.id === identity.id) return true
+  const sameResponse = !identity.responseId || item.id.startsWith(`${identity.responseId}:`)
+  // 某些兼容流会先发没有 response_id 的 delta，再在 completed 事件补齐 response_id；item_id 是此时最稳定的身份。
+  if (identity.itemId && item.id.endsWith(`:${identity.itemId}`)) return true
+  return identity.outputIndex !== undefined
+    && item.id.endsWith(`:index-${identity.outputIndex}`)
+    && sameResponse
+}
+
+function assistantContent(event: RunStreamEvent): string {
+  const payload = record(event.payload)
+  const value = [event.content, event.delta, payload?.content, payload?.delta]
+    .find((candidate) => typeof candidate === 'string' && candidate.length > 0)
+  return typeof value === 'string' ? value : ''
+}
+
+function assistantPhase(event: RunStreamEvent, type: string): string {
+  const payload = record(event.payload)
+  const phase = firstString(event.phase, payload?.phase)
+  if (phase) return phase
+  return type === 'assistant_delta' ? 'final_answer' : 'unknown'
+}
+
+function updateAssistantTimelineItem(
+  state: ThoughtTimelineState,
+  event: RunStreamEvent,
+  type: string,
+): ThoughtTimelineState {
+  const items = [...(state.items || [])]
+  const identity = assistantItemIdentity(event, items.length)
+  let index = items.findIndex((item) => assistantItemMatches(item, identity))
+  if (index < 0 && !identity.responseId && !identity.itemId) {
+    index = items.findLastIndex((item) => item.kind === 'assistant' && item.status === 'running')
+  }
+  const content = assistantContent(event)
+  const deltaEvent = type === 'assistant_message_delta' || type === 'assistant_delta'
+  const phase = assistantPhase(event, type)
+  const status = type === 'assistant_message_completed' ? 'completed' as const : 'running' as const
+  if (index < 0) {
+    items.push({
+      id: identity.id,
+      kind: 'assistant',
+      icon: 'think',
+      title: phase === 'final_answer' ? '最终回复' : '中间回复',
+      detail: content,
+      phase,
+      status,
+    })
+  } else {
+    const current = items[index]
+    items[index] = {
+      ...current,
+      id: identity.responseId || identity.itemId ? identity.id : current.id,
+      title: phase === 'final_answer' ? '最终回复' : current.title || '中间回复',
+      detail: deltaEvent ? `${current.detail}${content}` : content || current.detail,
+      phase: phase || current.phase,
+      status: type === 'assistant_message_completed' ? 'completed' : current.status,
+    }
+  }
+  return { ...state, startedAt: state.startedAt, items, activeItemId: undefined }
 }
 
 function safeArgumentDetail(event: RunStreamEvent): string {
@@ -462,8 +546,11 @@ export function updateThoughtTimeline(
   now = Date.now(),
 ): ThoughtTimelineState {
   const type = firstString(event.type, event.event_type).toLowerCase()
-  const start = state.startedAt ?? (type === 'model_step_started' || type === 'mcp_connecting' || toolStartTypes.has(type) ? now : null)
+  const start = state.startedAt ?? (type === 'model_step_started' || type === 'mcp_connecting' || toolStartTypes.has(type) || assistantEventTypes.has(type) ? now : null)
   const payload = record(event.payload)
+  if (assistantEventTypes.has(type)) {
+    return updateAssistantTimelineItem({ ...state, startedAt: start }, event, type)
+  }
   if (type === 'thought_delta') {
     const text = cleanThoughtText(firstString(event.delta, payload?.delta))
     if (!text) return start === state.startedAt ? state : { ...state, startedAt: start }
@@ -599,7 +686,17 @@ export function updateThoughtTimeline(
 // 重放持久化事件恢复已完成运行的思考时间线。
 export function timelineFromRunEvents(events: RunStreamEvent[]): ThoughtTimelineState {
   let timeline = emptyThoughtTimeline
-  for (const event of events) {
+  // 事件接口按分页方向可能返回倒序；sequence 是同一 Run 内唯一可靠的顺序。
+  const orderedEvents = [...events].sort((left, right) => {
+    const leftSequence = typeof left.sequence === 'number' ? left.sequence : Number.MAX_SAFE_INTEGER
+    const rightSequence = typeof right.sequence === 'number' ? right.sequence : Number.MAX_SAFE_INTEGER
+    if (leftSequence !== rightSequence) return leftSequence - rightSequence
+    const leftCreatedAt = Date.parse(firstString(left.created_at, left.timestamp))
+    const rightCreatedAt = Date.parse(firstString(right.created_at, right.timestamp))
+    if (Number.isFinite(leftCreatedAt) && Number.isFinite(rightCreatedAt) && leftCreatedAt !== rightCreatedAt) return leftCreatedAt - rightCreatedAt
+    return 0
+  })
+  for (const event of orderedEvents) {
     const payload = record(event.payload) ?? {}
     const type = firstString(event.type, event.event_type, payload.type, payload.event_type)
     if (!type) continue

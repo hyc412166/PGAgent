@@ -79,6 +79,7 @@ async def consume(
                 if assistant_callback is not None:
                     item = AssistantMessageItem(
                         response_id=response_id, item_id="message-0",
+                        output_index=0,
                         content="".join(content_parts), phase=OutputPhase.UNKNOWN,
                         end_turn=EndTurn.UNKNOWN,
                     )

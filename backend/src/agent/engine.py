@@ -128,6 +128,42 @@ def _safe_argument_text(value: Any, limit: int = 320) -> str:
     return text
 
 
+# 函数职责：复制 web_run 的跨调用页面索引，避免把模型参数或工具结果的可变对象直接带入运行状态。
+def _copy_web_pages(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(key): dict(item)
+        for key, item in value.items()
+        if str(key).strip() and isinstance(item, Mapping)
+    }
+
+
+# 函数职责：合并本次 web_run 返回的页面索引，保留此前搜索得到的 ref 供后续 open/click/find 使用。
+def _merge_web_pages(existing: Any, incoming: Any) -> dict[str, dict[str, Any]]:
+    merged = _copy_web_pages(existing)
+    merged.update(_copy_web_pages(incoming))
+    return merged
+
+
+# 函数职责：为 web_run 注入运行内页面索引；原始模型参数仍由调用方原样写入 transcript。
+def _web_run_dispatch_arguments(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    web_pages: Any,
+) -> dict[str, Any]:
+    dispatched = dict(arguments)
+    if tool_name != "web_run":
+        return dispatched
+    known_pages = _copy_web_pages(web_pages)
+    supplied_pages = _copy_web_pages(dispatched.get("pages"))
+    if not known_pages and not supplied_pages:
+        return dispatched
+    known_pages.update(supplied_pages)
+    dispatched["pages"] = known_pages
+    return dispatched
+
+
 # 函数职责：完成 safe_tool_argument_summary 对应的智能体处理。
 # 参数关系：tool_name 表示当前步骤使用的 tool_name 值；arguments 表示arguments 集合。
 # 返回关系：结果用于更新运行状态、形成模型输入或发送给上层调用方。
@@ -757,9 +793,10 @@ class RunOutcome:
     # 变量说明：events 表示events 集合。
     events: list[dict[str, Any]]
     # 变量说明：steps 表示steps 集合。
-    steps: int
+    # 手工恢复/测试构造的旧调用方可能不提供计数；缺省为零不改变运行时真实计数。
+    steps: int = 0
     # 变量说明：tool_calls 表示tool_calls 集合。
-    tool_calls: int
+    tool_calls: int = 0
     # 变量说明：mode 表示当前步骤使用的 mode 值。
     mode: str = "auto"
     # 变量说明：stop_reason 表示当前步骤使用的 stop_reason 值。
@@ -794,6 +831,9 @@ class RunOutcome:
     completion_verification_attempts: int = 0
     # 变量说明：memory_citation 表示当前步骤使用的 memory_citation 值。
     memory_citation: dict[str, Any] = field(default_factory=dict)
+    # web_run 的 search ref 在同一 Turn 内跨调用复用；页面索引不进入模型正文。
+    # 变量说明：web_pages 表示当前 Turn 已建立的网页引用索引。
+    web_pages: dict[str, dict[str, Any]] = field(default_factory=dict)
     # 当前 Turn 的结构化响应/工具账本，用于跨进程恢复；旧调用方可省略。
     output_ledger: TurnLedger | None = None
 
@@ -837,6 +877,9 @@ class AgentRuntime:
         self.model_call = model_call
         # 变量说明：_model_manages_retries 表示_model_manages_retries 集合。
         self._model_manages_retries = bool(getattr(model_call, "manages_retries", False))
+        # 只有协议网关明确声明会回调结构化 Assistant item 时，才用 item
+        # 生命周期替代旧文本 delta；普通测试替身和第三方调用仍保留兼容通道。
+        self._model_emits_assistant_items = bool(getattr(model_call, "emits_assistant_items", False))
         try:
             # 变量说明：model_signature 表示当前步骤使用的 model_signature 值。
             model_signature = inspect.signature(model_call)
@@ -866,6 +909,9 @@ class AgentRuntime:
             )
             # 变量说明：_model_accepts_retry 表示当前步骤使用的 _model_accepts_retry 值。
             self._model_accepts_retry = "on_retry" in model_signature.parameters or accepts_var_kwargs
+            self._model_accepts_assistant_item = (
+                "on_assistant_item" in model_signature.parameters or accepts_var_kwargs
+            )
         except (TypeError, ValueError):
             # 变量说明：_model_accepts_delta 表示当前步骤使用的 _model_accepts_delta 值。
             self._model_accepts_delta = False
@@ -876,6 +922,7 @@ class AgentRuntime:
             self._model_accepts_prompt_cache_key = False
             # 变量说明：_model_accepts_retry 表示当前步骤使用的 _model_accepts_retry 值。
             self._model_accepts_retry = False
+            self._model_accepts_assistant_item = False
         # 变量说明：tool_registry 表示当前步骤使用的 tool_registry 值。
         self.tool_registry = tool_registry
         # 变量说明：tool_router 表示当前步骤使用的 tool_router 值。
@@ -926,11 +973,13 @@ class AgentRuntime:
         *,
         approved: bool,
         call_id: str,
+        web_pages: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> ToolResult:
         # 变量说明：outcome 表示当前步骤使用的 outcome 值。
+        dispatched_arguments = _web_run_dispatch_arguments(name, arguments, web_pages)
         outcome = await self.tool_router.dispatch(
             name,
-            arguments,
+            dispatched_arguments,
             approved=approved,
             call_id=call_id,
             source="model",
@@ -1114,6 +1163,7 @@ class AgentRuntime:
         prior_completion_verification_attempts: int = 0,
         prior_acceptance_report: Mapping[str, Any] | None = None,
         prior_output_ledger: TurnLedger | None = None,
+        prior_web_pages: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> RunOutcome:
         """Execute until a final answer, approval pause, failure or safety stop."""
 
@@ -1664,6 +1714,7 @@ class AgentRuntime:
                 async def model_attempt() -> Any:
                     nonlocal offered_tool_names
                     buffered_candidate_deltas.clear()
+                    streamed_assistant_content: dict[tuple[str, str], str] = {}
                     # 变量说明：model_activity_seen 表示当前步骤使用的 model_activity_seen 值。
                     model_activity_seen = False
                     # 变量说明：timeout_scope 表示当前步骤使用的 timeout_scope 值。
@@ -1700,11 +1751,54 @@ class AgentRuntime:
                             # 验收前不提交最终回答，但实时展示模型进度，避免思考整段延迟出现。
                             await self._publish_transient("thought_delta", delta=delta, step=guard.steps)
                             return
+                        if self._model_emits_assistant_items:
+                            # 结构化协议会在同一增量后回调带 response/item 身份的
+                            # Assistant item；旧纯文本通道在这里不再重复发布。
+                            return
                         await self._publish_transient(
                             "assistant_delta",
                             delta=delta,
                             step=guard.steps,
                         )
+
+                    async def on_assistant_item(item: Any) -> None:
+                        await on_activity()
+                        if self.completion_verifier is not None:
+                            return
+                        from src.model.output import AssistantMessageItem
+
+                        if not isinstance(item, AssistantMessageItem):
+                            raise TypeError("on_assistant_item 必须接收 AssistantMessageItem")
+                        identity = (
+                            str(item.response_id or ""),
+                            str(item.item_id or f"index:{item.output_index}"),
+                        )
+                        previous = streamed_assistant_content.get(identity)
+                        if previous is None:
+                            await self._publish_transient(
+                                "assistant_message_started",
+                                response_id=item.response_id,
+                                item_id=item.item_id,
+                                output_index=item.output_index,
+                                phase=str(item.phase),
+                                step=guard.steps,
+                            )
+                            delta = item.content
+                        else:
+                            if not item.content.startswith(previous):
+                                raise ValueError("Assistant item 流式内容必须只追加，不能改写已展示前缀")
+                            delta = item.content[len(previous):]
+                        streamed_assistant_content[identity] = item.content
+                        if delta:
+                            await self._publish_transient(
+                                "assistant_message_delta",
+                                response_id=item.response_id,
+                                item_id=item.item_id,
+                                output_index=item.output_index,
+                                phase=str(item.phase),
+                                delta=delta,
+                                step=guard.steps,
+                            )
 
                     async def on_thought_delta(delta: str) -> None:
                         # provider reasoning summary 属于模型内部摘要，仅用于组装下一轮请求，不进入用户可见时间线。
@@ -1759,6 +1853,8 @@ class AgentRuntime:
                             )
                         # 变量说明：kwargs 的索引项 表示该语句创建或更新的目标数据。
                         kwargs["on_retry"] = provider_retry
+                    if self._model_accepts_assistant_item and self._model_emits_assistant_items:
+                        kwargs["on_assistant_item"] = on_assistant_item
                     # 变量说明：is_async_call 表示是否满足 is_async_call 条件。
                     is_async_call = inspect.iscoroutinefunction(self.model_call)
 
@@ -1889,6 +1985,44 @@ class AgentRuntime:
                             )
                         ]
                 output_ledger.accept_response(normalized_response)
+                if turn.normalized_response is not None and normalized_response.is_completed:
+                    # Provider response 的 item/response 完成边界在工具调度前落盘；
+                    # Turn 是否完成仍由后续 drain、等待和终态交付独立决定。
+                    from src.model.output import AssistantMessageItem
+
+                    response_output_chars = 0
+                    for response_item in normalized_response.items:
+                        if not isinstance(response_item, AssistantMessageItem):
+                            continue
+                        response_output_chars += len(response_item.content)
+                        item_payload: dict[str, Any] = {
+                            "content": response_item.content[:100_000],
+                            "output_index": response_item.output_index,
+                            "phase": str(response_item.phase),
+                            "has_tool_calls": bool(turn.tool_calls),
+                            "step": guard.steps,
+                        }
+                        if response_item.response_id:
+                            item_payload["response_id"] = response_item.response_id
+                        if response_item.item_id:
+                            item_payload["item_id"] = response_item.item_id
+                        state["events"] = await self._publish(
+                            state,
+                            "assistant_message_completed",
+                            **item_payload,
+                        )
+                    response_payload: dict[str, Any] = {
+                        "output_chars": response_output_chars,
+                        "has_tool_calls": bool(turn.tool_calls),
+                        "step": guard.steps,
+                    }
+                    if normalized_response.response_id:
+                        response_payload["response_id"] = normalized_response.response_id
+                    state["events"] = await self._publish(
+                        state,
+                        "model_response_completed",
+                        **response_payload,
+                    )
                 turn_decision = output_ledger.decision()
                 if legacy_duplicate_call_ids:
                     # The duplicate legacy call is intentionally left for
@@ -2124,6 +2258,26 @@ class AgentRuntime:
             memory_citation = parsed_memory_citation if not turn.tool_calls else {}
             # 变量说明：assistant_message 表示当前步骤使用的 assistant_message 值。
             assistant_message: dict[str, Any] = {"role": "assistant", "content": visible_content}
+            if turn.normalized_response is not None:
+                # 把 provider 的安全 item 身份带入 transcript，供 RunEvent 重放和前端原子替换；
+                # reasoning/provider 原始字段仍留在私有续接载荷中。
+                assistant_item = next(
+                    (item for item in turn.normalized_response.items if item.item_type == "assistant_message"),
+                    None,
+                )
+                if assistant_item is not None:
+                    item_identity: dict[str, Any] = {}
+                    if assistant_item.response_id:
+                        item_identity["response_id"] = assistant_item.response_id
+                    if assistant_item.item_id:
+                        item_identity["item_id"] = assistant_item.item_id
+                    if assistant_item.output_index is not None:
+                        item_identity["output_index"] = assistant_item.output_index
+                    if str(assistant_item.phase) in {"commentary", "final_answer", "unknown"}:
+                        item_identity["phase"] = str(assistant_item.phase)
+                    if item_identity:
+                        # 私有键会在 Chat/Responses 请求适配时剥离，但可随 transcript 进入 RunEvent。
+                        assistant_message["_pgagent_output_item"] = item_identity
             if turn.reasoning_content:
                 # DeepSeek reasoning models require their exact prior chain in
                 # every following request. Omitting it makes LiteLLM inject a
@@ -2463,6 +2617,7 @@ class AgentRuntime:
                                 call.arguments,
                                 approved=False,
                                 call_id=call.id,
+                                web_pages=state.get("web_pages"),
                             )
                             for call in turn.tool_calls
                         ),
@@ -2539,6 +2694,7 @@ class AgentRuntime:
                             call.arguments,
                             approved=False,
                             call_id=call.id,
+                            web_pages=state.get("web_pages"),
                         )
                 else:
                     # 变量说明：result 表示本步骤处理结果。
@@ -2645,6 +2801,10 @@ class AgentRuntime:
                     "transcript_delta": [*state.get("transcript_delta", []), dict(tool_message)],
                     "verification_trace": [*state.get("verification_trace", []), dict(tool_message)],
                     "context_artifact_refs": artifact_refs,
+                    "web_pages": _merge_web_pages(
+                        state.get("web_pages"),
+                        result.metadata.get("pages") if isinstance(result.metadata, Mapping) else None,
+                    ),
                 }
                 # 只有 observation 已成功进入 messages 与 transcript 后，结果才算完成提交。
                 if call.id not in legacy_duplicate_call_ids:
@@ -2894,6 +3054,7 @@ class AgentRuntime:
             "memory_citation": {},
             "stagnation_recovery_prompt": "",
             "output_ledger": prior_output_ledger or TurnLedger(),
+            "web_pages": _copy_web_pages(prior_web_pages),
         }
         # 变量说明：final 表示当前步骤使用的 final 值。
         final = await run_agent_loop(
@@ -2923,6 +3084,7 @@ class AgentRuntime:
             acceptance_report=dict(final.get("acceptance_report") or {}),
             completion_verification_attempts=max(0, int(final.get("completion_verification_attempts") or 0)),
             memory_citation=dict(final.get("memory_citation") or {}),
+            web_pages=_copy_web_pages(final.get("web_pages")),
             output_ledger=final.get("output_ledger") if isinstance(final.get("output_ledger"), TurnLedger) else TurnLedger(),
         )
 
@@ -3482,6 +3644,7 @@ class AgentRuntime:
             prior_completion_verification_attempts=prior.completion_verification_attempts,
             prior_acceptance_report=prior.acceptance_report,
             prior_output_ledger=prior.output_ledger,
+            prior_web_pages=prior.web_pages,
         )
 
     # 函数职责：完成 delegated_task_calls_from_messages 对应的智能体处理。
@@ -3764,4 +3927,5 @@ class AgentRuntime:
             prior_completion_verification_attempts=prior.completion_verification_attempts,
             prior_acceptance_report=prior.acceptance_report,
             prior_output_ledger=prior.output_ledger,
+            prior_web_pages=prior.web_pages,
         )

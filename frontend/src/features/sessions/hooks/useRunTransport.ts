@@ -2,7 +2,7 @@
 import { useCallback } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { api, apiUrl } from '../../../api'
-import { appendAssistantDelta, hasPersistedRunReply, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStreamPhase } from '../../../sessionStream'
+import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, hasPersistedRunReply, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStreamPhase } from '../../../sessionStream'
 import type { RunStreamEvent } from '../../../sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, thinkingStatusForRun, updateThoughtTimeline } from '../../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../../thoughtTimeline'
@@ -136,7 +136,8 @@ export function useRunTransport(options: RunTransportOptions) {
       phase: resolvedEvent ? runStreamPhase(resolvedEvent) : previous.phase,
       status: 'terminal',
       error: resolvedEvent?.error ? String(resolvedEvent.error) : previous.error,
-      draft: resolvedEvent ? appendAssistantDelta(previous.draft, resolvedEvent) : previous.draft,
+      assistantItems: resolvedEvent ? applyAssistantStreamEvent(previous.assistantItems, resolvedEvent) : previous.assistantItems,
+      draft: resolvedEvent ? assistantItemsText(applyAssistantStreamEvent(previous.assistantItems, resolvedEvent)) || appendAssistantDelta(previous.draft, resolvedEvent) : previous.draft,
       thought: resolvedEvent ? updateThoughtTimeline(previous.thought, resolvedEvent) : previous.thought,
     }))
 
@@ -158,7 +159,7 @@ export function useRunTransport(options: RunTransportOptions) {
       refreshedMessages?.ownerSessionId === sessionId
       && hasPersistedRunReply(refreshedMessages.items, runId),
     )
-    const hasDraft = Boolean(liveRunRef.current.runId === runId && liveRunRef.current.draft)
+    const hasDraft = Boolean(liveRunRef.current.runId === runId && (assistantItemsText(liveRunRef.current.assistantItems) || liveRunRef.current.draft))
     if (resolvedEvent?.error) setActionError(`运行失败：${String(resolvedEvent.error)}`)
     if (hasPersistedReply || (!hasDraft && !userInterruptedTerminal)) {
       setLiveRun(emptyLiveRun())
@@ -252,6 +253,7 @@ export function useRunTransport(options: RunTransportOptions) {
       runId,
       phase: previous.runId === runId && previous.phase ? previous.phase : '思考中…',
       draft: previous.runId === runId ? previous.draft : '',
+      assistantItems: previous.runId === runId ? previous.assistantItems : [],
       status: 'connecting',
       error: '',
       thought: previous.runId === runId
@@ -289,18 +291,20 @@ export function useRunTransport(options: RunTransportOptions) {
       const waitingApproval = parsed.type === 'approval_requested'
         || parsed.type === 'delegated_child_awaiting_approval'
         || (parsed.type === 'run_state' && parsed.status === 'awaiting_approval')
-      setLiveRun((previous) => ({
+      setLiveRun((previous) => {
+        const assistantItems = applyAssistantStreamEvent(previous.assistantItems, parsed)
+        return ({
         ...previous,
         runId,
         phase: runStreamPhase(parsed),
-        // 工具调用前收到的文本属于模型进度而非最终回答；工具真正开始时将其移入安全思考摘要并清空回答草稿。
-        draft: parsed.type === 'tool_started' || parsed.type === 'tool_call'
-          ? ''
-          : appendAssistantDelta(previous.draft, parsed),
+        // 正文是按 response/item 维护的持久化候选；工具开始、response 完成都不能清空它。
+        assistantItems,
+        draft: assistantItemsText(assistantItems) || appendAssistantDelta(previous.draft, parsed),
         status: terminal ? 'terminal' : waitingApproval ? 'awaiting_approval' : 'live',
         error: parsed.error ? String(parsed.error) : previous.error,
         thought: updateThoughtTimeline(previous.thought, parsed),
-      }))
+        })
+      })
       if (waitingApproval) void refreshApprovalsForSession(sessionId)
       if (parsed.type === 'tool_finished' && ['update_plan', 'todowrite', 'TodoWrite'].includes(String(parsed.tool_name || ''))) {
         void refreshDurableTask()

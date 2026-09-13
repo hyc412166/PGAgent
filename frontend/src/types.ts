@@ -302,6 +302,17 @@ export interface Message {
   citations?: Array<{ url: string; title: string }>
 }
 
+// AssistantStreamItem 是单次运行中按 response/item 顺序累计的可见正文；它与工具、终态事件分离，避免正文被工具阶段重置。
+export interface AssistantStreamItem {
+  id: string
+  responseId?: string
+  itemId?: string
+  outputIndex?: number
+  content: string
+  phase?: 'commentary' | 'final_answer' | 'unknown' | string
+  status: 'streaming' | 'completed'
+}
+
 // RunEvent 是已落盘运行事件，结构与实时 SSE 相近但包含服务端时间戳和 payload。
 export interface RunEvent {
   id?: string

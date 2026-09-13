@@ -202,4 +202,7 @@ def create_model_call(config: ProviderConfig, *, credentials):
 
     # 变量说明：manages_retries 表示当前流程使用的 manages_retries 集合。
     call.manages_retries = True
+    # 两种内置协议都会在正文增量后回调带 response/item 身份的累计
+    # AssistantMessageItem，运行时据此发布唯一的 canonical SSE 生命周期。
+    call.emits_assistant_items = True
     return call

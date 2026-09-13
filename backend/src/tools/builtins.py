@@ -817,10 +817,11 @@ def _environment_proxy() -> str | None:
 def _validate_public_http_url(url: str) -> tuple[str, str]:
     """Validate scheme and DNS answers before a web request.
 
-    The client also disables environment proxy discovery and redirects.  DNS is
-    revalidated for every explicit fetch.  This is a strong server-side guard
-    for normal use; it deliberately does not claim that a generic HTTP client
-    turns arbitrary network access into a filesystem sandbox.
+    Redirects are handled by the caller so every hop can be checked.  Callers
+    may use an environment proxy, but the requested hostname is still resolved
+    and checked before the request.  This is a strong server-side guard for
+    normal use; it deliberately does not claim that a generic HTTP client turns
+    arbitrary network access into a filesystem sandbox.
     """
 
     # 变量说明：candidate 表示当前步骤使用的 candidate 值。
@@ -1236,14 +1237,15 @@ def web_search(
     provider_query = search_query
     if domain_filters:
         provider_query = f"{search_query} ({' OR '.join(f'site:{domain}' for domain in sorted(domain_filters))})"
-    try:
-        proxy = _environment_proxy()
-        search_url, _host = _validate_public_http_url(_bing_search_endpoint(provider_query, proxy))
-        with httpx.Client(timeout=httpx.Timeout(15), follow_redirects=False, trust_env=True,
+
+    def fetch_search_response(url: str, *, trust_env: bool, proxy_configured: bool) -> tuple[str, int] | None:
+        """Read one bounded RSS response; None means only the proxy peer failed the second guard."""
+
+        with httpx.Client(timeout=httpx.Timeout(15), follow_redirects=False, trust_env=trust_env,
                           headers={"User-Agent": "PGAgent/0.1 (+local search)"}) as client:
-            with client.stream("GET", search_url) as response:
-                if not _response_peer_is_public(response, proxy_configured=bool(proxy)):
-                    return ToolResult("websearch", False, "连接目标不是公共网络地址", error_code="unsafe_url")
+            with client.stream("GET", url) as response:
+                if not _response_peer_is_public(response, proxy_configured=proxy_configured):
+                    return None
                 response.raise_for_status()
                 body = bytearray()
                 for chunk in response.iter_bytes():
@@ -1254,8 +1256,24 @@ def web_search(
                     if len(chunk) > remaining:
                         break
                 encoding = response.encoding or "utf-8"
-                status_code = response.status_code
-            markup = bytes(body).decode(encoding, errors="replace")
+                return bytes(body).decode(encoding, errors="replace"), response.status_code
+
+    try:
+        proxy = _environment_proxy()
+        search_url, _host = _validate_public_http_url(_bing_search_endpoint(provider_query, proxy))
+        response_data = fetch_search_response(
+            search_url,
+            trust_env=bool(proxy),
+            proxy_configured=bool(proxy),
+        )
+        if response_data is None and proxy:
+            # 代理对端是本机地址时，目标域名已经通过 DNS 公网校验；切到区域入口直连，
+            # 避免把代理链路误报为 unsafe_url，同时仍保持直连的二次对端检查。
+            direct_url, _direct_host = _validate_public_http_url(_bing_search_endpoint(provider_query, None))
+            response_data = fetch_search_response(direct_url, trust_env=False, proxy_configured=False)
+        if response_data is None:
+            return ToolResult("websearch", False, "连接目标不是公共网络地址", error_code="unsafe_url")
+        markup, status_code = response_data
     except UnsafeWebUrlError:
         return _search_failure("search_unsafe_url", "搜索目标未通过公共网络校验", stage="validation")
     except WebHostResolutionError:

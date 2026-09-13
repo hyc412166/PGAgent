@@ -35,7 +35,9 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 
 `received -> preparing_context -> acting -> awaiting_approval -> observing -> verifying -> completed|failed|stopped`
 
-主 Agent 给出候选答复后必须经过本地确定性完成门禁。门禁使用显式的当前 Run 轨迹检查非空答复、最终 assistant 对齐、工具调用 ID 唯一、每次调用恰有一个同名结构化结果、计数一致且没有待审批项。该过程不调用第二个模型，也不做主观语义评分；普通无工具回答只产生主 Agent 自身的一次模型请求。确定性检查拒绝时，反馈只在内存中回灌主 Agent 继续修订，不写入用户会话；默认最多 3 次，全部失败后以 acceptance_failed 停止。只有通过后候选文本才作为成功答复发布；失败或停止则由对话交付层持久化确定性终态说明。等待用户澄清使用 needs_user_input，不冒充任务完成。
+模型输出先由 provider adapter 归一化为有序 output items（assistant、reasoning、local tool、hosted tool），再由 response ledger 记录 response 完成、工具提交和 follow-up 状态。`phase=commentary/final_answer/unknown` 只影响展示，不能单独决定 Turn 完成；Chat Completions 不推断 phase。`response.completed` 或 `finish_reason` 只表示一次 provider response 结束，不表示用户 Turn 已完成。
+
+Turn 只有在 provider response 已结束、本地工具结果全部提交、没有待审批/后台等待或 follow-up，并且存在非空 assistant 正文时才进入 `completed`；失败、停止和空输出分别进入对应终态，不重新采样伪造候选。工具调用/结果一致性在 dispatch 与 result commit 边界检查，默认不安装额外 completion verifier，也不产生新的 `acceptance_failed`。终态消息持久化成功后才发布 `turn_completed/turn_failed/turn_stopped`，SSE 和前端只把这些 Turn 事件作为 canonical 终态；旧 `run_*` 事件仅为历史读取兼容。等待用户澄清使用 needs_user_input，不冒充任务完成。
 
 模型以 `auto` 模式自行判断任务是否需要内部规划。`AgentRuntime` 的显式循环负责重复调用、无进展、超时和完成验证；`RunCoordinator` 负责取消、审批和基于应用运行快照的恢复，不再用任意的总步数或总工具次数截断长任务。
 
@@ -51,7 +53,7 @@ Review profile 额外形成只读工作流上限：即使 Agent 配置误选了�
 - `todowrite` 是 JSON 可序列化的运行/会话待办状态；`skill` 只按 ID 返回会话已选的受管理 `SKILL.md` 文本，不执行脚本；`question` 结束本轮并将澄清问题作为正常助手消息。`task` 会先持久化完整 DAG，再按 ready wave 并发创建幂等委派记录和独立子 `Run`；失败前置节点的后继任务不会被错误启动。
 - 子 Agent 继承父运行已经冻结的权限模式；它的工具为“父运行允许工具”与“子 Agent 自己勾选工具”的交集，并强制移除递归委派、团队管理和共享任务板写入工具。子 Run 若需要二次审批会真实进入 `awaiting_approval`，若其后台 Job 未完成则进入事件等待，绝不把未批准或仅入队的操作说成已完成。
 - `ask`：写入、命令、委派与联网均须批准；`smart`：低风险读取和受限公网读取自动执行，写入、命令和委派须批准；`full`：无需批准，但仍保留上述基础安全边界。
-- 事件流提供 `model_step_started`、`tool_started`、`tool_finished` 和终态事件，携带安全参数摘要和耗时；工具结果正文、写入正文、Token/API Key 不写入时间线事件。
+- 事件流提供 `assistant_message_started/delta/completed`、`model_response_completed`、`model_step_started`、`tool_started`、`tool_finished` 和 Turn 终态事件。delta 只走瞬时 SSE，completed item 进入 RunEvent 供重放；`model_response_completed` 不是终态。事件携带安全参数摘要和耗时；工具结果正文、写入正文、Token/API Key 不写入时间线事件。
 
 ## 运行诊断与日志
 

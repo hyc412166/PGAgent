@@ -431,6 +431,9 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
                 public[key] = value
         if isinstance(source.get("has_tool_calls"), bool):
             public["has_tool_calls"] = source["has_tool_calls"]
+        phase = source.get("phase")
+        if phase in {"commentary", "final_answer", "unknown"}:
+            public["phase"] = phase
         content = _public_thought_text(source.get("content"), limit=100_000)
         if content is not None:
             public["content"] = content

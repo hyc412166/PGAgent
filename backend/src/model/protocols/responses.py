@@ -386,6 +386,12 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
                 if assistant_callback is not None:
                     await emit_assistant(AssistantMessageItem(
                         response_id=response_id, item_id=item_id,
+                        output_index=(
+                            event.get("output_index")
+                            if isinstance(event.get("output_index"), int)
+                            and not isinstance(event.get("output_index"), bool)
+                            else None
+                        ),
                         content=assistant_contents[item_id],
                     ))
             elif kind == "response.reasoning_summary_text.delta":

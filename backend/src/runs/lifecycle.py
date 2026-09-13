@@ -3078,6 +3078,7 @@ class RunCoordinator:
                     prior_completion_verification_attempts=prior.completion_verification_attempts,
                     prior_acceptance_report=prior.acceptance_report,
                     prior_output_ledger=prior.output_ledger,
+                    prior_web_pages=prior.web_pages,
                 )
             else:
                 # 变量说明：outcome 表示当前步骤使用的 outcome 值。

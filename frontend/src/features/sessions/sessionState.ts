@@ -1,10 +1,10 @@
 // 本文件实现 sessionState 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { emptyThoughtTimeline } from '../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../thoughtTimeline'
-import type { DelegatedTask, Message, PermissionMode, Run, Session, SessionContext, Teammate, ThinkingLevel, Workspace } from '../../types'
+import type { AssistantStreamItem, DelegatedTask, Message, PermissionMode, Run, Session, SessionContext, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 // 以下类型明确会话页各状态块的所有权：ownerSessionId 用于隔离切换会话前后的异步结果。
-export type LiveRunState = { runId: string; phase: string; draft: string; status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'; error: string; thought: ThoughtTimelineState; thinkingStatus: string }
+export type LiveRunState = { runId: string; phase: string; draft: string; assistantItems: AssistantStreamItem[]; status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'; error: string; thought: ThoughtTimelineState; thinkingStatus: string }
 export type OwnedSessionMessages = { ownerSessionId: string; items: Message[] }
 export type OwnedSessionRuns = { ownerSessionId: string; items: Run[] }
 export type OwnedSessionDelegations = { ownerSessionId: string; items: DelegatedTask[] }
@@ -20,7 +20,7 @@ export const noTeammates: Teammate[] = []
 
 // 创建全新的实时运行状态，避免上一轮草稿、错误或思考时间线泄漏到下一轮。
 export function emptyLiveRun(): LiveRunState {
-  return { runId: '', phase: '', draft: '', status: 'idle', error: '', thought: emptyThoughtTimeline, thinkingStatus: '' }
+  return { runId: '', phase: '', draft: '', assistantItems: [], status: 'idle', error: '', thought: emptyThoughtTimeline, thinkingStatus: '' }
 }
 
 // 页面重新进入活动运行时，以后端持久化时间恢复计时；仅在时间缺失或无效时使用当前时间。
@@ -37,8 +37,9 @@ export const runStreamEventNames = [
   'run_state', 'run_received', 'context_prepared', 'context_resumed', 'context_compacted',
   'context_compaction_started', 'context_compaction_finished', 'context_compaction_failed',
   'model_step_started', 'model_retry', 'progress', 'agent_progress', 'thought_summary',
-  'mcp_connecting', 'mcp_ready', 'mcp_degraded',
+  'mcp_connecting', 'mcp_server_ready', 'mcp_ready', 'mcp_degraded',
   'thought_delta', 'activity_update', 'assistant_delta', 'tool_started', 'tool_call',
+  'assistant_message_started', 'assistant_message_delta', 'assistant_message_completed', 'model_response_completed',
   'tool_finished', 'tool_result', 'completion_verification_started',
   'completion_verification_rejected', 'completion_verification_passed', 'approval_requested',
   'approval_granted', 'delegated_child_started', 'delegated_child_continuation_started',

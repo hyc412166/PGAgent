@@ -1,4 +1,6 @@
 // 本文件负责 sessionStream 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
+import type { AssistantStreamItem } from './types'
+
 // RunStreamEvent 是后端 SSE 事件的宽松前端模型；索引签名保留不同事件携带的扩展字段。
 export interface RunStreamEvent {
   type: string
@@ -13,7 +15,7 @@ export interface RunStreamEvent {
 }
 
 // 三组集合分别定义终态事件、终态状态，以及“已停止但稍后可自动续跑”的等待原因。
-const terminalTypes = new Set(['run_completed', 'run_interrupted', 'run_stopped', 'model_failed', 'integration_failed', 'failed', 'completed', 'stopped'])
+const terminalTypes = new Set(['turn_completed', 'turn_failed', 'turn_stopped', 'run_completed', 'run_interrupted', 'run_stopped', 'model_failed', 'integration_failed', 'failed', 'completed', 'stopped'])
 const terminalStatuses = new Set(['completed', 'stopped', 'failed', 'cancelled'])
 const resumableWaitingReasons = new Set([
   'waiting_background',
@@ -70,6 +72,10 @@ export function runStreamPhase(event: RunStreamEvent): string {
       : 'MCP 已连接'
     case 'mcp_degraded': return '部分 MCP 服务不可用，本轮继续使用已连接工具'
     case 'assistant_delta': return '正在回复…'
+    case 'assistant_message_started':
+    case 'assistant_message_delta': return '正在回复…'
+    case 'assistant_message_completed': return '已生成一段回复'
+    case 'model_response_completed': return '正在整理回复…'
     case 'tool_started':
     case 'tool_call': return event.tool_name ? `正在调用 ${event.tool_name}…` : '正在调用工具…'
     case 'tool_finished':
@@ -88,7 +94,9 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'delegated_child_stopped':
     case 'delegated_child_failed': return '子 Agent 未完成'
     case 'run_completed':
+    case 'turn_completed':
     case 'completed': return '已完成'
+    case 'turn_stopped':
     case 'run_interrupted':
     case 'run_stopped':
     case 'stopped': {
@@ -96,6 +104,7 @@ export function runStreamPhase(event: RunStreamEvent): string {
       return isResumableWaitingRun({ status: 'stopped', reason }) ? waitingRunPhase(reason) : '已停止'
     }
     case 'model_failed':
+    case 'turn_failed':
     case 'integration_failed':
     case 'failed': return '运行失败'
     default: return '处理中…'
@@ -105,7 +114,7 @@ export function runStreamPhase(event: RunStreamEvent): string {
 // 综合显式 terminal、事件类型和状态识别终态，同时排除可恢复等待点。
 export function isTerminalRunStreamEvent(event: RunStreamEvent): boolean {
   if (event.terminal === false) return false
-  const inferredStatus = event.status || (event.type === 'run_stopped' || event.type === 'stopped' ? 'stopped' : '')
+  const inferredStatus = event.status || (event.type === 'run_stopped' || event.type === 'turn_stopped' || event.type === 'stopped' ? 'stopped' : '')
   if (isResumableWaitingRun({
     status: inferredStatus,
     reason: String(event.reason || event.stop_reason || ''),
@@ -144,6 +153,97 @@ export function appendAssistantDelta(current: string, event: RunStreamEvent): st
   const partial = event.partial_output
   if (typeof partial === 'string' && partial.length > current.length) return partial
   return current
+}
+
+function streamString(event: RunStreamEvent, key: string): string {
+  const direct = event[key]
+  if (typeof direct === 'string' && direct.trim()) return direct.trim()
+  const payload = event.payload
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const nested = (payload as Record<string, unknown>)[key]
+    if (typeof nested === 'string' && nested.trim()) return nested.trim()
+  }
+  return ''
+}
+
+function streamNumber(event: RunStreamEvent, key: string): number | undefined {
+  const direct = event[key]
+  if (typeof direct === 'number' && Number.isInteger(direct) && direct >= 0) return direct
+  const payload = event.payload
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const nested = (payload as Record<string, unknown>)[key]
+    if (typeof nested === 'number' && Number.isInteger(nested) && nested >= 0) return nested
+  }
+  return undefined
+}
+
+function assistantItemKey(event: RunStreamEvent, fallbackIndex: number): { id: string; responseId?: string; itemId?: string; outputIndex?: number } {
+  const responseId = streamString(event, 'response_id') || undefined
+  const itemId = streamString(event, 'item_id') || undefined
+  const outputIndex = streamNumber(event, 'output_index')
+  const identity = itemId || (outputIndex === undefined ? `legacy-${fallbackIndex}` : `index-${outputIndex}`)
+  return { id: `${responseId || 'legacy'}:${identity}`, responseId, itemId, outputIndex }
+}
+
+function itemMatches(item: AssistantStreamItem, key: ReturnType<typeof assistantItemKey>): boolean {
+  if (item.id === key.id) return true
+  const sameResponse = !key.responseId || !item.responseId || item.responseId === key.responseId
+  if (key.itemId && item.itemId === key.itemId && sameResponse) return true
+  return key.outputIndex !== undefined && item.outputIndex === key.outputIndex && sameResponse
+}
+
+// 将细粒度正文事件折叠为稳定的有序条目；工具和 response completed 事件不会触碰这些条目。
+export function applyAssistantStreamEvent(items: AssistantStreamItem[], event: RunStreamEvent): AssistantStreamItem[] {
+  const type = String(event.type || event.event_type || '').toLowerCase()
+  if (!['assistant_message_started', 'assistant_message_delta', 'assistant_message_completed', 'assistant_delta'].includes(type)) return items
+  const next = items.map((item) => ({ ...item }))
+  const key = assistantItemKey(event, next.length)
+  let existingIndex = next.findIndex((item) => itemMatches(item, key))
+  // 旧 SSE 没有 response/item 标识；在同一运行内沿用最后一个未完成条目，
+  // 避免 started、delta、completed 三种兼容事件因为输出索引差异重复成空白消息。
+  if (existingIndex < 0 && !key.responseId && !key.itemId) {
+    existingIndex = next.findLastIndex((item) => item.status === 'streaming' && !item.responseId)
+  }
+  const content = typeof event.content === 'string'
+    ? event.content
+    : typeof event.delta === 'string' ? event.delta : ''
+  // 旧版 assistant_delta 只承载最终正文，没有显式 phase；兼容时按最终回复处理，
+  // 以免它被错误塞进可折叠的 commentary/执行详情区域。
+  const phase = streamString(event, 'phase') || (type === 'assistant_delta' ? 'final_answer' : undefined)
+  const status = type === 'assistant_message_completed' ? 'completed' as const : 'streaming' as const
+  if (existingIndex >= 0) {
+    const current = next[existingIndex]
+    next[existingIndex] = {
+      ...current,
+      id: key.responseId || key.itemId ? key.id : current.id,
+      responseId: current.responseId || key.responseId,
+      itemId: current.itemId || key.itemId,
+      outputIndex: current.outputIndex ?? key.outputIndex,
+      phase: phase || current.phase,
+      content: type === 'assistant_message_delta' || type === 'assistant_delta'
+        ? `${current.content}${content}`
+        : content || current.content,
+      status: type === 'assistant_message_completed' ? 'completed' : current.status,
+    }
+    return next
+  }
+  const item: AssistantStreamItem = {
+    ...key,
+    content: type === 'assistant_message_delta' || type === 'assistant_delta' ? content : content,
+    phase,
+    status,
+  }
+  // 同一个 response 内按 output_index 排序；不同 response 保留首次到达顺序。
+  const insertionIndex = key.responseId && key.outputIndex !== undefined
+    ? next.findIndex((candidate) => candidate.responseId === key.responseId && candidate.outputIndex !== undefined && candidate.outputIndex > key.outputIndex!)
+    : -1
+  if (insertionIndex >= 0) next.splice(insertionIndex, 0, item)
+  else next.push(item)
+  return next
+}
+
+export function assistantItemsText(items: AssistantStreamItem[]): string {
+  return items.map((item) => item.content).join('')
 }
 
 // 用事件 ID 去重重连后重复送达的 SSE；无 ID 的兼容事件默认接受。
