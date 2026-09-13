@@ -20,7 +20,10 @@ from uuid import uuid4
 
 
 # 变量说明：TERMINAL_EVENT_TYPES 表示当前流程使用的 TERMINAL_EVENT_TYPES 集合。
-TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_interrupted", "run_stopped", "model_failed", "integration_failed"})
+TERMINAL_EVENT_TYPES = frozenset({
+    "run_completed", "run_interrupted", "run_stopped", "model_failed", "integration_failed",
+    "turn_completed", "turn_failed", "turn_stopped",
+})
 
 
 # 类职责：定义 RunStreamSubscription 在本领域中的数据与行为。

@@ -299,6 +299,54 @@ def test_completed_outcome_persists_snapshot_and_assistant_message(seeded_run: t
         assert snapshot is not None and snapshot.payload["guard_snapshot"]["calls"] == 1
 
 
+def test_completed_outcome_publishes_turn_terminal_after_reply_is_delivered(
+    seeded_run: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id, session_id = seeded_run
+    published: list[dict] = []
+    monkeypatch.setattr(
+        "src.runs.lifecycle.run_stream_broker.publish",
+        lambda _run_id, event: published.append(dict(event)) or event,
+    )
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="最终答复",
+        messages=[{"role": "assistant", "content": "最终答复"}],
+        events=[{"type": "run_completed"}],
+    ))
+
+    assert any(event["type"] == "turn_completed" for event in published)
+    with database.SessionLocal() as db:
+        reply = db.scalar(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.terminal_for_turn_id.is_not(None),
+        ))
+        assert reply is not None
+        terminal = next(event for event in published if event["type"] == "turn_completed")
+        assert terminal["message_id"] == reply.id
+
+
+def test_outcome_persists_completed_assistant_item_but_not_delta(seeded_run: tuple[str, str]) -> None:
+    run_id, _session_id = seeded_run
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="可回放答复",
+        messages=[{"role": "assistant", "content": "可回放答复", "response_id": "resp-1", "item_id": "item-1"}],
+        events=[{"type": "run_completed"}],
+    ))
+    with database.SessionLocal() as db:
+        completed = db.scalar(select(RunEvent).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "assistant_message_completed",
+        ))
+        assert completed is not None
+        assert completed.payload["content"] == "可回放答复"
+        assert db.scalar(select(RunEvent).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "assistant_message_delta",
+        )) is None
+
+
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_terminal_stop_without_model_output_still_persists_one_user_reply 精确标识本用例的具体条件。
 def test_terminal_stop_without_model_output_still_persists_one_user_reply(
     accepted_run: tuple[str, str],
