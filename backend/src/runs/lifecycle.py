@@ -172,6 +172,7 @@ USER_INTERRUPT_REASONS = frozenset({USER_INTERRUPT_REASON, "parent_user_interrup
 # 变量说明：_PUBLIC_TRANSIENT_STREAM_EVENT_TYPES 表示当前流程使用的 _PUBLIC_TRANSIENT_STREAM_EVENT_TYPES 集合。
 _PUBLIC_TRANSIENT_STREAM_EVENT_TYPES = frozenset({
     "assistant_delta",
+    "assistant_message_delta",
     "thought_delta",
     "progress",
     "agent_progress",
@@ -1372,6 +1373,11 @@ class RunCoordinator:
             event_type = str(event.get("type") or "runtime_event")
             # 变量说明：payload 表示跨层传递的数据载荷。
             payload = {key: _json_safe(value) for key, value in event.items() if key != "type"}
+            # delta 事件只进入瞬时 SSE，避免按字符膨胀 RunEvent；其余
+            # assistant/model 事件仍通过同一有序持久化路径回放。
+            if event_type == "assistant_message_delta":
+                run_stream_broker.publish(run_id, {"type": event_type, **payload})
+                return
             with database_module.SessionLocal() as db:
                 # Claim the row with a conditional no-op update before
                 # appending the event.  If a user stop already committed, a
@@ -1425,6 +1431,12 @@ class RunCoordinator:
             safe_event = _json_safe(event)
             if str(safe_event.get("type") or "") not in _PUBLIC_TRANSIENT_STREAM_EVENT_TYPES:
                 return
+            event_type = str(safe_event.get("type") or "")
+            with RunCoordinator._stream_buffer_lock:
+                first_assistant_delta = (
+                    event_type == "assistant_delta"
+                    and not RunCoordinator._stream_buffers.get(run_id, {}).get("output")
+                )
             # Keep the low-latency stream transient, but retain a bounded copy
             # in memory for an explicit stop response.  This avoids one DB
             # transaction per token while still letting the stop endpoint
@@ -1435,6 +1447,13 @@ class RunCoordinator:
                 interrupted = run_id in RunCoordinator._interrupt_requested
             if interrupted:
                 return
+            if first_assistant_delta:
+                run_stream_broker.publish(run_id, {"type": "assistant_message_started"})
+                run_stream_broker.publish(run_id, {
+                    "type": "assistant_message_delta",
+                    "delta": safe_event.get("delta", ""),
+                    **({"step": safe_event["step"]} if isinstance(safe_event.get("step"), int) else {}),
+                })
             run_stream_broker.publish(run_id, safe_event)
 
         return sink
@@ -2360,6 +2379,9 @@ class RunCoordinator:
             }
         # 变量说明：persisted 表示当前步骤使用的 persisted 值。
         persisted = False
+        turn_stream_event: dict[str, Any] | None = None
+        assistant_stream_events: list[dict[str, Any]] = []
+        response_stream_event: dict[str, Any] | None = None
         # 变量说明：parent_bridge_event 表示当前步骤使用的 parent_bridge_event 值。
         parent_bridge_event: dict[str, Any] | None = None
         # 变量说明：extraction_job_id 表示extraction_job 对象的唯一标识。
@@ -2558,6 +2580,62 @@ class RunCoordinator:
                         arguments=dict(pending.get("arguments") or {}),
                         reason=str(pending.get("reason") or "该工具会修改本机状态，需要你的确认"),
                     ))
+
+            # Responses output items are durable replay facts.  Only the
+            # bounded assistant projection is stored here; token deltas stay
+            # transient in the stream broker.
+            assistant_items = [
+                item for item in (outcome.transcript_delta or outcome.messages)
+                if isinstance(item, dict) and item.get("role") == "assistant"
+            ]
+            existing_items = {
+                tuple(sorted((event.payload or {}).items()))
+                for event in db.scalars(select(RunEvent).where(
+                    RunEvent.run_id == run_id,
+                    RunEvent.event_type == "assistant_message_completed",
+                ))
+                if isinstance(event.payload, dict)
+            }
+            for output_index, item in enumerate(assistant_items):
+                content = str(item.get("content") or "")[:100_000]
+                item_payload: dict[str, Any] = {
+                    "content": content,
+                    "output_index": output_index,
+                    "has_tool_calls": bool(item.get("tool_calls")),
+                }
+                for key in ("response_id", "item_id"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value:
+                        item_payload[key] = value[:160]
+                if tuple(sorted(item_payload.items())) not in existing_items:
+                    append_run_event(
+                        db,
+                        run_id=run_id,
+                        event_type="assistant_message_completed",
+                        step=outcome.steps,
+                        payload=item_payload,
+                    )
+                    assistant_stream_events.append({"type": "assistant_message_completed", **item_payload})
+            if assistant_items:
+                response_payload = {"output_chars": len(str(outcome.output or ""))}
+                response_id = next(
+                    (item.get("response_id") for item in assistant_items if isinstance(item.get("response_id"), str)),
+                    None,
+                )
+                if response_id:
+                    response_payload["response_id"] = str(response_id)[:160]
+                if not db.scalar(select(RunEvent.id).where(
+                    RunEvent.run_id == run_id,
+                    RunEvent.event_type == "model_response_completed",
+                )):
+                    append_run_event(
+                        db,
+                        run_id=run_id,
+                        event_type="model_response_completed",
+                        step=outcome.steps,
+                        payload=response_payload,
+                    )
+                    response_stream_event = {"type": "model_response_completed", **response_payload}
             # 变量说明：terminal_provider_message 表示当前步骤使用的 terminal_provider_message 值。
             terminal_provider_message = next(
                 (
@@ -2574,7 +2652,7 @@ class RunCoordinator:
             terminal_reasoning = str(terminal_provider_message.get("reasoning_content") or "")
             # 变量说明：terminal_native 表示当前步骤使用的 terminal_native 值。
             terminal_native = terminal_provider_message.get("_pgagent_provider")
-            persist_terminal_response(
+            terminal_message = persist_terminal_response(
                 db,
                 run,
                 output=str(outcome.output or "").strip() or None,
@@ -2587,6 +2665,36 @@ class RunCoordinator:
                     } or None
                 ),
             )
+            if terminal_message is not None and turn is not None and is_terminal_delivery(
+                effective_status, effective_stop_reason
+            ):
+                turn_event_type = {
+                    "completed": "turn_completed",
+                    "failed": "turn_failed",
+                    "stopped": "turn_stopped",
+                }.get(effective_status)
+                if turn_event_type and not db.scalar(select(RunEvent.id).where(
+                    RunEvent.run_id == run_id,
+                    RunEvent.event_type == turn_event_type,
+                )):
+                    append_run_event(
+                        db,
+                        run_id=run_id,
+                        event_type=turn_event_type,
+                        payload={
+                            "turn_id": turn.id,
+                            "message_id": terminal_message.id,
+                            "status": effective_status,
+                            "error_code": normalized_error_code,
+                        },
+                    )
+                    turn_stream_event = {
+                        "type": turn_event_type,
+                        "turn_id": turn.id,
+                        "message_id": terminal_message.id,
+                        "status": effective_status,
+                        "error_code": normalized_error_code,
+                    }
             # 变量说明：cited 表示当前步骤使用的 cited 值。
             cited = (
                 []
@@ -2705,8 +2813,18 @@ class RunCoordinator:
             db.commit()
             # 变量说明：persisted 表示当前步骤使用的 persisted 值。
             persisted = True
-        if persisted and publish_event is not None:
-            run_stream_broker.publish(run_id, publish_event)
+        if persisted:
+            for event in assistant_stream_events:
+                run_stream_broker.publish(run_id, event)
+            if response_stream_event is not None:
+                run_stream_broker.publish(run_id, response_stream_event)
+            # New Turn terminal events are the sole SSE close signal.  Keep
+            # legacy run_* rows for readers, but do not emit them first or a
+            # reconnecting client could close before observing turn_*.
+            if turn_stream_event is not None:
+                run_stream_broker.publish(run_id, turn_stream_event)
+            elif publish_event is not None:
+                run_stream_broker.publish(run_id, publish_event)
         if persisted and parent_bridge_event is not None:
             # 变量说明：parent_run_id 表示parent_run 对象的唯一标识。
             parent_run_id = str(parent_bridge_event.get("parent_run_id") or "")

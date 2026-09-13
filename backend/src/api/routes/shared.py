@@ -120,9 +120,16 @@ _PUBLIC_RUN_EVENT_TYPES = frozenset({
     "agent_progress",
     "thought_summary",
     "activity_update",
+    "assistant_message_started",
+    "assistant_message_delta",
+    "assistant_message_completed",
+    "model_response_completed",
     "run_completed",
     "run_interrupted",
     "run_stopped",
+    "turn_completed",
+    "turn_failed",
+    "turn_stopped",
     "stopped",
     "terminal_response_persisted",
     "tool_call",
@@ -137,7 +144,7 @@ _TOOL_START_EVENT_TYPES = frozenset({"tool_call", "tool_started"})
 _TOOL_FINISH_EVENT_TYPES = frozenset({"tool_finished", "tool_result"})
 # 变量说明：_TERMINAL_EVENT_TYPES 表示当前流程使用的 _TERMINAL_EVENT_TYPES 集合。
 _TERMINAL_EVENT_TYPES = frozenset({
-    "completed", "failed", "integration_failed", "model_failed", "run_completed", "run_interrupted", "run_stopped", "stopped"
+    "completed", "failed", "integration_failed", "model_failed", "run_completed", "run_interrupted", "run_stopped", "stopped", "turn_completed", "turn_failed", "turn_stopped"
 })
 # 变量说明：_PUBLIC_EVENT_NUMBER_FIELDS 表示当前流程使用的 _PUBLIC_EVENT_NUMBER_FIELDS 集合。
 _PUBLIC_EVENT_NUMBER_FIELDS = frozenset({
@@ -397,7 +404,7 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
                 public[key] = identifier
 
     if event_type in _TOOL_START_EVENT_TYPES | _TOOL_FINISH_EVENT_TYPES | {"user_question_requested"}:
-        for key in ("tool_name", "tool_call_id"):
+        for key in ("tool_name", "tool_call_id", "response_id", "item_id", "call_id"):
             # 变量说明：text 表示当前步骤使用的 text 值。
             text = _public_event_text(source.get(key), limit=160)
             if text is not None:
@@ -412,6 +419,20 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
             result_summary = _public_event_text(source.get("result_summary"), limit=480)
             if result_summary is not None:
                 public["result_summary"] = result_summary
+
+    if event_type in {"assistant_message_started", "assistant_message_delta", "assistant_message_completed", "model_response_completed"}:
+        for key in ("response_id", "item_id", "output_index", "step"):
+            value = source.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                public[key] = value
+        if isinstance(source.get("has_tool_calls"), bool):
+            public["has_tool_calls"] = source["has_tool_calls"]
+        content = _public_thought_text(source.get("content"), limit=100_000)
+        if content is not None:
+            public["content"] = content
+        delta = _public_thought_text(source.get("delta"), limit=100_000)
+        if delta is not None:
+            public["delta"] = delta
 
     if event_type in {
         "context_protocol_repaired",
@@ -493,6 +514,12 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
     if event_type == "terminal_response_persisted":
         for key in ("turn_id", "message_id", "trace_id", "status", "error_code", "source"):
             # 变量说明：text 表示当前步骤使用的 text 值。
+            text = _public_event_text(source.get(key), limit=200)
+            if text is not None:
+                public[key] = text
+
+    if event_type in {"turn_completed", "turn_failed", "turn_stopped"}:
+        for key in ("turn_id", "message_id", "status", "error_code"):
             text = _public_event_text(source.get(key), limit=200)
             if text is not None:
                 public[key] = text

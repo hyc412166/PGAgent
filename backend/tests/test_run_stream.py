@@ -54,3 +54,12 @@ async def test_broker_publish_from_worker_thread_reaches_async_subscriber() -> N
         assert event["event_id"]
     finally:
         broker.unsubscribe(subscription)
+
+
+def test_turn_terminal_events_close_stream_but_model_response_does_not() -> None:
+    from src.api.runtime import _stream_event_is_terminal
+
+    assert _stream_event_is_terminal({"type": "turn_completed"})
+    assert _stream_event_is_terminal({"type": "turn_failed"})
+    assert _stream_event_is_terminal({"type": "turn_stopped"})
+    assert not _stream_event_is_terminal({"type": "model_response_completed"})
