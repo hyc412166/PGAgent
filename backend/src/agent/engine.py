@@ -1835,11 +1835,9 @@ class AgentRuntime:
                 # adapter sidecar 是新 Turn 状态机的唯一结构化输入；旧 ModelTurn
                 # 通过等价投影继续兼容现有测试、脚本和 transcript。
                 turn = ModelTurn.from_response(response)
-                output_ledger = (
-                    state.get("output_ledger")
-                    if turn.normalized_response is not None
-                    else None
-                )
+                # 兼容旧 ModelTurn 时仍沿用本轮已有账本；否则审批/工具恢复
+                # 会把已提交的 call 状态替换成空账本，导致重复副作用。
+                output_ledger = state.get("output_ledger")
                 if output_ledger is None:
                     output_ledger = TurnLedger()
                 hosted_before = output_ledger.hosted_tool_count
