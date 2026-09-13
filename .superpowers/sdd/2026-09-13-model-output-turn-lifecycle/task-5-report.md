@@ -19,6 +19,8 @@
 
 - 命令：`python -m pytest -q tests/test_run_stream.py::test_turn_terminal_events_close_stream_but_model_response_does_not tests/test_run_service.py::test_completed_outcome_publishes_turn_terminal_after_reply_is_delivered tests/test_run_service.py::test_outcome_persists_completed_assistant_item_but_not_delta`。
 - 结果：3 passed；pytest 退出时 Windows 临时目录清理产生既有 `PermissionError` 警告，不影响用例结果。
+- 回归命令：`python -m pytest -q tests/test_run_stream.py tests/test_runtime_api.py -k 'stream or terminal'`。
+- 回归结果：9 passed；同样仅有 pytest 临时目录清理警告。
 
 ## 已知风险
 
