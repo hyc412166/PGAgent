@@ -2666,16 +2666,19 @@ class RunCoordinator:
                     existing_legacy_items.add(legacy_identity)
             if assistant_items:
                 existing_response_ids: set[str] = set()
-                existing_response_projections: set[tuple[int, bool]] = set()
+                existing_response_projection_counts: dict[tuple[int, bool], int] = {}
                 for event in db.scalars(select(RunEvent).where(
                     RunEvent.run_id == run_id,
                     RunEvent.event_type == "model_response_completed",
                 )):
                     payload = event.payload if isinstance(event.payload, dict) else {}
-                    existing_response_projections.add((
+                    response_projection = (
                         int(payload.get("output_chars") or 0),
                         bool(payload.get("has_tool_calls")),
-                    ))
+                    )
+                    existing_response_projection_counts[response_projection] = (
+                        existing_response_projection_counts.get(response_projection, 0) + 1
+                    )
                     response_id = payload.get("response_id")
                     if isinstance(response_id, str) and response_id:
                         existing_response_ids.add(response_id[:160])
@@ -2711,10 +2714,13 @@ class RunCoordinator:
                     )
                     response_stream_events.append({"type": "model_response_completed", **response_payload})
                     existing_response_ids.add(response_id)
-                    existing_response_projections.add((
+                    response_projection = (
                         response_payload["output_chars"],
                         response_payload["has_tool_calls"],
-                    ))
+                    )
+                    existing_response_projection_counts[response_projection] = (
+                        existing_response_projection_counts.get(response_projection, 0) + 1
+                    )
 
                 for legacy_item in legacy_items:
                     legacy_response_payload = {
@@ -2725,7 +2731,9 @@ class RunCoordinator:
                         legacy_response_payload["output_chars"],
                         legacy_response_payload["has_tool_calls"],
                     )
-                    if legacy_identity in existing_response_projections:
+                    existing_count = existing_response_projection_counts.get(legacy_identity, 0)
+                    if existing_count:
+                        existing_response_projection_counts[legacy_identity] = existing_count - 1
                         continue
                     append_run_event(
                         db,
@@ -2738,7 +2746,6 @@ class RunCoordinator:
                         "type": "model_response_completed",
                         **legacy_response_payload,
                     })
-                    existing_response_projections.add(legacy_identity)
             # 变量说明：terminal_provider_message 表示当前步骤使用的 terminal_provider_message 值。
             terminal_provider_message = next(
                 (

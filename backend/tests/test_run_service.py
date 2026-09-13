@@ -456,6 +456,11 @@ def test_outcome_backfills_missing_stable_response_without_duplicating_tool_only
             },
             {
                 "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-2"}],
+            },
+            {
+                "role": "assistant",
                 "content": "最终答复",
                 "_pgagent_output_item": {
                     "response_id": "resp-final",
@@ -483,6 +488,7 @@ def test_outcome_backfills_missing_stable_response_without_duplicating_tool_only
         assert response_events == [
             ("resp-tool", 0, True),
             ("resp-final", 4, False),
+            (None, 0, True),
         ]
 
 
