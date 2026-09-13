@@ -10,7 +10,7 @@ import asyncio
 
 import pytest
 
-from src.runs.stream import RunStreamBroker, TERMINAL_EVENT_TYPES
+from src.runs.stream import RunStreamBroker, TERMINAL_EVENT_TYPES, run_stream_broker
 
 
 @pytest.mark.asyncio
@@ -54,6 +54,31 @@ async def test_broker_publish_from_worker_thread_reaches_async_subscriber() -> N
         assert event["event_id"]
     finally:
         broker.unsubscribe(subscription)
+
+
+@pytest.mark.asyncio
+async def test_run_stream_sink_emits_one_canonical_assistant_delta() -> None:
+    from src.runs.lifecycle import RunCoordinator
+
+    run_id = "canonical-assistant-delta-test"
+    replay, subscription = run_stream_broker.subscribe(run_id)
+    try:
+        sink = RunCoordinator._stream_sink(run_id)
+        sink({"type": "assistant_delta", "delta": "首段", "step": 1})
+        sink({"type": "assistant_delta", "delta": "后段", "step": 1})
+        events = replay + [
+            await subscription.queue.get(),
+            await subscription.queue.get(),
+            await subscription.queue.get(),
+        ]
+        assert [event["type"] for event in events] == [
+            "assistant_message_started",
+            "assistant_message_delta",
+            "assistant_message_delta",
+        ]
+        assert [event["delta"] for event in events[1:]] == ["首段", "后段"]
+    finally:
+        run_stream_broker.unsubscribe(subscription)
 
 
 def test_turn_terminal_events_close_stream_but_model_response_does_not() -> None:

@@ -184,6 +184,64 @@ describe('助手消息中的思考过程展示', () => {
     expect(markup).not.toContain('thought-activity-list')
   })
 
+  it('收起实时执行详情时隐藏中间回复但保留最终回复', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-collapsed-commentary',
+        phase: '已完成',
+        draft: '',
+        status: 'terminal',
+        error: '',
+        thinkingStatus: '处理中',
+        thought: {
+          startedAt: 1_000,
+          elapsedMs: 4_000,
+          finished: true,
+          conclusion: '',
+          tools: [],
+          items: [
+            { id: 'commentary-collapsed', kind: 'assistant', icon: 'think', title: '中间回复', detail: '这是中间过程。', phase: 'commentary', status: 'completed' },
+            { id: 'final-collapsed', kind: 'assistant', icon: 'think', title: '最终回复', detail: '这是最终结果。', phase: 'final_answer', status: 'completed' },
+          ],
+        },
+      },
+    }))
+
+    expect(markup).not.toContain('这是中间过程。')
+    expect(markup).toContain('这是最终结果。')
+  })
+
+  it('最终回复位于执行详情容器之外，收起详情不会隐藏最终回复', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-final-outside-details',
+        phase: '已完成',
+        draft: '',
+        status: 'terminal',
+        error: '',
+        thinkingStatus: '处理中',
+        thought: {
+          startedAt: 1_000,
+          elapsedMs: 4_000,
+          finished: true,
+          conclusion: '',
+          tools: [],
+          items: [
+            { id: 'commentary-outside', kind: 'assistant', icon: 'think', title: '中间回复', detail: '执行中的说明。', phase: 'commentary', status: 'completed' },
+            { id: 'final-outside', kind: 'assistant', icon: 'think', title: '最终回复', detail: '独立的最终回复。', phase: 'final_answer', status: 'completed' },
+          ],
+        },
+      },
+    }))
+
+    const detailsStart = markup.indexOf('<div class="live-thought')
+    const finalStart = markup.indexOf('<div class="live-final-content')
+    expect(detailsStart).toBeGreaterThanOrEqual(0)
+    expect(finalStart).toBeGreaterThan(detailsStart)
+    expect(markup.slice(detailsStart, finalStart)).not.toContain('独立的最终回复。')
+    expect(markup.slice(finalStart)).toContain('独立的最终回复。')
+  })
+
   it('用户消息保留纯文本气泡，不把用户输入当成 Markdown 页面', () => {
     const markup = renderToStaticMarkup(createElement(MessageBubble, {
       message: {
@@ -250,7 +308,7 @@ describe('助手消息中的思考过程展示', () => {
     expect(markup).toContain('执行详情 · 用时 14s')
   })
 
-  it('没有思考文本时只显示静态耗时，不显示执行详情或上下文准备活动', () => {
+  it('只有上下文准备时只显示静态耗时，不显示执行详情', () => {
     const markup = renderToStaticMarkup(createElement(CompletedThoughtTimeline, {
       runId: 'run-context-only',
       timeline: {
@@ -268,6 +326,79 @@ describe('助手消息中的思考过程展示', () => {
     expect(markup).not.toContain('执行详情')
     expect(markup).not.toContain('准备上下文')
     expect(markup).not.toContain('上下文准备中')
+  })
+
+  it('没有思考文本但有工具调用时仍显示执行详情', () => {
+    const markup = renderToStaticMarkup(createElement(CompletedThoughtTimeline, {
+      runId: 'run-tool-only',
+      timeline: {
+        startedAt: 1_000,
+        elapsedMs: 9_000,
+        finished: true,
+        conclusion: '',
+        activeItemId: undefined,
+        tools: [{ id: 'tool-1', name: 'Shell', target: 'Get-Content probe.txt', status: 'completed' }],
+        items: [{ id: 'tool-1', kind: 'tool', icon: 'shell', title: 'Shell', detail: 'Get-Content probe.txt', status: 'completed' }],
+      },
+    }))
+
+    expect(markup).toContain('执行详情 · 用时 9s')
+    expect(markup).not.toContain('completed-thought-static')
+  })
+
+  it('实时输出按中间回复、工具调用、后续回复和最终回复的顺序渲染', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-ordered-output',
+        phase: '执行中',
+        draft: '',
+        status: 'live',
+        error: '',
+        thinkingStatus: '处理中',
+        thought: {
+          startedAt: 1_000,
+          elapsedMs: 0,
+          finished: false,
+          conclusion: '',
+          activeItemId: undefined,
+          tools: [{ id: 'tool-ordered', name: 'Shell', target: 'rg -n result', status: 'completed' }],
+          items: [
+            { id: 'commentary-1', kind: 'assistant', icon: 'think', title: '中间回复', detail: '先检查项目。', phase: 'commentary', status: 'completed' },
+            { id: 'tool-ordered', kind: 'tool', icon: 'shell', title: 'Shell', detail: 'rg -n result', status: 'completed' },
+            { id: 'commentary-2', kind: 'assistant', icon: 'think', title: '中间回复', detail: '已找到结果。', phase: 'commentary', status: 'completed' },
+            { id: 'final-1', kind: 'assistant', icon: 'think', title: '最终回复', detail: '最终答案。', phase: 'final_answer', status: 'completed' },
+          ],
+        },
+      },
+    }))
+
+    expect(markup.indexOf('先检查项目。')).toBeLessThan(markup.indexOf('rg -n result'))
+    expect(markup.indexOf('rg -n result')).toBeLessThan(markup.indexOf('已找到结果。'))
+    expect(markup.indexOf('已找到结果。')).toBeLessThan(markup.indexOf('最终答案。'))
+  })
+
+  it('终态水合后仍保留 commentary，且不会重复已经落盘的最终回复', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: { id: 'message-terminal-commentary', role: 'assistant', content: '最终答案。', created_at: '2026-09-08T00:00:00.000Z' },
+      thoughtRunId: 'run-terminal-commentary',
+      thoughtTimeline: {
+        startedAt: 1_000,
+        elapsedMs: 4_000,
+        finished: true,
+        conclusion: '',
+        activeItemId: undefined,
+        tools: [{ id: 'tool-terminal', name: 'Shell', target: 'rg -n result', status: 'completed' }],
+        items: [
+          { id: 'commentary-terminal', kind: 'assistant', icon: 'think', title: '中间回复', detail: '终态前的说明。', phase: 'commentary', status: 'completed' },
+          { id: 'tool-terminal', kind: 'tool', icon: 'shell', title: 'Shell', detail: 'rg -n result', status: 'completed' },
+          { id: 'final-terminal', kind: 'assistant', icon: 'think', title: '最终回复', detail: '最终答案。', phase: 'final_answer', status: 'completed' },
+        ],
+      },
+    }))
+
+    expect(markup.indexOf('终态前的说明。')).toBeLessThan(markup.indexOf('最终答案。'))
+    expect(markup.match(/最终答案。/g)).toHaveLength(1)
+    expect(markup).toContain('执行详情 · 用时 4s')
   })
 
   it('普通步骤直接展示且只有工具调用可以展开', () => {

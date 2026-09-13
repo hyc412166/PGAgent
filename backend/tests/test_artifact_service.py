@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
+from src.config import PROJECT_ROOT, settings
 from src.context.assembly import FilesystemArtifactStore, ToolOutputBudgeter
 from src.artifacts.storage import ArtifactToolStore
 from src.tools.registry import create_default_registry
@@ -33,6 +35,28 @@ def test_artifact_reader_returns_bounded_character_pages(tmp_path) -> None:
     }
     assert second.ok and second.content == "丁戊己"
     assert second.metadata["next_offset"] == 6
+
+
+# 测试场景：仅构造 artifact store 不应在磁盘留下空会话目录，首次写入时才创建目录。
+def test_filesystem_artifact_store_creates_root_on_first_write(tmp_path) -> None:
+    root = tmp_path / "session"
+
+    FilesystemArtifactStore(root)
+
+    assert not root.exists()
+
+    store = FilesystemArtifactStore(root)
+    store.put("persisted output")
+
+    assert root.is_dir()
+
+
+# 测试场景：后端测试使用隔离的数据根目录，不得把运行产物写入项目正式 data 目录。
+def test_backend_test_data_dir_is_isolated(tmp_path) -> None:
+    data_dir = Path(settings.data_dir)
+
+    assert data_dir != PROJECT_ROOT / "data"
+    assert data_dir.is_relative_to(tmp_path)
 
 
 # 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_artifact_reader_cannot_cross_session_store 精确标识本用例的具体条件。

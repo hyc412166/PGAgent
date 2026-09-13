@@ -37,6 +37,7 @@ export type LiveRunView = {
   runId: string
   phase: string
   draft: string
+  assistantItems?: Array<{ id: string; content: string; status: 'streaming' | 'completed'; responseId?: string; itemId?: string; outputIndex?: number; phase?: string }>
   status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'
   error: string
   thought: ThoughtTimelineState
@@ -235,14 +236,12 @@ function fallbackThoughtItems(timeline: ThoughtTimelineState): ThoughtActivityIt
   }))
 }
 
-// 实时阶段只要存在工具、进度或可见思考，就保留执行详情入口；上下文准备事件单独隐藏。
+// 实时和历史阶段只要存在工具、进度或可见思考，就保留执行详情入口；上下文准备事件单独隐藏。
 function hasActivityDetails(items: ThoughtActivityItem[]) {
-  return items.some((item) => item.kind !== 'context' && item.title !== 'Tool Search' && (Boolean(item.detail.trim()) || item.kind !== 'thought'))
-}
-
-// 历史消息只有真实的思考文本才显示可展开入口；工具或上下文状态不属于思考内容。
-function hasThoughtContent(items: ThoughtActivityItem[]) {
-  return items.some((item) => item.kind === 'thought' && Boolean(item.detail.trim()))
+  return items.some((item) => {
+    if (item.kind === 'assistant') return item.phase !== 'final_answer' && Boolean(item.detail.trim())
+    return item.kind !== 'context' && item.title !== 'Tool Search' && (Boolean(item.detail.trim()) || item.kind !== 'thought')
+  })
 }
 
 function toolGroupLabel(items: ThoughtActivityItem[]) {
@@ -257,6 +256,60 @@ function groupedToolStatus(item: ThoughtActivityItem) {
   if (item.status === 'running') return item.icon === 'shell' ? '正在运行' : '正在调用'
   if (item.status === 'failed') return item.icon === 'shell' ? '运行失败' : '调用失败'
   return item.icon === 'shell' ? '已运行' : '已调用'
+}
+
+type OrderedContentEntry =
+  | { kind: 'assistant'; item: ThoughtActivityItem }
+  | { kind: 'activities'; items: ThoughtActivityItem[] }
+
+// 按 timeline.items 的到达顺序切分内容；只有相邻工具才会在同一个活动块内合并。
+function orderedContentEntries(items: ThoughtActivityItem[], includeFinalAssistant: boolean): OrderedContentEntry[] {
+  const entries: OrderedContentEntry[] = []
+  let activities: ThoughtActivityItem[] = []
+  const flushActivities = () => {
+    if (activities.length) entries.push({ kind: 'activities', items: activities })
+    activities = []
+  }
+  for (const item of items) {
+    if (item.kind === 'assistant') {
+      if (item.phase === 'final_answer' && !includeFinalAssistant) continue
+      if (!item.detail.trim()) continue
+      flushActivities()
+      entries.push({ kind: 'assistant', item })
+      continue
+    }
+    activities.push(item)
+  }
+  flushActivities()
+  return entries
+}
+
+// 统一渲染模型正文和执行活动，避免“所有活动在前、所有正文在后”的固定布局。
+function OrderedRunContent({
+  items,
+  activitiesVisible,
+  live,
+  activeItemId,
+  includeFinalAssistant,
+}: {
+  items: ThoughtActivityItem[]
+  activitiesVisible: boolean
+  live?: boolean
+  activeItemId?: string
+  includeFinalAssistant: boolean
+}) {
+  return <div className="ordered-run-content">
+    {orderedContentEntries(items, includeFinalAssistant).map((entry, index) => {
+      if (entry.kind === 'assistant') {
+        // 折叠执行详情时保留最终回复；commentary 属于执行过程，随详情一起隐藏。
+        if (!activitiesVisible && entry.item.phase !== 'final_answer') return null
+        return <div className="ordered-assistant-content" key={entry.item.id}><MarkdownContent content={entry.item.detail} /></div>
+      }
+      return activitiesVisible
+        ? <ThoughtActivityList key={`activities-${entry.items[0]?.id || index}`} items={entry.items} live={live} activeItemId={activeItemId} />
+        : null
+    })}
+  </div>
 }
 
 // ThoughtActivityList 统一渲染实时与历史活动，并突出当前活动。
@@ -294,6 +347,7 @@ function ThoughtActivityList({ items, live = false, activeItemId }: { items: Tho
         </section>
       }
       const item = entry.item
+      if (item.kind === 'assistant') return <div key={item.id} className="ordered-assistant-content"><MarkdownContent content={item.detail} /></div>
       if (item.kind === 'thought') return <p key={item.id} className={`thought-activity-thought ${item.status}`}>{item.detail}</p>
       // 普通联网搜索保持紧凑；当来源 URL 过长时提供展开入口，避免摘要撑坏标题布局。
       const hasLongUrl = /https?:\/\/\S{72,}/i.test(item.detail)
@@ -312,19 +366,19 @@ function ThoughtActivityList({ items, live = false, activeItemId }: { items: Tho
   </div>
 }
 
-// CompletedThoughtTimeline 在助手历史消息上方展示可折叠的已完成思考过程。
+// CompletedThoughtTimeline 在助手历史消息上方展示可折叠的执行详情。
 export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({ runId, timeline }: { runId: string; timeline: ThoughtTimelineState }) {
   const [expanded, setExpanded] = useState(false)
   const duration = formatThoughtDuration(timeline.elapsedMs)
   const items = fallbackThoughtItems(timeline)
-  const hasDetails = hasThoughtContent(items)
+  const hasDetails = hasActivityDetails(items)
   const summary = timeline.conclusion || '执行完成'
 
   return <article className={`completed-thought ${hasDetails && expanded ? 'expanded' : ''} ${hasDetails ? '' : 'no-details'}`}>
     {hasDetails ? <button type="button" className="completed-thought-toggle" aria-expanded={expanded} aria-controls={`thought-details-${runId}`} onClick={() => setExpanded((value) => !value)}>
       <span className="completed-thought-duration">执行详情 · 用时 {duration}</span><span className="completed-thought-summary">{summary}</span><ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
     </button> : <span className="completed-thought-duration completed-thought-static">用时 {duration}</span>}
-    {hasDetails && expanded && <div id={`thought-details-${runId}`}><ThoughtActivityList items={items} /></div>}
+    {hasDetails && <div id={`thought-details-${runId}`}><OrderedRunContent items={items} activitiesVisible={expanded} includeFinalAssistant={false} /></div>}
   </article>
 })
 
@@ -347,16 +401,41 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded }: { liveRun: Li
       ? `${liveRun.thinkingStatus} ${formatLiveThinkingDuration(liveThoughtMs)}`
       : liveRun.phase || '已完成'
   const items = fallbackThoughtItems(liveRun.thought)
-  const hasDetails = hasActivityDetails(items)
+  const assistantItems = liveRun.assistantItems?.length
+    ? liveRun.assistantItems
+    : liveRun.draft
+      ? [{ id: 'legacy-live-output', content: liveRun.draft, status: 'streaming' as const, phase: 'final_answer' }]
+      : []
+  const displayItems = items.some((item) => item.kind === 'assistant')
+    ? items
+    : [
+      ...items,
+      ...assistantItems.map((item) => ({
+        id: item.id,
+        kind: 'assistant' as const,
+        icon: 'think' as const,
+        title: item.phase === 'final_answer' ? '最终回复' : '中间回复',
+        detail: item.content,
+        phase: item.phase || 'unknown',
+        status: item.status === 'completed' ? 'completed' as const : 'running' as const,
+      })),
+    ]
+  // final_answer 是用户最终看到的正文，不属于可折叠的执行详情；其余 assistant 条目才是 commentary。
+  const executionItems = displayItems.filter((item) => item.kind !== 'assistant' || item.phase !== 'final_answer')
+  const finalItems = displayItems.filter((item) => item.kind === 'assistant' && item.phase === 'final_answer')
+  const hasDetails = hasActivityDetails(executionItems)
   return (
     <article className={`message assistant live-message ${liveRun.status === 'terminal' ? 'live-message-terminal' : ''}`}>
       <div className="message-avatar"><PenguinMark size={21} /></div>
       <div className="message-body"><div className="message-meta"><strong>PGAgent</strong><span className="live-phase">{phase}</span></div>
-        {hasDetails && <div className={`live-thought ${expanded ? 'expanded' : ''}`}>
-          <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
-          {expanded && <ThoughtActivityList items={items} live activeItemId={liveRun.thought.activeItemId} />}
-        </div>}
-        {liveRun.draft && <MarkdownContent content={liveRun.draft} />}{liveRun.error && <p className="live-error">{liveRun.error}</p>}
+        {hasDetails
+          ? <div className={`live-thought ${expanded ? 'expanded' : ''}`}>
+            <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
+            <OrderedRunContent items={executionItems} activitiesVisible={expanded} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} />
+          </div>
+          : null}
+        {!!finalItems.length && <div className="live-final-content"><OrderedRunContent items={finalItems} activitiesVisible includeFinalAssistant /></div>}
+        {liveRun.error && <p className="live-error">{liveRun.error}</p>}
       </div>
     </article>
   )

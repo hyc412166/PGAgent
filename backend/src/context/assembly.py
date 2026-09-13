@@ -200,7 +200,6 @@ class FilesystemArtifactStore:
     def __init__(self, root: str | Path) -> None:
         # 变量说明：root 表示处理范围的根目录。
         self.root = Path(root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
 
     # 函数职责：完成 path 对应的业务处理。
     # 参数关系：artifact_id 表示artifact 对象的唯一标识。
@@ -229,6 +228,8 @@ class FilesystemArtifactStore:
         artifact_id = f"artifact_{digest[:24]}"
         # 变量说明：path 表示当前文件或目录路径。
         path = self._path(artifact_id)
+        # 只有真正持久化内容时才创建会话目录，避免仅装配运行时产生空目录。
+        path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             # 变量说明：temporary 表示当前步骤使用的 temporary 值。
             temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")

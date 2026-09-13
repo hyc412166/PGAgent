@@ -1,6 +1,6 @@
 // 本测试文件验证 sessionStream 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
-import { appendAssistantDelta, composerSurface, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
+import { appendAssistantDelta, applyAssistantStreamEvent, composerSurface, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
 
 // 测试分组：会话 SSE 事件。
 describe('会话 SSE 事件', () => {
@@ -35,6 +35,52 @@ describe('会话 SSE 事件', () => {
     expect(delta).toEqual({ type: 'assistant_delta', delta: '你好' })
     expect(appendAssistantDelta('开始：', delta!)).toBe('开始：你好')
     expect(runStreamPhase(delta!)).toBe('正在回复…')
+  })
+
+  it('按 response/item 保留有序助手正文，工具事件不会清空此前内容', () => {
+    let items = applyAssistantStreamEvent([], { type: 'assistant_message_started', response_id: 'resp-1', item_id: 'item-1', output_index: 0 })
+    items = applyAssistantStreamEvent(items, { type: 'assistant_message_delta', response_id: 'resp-1', item_id: 'item-1', delta: '先检查 ' })
+    items = applyAssistantStreamEvent(items, { type: 'tool_started', tool_name: 'read_file' })
+    items = applyAssistantStreamEvent(items, { type: 'assistant_message_delta', response_id: 'resp-1', item_id: 'item-1', delta: '结果。' })
+
+    expect(items).toEqual([expect.objectContaining({ id: 'resp-1:item-1', content: '先检查 结果。', status: 'streaming' })])
+  })
+
+  it('兼容旧 assistant_delta 时将其归类为最终回复', () => {
+    const items = applyAssistantStreamEvent([], { type: 'assistant_delta', delta: '最终正文' })
+
+    expect(items[0]).toEqual(expect.objectContaining({ content: '最终正文', phase: 'final_answer' }))
+  })
+
+  it('完成 item 原子替换正文，model response completed 不改变 live item', () => {
+    let items = applyAssistantStreamEvent([], { type: 'assistant_message_delta', response_id: 'resp-2', item_id: 'item-2', delta: '草稿' })
+    items = applyAssistantStreamEvent(items, { type: 'model_response_completed', response_id: 'resp-2' })
+    expect(items[0].status).toBe('streaming')
+    items = applyAssistantStreamEvent(items, { type: 'assistant_message_completed', response_id: 'resp-2', item_id: 'item-2', content: '最终正文', output_index: 0 })
+    expect(items).toEqual([expect.objectContaining({ id: 'resp-2:item-2', content: '最终正文', status: 'completed' })])
+  })
+
+  it('response id 稍后到达时按 item id 合并而不重复正文', () => {
+    let items = applyAssistantStreamEvent([], { type: 'assistant_message_started', item_id: 'item-late', output_index: 1 })
+    items = applyAssistantStreamEvent(items, { type: 'assistant_message_delta', item_id: 'item-late', output_index: 1, delta: '流式正文' })
+    items = applyAssistantStreamEvent(items, {
+      type: 'assistant_message_completed',
+      response_id: 'resp-late',
+      item_id: 'item-late',
+      output_index: 1,
+      content: '流式正文',
+      phase: 'commentary',
+    })
+
+    expect(items).toHaveLength(1)
+    expect(items[0]).toEqual(expect.objectContaining({
+      id: 'resp-late:item-late',
+      responseId: 'resp-late',
+      itemId: 'item-late',
+      outputIndex: 1,
+      content: '流式正文',
+      status: 'completed',
+    }))
   })
 
   // 测试场景：在中断终态用服务端 partial_output 补齐丢失的流片段。

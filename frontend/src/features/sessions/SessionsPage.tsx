@@ -274,6 +274,8 @@ function SessionsPage() {
     .filter((run) => shouldShowStoppedRunNotice(run, repliedRunIds, stoppedNoticeHistoryReady))
     .slice()
     .reverse()
+  // 终态消息一旦刷新到位，立即隐藏 live item；这样持久正文与流式正文不会同时出现一帧。
+  const liveReplyPersisted = Boolean(liveRun.runId && repliedRunIds.has(liveRun.runId))
   const completedThoughtLayoutVersion = Object.entries(completedThoughtsByRun)
     .map(([runId, timeline]) => `${runId}:${timeline.elapsedMs}:${timeline.tools.length}:${timeline.items?.length ?? 0}`)
     .join('|')
@@ -1175,7 +1177,7 @@ function SessionsPage() {
                   onCancel={() => void cancelDurableTask(durableTask.data!.id)}
                 />}
                 {!draftActive && stoppedRunNotices.map((run) => <div key={`run-notice:${run.id}`} className="stopped-run-notice" role="status"><AlertCircle size={16} /><div><strong>{run.status === 'failed' ? '本次运行失败，未生成最终回复' : '本次运行已停止，未生成最终回复'}</strong><p>{run.error_message || run.stop_reason || 'Agent 未能继续执行，请调整指令后重试。'}</p></div></div>)}
-                {liveRun.status !== 'idle'
+                {liveRun.status !== 'idle' && !liveReplyPersisted
                   && (!completedThoughtsByRun[liveRun.runId] || (canEditInterrupted && liveRun.runId === interruptedRunId))
                   && <LiveAssistantMessage liveRun={liveRun} />}
                 {canEditInterrupted && <div className="interrupted-run-actions">

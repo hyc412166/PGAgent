@@ -69,5 +69,8 @@ class RunState(TypedDict, total=False):
     # 模型服务端托管工具调用数量，与本地注册工具计数分开记录。
     # 变量说明：hosted_tool_calls 表示hosted_tool_calls 集合。
     hosted_tool_calls: int
+    # web_run 的 search ref 在同一 Turn 内跨调用复用；页面索引不进入模型正文。
+    # 变量说明：web_pages 表示当前 Turn 已建立的网页引用索引。
+    web_pages: dict[str, dict[str, Any]]
     # response/item 账本只保存运行内结构化事实；持久化与恢复由 lifecycle 层负责。
     output_ledger: TurnLedger

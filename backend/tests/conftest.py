@@ -21,5 +21,7 @@ def isolate_personal_agents_home(tmp_path, monkeypatch):  # type: ignore[no-unty
     # data_dir 保存本次测试的隔离文件；monkeypatch 将配置指向该目录并在测试后自动恢复。
     data_dir = tmp_path / "pgagent-data"
     data_dir.mkdir()
+    # 运行时、附件和上下文服务共享这个单例设置对象；统一替换其数据根目录，防止测试写入正式 data。
+    monkeypatch.setattr(type(settings), "data_dir", property(lambda _settings: data_dir))
     monkeypatch.setattr(instruction_service, "settings", SimpleNamespace(data_dir=data_dir))
     monkeypatch.setattr(settings, "mcp_config_path", str(data_dir / "mcp.json"))

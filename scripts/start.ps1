@@ -41,15 +41,21 @@ if (-not (Test-Path -LiteralPath $FrontendIndex)) {
     try { & $NpmPath run build } finally { Pop-Location }
 }
 
-# Import only the supported marketplace values into the PGAgent process; never print secrets.
+# Import supported local values into the PGAgent process; never print secrets.
 if (Test-Path -LiteralPath $LocalEnvironmentFile) {
-    # localEnvironmentLines 是文件原文；marketEnvironmentLoaded 仅记录是否成功导入至少一个值。
+    # localEnvironmentLines 是文件原文；localEnvironmentLoaded 仅记录是否成功导入至少一个值。
     $localEnvironmentLines = Get-Content -LiteralPath $LocalEnvironmentFile
-    $marketEnvironmentLoaded = $false
+    $localEnvironmentLoaded = $false
     foreach ($environmentKey in @(
         'VERCEL_OIDC_TOKEN',
         'PGAGENT_SKILL_MARKET_URL',
-        'PGAGENT_SKILL_MARKET_CLIENT_TOKEN'
+        'PGAGENT_SKILL_MARKET_CLIENT_TOKEN',
+        # 标准代理变量由 httpx trust_env=True 读取，写入 .env.local 后不再依赖
+        # Windows Terminal/Codex 启动时是否恰好继承了当前 PowerShell 环境。
+        'HTTP_PROXY',
+        'HTTPS_PROXY',
+        'ALL_PROXY',
+        'NO_PROXY'
     )) {
         # escapedKey 用于安全拼接正则；environmentLine 取同名配置的最后一次声明。
         $escapedKey = [regex]::Escape($environmentKey)
@@ -68,12 +74,12 @@ if (Test-Path -LiteralPath $LocalEnvironmentFile) {
             }
             if ($environmentValue) {
                 Set-Item -LiteralPath "Env:$environmentKey" -Value $environmentValue
-                $marketEnvironmentLoaded = $true
+                $localEnvironmentLoaded = $true
             }
         }
     }
-    if ($marketEnvironmentLoaded) {
-        Write-Host 'Loaded local Skill marketplace configuration.' -ForegroundColor DarkGray
+    if ($localEnvironmentLoaded) {
+        Write-Host 'Loaded local PGAgent environment configuration.' -ForegroundColor DarkGray
     }
 }
 

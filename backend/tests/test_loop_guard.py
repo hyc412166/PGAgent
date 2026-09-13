@@ -18,7 +18,7 @@ from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConf
 from src.agent.errors import APIErrorKind, call_with_retry, classify_api_error
 from src.agent.guards import LoopGuard
 from src.agent.turn import LocalToolStatus, TurnLedger
-from src.model.output import AssistantMessageItem, LocalToolCallItem, NormalizedModelResponse
+from src.model.output import AssistantMessageItem, LocalToolCallItem, NormalizedModelResponse, OutputPhase, ResponseStatus
 from src.tools import create_default_registry
 from src.tools.types import ToolResult
 
@@ -1536,6 +1536,67 @@ async def test_assistant_deltas_use_only_transient_stream_sink(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_structured_assistant_stream_keeps_item_identity_and_response_boundaries(tmp_path) -> None:
+    durable_events: list[dict] = []
+    transient_events: list[dict] = []
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        await kwargs["on_delta"]("先")
+        await kwargs["on_assistant_item"](AssistantMessageItem(
+            response_id="resp-1",
+            item_id="item-1",
+            output_index=1,
+            content="先",
+        ))
+        await kwargs["on_delta"]("检查")
+        await kwargs["on_assistant_item"](AssistantMessageItem(
+            response_id="resp-1",
+            item_id="item-1",
+            output_index=1,
+            content="先检查",
+        ))
+        return {
+            "_pgagent_normalized_response": NormalizedModelResponse(
+                response_id="resp-1",
+                items=[AssistantMessageItem(
+                    response_id="resp-1",
+                    item_id="item-1",
+                    output_index=1,
+                    content="先检查",
+                    phase=OutputPhase.FINAL_ANSWER,
+                )],
+                status=ResponseStatus.COMPLETED,
+            )
+        }
+
+    model_call.emits_assistant_items = True  # type: ignore[attr-defined]
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+        event_sink=durable_events.append,
+        stream_sink=transient_events.append,
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert [event["type"] for event in transient_events] == [
+        "assistant_message_started",
+        "assistant_message_delta",
+        "assistant_message_delta",
+    ]
+    assert [event.get("delta") for event in transient_events[1:]] == ["先", "检查"]
+    assert all(event.get("response_id") == "resp-1" for event in transient_events)
+    assert all(event.get("item_id") == "item-1" for event in transient_events)
+    event_types = [event["type"] for event in durable_events]
+    assert event_types.index("assistant_message_completed") < event_types.index("model_response_completed")
+    assert event_types.index("model_response_completed") < event_types.index("model_step_finished")
+    completed = next(event for event in durable_events if event["type"] == "assistant_message_completed")
+    assert completed["output_index"] == 1
+    assert completed["phase"] == "final_answer"
+
+
+@pytest.mark.asyncio
 # 测试场景：验证 provider reasoning 只用于协议续接，不进入用户时间线。
 async def test_provider_reasoning_is_not_published_to_user_timeline(tmp_path) -> None:
     durable_events: list[dict] = []
@@ -1603,6 +1664,60 @@ async def test_provider_web_search_is_visible_without_local_dispatch(tmp_path) -
     assert [event["type"] for event in hosted_events] == ["tool_started", "tool_finished"]
     assert hosted_events[0]["arguments"] == {"query": {"text": "latest release", "chars": 14}}
     assert hosted_events[1]["source_count"] == 1
+
+
+@pytest.mark.asyncio
+# 测试场景：同一运行内先搜索再按 search ref 打开时，引用页必须跨 web_run 调用保留。
+async def test_web_run_ref_pages_survive_follow_up_tool_call(tmp_path, monkeypatch) -> None:
+    observed_pages: list[dict] = []
+    web_run_calls = 0
+
+    def fake_web_run(_sandbox, **arguments):
+        nonlocal web_run_calls
+        web_run_calls += 1
+        if web_run_calls == 1:
+            return ToolResult(
+                "web_run",
+                True,
+                "search result",
+                metadata={"pages": {"search1": {"url": "https://example.com/story"}}},
+            )
+        observed_pages.append(dict(arguments.get("pages") or {}))
+        return ToolResult("web_run", True, "opened")
+
+    monkeypatch.setattr("src.tools.builtins.web_run", fake_web_run)
+    calls = 0
+
+    async def model_call(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelTurn(
+                tool_calls=[ModelToolCall(
+                    "search-call",
+                    "web_run",
+                    {"search_query": [{"q": "latest news"}]},
+                )]
+            )
+        if calls == 2:
+            return ModelTurn(
+                tool_calls=[ModelToolCall(
+                    "open-call",
+                    "web_run",
+                    {"open": [{"ref_id": "search1"}]},
+                )]
+            )
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path)),
+    )
+
+    outcome = await runtime.run(system_prompt="safe", recent_messages=[])
+
+    assert outcome.status == "completed"
+    assert observed_pages == [{"search1": {"url": "https://example.com/story"}}]
 
 
 @pytest.mark.asyncio

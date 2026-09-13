@@ -30,6 +30,72 @@ describe('实时 Thought 时间线', () => {
     expect(completed.items.find((item) => item.kind === 'tool')?.detail).toContain('读取：.gitignore')
   })
 
+  it('按真实事件顺序保留中间回复、工具调用和后续回复', () => {
+    let timeline = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'assistant_message_completed',
+      response_id: 'response-1',
+      item_id: 'item-commentary-1',
+      phase: 'commentary',
+      content: '先检查项目结构。',
+    }, 1_000)
+    timeline = updateThoughtTimeline(timeline, {
+      type: 'tool_started',
+      tool_name: 'read_file',
+      tool_call_id: 'tool-1',
+      arguments: { path: 'README.md' },
+    }, 1_100)
+    timeline = updateThoughtTimeline(timeline, {
+      type: 'tool_finished',
+      tool_name: 'read_file',
+      tool_call_id: 'tool-1',
+      ok: true,
+    }, 1_200)
+    timeline = updateThoughtTimeline(timeline, {
+      type: 'assistant_message_completed',
+      response_id: 'response-2',
+      item_id: 'item-commentary-2',
+      phase: 'commentary',
+      content: '已读取文件，现在整理结果。',
+    }, 1_300)
+    timeline = updateThoughtTimeline(timeline, {
+      type: 'assistant_message_completed',
+      response_id: 'response-3',
+      item_id: 'item-final',
+      phase: 'final_answer',
+      content: '最终结果。',
+    }, 1_400)
+
+    expect(timeline.items.map((item) => `${item.kind}:${item.detail}`)).toEqual([
+      'assistant:先检查项目结构。',
+      expect.stringMatching(/^tool:读取：README\.md/),
+      'assistant:已读取文件，现在整理结果。',
+      'assistant:最终结果。',
+    ])
+    expect(timeline.items.map((item) => item.phase)).toEqual([
+      'commentary',
+      undefined,
+      'commentary',
+      'final_answer',
+    ])
+  })
+
+  it('从倒序事件页按 sequence 恢复时间线，避免刷新后顺序反转', () => {
+    const timeline = timelineFromRunEvents([
+      { sequence: 5, type: '', event_type: 'run_completed', created_at: '2026-08-11T00:00:00.500Z', payload: { elapsed_ms: 500 } },
+      { sequence: 4, type: '', event_type: 'assistant_message_completed', created_at: '2026-08-11T00:00:00.400Z', payload: { response_id: 'response-final', item_id: 'item-final', phase: 'final_answer', content: '最终结果。' } },
+      { sequence: 3, type: '', event_type: 'tool_started', created_at: '2026-08-11T00:00:00.300Z', payload: { tool_name: 'read_file', tool_call_id: 'tool-1', arguments: { path: 'README.md' } } },
+      { sequence: 2, type: '', event_type: 'assistant_message_completed', created_at: '2026-08-11T00:00:00.200Z', payload: { response_id: 'response-commentary', item_id: 'item-commentary', phase: 'commentary', content: '先检查项目结构。' } },
+      { sequence: 1, type: '', event_type: 'model_step_started', created_at: '2026-08-11T00:00:00.100Z', payload: {} },
+    ])
+
+    expect(timeline.items.map((item) => `${item.kind}:${item.detail}`)).toEqual([
+      'thought:',
+      'assistant:先检查项目结构。',
+      expect.stringMatching(/^tool:读取：README\.md/),
+      'assistant:最终结果。',
+    ])
+  })
+
   it('展示 rg/read 的具体参数并隐藏内部 tool_search', () => {
     const searched = updateThoughtTimeline(emptyThoughtTimeline, {
       type: 'tool_started', tool_name: 'rg', tool_call_id: 'rg-1', arguments: { pattern: 'web_run', path: 'backend/src' },

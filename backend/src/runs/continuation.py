@@ -69,6 +69,7 @@ class RunContinuationCodec:
             "acceptance_report": dict(outcome.acceptance_report),
             "completion_verification_attempts": outcome.completion_verification_attempts,
             "memory_citation": outcome.memory_citation,
+            "web_pages": outcome.web_pages,
         })
         # 新版运行时可提供已经投影为 mapping 的账本；旧 RunOutcome 没有
         # 该属性时保持原快照形状，恢复路径不会因字段缺失而失败。
@@ -113,6 +114,11 @@ class RunContinuationCodec:
                 int(payload.get("completion_verification_attempts") or 0),
             ),
             memory_citation=dict(payload.get("memory_citation") or {}),
+            web_pages={
+                str(key): dict(item)
+                for key, item in (payload.get("web_pages") or {}).items()
+                if str(key).strip() and isinstance(item, dict)
+            },
             output_ledger=(
                 TurnLedger.from_snapshot(payload["output_ledger"])
                 if "output_ledger" in payload
