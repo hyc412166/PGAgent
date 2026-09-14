@@ -7,3 +7,15 @@
 
   ➜  Local:   http://127.0.0.1:5174/
   ➜  press h + enter to show help
+23:13:15 [vite] (client) hmr update /src/features/sessions/presentation.tsx
+23:36:42 [vite] (client) hmr update /src/styles/index.css
+23:36:42 [vite] (client) hmr update /src/features/sessions/presentation.tsx
+23:37:35 [vite] (client) hmr update /src/styles/index.css
+23:55:27 [vite] (client) hmr update /src/styles/index.css
+23:56:33 [vite] (client) hmr update /src/styles/index.css
+23:57:03 [vite] (client) hmr update /src/styles/index.css
+00:15:20 [vite] (client) hmr update /src/styles/index.css
+00:17:53 [vite] (client) hmr update /src/styles/index.css
+10:05:09 [vite] (client) hmr update /src/styles/index.css
+10:10:29 [vite] (client) hmr update /src/styles/index.css
+10:27:40 [vite] (client) hmr update /src/styles/index.css
