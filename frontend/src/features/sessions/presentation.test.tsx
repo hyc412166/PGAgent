@@ -1,11 +1,14 @@
 // 本测试文件验证会话侧栏中的持久运行事件只使用安全展示模型。
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 
 import { ChildAgentPanel, CompletedThoughtTimeline, LiveAssistantMessage, MessageBubble } from './presentation'
 import { formatApprovalArguments } from './approvalPresentation'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
+
+const sessionsCss = readFileSync(new URL('../../styles/sessions.css', import.meta.url), 'utf8')
 
 describe('子 Agent 运行事件展示', () => {
   it('将审批参数格式化为可读内容并脱敏敏感字段', () => {
@@ -106,6 +109,67 @@ describe('助手消息中的思考过程展示', () => {
     expect(markup).not.toContain('Get-Content first.ts')
     expect(markup).not.toContain('rg -n second')
     expect(markup).not.toContain('pnpm test')
+  })
+
+  it('连续联网搜索默认使用放大镜图标而不是终端图标', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-web-search-group',
+        phase: '执行中',
+        draft: '',
+        status: 'live',
+        error: '',
+        thinkingStatus: '处理中',
+        thought: {
+          startedAt: 1_000,
+          elapsedMs: 0,
+          finished: false,
+          conclusion: '',
+          tools: [],
+          items: [
+            { id: 'search-1', kind: 'tool', icon: 'search', title: '联网搜索', detail: '搜索：latest US news', status: 'completed' },
+            { id: 'search-2', kind: 'tool', icon: 'search', title: '联网搜索', detail: '搜索：latest China news', status: 'completed' },
+          ],
+        },
+      },
+    }))
+
+    expect(markup).toContain('is-search')
+    expect(markup).not.toContain('is-shell')
+  })
+
+  it('工具分组标题使用与文字同高的语义图标容器', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-aligned-search-group',
+        phase: '执行中',
+        draft: '',
+        status: 'live',
+        error: '',
+        thinkingStatus: '处理中',
+        thought: {
+          startedAt: 1_000,
+          elapsedMs: 0,
+          finished: false,
+          conclusion: '',
+          tools: [],
+          items: [
+            { id: 'aligned-search-1', kind: 'tool', icon: 'search', title: '联网搜索', detail: '搜索：latest US news', status: 'completed' },
+            { id: 'aligned-search-2', kind: 'tool', icon: 'search', title: '联网搜索', detail: '搜索：latest China news', status: 'completed' },
+          ],
+        },
+      },
+    }))
+
+    expect(markup).toContain('tool-activity-icon thought-activity-icon is-search')
+  })
+
+  it('工具活动图标不会继承起始对齐并在展开详情时保持标题行对齐', () => {
+    expect(sessionsCss).toMatch(/\.tool-activity-icon\s*\{[^}]*align-self:\s*center;/s)
+    expect(sessionsCss).toContain('.thought-activity.kind-tool { align-items: start; }')
+    expect(sessionsCss).toContain('.thought-activity.kind-tool .thought-activity-icon { align-self: start; transform: translateY(1px); }')
+    expect(sessionsCss).toContain('.tool-activity-group-item-toggle > .tool-activity-icon { flex: 0 0 20px; transform: translateY(1px); }')
+    expect(sessionsCss).toContain('.tool-activity-group-item-toggle > span:not(.tool-activity-icon) {')
   })
 
   it('将助手 Markdown 代码块渲染为带语言标签和语法高亮的代码面板', () => {

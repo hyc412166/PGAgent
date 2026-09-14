@@ -223,6 +223,28 @@ function ThoughtActivityIcon({ icon }: { icon: ThoughtActivityIcon }) {
   return <span className="thought-activity-icon is-generic"><Wrench size={13} /></span>
 }
 
+// 分组工具保持现有紧凑尺寸，但图形仍由每条活动的语义决定，不能统一伪装成终端命令。
+function ToolActivityGlyph({ icon, size }: { icon: ThoughtActivityIcon; size: number }) {
+  const semanticIcon = icon === 'edit' ? 'write' : icon
+  const className = `tool-activity-icon thought-activity-icon is-${semanticIcon}`
+  const glyph = icon === 'task' ? <PenguinMark size={size} />
+    : icon === 'search' ? <Search size={size} aria-hidden="true" />
+      : icon === 'read' ? <FileText size={size} aria-hidden="true" />
+        : icon === 'write' || icon === 'edit' ? <Pencil size={size} aria-hidden="true" />
+          : icon === 'shell' ? <SquareTerminal size={size} aria-hidden="true" />
+            : icon === 'approval' ? <ShieldCheck size={size} aria-hidden="true" />
+              : icon === 'context' ? <Globe2 size={size} aria-hidden="true" />
+                : icon === 'think' ? <Brain size={size} aria-hidden="true" />
+                  : <Wrench size={size} aria-hidden="true" />
+  return <span className={className}>{glyph}</span>
+}
+
+// 同类工具组沿用共同语义；混合工具组使用通用图标，避免标题偏向其中任意一种工具。
+function groupedActivityIcon(items: ThoughtActivityItem[]): ThoughtActivityIcon {
+  const firstIcon = items[0]?.icon || 'generic'
+  return items.every((item) => item.icon === firstIcon) ? firstIcon : 'generic'
+}
+
 // 旧运行缺少结构化活动时，从思考文本和工具列表生成兼容展示条目。
 function fallbackThoughtItems(timeline: ThoughtTimelineState): ThoughtActivityItem[] {
   if (timeline.items?.length) return timeline.items
@@ -326,7 +348,7 @@ function ThoughtActivityList({ items, live = false, activeItemId }: { items: Tho
         const label = toolGroupLabel(entry.items)
         return <section className={`tool-activity-group ${expanded ? 'expanded' : ''}`} key={entry.id}>
           <button type="button" className="tool-activity-group-toggle" aria-expanded={expanded} onClick={() => setExpandedGroups((current) => ({ ...current, [entry.id]: !current[entry.id] }))}>
-            <SquareTerminal size={14} aria-hidden="true" />
+            <ToolActivityGlyph icon={groupedActivityIcon(entry.items)} size={14} />
             <span>{label}</span>
             <ChevronRight className="tool-activity-group-chevron" size={14} aria-hidden="true" />
           </button>
@@ -336,7 +358,7 @@ function ThoughtActivityList({ items, live = false, activeItemId }: { items: Tho
               const expandable = Boolean(item.detail.trim())
               return <div className={`tool-activity-group-item ${item.status}`} key={item.id}>
                 <button type="button" className="tool-activity-group-item-toggle" aria-expanded={expandable ? itemExpanded : undefined} disabled={!expandable} onClick={() => expandable && setExpandedItems((current) => ({ ...current, [item.id]: !current[item.id] }))}>
-                  <SquareTerminal size={13} aria-hidden="true" />
+                  <ToolActivityGlyph icon={item.icon} size={13} />
                   <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>
                   {expandable && <ChevronRight className="tool-activity-item-chevron" size={13} aria-hidden="true" />}
                 </button>

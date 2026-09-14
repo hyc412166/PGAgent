@@ -601,7 +601,7 @@
   text-align: left;
 }
 .tool-activity-group-toggle:hover { color: var(--muted); }
-.tool-activity-group-toggle > svg:first-child { color: var(--muted-2); }
+.tool-activity-group-toggle > .tool-activity-icon { flex: 0 0 20px; }
 .tool-activity-group-chevron,
 .tool-activity-item-chevron { color: var(--muted-2); transition: transform .16s ease; }
 .tool-activity-group-toggle[aria-expanded="true"] .tool-activity-group-chevron,
@@ -625,10 +625,10 @@
 }
 .tool-activity-group-item-toggle:not(:disabled):hover { color: var(--ocean-700); background: var(--surface-soft); }
 .tool-activity-group-item-toggle:disabled { cursor: default; opacity: 1; }
-.tool-activity-group-item-toggle > svg:first-child { flex: 0 0 auto; color: var(--muted-2); }
-.tool-activity-group-item-toggle > span { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 7px; overflow: hidden; }
-.tool-activity-group-item-toggle strong { flex: 0 0 auto; color: var(--muted); font-size: .6875rem; font-weight: 400; white-space: nowrap; }
-.tool-activity-group-item-toggle code { min-width: 0; overflow: hidden; color: var(--muted-2); font: .6875rem/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.tool-activity-group-item-toggle > .tool-activity-icon { flex: 0 0 20px; transform: translateY(1px); }
+.tool-activity-group-item-toggle > span:not(.tool-activity-icon) { min-width: 0; flex: 1; display: flex; align-items: center; gap: 7px; overflow: hidden; }
+.tool-activity-group-item-toggle strong { flex: 0 0 auto; color: var(--muted); font-size: .6875rem; font-weight: 400; line-height: 20px; white-space: nowrap; }
+.tool-activity-group-item-toggle code { min-width: 0; overflow: hidden; color: var(--muted-2); font: .6875rem/20px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .tool-activity-group-item.failed .tool-activity-group-item-toggle strong { color: var(--red); }
 .tool-activity-group-detail { margin: 2px 0 5px 20px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
 .tool-activity-group-detail strong { display: block; color: var(--ink); font-size: .6875rem; }
@@ -637,6 +637,8 @@
 .thought-activity-static { min-height: 20px; display: flex; flex-direction: row; align-items: center; gap: 10px; justify-content: space-between; }
 .thought-activity.kind-tool .thought-activity-static { justify-content: flex-start; }
 .thought-activity.kind-tool .thought-activity-static .thought-activity-summary { margin-left: 0; }
+.thought-activity.kind-tool { align-items: start; }
+.thought-activity.kind-tool .thought-activity-icon { align-self: start; transform: translateY(1px); }
 .thought-activity-title { display: block; min-width: max-content; color: var(--ink); font-size: .75rem; font-weight: 400; line-height: 20px; white-space: nowrap; }
 .thought-activity-thought { margin: 0; color: var(--ink); font-size: .75rem; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
 .thought-activity.is-active .thought-activity-title {
@@ -645,7 +647,7 @@
 }
 .thought-activity-toggle { width: 100%; min-width: 0; min-height: 25px; display: flex; align-items: center; gap: 7px; padding: 0; border: 0; color: var(--ink); background: transparent; font: inherit; text-align: left; }
 .thought-activity-toggle > span:first-child { min-width: 0; width: 100%; flex: 1 1 auto; display: flex; flex-direction: row; align-items: center; gap: 10px; overflow: hidden; }
-.thought-activity-summary { min-width: 0; max-width: min(720px, 100%); flex: 1 1 auto; margin-left: auto; overflow: hidden; color: var(--muted-2); font-size: .6875rem; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.thought-activity-summary { min-width: 0; max-width: min(720px, 100%); flex: 1 1 auto; margin-left: auto; overflow: hidden; color: var(--muted-2); font-size: .6875rem; line-height: 20px; text-overflow: ellipsis; white-space: nowrap; }
 .thought-activity-toggle:hover { color: var(--ocean-700); }
 .thought-activity-chevron { color: var(--muted-2); transition: transform .16s ease; }
 .thought-activity-toggle[aria-expanded="true"] .thought-activity-chevron { transform: rotate(90deg); }
@@ -658,6 +660,7 @@
 .thought-activity-icon.is-task { color: var(--violet); background: var(--violet-soft); }
 .thought-activity-icon.is-approval { color: var(--yellow); background: var(--yellow-soft); }
 .thought-activity-icon.is-context { color: var(--ocean-700); background: var(--surface-deep); }
+.tool-activity-icon { flex: 0 0 20px; width: 20px; height: 20px; margin: 0; align-self: center; }
 @keyframes deep-sea-breathe {
   0%, 100% { color: #174d67; opacity: .68; text-shadow: 0 0 0 rgba(24, 139, 190, 0); }
   48% { color: #087ca8; opacity: 1; text-shadow: 0 0 5px rgba(13, 130, 177, .34), 0 0 12px rgba(24, 156, 202, .16); }
