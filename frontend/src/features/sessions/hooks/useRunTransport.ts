@@ -2,7 +2,7 @@
 import { useCallback } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { api, apiUrl } from '../../../api'
-import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, hasPersistedRunReply, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStreamPhase } from '../../../sessionStream'
+import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, hasPersistedRunReply, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, restoreAssistantItemsFromEvents, runStreamPhase } from '../../../sessionStream'
 import type { RunStreamEvent } from '../../../sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, thinkingStatusForRun, updateThoughtTimeline } from '../../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../../thoughtTimeline'
@@ -261,6 +261,30 @@ export function useRunTransport(options: RunTransportOptions) {
         : { ...emptyThoughtTimeline, startedAt: runThinkingStartedAt(persistedStartedAt) },
       thinkingStatus: previous.thinkingStatus || thinkingStatusForRun(runId),
     }))
+
+    // SSE 只会发送连接建立后的事件；先用持久化事件恢复正文，避免重连/刷新后出现空白。
+    void (async () => {
+      const events: RunEvent[] = []
+      let before: number | undefined
+      do {
+        const page = await api.listRunEvents(runId, before === undefined ? {} : { before })
+        events.push(...page.items)
+        before = page.next_before === null ? undefined : page.next_before
+      } while (before !== undefined && activeIdRef.current === sessionId && streamRunIdRef.current === runId)
+      if (activeIdRef.current !== sessionId || streamRunIdRef.current !== runId) return
+      for (const event of events) {
+        const eventId = String(event.id || '')
+        if (eventId) seenStreamEventsRef.current.eventIds.add(eventId)
+      }
+      const restored = restoreAssistantItemsFromEvents(events.map((event) => ({ ...event, type: event.type || event.event_type || '' })))
+      if (!restored.length) return
+      setLiveRun((previous) => {
+        if (previous.runId !== runId || previous.assistantItems.length) return previous
+        return { ...previous, assistantItems: restored, draft: assistantItemsText(restored) }
+      })
+    })().catch(() => {
+      // SSE/轮询仍是主链路；持久化恢复失败保持可见的实时错误路径，不吞掉后续流。
+    })
 
     let source: EventSource
     try {

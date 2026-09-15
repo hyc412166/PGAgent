@@ -39,4 +39,10 @@ describe('运行事件诊断视图', () => {
       next_before: 9,
     })
   })
+
+  it('去除游标页重叠事件', () => {
+    const current = { items: [{ id: 'event-1', sequence: 1 }], next_before: 1 } as RunEventPage
+    const incoming = { items: [{ id: 'event-1', sequence: 1 }, { id: 'event-0', sequence: 0 }], next_before: null } as RunEventPage
+    expect(appendRunEventPage(current, incoming).items.map((event) => event.id)).toEqual(['event-1', 'event-0'])
+  })
 })

@@ -1,6 +1,6 @@
 // 本测试文件验证 sessionStream 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
-import { appendAssistantDelta, applyAssistantStreamEvent, composerSurface, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
+import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, composerSurface, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, restoreAssistantItemsFromEvents, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
 
 // 测试分组：会话 SSE 事件。
 describe('会话 SSE 事件', () => {
@@ -50,6 +50,16 @@ describe('会话 SSE 事件', () => {
     const items = applyAssistantStreamEvent([], { type: 'assistant_delta', delta: '最终正文' })
 
     expect(items[0]).toEqual(expect.objectContaining({ content: '最终正文', phase: 'final_answer' }))
+  })
+
+  it('从持久化事件恢复断线期间的助手正文', () => {
+    const items = restoreAssistantItemsFromEvents([
+      { type: 'assistant_message_started', response_id: 'resp-reconnect', item_id: 'item-1', output_index: 0 },
+      { type: 'assistant_message_delta', response_id: 'resp-reconnect', item_id: 'item-1', delta: '断线前后正文' },
+      { type: 'assistant_message_completed', response_id: 'resp-reconnect', item_id: 'item-1', content: '断线前后正文', output_index: 0 },
+    ])
+    expect(assistantItemsText(items)).toBe('断线前后正文')
+    expect(items[0].status).toBe('completed')
   })
 
   it('完成 item 原子替换正文，model response completed 不改变 live item', () => {

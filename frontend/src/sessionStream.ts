@@ -246,6 +246,11 @@ export function assistantItemsText(items: AssistantStreamItem[]): string {
   return items.map((item) => item.content).join('')
 }
 
+// 从持久化运行事件恢复正文；用于断线重连或页面重新进入活动运行时补齐漏收的增量。
+export function restoreAssistantItemsFromEvents(events: RunStreamEvent[]): AssistantStreamItem[] {
+  return events.reduce<AssistantStreamItem[]>((items, event) => applyAssistantStreamEvent(items, event), [])
+}
+
 // 用事件 ID 去重重连后重复送达的 SSE；无 ID 的兼容事件默认接受。
 export function rememberRunStreamEvent(seenEventIds: Set<string>, event: RunStreamEvent, lastEventId = ''): boolean {
   const eventId = String(event.event_id || lastEventId || '')

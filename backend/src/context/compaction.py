@@ -56,7 +56,13 @@ from src.agent import (
 from src.context import ContextManager, FilesystemArtifactStore
 from src.context.window import message_tokens
 from src.attachments.storage import attachment_message_content
-from src.context.assembly import COMPACTION_SCHEMA, CONTINUATION_PREFIX
+from src.context.assembly import (
+    COMPACTION_SCHEMA,
+    CONTINUATION_PREFIX,
+    InMemoryArtifactStore,
+    ToolOutputBudgeter,
+    compact_tool_results_for_model,
+)
 from src.tools import create_default_registry
 from src.tools.registry import TOOL_SCHEMAS
 from src.tools.types import ToolResult
@@ -676,9 +682,27 @@ def _prepare_session_history(db: Any, session: Session) -> list[dict[str, Any]]:
         ],
         *[_message_payload(row) for row in rows],
     ]
+    # 工具结果在真正发给 provider 前会按同一套预算规则外部化；统计口径
+    # 必须复用该变换，否则超大工具输出会把 API 的 context 使用量夸大。
+    provider_messages = _provider_visible_messages(messages)
     # 变量说明：context_tokens 表示当前流程使用的 context_tokens 集合。
     session.context_tokens = min(
-        sum(message_tokens(message) for message in messages),
+        sum(message_tokens(message) for message in provider_messages),
         settings.context_limit_tokens,
     )
     return messages
+
+
+def _provider_visible_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the deterministic provider projection used for token accounting.
+
+    The in-memory store intentionally discards artifacts here: persistence of
+    artifacts happens during runtime budgeting, while this helper only mirrors
+    the visible preview shape for statistics and API reads.
+    """
+
+    result = compact_tool_results_for_model(
+        [dict(message) for message in messages],
+        budgeter=ToolOutputBudgeter(InMemoryArtifactStore()),
+    )
+    return result.messages

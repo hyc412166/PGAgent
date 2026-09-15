@@ -12,6 +12,12 @@ export type RunEventPresentation = {
   tone: RunEventTone
 }
 
+// 工具完成事件是内部收尾信号，正文时间线只保留工具开始调用，避免同一调用重复占位。
+export function isHiddenRunEvent(event: RunEvent): boolean {
+  const type = text(event.type) || text(event.event_type) || ''
+  return type === 'tool_finished' || type === 'tool_result'
+}
+
 // 事件标题只覆盖公开契约中的已知事件；未知类型统一使用中性描述。
 const eventTitles: Record<string, string> = {
   approval_rejected: '审批已拒绝',
@@ -175,15 +181,16 @@ export function presentRunEvent(event: RunEvent): RunEventPresentation {
     return { title: '运行事件', detail: '记录了一项运行状态变化', facts: [], tone: 'neutral' }
   }
   const toolName = text(payload.tool_name) || '未知工具'
+  const toolFailed = payload.ok === false || Boolean(text(payload.error_code))
   const title = type === 'tool_started' || type === 'tool_call'
     ? `开始调用 ${toolName}`
     : type === 'tool_finished' || type === 'tool_result'
-      ? payload.ok === false ? `${toolName} 调用失败` : `${toolName} 调用完成`
+      ? toolFailed ? `${toolName} 调用失败` : `${toolName} 调用完成`
       : eventTitles[type]
   const detail = type === 'tool_started' || type === 'tool_call'
     ? '工具正在执行'
     : type === 'tool_finished' || type === 'tool_result'
-      ? payload.ok === false ? '工具返回了失败结果' : '工具已经返回结果'
+      ? toolFailed ? '工具返回了失败结果' : '工具已经返回结果'
       : eventDetail(type, payload)
   const facts: RunEventFact[] = []
   for (const key of diagnosticFactKeys) {

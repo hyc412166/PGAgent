@@ -131,6 +131,13 @@ class SessionRunRequest(BaseModel):
 # 类职责：定义 SessionContextRead 在本领域中的数据与行为。
 # 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class SessionContextRead(BaseModel):
+    # Codex 风格字段：active_context_tokens 表示当前窗口实际占用量；其余字段描述自动压缩范围和剩余预算。
+    active_context_tokens: int
+    auto_compact_scope_tokens: int
+    auto_compact_scope_limit: int
+    full_context_window_limit: int
+    base_window_tokens_remaining: int
+    token_limit_reached: bool
     # 变量说明：used_tokens 表示当前流程使用的 used_tokens 集合。
     used_tokens: int
     # 变量说明：limit_tokens 表示当前流程使用的 limit_tokens 集合。
@@ -843,6 +850,14 @@ def session_context(session_id: str, db: OrmSession = Depends(get_db)) -> Sessio
         .order_by(ConversationCompaction.source_sequence.desc(), ConversationCompaction.created_at.desc())
     )
     return SessionContextRead(
+        active_context_tokens=used_tokens,
+        # Total scope 与 Codex 的 Total 模式一致：压缩判断使用当前活动上下文本身，
+        # 不是“距离阈值还剩多少”这种反向数值。
+        auto_compact_scope_tokens=used_tokens,
+        auto_compact_scope_limit=settings.compact_threshold_tokens,
+        full_context_window_limit=settings.context_limit_tokens,
+        base_window_tokens_remaining=max(0, settings.context_limit_tokens - used_tokens),
+        token_limit_reached=used_tokens >= settings.compact_threshold_tokens,
         used_tokens=used_tokens,
         limit_tokens=settings.context_limit_tokens,
         compact_threshold_tokens=settings.compact_threshold_tokens,

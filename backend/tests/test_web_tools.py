@@ -10,9 +10,17 @@ import json
 from datetime import datetime, timezone
 
 import httpx
+import pytest
 
 from src.tools import builtins
 from src.tools.sandbox import WorkspaceSandbox
+
+
+@pytest.fixture(autouse=True)
+def disable_external_search_key(monkeypatch):
+    """联网单元测试默认覆盖本地 key，避免请求真实额度；Brave 用例自行启用替身 key。"""
+    monkeypatch.setattr(builtins.settings, "brave_search_api_key", None)
+    monkeypatch.delenv("PGAGENT_BRAVE_SEARCH_API_KEY", raising=False)
 
 
 # 辅助函数：_install_transport 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
@@ -21,6 +29,7 @@ def _install_transport(monkeypatch, handler) -> None:
 
     # 辅助方法：client_factory 实现测试替身在此调用阶段需要的最小行为。
     def client_factory(**kwargs):
+        kwargs.pop("proxy", None)
         kwargs["transport"] = httpx.MockTransport(handler)
         return real_client(**kwargs)
 
@@ -28,12 +37,15 @@ def _install_transport(monkeypatch, handler) -> None:
 
 
 # 测试场景：所有公共联网工具都允许 httpx 读取进程级 HTTP(S)_PROXY 配置，避免搜索和打开网页使用不同出口。
-def test_public_web_clients_enable_environment_proxy(monkeypatch, tmp_path) -> None:
+def test_public_web_clients_use_explicit_environment_proxy(monkeypatch, tmp_path) -> None:
     real_client = httpx.Client
-    observed: list[bool] = []
+    observed: list[tuple[str | None, bool]] = []
+    monkeypatch.setattr(builtins.urllib.request, "getproxies", lambda: {"https": "http://127.0.0.1:7897"})
+    monkeypatch.setattr(builtins.urllib.request, "proxy_bypass", lambda _host: False)
 
     def client_factory(**kwargs):
-        observed.append(kwargs.get("trust_env"))
+        observed.append((kwargs.get("proxy"), kwargs.get("trust_env")))
+        kwargs.pop("proxy", None)
         kwargs["transport"] = httpx.MockTransport(
             lambda request: httpx.Response(
                 200,
@@ -51,16 +63,19 @@ def test_public_web_clients_enable_environment_proxy(monkeypatch, tmp_path) -> N
 
     assert opened.ok
     assert payload == {"ok": True} and error is None
-    assert observed == [True, True]
+    assert observed == [
+        ("http://127.0.0.1:7897", False),
+        ("http://127.0.0.1:7897", False),
+    ]
 
 
 # 测试场景：通过环境代理访问公共网页时，代理对端不能被误判为非公共目标。
 def test_public_web_clients_mark_proxy_peer_as_allowed(monkeypatch, tmp_path) -> None:
     observed: list[bool] = []
 
-    def peer_check(_response, *, proxy_configured=False):
-        observed.append(proxy_configured)
-        return proxy_configured
+    def peer_check(_response, *, proxy_configured=False, proxy_url=None):
+        observed.append(proxy_configured or bool(proxy_url))
+        return proxy_configured or bool(proxy_url)
 
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
     monkeypatch.setattr(builtins, "_response_peer_is_public", peer_check)
@@ -75,22 +90,22 @@ def test_public_web_clients_mark_proxy_peer_as_allowed(monkeypatch, tmp_path) ->
     assert observed == [True]
 
 
-# 测试场景：本机代理将 Bing 请求的对端判定为非公网地址时，搜索应切换到区域入口直连，避免把代理误报成 unsafe_url。
-def test_web_search_falls_back_to_direct_regional_endpoint_after_proxy_peer_rejection(monkeypatch, tmp_path) -> None:
+# 测试场景：本机代理对端属于显式选用的代理路由时，搜索不应把代理地址误报成 unsafe_url。
+def test_web_search_uses_explicit_proxy_route_without_unsafe_url(monkeypatch, tmp_path) -> None:
     requests: list[tuple[str, bool]] = []
-    peer_checks = iter([False, True])
     markup = """<?xml version="1.0"?><rss><channel><item>
       <title>Headline</title><link>https://example.com/story</link>
       <description>Summary</description>
     </item></channel></rss>"""
 
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
-    monkeypatch.setattr(builtins, "_response_peer_is_public", lambda _response, **_kwargs: next(peer_checks))
+    monkeypatch.setattr(builtins, "_response_peer_is_public", lambda _response, **_kwargs: True)
 
     real_client = httpx.Client
 
     def client_factory(**kwargs):
         trust_env = bool(kwargs.get("trust_env"))
+        kwargs.pop("proxy", None)
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append((str(request.url), trust_env))
@@ -104,9 +119,8 @@ def test_web_search_falls_back_to_direct_regional_endpoint_after_proxy_peer_reje
     result = builtins.web_search(WorkspaceSandbox(tmp_path), "latest news")
 
     assert result.ok
-    assert len(requests) == 2
-    assert "www.bing.com/search" in requests[0][0] and requests[0][1] is True
-    assert "cn.bing.com/search" in requests[1][0] and requests[1][1] is False
+    assert len(requests) == 1
+    assert "www.bing.com/search" in requests[0][0] and requests[0][1] is False
 
 
 # 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_web_address_classifier_rejects_non_global_ranges 精确标识本用例的具体条件。
@@ -314,7 +328,7 @@ def test_web_run_deduplicates_searches_and_preserves_order(monkeypatch, tmp_path
         WorkspaceSandbox(tmp_path),
         search_query=[
             {"q": "  latest US news  ", "recency": 1, "domains": ["apnews.com"]},
-            {"q": "latest   US news"},
+            {"q": "latest   US news", "recency": 1, "domains": ["apnews.com"]},
             {"q": "second query"},
         ],
     )
@@ -345,6 +359,114 @@ def test_web_run_accepts_legacy_max_items_alias(monkeypatch, tmp_path) -> None:
     )
 
     assert result.ok
+
+
+def test_web_run_rejects_more_than_ten_navigation_commands(tmp_path) -> None:
+    result = builtins.web_run(
+        WorkspaceSandbox(tmp_path),
+        open=[{"ref_id": f"https://example.com/{index}"} for index in range(11)],
+    )
+
+    assert not result.ok
+    assert result.error_code == "invalid_command"
+
+
+def test_web_run_keeps_large_search_aggregation_valid_and_bounded(monkeypatch, tmp_path) -> None:
+    def fake_search(_sandbox, query, **_kwargs):
+        return builtins.ToolResult(
+            "websearch",
+            True,
+            "search body " * 5_000,
+            metadata={
+                "provider": "brave",
+                "results": [
+                    {
+                        "title": f"{query}-{index}" + "t" * 500,
+                        "url": f"https://example.com/{query}/{index}?" + "u" * 1_500,
+                        "description": "d" * 2_000,
+                    }
+                    for index in range(10)
+                ],
+            },
+        )
+
+    monkeypatch.setattr(builtins, "web_search", fake_search)
+    result = builtins.web_run(
+        WorkspaceSandbox(tmp_path),
+        search_query=[{"q": f"query {index}", "limit": 10} for index in range(5)],
+    )
+
+    payload = json.loads(result.content)
+    assert result.ok
+    assert len(result.content) <= 40_000
+    assert len(payload) == 5
+    assert any(item.get("output_truncated") is True for item in payload)
+
+
+def test_web_run_hard_limit_holds_for_twenty_mixed_commands(monkeypatch, tmp_path) -> None:
+    def fake_search(_sandbox, query, **_kwargs):
+        return builtins.ToolResult(
+            "websearch", True, "s" * 50_000,
+            metadata={"provider": "brave", "results": [
+                {"title": "t" * 500, "url": f"https://example.com/{query}/{index}?" + "u" * 1_500,
+                 "description": "d" * 2_000}
+                for index in range(10)
+            ]},
+        )
+
+    monkeypatch.setattr(builtins, "web_search", fake_search)
+    monkeypatch.setattr(
+        builtins, "web_weather",
+        lambda *_args, **_kwargs: builtins.ToolResult("web_weather", True, "w" * 50_000),
+    )
+    pages = {
+        f"page{index}": {"url": f"https://example.com/page/{index}", "text": "x" * 5_000, "links": []}
+        for index in range(10)
+    }
+
+    result = builtins.web_run(
+        WorkspaceSandbox(tmp_path),
+        search_query=[{"q": f"query {index}", "limit": 10} for index in range(5)],
+        open=[{"ref_id": f"page{index}"} for index in range(10)],
+        weather=[{"location": f"city {index}"} for index in range(5)],
+        pages=pages,
+    )
+
+    assert result.ok
+    assert len(result.content) <= 40_000
+    assert len(json.loads(result.content)) == 20
+
+
+def test_web_run_compaction_preserves_fallback_status_diagnostics(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        builtins, "web_search",
+        lambda *_args, **_kwargs: builtins.ToolResult(
+            "websearch", False, "bing failed", error_code="search_http_error",
+            metadata={
+                "provider": "bing_rss", "status_code": 502,
+                "fallback_from": "brave", "initial_error_code": "brave_http_503",
+                "initial_status_code": 503, "brave_error": "brave_http_503",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        builtins, "web_screenshot",
+        lambda *_args, **_kwargs: builtins.ToolResult(
+            "web_run", True, "shot", metadata={"blob": "x" * 50_000},
+        ),
+    )
+
+    result = builtins.web_run(
+        WorkspaceSandbox(tmp_path),
+        search_query=[{"q": f"query {index}", "domains": ["example.com"]} for index in range(5)],
+        screenshot=[{"url": f"https://example.com/{index}"} for index in range(15)],
+    )
+
+    search = json.loads(result.content)[0]
+    assert len(result.content) <= 40_000
+    assert search["status_code"] == 502
+    assert search["initial_status_code"] == 503
+    assert search["initial_error_code"] == "brave_http_503"
 
 
 # 测试场景：批量搜索全部没有结果时，顶层状态必须反映失败，便于模型触发可观测重试。
@@ -426,6 +548,26 @@ def test_web_search_classifies_dns_and_timeout_failures(monkeypatch, tmp_path) -
     timeout_result = builtins.web_search(WorkspaceSandbox(tmp_path), "latest news")
     assert timeout_result.error_code == "search_timeout"
     assert timeout_result.metadata["stage"] == "request"
+
+
+def test_web_search_uses_brave_key_without_exposing_it(monkeypatch, tmp_path) -> None:
+    observed = {}
+    monkeypatch.setattr(builtins.settings, "brave_search_api_key", "test-secret")
+    real_client = httpx.Client
+
+    def handler(request):
+        observed.update({"url": str(request.url), "headers": request.headers, "params": request.url.params})
+        return httpx.Response(200, json={"web": {"results": [{"title": "Codex source", "url": "https://github.com/openai/codex", "description": "source"}]}})
+
+    def client_factory(**kwargs):
+        kwargs.pop("proxy", None)
+        return real_client(**{**kwargs, "transport": httpx.MockTransport(handler)})
+
+    monkeypatch.setattr(builtins.httpx, "Client", client_factory)
+    result = builtins.web_search(WorkspaceSandbox(tmp_path), "codex source")
+    assert result.ok and result.metadata["provider"] == "brave"
+    assert observed["headers"]["x-subscription-token"] == "test-secret"
+    assert "test-secret" not in result.content
 
 
 # 测试场景：没有代理时直接使用区域 Bing 入口，避免 www.bing.com 的未跟随重定向。
