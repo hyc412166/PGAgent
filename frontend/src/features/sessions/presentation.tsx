@@ -325,7 +325,7 @@ function OrderedRunContent({
       if (entry.kind === 'assistant') {
         // 折叠执行详情时保留最终回复；commentary 属于执行过程，随详情一起隐藏。
         if (!activitiesVisible && entry.item.phase !== 'final_answer') return null
-        return <div className="ordered-assistant-content" key={entry.item.id}><MarkdownContent content={entry.item.detail} /></div>
+        return <div className="ordered-assistant-content" key={entry.item.id}><MarkdownContent content={entry.item.detail} streaming={Boolean(live && entry.item.status === 'running')} /></div>
       }
       return activitiesVisible
         ? <ThoughtActivityList key={`activities-${entry.items[0]?.id || index}`} items={entry.items} live={live} activeItemId={activeItemId} />
@@ -369,7 +369,7 @@ function ThoughtActivityList({ items, live = false, activeItemId }: { items: Tho
         </section>
       }
       const item = entry.item
-      if (item.kind === 'assistant') return <div key={item.id} className="ordered-assistant-content"><MarkdownContent content={item.detail} /></div>
+      if (item.kind === 'assistant') return <div key={item.id} className="ordered-assistant-content"><MarkdownContent content={item.detail} streaming={Boolean(live && item.status === 'running')} /></div>
       if (item.kind === 'thought') return <p key={item.id} className={`thought-activity-thought ${item.status}`}>{item.detail}</p>
       // 普通联网搜索保持紧凑；当来源 URL 过长时提供展开入口，避免摘要撑坏标题布局。
       const hasLongUrl = /https?:\/\/\S{72,}/i.test(item.detail)
@@ -456,7 +456,7 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded }: { liveRun: Li
             <OrderedRunContent items={executionItems} activitiesVisible={expanded} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} />
           </div>
           : null}
-        {!!finalItems.length && <div className="live-final-content"><OrderedRunContent items={finalItems} activitiesVisible includeFinalAssistant /></div>}
+        {!!finalItems.length && <div className="live-final-content"><OrderedRunContent items={finalItems} activitiesVisible live includeFinalAssistant /></div>}
         {liveRun.error && <p className="live-error">{liveRun.error}</p>}
       </div>
     </article>

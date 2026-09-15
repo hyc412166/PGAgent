@@ -1,10 +1,15 @@
-// 本组件负责把 Agent 的 Markdown 正文转换为可读的富文本，并统一代码块与表格的交互样式。
-import { Children, isValidElement, memo, useState, type ReactNode } from 'react'
+// 本组件负责把 Agent 的 Markdown 与 LaTeX 正文转换为富文本，并统一公式、代码块和表格的展示。
+import { Children, isValidElement, memo, useEffect, useState, type ComponentProps, type ReactNode } from 'react'
 import { CheckCheck, Code2, Copy, XCircle } from 'lucide-react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import rehypeHighlight from 'rehype-highlight'
+import rehypeKatex from 'rehype-katex'
 import remarkBreaks from 'remark-breaks'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math-extended'
+import 'katex/dist/katex.min.css'
+
+import { createLiveMarkdownCoalescer } from './liveMarkdownCoalescer'
 
 const languageLabels: Record<string, string> = {
   bash: 'Bash',
@@ -14,6 +19,7 @@ const languageLabels: Record<string, string> = {
   js: 'JavaScript',
   json: 'JSON',
   jsx: 'JSX',
+  latex: 'LaTeX',
   markdown: 'Markdown',
   md: 'Markdown',
   plaintext: '纯文本',
@@ -53,6 +59,35 @@ function displayLanguage(language: string) {
   return language.length <= 4
     ? language.toUpperCase()
     : `${language.charAt(0).toUpperCase()}${language.slice(1)}`
+}
+
+type MarkdownTreeNode = {
+  type?: string
+  properties?: { className?: unknown }
+  children?: MarkdownTreeNode[]
+}
+
+// rehype-katex 也会处理 ```math；先改成 latex 代码语言，确保 fenced code 保持源码语义。
+function preserveLatexCodeFences() {
+  return (tree: MarkdownTreeNode) => {
+    const pending = [tree]
+    while (pending.length) {
+      const node = pending.pop()
+      if (!node) continue
+      if (node.type === 'element' && node.properties) {
+        const rawClassName = node.properties.className
+        const classNames = Array.isArray(rawClassName)
+          ? rawClassName.map(String)
+          : typeof rawClassName === 'string'
+            ? rawClassName.split(/\s+/)
+            : []
+        if (classNames.includes('language-math') && !classNames.includes('math-inline') && !classNames.includes('math-display')) {
+          node.properties.className = classNames.map((className) => className === 'language-math' ? 'language-latex' : className)
+        }
+      }
+      if (node.children) pending.push(...node.children)
+    }
+  }
 }
 
 // MarkdownCodeBlock 保留高亮器生成的 token 节点，同时从同一棵节点树提取原始代码用于复制。
@@ -98,18 +133,34 @@ const markdownComponents: Components = {
   },
 }
 
-const remarkPlugins = [remarkGfm, remarkBreaks]
-const rehypePlugins: Array<[typeof rehypeHighlight, { detect: boolean; plainText: string[] }]> = [[rehypeHighlight, { detect: false, plainText: ['text', 'plaintext', 'txt'] }]]
+const remarkPlugins: NonNullable<ComponentProps<typeof ReactMarkdown>['remarkPlugins']> = [[remarkMath, { backslashDelimiters: true, singleDollarTextMath: false }], remarkGfm, remarkBreaks]
+const rehypePlugins: NonNullable<ComponentProps<typeof ReactMarkdown>['rehypePlugins']> = [preserveLatexCodeFences, [rehypeHighlight, { detect: false, plainText: ['text', 'plaintext', 'txt', 'math'] }], rehypeKatex]
 
-function MarkdownContentView({ content }: { content: string }) {
+const MarkdownDocument = memo(function MarkdownDocument({ content }: { content: string }) {
+  return <ReactMarkdown
+    components={markdownComponents}
+    remarkPlugins={remarkPlugins}
+    rehypePlugins={rehypePlugins}
+  >
+    {content}
+  </ReactMarkdown>
+})
+
+function MarkdownContentView({ content, streaming = false }: { content: string; streaming?: boolean }) {
+  const [renderedContent, setRenderedContent] = useState(content)
+  const [coalescer] = useState(() => createLiveMarkdownCoalescer(content, setRenderedContent))
+
+  useEffect(() => {
+    if (streaming) coalescer.push(content)
+    else coalescer.flush(content)
+  }, [coalescer, content, streaming])
+
+  useEffect(() => () => coalescer.dispose(), [coalescer])
+
+  // 流式正文最多每 100ms 触发一次完整 Markdown/KaTeX 解析；结束态直接使用最终内容。
+  const visibleContent = streaming ? renderedContent : content
   return <div className="message-content markdown-content">
-    <ReactMarkdown
-      components={markdownComponents}
-      remarkPlugins={remarkPlugins}
-      rehypePlugins={rehypePlugins}
-    >
-      {content}
-    </ReactMarkdown>
+    <MarkdownDocument content={visibleContent} />
   </div>
 }
 

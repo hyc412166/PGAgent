@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 
 import { ChildAgentPanel, CompletedThoughtTimeline, LiveAssistantMessage, MessageBubble } from './presentation'
+import { createLiveMarkdownCoalescer } from './liveMarkdownCoalescer'
 import { formatApprovalArguments } from './approvalPresentation'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
 
@@ -49,6 +50,33 @@ describe('子 Agent 运行事件展示', () => {
 })
 
 describe('助手消息中的思考过程展示', () => {
+  it('合并高频流式正文更新，并在结束时立即刷新最终内容', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-15T00:00:00.000Z'))
+    const commits: string[] = []
+    const coalescer = createLiveMarkdownCoalescer('初始', (content) => commits.push(content))
+
+    try {
+      coalescer.push('第一段')
+      vi.advanceTimersByTime(40)
+      coalescer.push('第二段')
+      vi.advanceTimersByTime(59)
+      expect(commits).toEqual([])
+
+      vi.advanceTimersByTime(1)
+      expect(commits).toEqual(['第二段'])
+
+      coalescer.push('尚未提交')
+      coalescer.flush('完整最终回复')
+      expect(commits).toEqual(['第二段', '完整最终回复'])
+      vi.advanceTimersByTime(100)
+      expect(commits).toEqual(['第二段', '完整最终回复'])
+    } finally {
+      coalescer.dispose()
+      vi.useRealTimers()
+    }
+  })
+
   it('只把相邻的多个工具调用合并成一个工具组', () => {
     const grouped = groupThoughtActivities([
       { id: 'thought-1', kind: 'thought', icon: 'think', title: '思考', detail: '先检查文件', status: 'completed' },
@@ -203,6 +231,160 @@ describe('助手消息中的思考过程展示', () => {
     expect(markup).toContain('<th>测试规模</th>')
     expect(markup).toContain('>3千-1万</td>')
     expect(markup).toContain('markdown-table-wrap')
+  })
+
+  it('将反斜杠分隔的块级 LaTeX 渲染为公式而不是代码面板', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: {
+        id: 'message-latex-display',
+        role: 'assistant',
+        content: '论文用 Headroom-Closed Index：\n\n\\[\nH=100\\times\\frac{s-F_{0}}{100-F_{0}}\n\\]',
+        created_at: '2026-09-15T00:00:00.000Z',
+      },
+    }))
+
+    expect(markup).toContain('katex-display')
+    expect(markup).toContain('<math')
+    expect(markup).not.toContain('markdown-code-block')
+  })
+
+  it('将反斜杠分隔的行内 LaTeX 保留在正文行内', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: {
+        id: 'message-latex-inline',
+        role: 'assistant',
+        content: '其中 \\(P\\) 表示跨轮次持久性。',
+        created_at: '2026-09-15T00:00:00.000Z',
+      },
+    }))
+
+    expect(markup).toContain('katex-mathml')
+    expect(markup).toContain('<mi>P</mi>')
+    expect(markup).not.toContain('markdown-math-block')
+  })
+
+  it('实时助手回复复用块级 LaTeX 渲染', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-latex-draft',
+        phase: '生成回复',
+        draft: '\\[\nR=(P,S,E,D,M,V,G)\n\\]',
+        status: 'live',
+        error: '',
+        thinkingStatus: '处理中',
+        thought: { startedAt: null, elapsedMs: 0, finished: false, conclusion: '', tools: [], items: [] },
+      },
+    }))
+
+    expect(markup).toContain('katex-display')
+    expect(markup).not.toContain('markdown-code-block')
+  })
+
+  it('代码范围内的 LaTeX 分隔符保持原样', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: {
+        id: 'message-latex-code',
+        role: 'assistant',
+        content: '`\\(P\\)`\n\n```text\n\\[\nH=100\\times\\frac{s-F_0}{100-F_0}\n\\]\n```',
+        created_at: '2026-09-15T00:00:00.000Z',
+      },
+    }))
+
+    expect(markup).not.toContain('class="katex')
+    expect(markup).toContain('markdown-code-block')
+    expect(markup).toContain('\\(P\\)')
+    expect(markup).toContain('\\frac')
+  })
+
+  it('math fenced code 仍作为可复制的 LaTeX 源码展示', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: {
+        id: 'message-latex-math-fence',
+        role: 'assistant',
+        content: '```math\nH=100\\times\\frac{s-F_0}{100-F_0}\n```',
+        created_at: '2026-09-15T00:00:00.000Z',
+      },
+    }))
+
+    expect(markup).not.toContain('class="katex')
+    expect(markup).toContain('markdown-code-block')
+    expect(markup).toContain('LaTeX')
+    expect(markup).toContain('\\frac')
+  })
+
+  it('跨行 inline code 中的 LaTeX 分隔符保持原样', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: {
+        id: 'message-latex-multiline-code-span',
+        role: 'assistant',
+        content: '``示例\n\\(P\\)\n结束``',
+        created_at: '2026-09-15T00:00:00.000Z',
+      },
+    }))
+
+    expect(markup).not.toContain('class="katex')
+    expect(markup).toContain('\\(P\\)')
+    expect(markup).not.toContain('$$P$$')
+  })
+
+  it('未闭合的块级分隔符不会阻断后续合法行内公式', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: {
+        id: 'message-latex-unclosed-display',
+        role: 'assistant',
+        content: '\\[\n这段分隔符尚未闭合。\n\n后续 \\(P\\) 仍应显示为公式。',
+        created_at: '2026-09-15T00:00:00.000Z',
+      },
+    }))
+
+    expect(markup).toContain('class="katex')
+    expect(markup).toContain('<mi>P</mi>')
+    expect(markup).toContain('[')
+  })
+
+  it('引用中的 fenced code 不改写 LaTeX 分隔符', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: {
+        id: 'message-latex-blockquote-fence',
+        role: 'assistant',
+        content: '> ~~~text\n> \\(P\\)\n> ~~~',
+        created_at: '2026-09-15T00:00:00.000Z',
+      },
+    }))
+
+    expect(markup).not.toContain('class="katex')
+    expect(markup).toContain('\\(P\\)')
+    expect(markup).not.toContain('$$P$$')
+  })
+
+  it('缩进代码不改写 LaTeX 分隔符', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: {
+        id: 'message-latex-indented-code',
+        role: 'assistant',
+        content: '    \\(P\\)\n    \\[\n    H=100\\times\\frac{s-F_0}{100-F_0}\n    \\]',
+        created_at: '2026-09-15T00:00:00.000Z',
+      },
+    }))
+
+    expect(markup).not.toContain('class="katex')
+    expect(markup).toContain('\\(P\\)')
+    expect(markup).toContain('\\frac')
+  })
+
+  it('链接目标中的反斜杠括号不被当作行内公式', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: {
+        id: 'message-latex-link-destination',
+        role: 'assistant',
+        content: '[文档](https://example.test/a\\(b\\))',
+        created_at: '2026-09-15T00:00:00.000Z',
+      },
+    }))
+
+    expect(markup).not.toContain('class="katex')
+    expect(markup).toContain('href="https://example.test/a(b)"')
+    expect(markup).not.toContain('$$')
   })
 
   it('实时助手草稿复用同一套 Markdown 代码块渲染', () => {

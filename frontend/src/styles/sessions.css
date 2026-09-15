@@ -338,6 +338,19 @@
 :root[data-theme='dark'] .markdown-content :not(pre) > code,
 .theme-dark .markdown-content :not(pre) > code { color: #ffc078; }
 
+/* KaTeX 负责数学字形；外层只约束会话中的间距和窄屏溢出，不改变消息表面。 */
+.markdown-content .katex-display {
+  max-width: 100%;
+  margin: 12px 0;
+  padding: 7px 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.markdown-content .katex .cjk_fallback {
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-style: normal;
+}
+
 .markdown-code-block {
   margin: 12px 0;
   overflow: hidden;
