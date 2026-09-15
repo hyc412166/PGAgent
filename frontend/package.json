@@ -11,14 +11,17 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "katex": "^0.16.47",
     "lucide-react": "^0.468.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-markdown": "^10.1.0",
     "react-router-dom": "^7.1.1",
     "rehype-highlight": "^7.0.2",
+    "rehype-katex": "^7.0.1",
     "remark-breaks": "^4.0.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "remark-math-extended": "^6.1.1"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
