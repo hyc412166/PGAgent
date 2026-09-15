@@ -20,6 +20,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -32,9 +33,11 @@ from typing import Any, Awaitable, Callable, Iterator, Mapping
 from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit, urlunsplit
 
 import httpx
+from src.config.settings import settings
 
 from .sandbox import SandboxViolation, WorkspaceSandbox
 from .types import ApprovalRequest, ToolResult
+from .web_pages import PageReader
 
 # 变量说明：DEFAULT_COMMAND_ALLOWLIST 表示当前步骤使用的 DEFAULT_COMMAND_ALLOWLIST 值。
 DEFAULT_COMMAND_ALLOWLIST = frozenset(
@@ -71,6 +74,9 @@ MAX_WEB_RESPONSE_BYTES = 1_000_000
 DEFAULT_WEB_PAGE_CHARS = 12_000
 # 变量说明：MAX_WEB_PAGE_CHARS 表示当前流程使用的 MAX_WEB_PAGE_CHARS 集合。
 MAX_WEB_PAGE_CHARS = 20_000
+MAX_WEB_RUN_NAVIGATION_COMMANDS = 10
+MAX_WEB_RUN_COMMANDS = 20
+MAX_WEB_RUN_OUTPUT_CHARS = 40_000
 # 变量说明：MAX_WEB_REDIRECTS 表示当前流程使用的 MAX_WEB_REDIRECTS 集合。
 MAX_WEB_REDIRECTS = 5
 # 变量说明：MAX_SKILL_INSTRUCTION_CHARS 表示当前流程使用的 MAX_SKILL_INSTRUCTION_CHARS 集合。
@@ -119,6 +125,9 @@ class _ReadableHtmlParser(HTMLParser):
         self._skip_depth = 0
         # 变量说明：_in_title 表示当前步骤使用的 _in_title 值。
         self._in_title = False
+        self._pre_depth = 0
+        self.links: list[dict[str, Any]] = []
+        self._anchor: dict[str, Any] | None = None
 
     # 函数职责：处理 starttag 对应的数据或流程。
     # 参数关系：tag 表示当前步骤使用的 tag 值；attrs 表示当前流程使用的 attrs 集合。
@@ -133,6 +142,11 @@ class _ReadableHtmlParser(HTMLParser):
             return
         # 变量说明：attributes 表示当前流程使用的 attributes 集合。
         attributes = {str(key).lower(): str(value or "") for key, value in attrs}
+        if name == "pre":
+            self._pre_depth += 1
+        if name == "a" and attributes.get("href"):
+            self._anchor = {"id": len(self.links) + 1, "href": attributes["href"], "text": ""}
+            self.links.append(self._anchor)
         if name == "title":
             # 变量说明：_in_title 表示当前步骤使用的 _in_title 值。
             self._in_title = True
@@ -161,6 +175,11 @@ class _ReadableHtmlParser(HTMLParser):
         if name == "title":
             # 变量说明：_in_title 表示当前步骤使用的 _in_title 值。
             self._in_title = False
+        if name == "pre":
+            self._pre_depth = max(0, self._pre_depth - 1)
+        if name == "a" and self._anchor is not None:
+            self.parts.append(f" [{self._anchor['id']}]")
+            self._anchor = None
         if name in self._BLOCKS:
             self.parts.append("\n")
 
@@ -171,24 +190,21 @@ class _ReadableHtmlParser(HTMLParser):
         if self._skip_depth:
             return
         # 变量说明：value 表示当前字段或计算值。
-        value = data.strip()
+        value = data if self._pre_depth else " ".join(data.split())
         if not value:
             return
         if self._in_title:
             self.title_parts.append(value)
-        self.parts.append(value)
+        if self._anchor is not None:
+            self._anchor["text"] += value
+        self.parts.append(value if self._pre_depth else value + " ")
 
     # 函数职责：完成 readable_text 对应的业务处理。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def readable_text(self) -> str:
         # 变量说明：lines 表示当前流程使用的 lines 集合。
-        lines = []
-        for line in " ".join(self.parts).splitlines():
-            # 变量说明：normalized 表示当前步骤使用的 normalized 值。
-            normalized = " ".join(line.split())
-            if normalized and (not lines or lines[-1] != normalized):
-                lines.append(normalized)
-        return "\n".join(lines)
+        # pre/code 内部的缩进和重复行是源码语义，不能按文章正文做空白归一化。
+        return "".join(self.parts).strip("\r\n")
 
 
 # 函数职责：完成 approval 对应的业务处理。
@@ -802,13 +818,14 @@ def _is_public_ip(address: str) -> bool:
     return candidate.is_global
 
 
-# 返回进程环境中由 httpx trust_env 使用的第一个代理配置。
-def _environment_proxy() -> str | None:
-    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
-        value = os.getenv(name)
-        if value:
-            return value
-    return None
+# urllib 同时支持环境变量和 Windows 系统代理；按目标应用 bypass 后显式交给 httpx。
+def _environment_proxy(url: str = "https://www.bing.com/") -> str | None:
+    parsed = urlsplit(url)
+    proxies = urllib.request.getproxies()
+    if urllib.request.proxy_bypass(parsed.netloc):
+        return None
+    proxy = proxies.get(parsed.scheme.lower()) or proxies.get("all")
+    return (proxy if "://" in proxy else f"http://{proxy}") if proxy else None
 
 
 # 函数职责：校验 public_http_url 对应的数据或流程。
@@ -864,7 +881,7 @@ def _validate_public_http_url(url: str) -> tuple[str, str]:
 # 函数职责：完成 response_peer_is_public 对应的业务处理。
 # 参数关系：response 表示下游返回的响应。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def _response_peer_is_public(response: httpx.Response, *, proxy_configured: bool = False) -> bool:
+def _response_peer_is_public(response: httpx.Response, *, proxy_url: str | None = None, proxy_configured: bool | None = None) -> bool:
     """Best-effort second SSRF check against the actual connected peer."""
 
     # 变量说明：stream 表示当前步骤使用的 stream 值。
@@ -874,16 +891,27 @@ def _response_peer_is_public(response: httpx.Response, *, proxy_configured: bool
         # preflight DNS guard remains in effect and keeps tests transport-agnostic.
         return True
     # 变量说明：peer 表示当前步骤使用的 peer 值。
-    peer = stream.get_extra_info("server_addr")
+    try:
+        peer = stream.get_extra_info("server_addr")
+    except OSError:
+        # 响应离开上下文后底层 socket 可能已关闭；此时 peer 信息不可读，
+        # 仍保留前置 DNS 公网校验，不把不可观测误报成 unsafe_url。
+        return True
     if not peer:
         return True
     try:
-        # 通过显式本机代理时，TCP 对端必然是代理地址；目标主机已在
-        # _validate_public_http_url 中完成 DNS 公网校验，不能再把代理误判为 SSRF。
-        if proxy_configured and not _is_public_ip(str(peer[0])):
+        if _is_public_ip(str(peer[0])):
             return True
-        return _is_public_ip(str(peer[0]))
-    except (IndexError, TypeError):
+        # 只认可本次请求实际使用的代理对端，而不是“配置过代理就放行所有私网”。
+        if proxy_url or proxy_configured:
+            if not proxy_url:
+                return True
+            proxy = urlsplit(proxy_url)
+            port = proxy.port or (443 if proxy.scheme == "https" else 80)
+            addresses = {answer[4][0] for answer in socket.getaddrinfo(proxy.hostname, port, type=socket.SOCK_STREAM)}
+            return str(peer[0]) in addresses and int(peer[1]) == port
+        return False
+    except (IndexError, TypeError, ValueError, OSError):
         return False
 
 
@@ -899,9 +927,11 @@ def web_fetch(
     offset: int = 0,
     max_chars: int = DEFAULT_WEB_PAGE_CHARS,
     _tool_name: str = "webfetch",
+    _include_document: bool = False,
 ) -> ToolResult:
     """Open a public page as bounded structured text, validating every redirect."""
 
+    metadata: dict[str, Any] = {"stage": "arguments"}
     try:
         # 变量说明：timeout 表示当前步骤使用的 timeout 值。
         timeout = min(max(float(timeout_seconds), 1.0), 30.0)
@@ -922,21 +952,20 @@ def web_fetch(
         current_url = requested_url
         # 变量说明：redirects 表示当前流程使用的 redirects 集合。
         redirects: list[str] = []
-        with httpx.Client(
-            follow_redirects=False,
-            timeout=httpx.Timeout(timeout),
-            # 允许 httpx 读取进程级 HTTP_PROXY/HTTPS_PROXY，保证 open 与 search 使用同一出口。
-            trust_env=True,
-            headers=headers,
-        ) as client:
-            for redirect_count in range(MAX_WEB_REDIRECTS + 1):
-                # 变量说明：safe_url 表示safe 的访问地址；host 表示当前步骤使用的 host 值。
-                safe_url, host = _validate_public_http_url(current_url)
-                # 变量说明：body 表示当前步骤使用的 body 值。
-                body = bytearray()
+        for redirect_count in range(MAX_WEB_REDIRECTS + 1):
+            metadata["stage"] = "redirect_validation" if redirects else "url_validation"
+            safe_url, host = _validate_public_http_url(current_url)
+            proxy = _environment_proxy(safe_url)
+            metadata.update(url=safe_url, proxy_used=bool(proxy), stage="request")
+            body = bytearray()
+            # 禁止 httpx 再隐式选择另一条路由；redirect 的下一跳重新解析代理和 bypass。
+            with httpx.Client(follow_redirects=False, timeout=httpx.Timeout(timeout),
+                              trust_env=False, proxy=proxy, headers=headers) as client:
                 with client.stream("GET", safe_url) as response:
-                    if not _response_peer_is_public(response, proxy_configured=bool(_environment_proxy())):
-                        return ToolResult(_tool_name, False, "连接目标不是公共网络地址", error_code="unsafe_url")
+                    metadata.update(stage="peer_validation", status_code=response.status_code)
+                    if not _response_peer_is_public(response, proxy_url=proxy, proxy_configured=bool(proxy)):
+                        return ToolResult(_tool_name, False, "连接对端既不是公网地址，也不是本次请求选用的代理", error_code="unsafe_url", metadata=metadata)
+                    metadata["stage"] = "http"
                     if 300 <= response.status_code < 400:
                         # 变量说明：location 表示当前步骤使用的 location 值。
                         location = response.headers.get("location", "").strip()
@@ -964,13 +993,14 @@ def web_fetch(
                     # 变量说明：encoding 表示当前步骤使用的 encoding 值。
                     encoding = response.encoding or "utf-8"
                     break
-            else:  # pragma: no cover - bounded loop always returns or breaks
-                raise RuntimeError("redirect loop ended unexpectedly")
+        else:  # pragma: no cover - bounded loop always returns or breaks
+            raise RuntimeError("redirect loop ended unexpectedly")
 
         # 变量说明：truncated_bytes 表示当前流程使用的 truncated_bytes 集合。
         truncated_bytes = len(body) >= byte_limit
         # 变量说明：metadata 表示当前步骤使用的 metadata 值。
         metadata = {
+            **metadata,
             "url": safe_url,
             "requested_url": requested_url,
             "host": host,
@@ -990,9 +1020,10 @@ def web_fetch(
         if not any(marker in content_type for marker in ("text/", "json", "xml", "javascript")):
             return ToolResult(
                 _tool_name,
-                True,
+                False,
                 "已读取非文本响应；为避免将二进制内容写入上下文，不返回正文。",
                 metadata={**metadata, "truncated": truncated_bytes},
+                error_code="unsupported_content_type",
             )
 
         # 变量说明：decoded 表示当前步骤使用的 decoded 值。
@@ -1003,10 +1034,15 @@ def web_fetch(
         description = ""
         # 变量说明：published_at 表示published_at 对应的时间信息。
         published_at = ""
+        links: list[dict[str, Any]] = []
         if "html" in content_type or re.search(r"<html\b", decoded[:2_000], re.IGNORECASE):
             # 变量说明：parser 表示当前步骤使用的 parser 值。
             parser = _ReadableHtmlParser()
             parser.feed(decoded)
+            for link in parser.links:
+                target_url = urljoin(safe_url, link["href"])
+                if urlsplit(target_url).scheme in {"http", "https"}:
+                    links.append({"id": link["id"], "url": target_url, "text": link["text"][:300]})
             # 变量说明：readable 表示当前步骤使用的 readable 值。
             readable = parser.readable_text()
             # 变量说明：title 表示当前步骤使用的 title 值。
@@ -1037,7 +1073,7 @@ def web_fetch(
             readable = _clean_html_text(decoded) if "xml" in content_type else decoded
 
         # 变量说明：readable 表示当前步骤使用的 readable 值。
-        readable = readable.strip()
+        # 原始源码的开头空行也是行号的一部分，不做 strip。
         # 变量说明：page 表示当前步骤使用的 page 值。
         page = readable[page_offset:page_offset + page_limit]
         # 变量说明：next_offset 表示当前步骤使用的 next_offset 值。
@@ -1049,6 +1085,7 @@ def web_fetch(
             "description": " ".join(description.split())[:1_000] or None,
             "published_at": published_at[:200] or None,
             "content": page,
+            "links": links,
         }
         return ToolResult(
             _tool_name,
@@ -1060,14 +1097,27 @@ def web_fetch(
                 "next_offset": next_offset,
                 "total_chars": len(readable),
                 "truncated": truncated_bytes or next_offset is not None,
+                **({"document": {
+                    "text": readable, "url": safe_url, "title": title[:500] or None,
+                    "links": links, "source_truncated": truncated_bytes,
+                    "content_type": content_type,
+                    "published_at": published_at[:200] or None,
+                    "date_source": "page_metadata" if published_at else None,
+                }} if _include_document else {}),
             },
         )
-    except (UnsafeWebUrlError, ValueError) as exc:
-        return ToolResult(_tool_name, False, str(exc), error_code="unsafe_url")
+    except UnsafeWebUrlError as exc:
+        return ToolResult(_tool_name, False, str(exc), error_code="unsafe_url", metadata=metadata)
     except WebHostResolutionError:
-        return ToolResult(_tool_name, False, "网络请求失败: 无法解析目标主机", error_code="network_error")
+        return ToolResult(_tool_name, False, "网络请求失败: 无法解析目标主机", error_code="dns_error", metadata=metadata)
+    except httpx.TimeoutException:
+        return ToolResult(_tool_name, False, "网页请求超时", error_code="network_timeout", metadata=metadata)
+    except httpx.ProxyError:
+        return ToolResult(_tool_name, False, "代理连接失败", error_code="proxy_error", metadata=metadata)
     except httpx.HTTPError as exc:
-        return ToolResult(_tool_name, False, f"网络请求失败: {type(exc).__name__}", error_code="network_error")
+        return ToolResult(_tool_name, False, f"网络请求失败: {type(exc).__name__}", error_code="network_error", metadata=metadata)
+    except ValueError:
+        return ToolResult(_tool_name, False, "网页读取参数或响应编码无效", error_code="invalid_arguments", metadata=metadata)
 
 
 # 函数职责：完成 web_open 对应的业务处理。
@@ -1080,6 +1130,7 @@ def web_open(
     timeout_seconds: float = 15,
     offset: int = 0,
     max_chars: int = DEFAULT_WEB_PAGE_CHARS,
+    _include_document: bool = False,
 ) -> ToolResult:
     """Structured replacement for webfetch; the legacy entry point remains executable."""
 
@@ -1090,6 +1141,7 @@ def web_open(
         offset=offset,
         max_chars=max_chars,
         _tool_name="web_open",
+        _include_document=_include_document,
     )
 
 
@@ -1234,17 +1286,110 @@ def web_search(
         for domain in (domains or [])
         if str(domain).strip()
     }
+
+    brave_key = str(settings.brave_search_api_key or os.getenv("PGAGENT_BRAVE_SEARCH_API_KEY") or "").strip()
+    brave_error: str | None = None
+    brave_status_code: int | None = None
+    if brave_key:
+        params: dict[str, Any] = {"q": search_query, "count": result_limit, "search_lang": "en", "country": "us"}
+        if recency_days is not None:
+            today = datetime.now(timezone.utc).date()
+            params["freshness"] = "pd" if recency_days == 1 else f"{today - timedelta(days=recency_days)}to{today}"
+        if domain_filters:
+            params["q"] = f"{search_query} ({' OR '.join(f'site:{domain}' for domain in sorted(domain_filters))})"
+        try:
+            brave_proxy = _environment_proxy("https://api.search.brave.com/")
+            with httpx.Client(
+                headers={"Accept": "application/json", "X-Subscription-Token": brave_key},
+                timeout=httpx.Timeout(15), follow_redirects=False,
+                trust_env=False, proxy=brave_proxy,
+            ) as client:
+                with client.stream(
+                    "GET", "https://api.search.brave.com/res/v1/web/search", params=params,
+                ) as brave_response:
+                    if not _response_peer_is_public(brave_response, proxy_url=brave_proxy, proxy_configured=bool(brave_proxy)):
+                        payload, brave_error = None, "unsafe_url"
+                    else:
+                        brave_status_code = brave_response.status_code
+                        if brave_response.status_code != 200:
+                            payload, brave_error = None, f"http_{brave_response.status_code}"
+                        else:
+                            body = bytearray()
+                            response_too_large = False
+                            for chunk in brave_response.iter_bytes():
+                                remaining = MAX_WEB_RESPONSE_BYTES - len(body)
+                                if remaining <= 0 or len(chunk) > remaining:
+                                    response_too_large = True
+                                    break
+                                body.extend(chunk)
+                            if response_too_large:
+                                payload, brave_error = None, "response_too_large"
+                            else:
+                                payload, brave_error = json.loads(bytes(body)), None
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            payload, brave_error = None, type(exc).__name__
+        if brave_error is None:
+            if not isinstance(payload, Mapping) or not isinstance(payload.get("web", {}), Mapping):
+                return _search_failure("search_response_error", "Brave 响应格式无效", stage="parse", provider="brave")
+            brave_results = payload.get("web", {}).get("results", [])
+            if not isinstance(brave_results, list):
+                return _search_failure("search_response_error", "Brave 结果格式无效", stage="parse", provider="brave")
+            results = []
+            for item in brave_results:
+                if not isinstance(item, Mapping) or not item.get("url"):
+                    continue
+                source = (urlsplit(str(item["url"])).hostname or "").lower().removeprefix("www.")
+                if domain_filters and not any(source == domain or source.endswith(f".{domain}") for domain in domain_filters):
+                    continue
+                results.append({
+                    "title": str(item.get("title") or "")[:500], "url": str(item["url"])[:2_000],
+                    "description": _clean_html_text(str(item.get("description") or ""))[:2_000],
+                    # Brave page_age 可为最后更新时间，不能当成新闻发布日期。
+                    "published_at": None, "page_age": item.get("page_age"),
+                    "date_source": "search_index", "opened": False, "source": source,
+                })
+            results = results[:result_limit]
+            if not results:
+                return _search_failure("search_empty_results", "Brave 未返回符合当前条件的结果；未放宽过滤或切换来源", stage="filter", provider="brave")
+            return ToolResult(
+                "websearch", True,
+                "\n".join(f"{i}. {x['title']}\n   {x['url']}\n   {x['description']}" for i, x in enumerate(results, 1)),
+                metadata={"provider": "brave", "count": len(results), "query": search_query, "results": results},
+            )
+        brave_error = f"brave_{brave_error}"
+        if brave_error in {"brave_http_401", "brave_http_403", "brave_http_429"}:
+            status_code = int(brave_error.rsplit("_", 1)[1])
+            return _search_failure(brave_error, f"Brave Search API 返回 HTTP {status_code}", stage="http", provider="brave", status_code=status_code)
+        if brave_error in {"brave_unsafe_url", "brave_response_too_large"}:
+            return _search_failure(brave_error, "Brave 请求未通过网络安全检查", stage="validation", provider="brave")
+
+    # Brave 已尝试但需回退时，Bing 的成功和失败都保留首个上游诊断。
+    fallback_metadata = (
+        {
+            "fallback_from": "brave",
+            "brave_error": brave_error,
+            "initial_error_code": brave_error,
+            **({"initial_status_code": brave_status_code}
+               if brave_status_code is not None else {}),
+        }
+        if brave_key and brave_error else {}
+    )
+
+    def bing_failure(error_code: str, message: str, *, stage: str, **metadata: Any) -> ToolResult:
+        return _search_failure(error_code, message, stage=stage, **fallback_metadata, **metadata)
+
     provider_query = search_query
     if domain_filters:
         provider_query = f"{search_query} ({' OR '.join(f'site:{domain}' for domain in sorted(domain_filters))})"
 
-    def fetch_search_response(url: str, *, trust_env: bool, proxy_configured: bool) -> tuple[str, int] | None:
+    def fetch_search_response(url: str) -> tuple[str, int] | None:
         """Read one bounded RSS response; None means only the proxy peer failed the second guard."""
 
-        with httpx.Client(timeout=httpx.Timeout(15), follow_redirects=False, trust_env=trust_env,
-                          headers={"User-Agent": "PGAgent/0.1 (+local search)"}) as client:
+        proxy = _environment_proxy(url)
+        with httpx.Client(timeout=httpx.Timeout(15), follow_redirects=False, trust_env=False, proxy=proxy,
+                headers={"User-Agent": "PGAgent/0.1 (+local search)"}) as client:
             with client.stream("GET", url) as response:
-                if not _response_peer_is_public(response, proxy_configured=proxy_configured):
+                if not _response_peer_is_public(response, proxy_url=proxy, proxy_configured=bool(proxy)):
                     return None
                 response.raise_for_status()
                 body = bytearray()
@@ -1261,42 +1406,33 @@ def web_search(
     try:
         proxy = _environment_proxy()
         search_url, _host = _validate_public_http_url(_bing_search_endpoint(provider_query, proxy))
-        response_data = fetch_search_response(
-            search_url,
-            trust_env=bool(proxy),
-            proxy_configured=bool(proxy),
-        )
-        if response_data is None and proxy:
-            # 代理对端是本机地址时，目标域名已经通过 DNS 公网校验；切到区域入口直连，
-            # 避免把代理链路误报为 unsafe_url，同时仍保持直连的二次对端检查。
-            direct_url, _direct_host = _validate_public_http_url(_bing_search_endpoint(provider_query, None))
-            response_data = fetch_search_response(direct_url, trust_env=False, proxy_configured=False)
+        response_data = fetch_search_response(search_url)
         if response_data is None:
-            return ToolResult("websearch", False, "连接目标不是公共网络地址", error_code="unsafe_url")
+            return bing_failure("search_unsafe_url", "搜索连接目标不是公共网络地址", stage="peer_validation")
         markup, status_code = response_data
     except UnsafeWebUrlError:
-        return _search_failure("search_unsafe_url", "搜索目标未通过公共网络校验", stage="validation")
+        return bing_failure("search_unsafe_url", "搜索目标未通过公共网络校验", stage="validation")
     except WebHostResolutionError:
-        return _search_failure("search_dns_error", "搜索主机解析失败", stage="dns")
+        return bing_failure("search_dns_error", "搜索主机解析失败", stage="dns")
     except httpx.TimeoutException:
-        return _search_failure("search_timeout", "搜索请求超时", stage="request")
+        return bing_failure("search_timeout", "搜索请求超时", stage="request")
     except httpx.ProxyError:
-        return _search_failure("search_proxy_error", "搜索代理连接失败", stage="proxy")
+        return bing_failure("search_proxy_error", "搜索代理连接失败", stage="proxy")
     except httpx.ConnectError:
-        return _search_failure("search_connection_error", "搜索服务连接失败", stage="connect")
+        return bing_failure("search_connection_error", "搜索服务连接失败", stage="connect")
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code if exc.response is not None else None
-        return _search_failure("search_http_error", "搜索服务返回 HTTP 错误", stage="response", status_code=status_code)
+        return bing_failure("search_http_error", "搜索服务返回 HTTP 错误", stage="response", status_code=status_code)
     except httpx.HTTPError:
-        return _search_failure("search_request_error", "搜索请求失败", stage="request")
+        return bing_failure("search_request_error", "搜索请求失败", stage="request")
     except (UnicodeError, ValueError):
-        return _search_failure("search_response_error", "搜索响应无法解码", stage="response")
+        return bing_failure("search_response_error", "搜索响应无法解码", stage="response")
     # 变量说明：results 表示批量处理结果集合。
     # 先多取一些候选，再应用来源和时效过滤，避免前几条无关结果导致空集。
     try:
         ET.fromstring(markup)
     except ET.ParseError:
-        return _search_failure("search_parse_error", "搜索响应不是有效 RSS/XML", stage="parse")
+        return bing_failure("search_parse_error", "搜索响应不是有效 RSS/XML", stage="parse")
     results = _bing_rss_results(markup, max(result_limit, 20))
     if domain_filters:
         results = [
@@ -1323,7 +1459,7 @@ def web_search(
         results = recent
     results = results[:result_limit]
     if not results:
-        return _search_failure(
+        return bing_failure(
             "search_empty_results",
             "搜索响应有效，但没有符合当前查询或过滤条件的结果。",
             stage="filter",
@@ -1343,6 +1479,7 @@ def web_search(
         "\n".join(lines),
         metadata={
             "provider": "bing_rss",
+            **fallback_metadata,
             "count": len(results),
             "query": search_query,
             "results": [
@@ -1356,21 +1493,24 @@ def web_search(
 # 函数职责：完成 public_json 对应的业务处理。
 # 参数关系：url 表示当前步骤使用的 url 值；params 表示当前流程使用的 params 集合。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def _public_json(url: str, *, params: Mapping[str, Any] | None = None) -> tuple[dict[str, Any] | list[Any] | None, str | None]:
+def _public_json(url: str, *, params: Mapping[str, Any] | None = None, headers: Mapping[str, str] | None = None) -> tuple[dict[str, Any] | list[Any] | None, str | None]:
     try:
         # 变量说明：safe_url 表示safe 的访问地址；_ 表示当前步骤使用的 _ 值。
         safe_url, _ = _validate_public_http_url(url)
-        with httpx.Client(timeout=httpx.Timeout(15), trust_env=True, headers={"User-Agent": "PGAgent/0.1"}) as client:
+        proxy = _environment_proxy(safe_url)
+        with httpx.Client(timeout=httpx.Timeout(15), trust_env=False, proxy=proxy, headers={"User-Agent": "PGAgent/0.1", **dict(headers or {})}) as client:
             # 变量说明：response 表示下游返回的响应。
             response = client.get(safe_url, params=dict(params or {}))
-            if not _response_peer_is_public(response, proxy_configured=bool(_environment_proxy())):
+            if not _response_peer_is_public(response, proxy_url=proxy, proxy_configured=bool(proxy)):
                 return None, "unsafe_url"
             response.raise_for_status()
             # 变量说明：payload 表示跨层传递的数据载荷。
             payload = response.json()
         return payload, None
-    except (UnsafeWebUrlError, WebHostResolutionError):
+    except UnsafeWebUrlError:
         return None, "unsafe_url"
+    except WebHostResolutionError:
+        return None, "dns_error"
     except (httpx.HTTPError, ValueError, json.JSONDecodeError):
         return None, "network_error"
 
@@ -1484,6 +1624,8 @@ def web_run(
     time: list[Mapping[str, Any]] | None = None,
     pages: Mapping[str, Any] | None = None,
     maxItems: int | None = None,
+    response_length: str = "short",
+    _ref_prefix: str = "",
 ) -> ToolResult:
     """Execute the public Codex web_run command shape using PGAgent primitives."""
 
@@ -1494,6 +1636,22 @@ def web_run(
     del maxItems
     # 变量说明：output 表示当前步骤使用的 output 值。
     output: list[dict[str, Any]] = []
+    if response_length not in {"short", "medium", "long"}:
+        return ToolResult("web_run", False, "response_length 必须是 short、medium 或 long", error_code="invalid_arguments")
+    navigation_count = len(open or []) + len(click or []) + len(find or [])
+    command_count = sum(len(items or []) for items in (
+        search_query, open, click, find, screenshot, finance, weather, sports, time,
+    ))
+    if navigation_count > MAX_WEB_RUN_NAVIGATION_COMMANDS:
+        return ToolResult("web_run", False, "一次 web_run 最多包含 10 个 open、click 或 find 命令", error_code="invalid_command")
+    if command_count > MAX_WEB_RUN_COMMANDS:
+        return ToolResult("web_run", False, "一次 web_run 最多包含 20 个命令", error_code="invalid_command")
+    reader = PageReader(
+        stored_pages,
+        lambda url: web_open(sandbox, url, _include_document=True),
+        max(1_000, {"short": 4_000, "medium": 12_000, "long": 24_000}[response_length] // max(1, navigation_count)),
+        ref_prefix=_ref_prefix,
+    )
     # 变量说明：source_url 表示本轮结果中可安全展示的来源地址。
     source_url: str | None = None
     search_items = list(search_query or [])
@@ -1502,7 +1660,7 @@ def web_run(
 
     # 先规范化并去重查询，再并发请求；这样可避免模型在同一轮重复消耗搜索配额。
     unique_searches: list[tuple[str, Mapping[str, Any]]] = []
-    seen_queries: set[str] = set()
+    seen_queries: set[tuple[str, tuple[str, ...], int | None]] = set()
     for item in search_items:
         query = " ".join(str(item.get("q") or item.get("query") or "").split())
         if not query or not query.isascii() or not re.search(r"[A-Za-z]", query):
@@ -1512,7 +1670,14 @@ def web_run(
                 "搜索查询必须是纯英文（ASCII）文本；请先将用户意图转换为英文关键词",
                 error_code="invalid_query_language",
             )
-        key = query.casefold()
+        raw_domains = item.get("domains")
+        normalized_domains = tuple(sorted({
+            str(domain).strip().lower().removeprefix("www.")
+            for domain in (raw_domains if isinstance(raw_domains, (list, tuple)) else [])
+            if str(domain).strip()
+        }))
+        recency_value = int(item["recency"]) if item.get("recency") is not None else None
+        key = (query.casefold(), normalized_domains, recency_value)
         if key in seen_queries:
             continue
         seen_queries.add(key)
@@ -1531,7 +1696,9 @@ def web_run(
         )
         # 严格来源/时效过滤在 RSS 上容易造成空召回；保留原查询并放宽过滤重试一次。
         filter_relaxable_errors = {"search_provider_unavailable", "search_empty_results"}
-        if not result.ok and result.error_code in filter_relaxable_errors and (domains or item.get("recency") is not None):
+        if (result.metadata.get("provider") != "brave"
+                and not result.ok and result.error_code in filter_relaxable_errors
+                and (domains or item.get("recency") is not None)):
             fallback = web_search(
                 sandbox,
                 query,
@@ -1571,9 +1738,10 @@ def web_run(
     # 限制为 5 个并发请求，既利用代理连接池，也避免按查询数量无限扩张。
     with ThreadPoolExecutor(max_workers=min(5, max(1, len(unique_searches)))) as executor:
         search_results = list(executor.map(run_search, unique_searches))
+    search_prefix = f"{_ref_prefix}search"
     existing_search_numbers = [
-        int(str(key)[6:]) for key in stored_pages
-        if str(key).startswith("search") and str(key)[6:].isdigit()
+        int(key[len(search_prefix):]) for key in stored_pages
+        if key.startswith(search_prefix) and key[len(search_prefix):].isdigit()
     ]
     next_ref = max(existing_search_numbers, default=0) + 1
     for query, result in search_results:
@@ -1581,9 +1749,9 @@ def web_run(
         for hit in result.metadata.get("results", []) if isinstance(result.metadata, Mapping) else []:
             if not isinstance(hit, Mapping):
                 continue
-            ref_id = f"search{next_ref}"
+            ref_id = f"{search_prefix}{next_ref}"
             next_ref += 1
-            normalized_hit = {"ref_id": ref_id, **dict(hit)}
+            normalized_hit = {**dict(hit), "ref_id": ref_id}
             query_results.append(normalized_hit)
             # 变量说明：stored_pages 的索引项 表示该语句创建或更新的目标数据。
             stored_pages[ref_id] = normalized_hit
@@ -1594,52 +1762,18 @@ def web_run(
             "content": result.content,
             "results": query_results,
             "error_code": result.error_code,
+            "provider": result.metadata.get("provider"),
+            **({"warning": "来源或时效过滤已放宽；以下结果不保证符合原过滤条件", "fallback": result.metadata["fallback"]}
+               if result.metadata.get("fallback") else {}),
+            **({key: result.metadata[key] for key in ("status_code", "initial_status_code", "fallback_from", "initial_error_code", "brave_error")
+               if result.metadata.get(key) is not None}),
         })
-    for item in open or []:
-        # 变量说明：ref_id 表示ref 对象的唯一标识。
-        ref_id = str(item.get("ref_id") or item.get("ref") or item.get("url") or "").strip()
-        # 变量说明：target 表示当前步骤使用的 target 值。
-        target = stored_pages.get(ref_id, {})
-        # 变量说明：url 表示当前步骤使用的 url 值。
-        # 空的 stored_pages 条目不能把直接 URL 解析成字符串 "None"。
-        stored_url = target.get("url") if isinstance(target, Mapping) else target
-        url = str(stored_url or ref_id)
-        # 变量说明：result 表示本步骤产生的结果。
-        result = web_open(
-            sandbox,
-            url,
-            offset=max(0, int(item.get("offset") or 0)),
-            max_chars=min(20_000, max(1_000, int(item.get("max_chars") or DEFAULT_WEB_PAGE_CHARS))),
-        )
-        output.append({"type": "open", "ref_id": ref_id, "url": url, "ok": result.ok, "content": result.content})
-        if result.ok:
-            # 变量说明：stored_pages 的索引项 表示该语句创建或更新的目标数据。
-            stored_pages[ref_id] = {"url": url, "content": result.content}
-    for item in click or []:
-        # 变量说明：ref_id 表示ref 对象的唯一标识。
-        ref_id = str(item.get("ref_id") or "").strip()
-        # 变量说明：links 表示当前流程使用的 links 集合。
-        links = stored_pages.get(ref_id, {}).get("links", []) if isinstance(stored_pages.get(ref_id), Mapping) else []
-        # 变量说明：link_id 表示link 对象的唯一标识。
-        link_id = str(item.get("id") or item.get("link_id") or "")
-        # 变量说明：target_url 表示target 的访问地址。
-        target_url = next((str(link.get("url")) for link in links if str(link.get("id")) == link_id), "")
-        if not target_url:
-            output.append({"type": "click", "ref_id": ref_id, "id": link_id, "ok": False, "error": "link_not_found"})
-            continue
-        # 变量说明：result 表示本步骤产生的结果。
-        result = web_open(sandbox, target_url)
-        output.append({"type": "click", "ref_id": ref_id, "id": link_id, "ok": result.ok, "content": result.content})
-    for item in find or []:
-        # 变量说明：ref_id 表示ref 对象的唯一标识。
-        ref_id = str(item.get("ref_id") or "").strip()
-        # 变量说明：pattern 表示当前步骤使用的 pattern 值。
-        pattern = str(item.get("pattern") or "")
-        # 变量说明：content 表示待处理或返回的正文内容。
-        content = str(stored_pages.get(ref_id, {}).get("content") or "")
-        # 变量说明：index 表示当前元素的位置索引。
-        index = content.casefold().find(pattern.casefold()) if pattern else -1
-        output.append({"type": "find", "ref_id": ref_id, "pattern": pattern, "ok": index >= 0, "index": index})
+    for kind, items in (("open", open), ("click", click), ("find", find)):
+        for item in items or []:
+            navigated = reader.execute(kind, item)
+            output.append(navigated)
+            if navigated.get("ok"):
+                source_url = source_url or navigated.get("source_url") or navigated.get("url")
     for item in screenshot or []:
         # 变量说明：result 表示本步骤产生的结果。
         result = web_screenshot(sandbox, url=str(item.get("url") or item.get("ref_id") or ""), full_page=bool(item.get("full_page")))
@@ -1667,6 +1801,65 @@ def web_run(
         output.append({"type": "time", "ok": result.ok, "content": result.content, "error_code": result.error_code})
     if not output:
         return ToolResult("web_run", False, "至少提供一个 search_query、open、click 或 find 命令", error_code="invalid_command")
+    serialized_output = json.dumps(output, ensure_ascii=False)
+    visible_output = output
+    if len(serialized_output) > MAX_WEB_RUN_OUTPUT_CHARS:
+        visible_output = []
+        for command in output:
+            visible = dict(command)
+            content = visible.get("content")
+            if isinstance(content, str) and len(content) > 1_000:
+                visible["content"] = content[:980] + "…[输出已截断]"
+            results = visible.get("results")
+            if isinstance(results, list) and len(results) > 2:
+                compact_results = []
+                for result in results[:2]:
+                    compact = dict(result)
+                    for key, limit in (("title", 300), ("url", 2_000), ("description", 300)):
+                        value = compact.get(key)
+                        if isinstance(value, str) and len(value) > limit:
+                            compact[key] = value[:limit - 1] + "…"
+                    compact_results.append(compact)
+                visible["results"] = compact_results
+                visible["result_count"] = len(results)
+            visible["output_truncated"] = True
+            visible_output.append(visible)
+        serialized_output = json.dumps(visible_output, ensure_ascii=False)
+        if len(serialized_output) > MAX_WEB_RUN_OUTPUT_CHARS:
+            minimal_output: list[dict[str, Any]] = []
+            scalar_keys = (
+                "type", "query", "ok", "error_code", "provider", "opened",
+                "status_code", "initial_status_code", "ref_id", "url", "fallback_from",
+                "initial_error_code", "brave_error",
+            )
+            for command in visible_output:
+                summary = {
+                    key: (command[key][:500] + "…" if isinstance(command.get(key), str) and len(command[key]) > 500 else command[key])
+                    for key in scalar_keys if key in command
+                }
+                content = command.get("content")
+                if isinstance(content, str) and content:
+                    summary["content"] = content[:200] + ("…" if len(content) > 200 else "")
+                results = command.get("results")
+                if isinstance(results, list) and results:
+                    first = dict(results[0])
+                    for key, limit in (("title", 200), ("url", 1_000), ("description", 100)):
+                        value = first.get(key)
+                        if isinstance(value, str) and len(value) > limit:
+                            first[key] = value[:limit - 1] + "…"
+                    summary["results"] = [first]
+                    summary["result_count"] = command.get("result_count", len(results))
+                summary["output_truncated"] = True
+                minimal_output.append(summary)
+            visible_output = minimal_output
+            serialized_output = json.dumps(visible_output, ensure_ascii=False)
+        if len(serialized_output) > MAX_WEB_RUN_OUTPUT_CHARS:
+            visible_output = [
+                {"type": command.get("type"), "ok": command.get("ok"),
+                 "error_code": command.get("error_code"), "output_truncated": True}
+                for command in output
+            ]
+            serialized_output = json.dumps(visible_output, ensure_ascii=False)
     successful_commands = [item for item in output if item.get("ok") is True]
     if not successful_commands:
         failure_code = next(
@@ -1676,11 +1869,11 @@ def web_run(
         return ToolResult(
             "web_run",
             False,
-            json.dumps(output, ensure_ascii=False)[:40_000],
+            serialized_output,
             error_code=failure_code,
-            metadata={"commands": output, "pages": stored_pages, **({"source_url": source_url} if source_url else {})},
+            metadata={"commands": visible_output, "pages": stored_pages, **({"source_url": source_url} if source_url else {})},
         )
-    return ToolResult("web_run", True, json.dumps(output, ensure_ascii=False)[:40_000], metadata={"commands": output, "pages": stored_pages, **({"source_url": source_url} if source_url else {})})
+    return ToolResult("web_run", True, serialized_output, metadata={"commands": visible_output, "pages": stored_pages, **({"source_url": source_url} if source_url else {})})
 
 
 # 函数职责：规范化 todos 对应的数据或流程。
@@ -3141,9 +3334,11 @@ def run_command(
                     (partial + "\nCommand execution interrupted by the user.")[:output_limit],
                     error_code="cancelled",
                     metadata={
+                        "command": command,
                         "cwd": relative_cwd,
                         "process_tree_terminated": tree_terminated,
                         "truncated": output_truncated,
+                        "output_truncated": output_truncated,
                         "security_scope": "current_user_host_permissions",
                     },
                 )
@@ -3155,10 +3350,12 @@ def run_command(
                 (partial + f"\n命令执行超时（{timeout_seconds}s），{termination_text}")[:output_limit],
                 error_code="timeout",
                 metadata={
+                    "command": command,
                     "cwd": relative_cwd,
                     "timeout_seconds": timeout_seconds,
                     "process_tree_terminated": tree_terminated,
                     "truncated": output_truncated,
+                    "output_truncated": output_truncated,
                     "security_scope": "current_user_host_permissions",
                 },
             )
@@ -3175,11 +3372,13 @@ def run_command(
             changed=False,
             error_code=None if process.returncode == 0 else "nonzero_exit",
             metadata={
+                "command": command,
                 "cwd": relative_cwd,
                 "exit_code": process.returncode,
                 "truncated": output_truncated,
+                "output_truncated": output_truncated,
                 "security_scope": "current_user_host_permissions",
             },
         )
     except (ValueError, OSError) as exc:
-        return ToolResult("run_command", False, str(exc), error_code="command_error")
+        return ToolResult("run_command", False, str(exc), error_code="command_error", metadata={"command": command})

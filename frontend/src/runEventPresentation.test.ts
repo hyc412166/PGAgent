@@ -1,11 +1,19 @@
 // 本测试文件验证 runEventPresentation 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
 
-import { formatRunEventTime, presentRunEvent, runDisplayTitle, runSecondaryLabel } from './runEventPresentation'
+import { formatRunEventTime, isHiddenRunEvent, presentRunEvent, runDisplayTitle, runSecondaryLabel } from './runEventPresentation'
 import type { Run, RunEvent } from './types'
 
 // 测试分组：run record presentation。
 describe('run record presentation', () => {
+  it('hides internal tool completion events and marks failed artifact reads as failures', () => {
+    expect(isHiddenRunEvent({ event_type: 'tool_finished' })).toBe(true)
+    expect(isHiddenRunEvent({ event_type: 'tool_result' })).toBe(true)
+    expect(isHiddenRunEvent({ event_type: 'tool_started' })).toBe(false)
+    const presented = presentRunEvent({ event_type: 'tool_finished', payload: { tool_name: 'read_artifact', error_code: 'artifact_not_found' } })
+    expect(presented.title).toBe('read_artifact 调用失败')
+    expect(presented.detail).toBe('工具返回了失败结果')
+  })
   // 测试场景：uses the conversation title and keeps the run id as secondary metadata。
   it('uses the conversation title and keeps the run id as secondary metadata', () => {
     const run = {

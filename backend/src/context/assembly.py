@@ -689,6 +689,14 @@ class PromptLayout:
     truncated: bool = False
     # 变量说明：artifact_refs 表示当前流程使用的 artifact_refs 集合。
     artifact_refs: list[ArtifactRef] = field(default_factory=list)
+    # Codex-style token accounting keeps the active context and the automatic
+    # compaction scope separate from the provider's hard window limit.
+    active_context_tokens: int = 0
+    auto_compact_scope_tokens: int = 0
+    auto_compact_scope_limit: int | None = None
+    full_context_window_limit: int | None = None
+    base_window_tokens_remaining: int | None = None
+    token_limit_reached: bool = False
 
     # 函数职责：完成 messages 对应的业务处理。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
@@ -741,6 +749,48 @@ class ContextAssembler:
     @property
     def input_budget(self) -> int:
         return max(256, self.max_tokens - self.output_reserve_tokens - self.safety_buffer_tokens)
+
+    @property
+    def full_context_window_limit(self) -> int:
+        """Hard provider window, independent of the auto-compaction scope."""
+
+        return self.max_tokens
+
+    @property
+    def auto_compact_scope_limit(self) -> int:
+        """Configured automatic-compaction threshold (legacy alias preserved)."""
+
+        return self.compaction_threshold
+
+    def token_status(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        scope_messages: Sequence[Mapping[str, Any]] | None = None,
+        full_context_window_limit: int | None = None,
+        auto_compact_scope_limit: int | None = None,
+    ) -> dict[str, int | bool | None]:
+        """Return Codex-compatible token status for a provider-visible prompt.
+
+        ``scope_messages`` allows a caller with a carried prefix snapshot to
+        count only the body-after-prefix.  Ordinary PGAgent turns use the full
+        prompt for both values, matching Codex's ``total`` scope.
+        """
+
+        active = _token_total(messages)
+        scoped = _token_total(scope_messages if scope_messages is not None else messages)
+        full_limit = int(full_context_window_limit or self.full_context_window_limit)
+        scope_limit = int(auto_compact_scope_limit or self.auto_compact_scope_limit)
+        remaining_candidates = [max(0, scope_limit - scoped), max(0, full_limit - active)]
+        return {
+            "active_context_tokens": active,
+            "auto_compact_scope_tokens": scoped,
+            "auto_compact_scope_limit": scope_limit,
+            "full_context_window_limit": full_limit,
+            "base_window_tokens_remaining": min(remaining_candidates),
+            "full_context_window_limit_reached": active >= full_limit,
+            "token_limit_reached": scoped >= scope_limit or active >= full_limit,
+        }
 
     # 函数职责：完成 stable_prefix 对应的业务处理。
     # 参数关系：system_rules 表示当前流程使用的 system_rules 集合；workspace_rules 表示当前流程使用的 workspace_rules 集合；permission_policy 表示当前步骤使用的 permission_policy 值；extra_messages 表示当前流程使用的 extra_messages 集合。
@@ -798,12 +848,24 @@ class ContextAssembler:
         total = _token_total([*stable, *dynamic])
         # 变量说明：budget 表示当前步骤使用的 budget 值。
         budget = max_tokens if max_tokens is not None else self.input_budget
+        status = self.token_status(
+            [*stable, *dynamic],
+            scope_messages=[*stable, *dynamic],
+            full_context_window_limit=budget,
+            auto_compact_scope_limit=min(budget, self.auto_compact_scope_limit),
+        )
         return PromptLayout(
             stable_prefix=stable,
             transcript=dynamic,
             cache_key=str(cache_key or self._stable_key(stable)),
             estimated_tokens=total,
-            requires_compaction=total >= min(budget, self.compaction_threshold),
+            requires_compaction=bool(status["token_limit_reached"]),
+            active_context_tokens=int(status["active_context_tokens"]),
+            auto_compact_scope_tokens=int(status["auto_compact_scope_tokens"]),
+            auto_compact_scope_limit=int(status["auto_compact_scope_limit"]),
+            full_context_window_limit=int(status["full_context_window_limit"]),
+            base_window_tokens_remaining=int(status["base_window_tokens_remaining"]),
+            token_limit_reached=bool(status["token_limit_reached"]),
         )
 
 

@@ -290,7 +290,8 @@ def repl(
             check=False,
         )
         # 变量说明：output 表示当前步骤使用的 output 值。
-        output = (completed.stdout + completed.stderr)[:100_000]
+        combined_output = completed.stdout + completed.stderr
+        output = combined_output[:100_000]
         return ToolResult(
             "REPL",
             completed.returncode == 0,
@@ -341,7 +342,8 @@ def powershell(
             check=False,
         )
         # 变量说明：output 表示当前步骤使用的 output 值。
-        output = (completed.stdout + completed.stderr)[:100_000]
+        combined_output = completed.stdout + completed.stderr
+        output = combined_output[:100_000]
         return ToolResult(
             "PowerShell",
             completed.returncode == 0,
@@ -349,6 +351,8 @@ def powershell(
             error_code=None if completed.returncode == 0 else "powershell_error",
             metadata={
                 "exit_code": completed.returncode,
+                "command": str(command),
+                "output_truncated": len(combined_output) > 100_000,
                 "description": description or "",
                 "cwd": relative_cwd,
                 "shell": "powershell",
@@ -356,7 +360,7 @@ def powershell(
             },
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return ToolResult("PowerShell", False, str(exc), error_code="timeout" if isinstance(exc, subprocess.TimeoutExpired) else "runtime_unavailable")
+        return ToolResult("PowerShell", False, str(exc), error_code="timeout" if isinstance(exc, subprocess.TimeoutExpired) else "runtime_unavailable", metadata={"command": str(command), "cwd": relative_cwd})
 
 
 # 函数职责：完成 background_worker 对应的业务处理。

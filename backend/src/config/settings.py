@@ -18,7 +18,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 # 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class Settings(BaseSettings):
     # 变量说明：model_config 表示当前步骤使用的 model_config 值。
-    model_config = SettingsConfigDict(env_prefix="PGAGENT_", env_file=PROJECT_ROOT / ".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="PGAGENT_",
+        # .env.local 只属于当前 PGAgent checkout，优先于可提交的 .env 模板。
+        env_file=(PROJECT_ROOT / ".env", PROJECT_ROOT / ".env.local"),
+        extra="ignore",
+    )
 
     # 变量说明：host 表示当前步骤使用的 host 值。
     host: str = "127.0.0.1"
@@ -30,6 +35,8 @@ class Settings(BaseSettings):
     log_dir: str | None = None
     log_retention_days: int = Field(default=14, ge=1)
     log_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1)
+    # Brave 搜索密钥只供后端当前进程读取；绝不进入工具结果、日志或前端。
+    brave_search_api_key: str | None = None
     # Zero/None disables aggregate step/call limits. Repetition and no-progress
     # heuristics are opt-in; durable task recovery is not cut off by default.
     # 变量说明：max_steps 表示当前流程使用的 max_steps 集合。

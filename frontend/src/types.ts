@@ -215,6 +215,12 @@ export interface SkillInstallPreview {
 
 // SessionContext 描述当前上下文窗口用量、压缩阈值及压缩状态。
 export interface SessionContext {
+  active_context_tokens?: number
+  auto_compact_scope_tokens?: number
+  auto_compact_scope_limit?: number
+  full_context_window_limit?: number
+  base_window_tokens_remaining?: number
+  token_limit_reached?: boolean
   used_tokens: number
   limit_tokens: number
   compact_threshold_tokens: number

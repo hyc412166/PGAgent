@@ -1,5 +1,5 @@
 // 本组件负责把 Agent 的 Markdown 正文转换为可读的富文本，并统一代码块与表格的交互样式。
-import { Children, isValidElement, useState, type ReactNode } from 'react'
+import { Children, isValidElement, memo, useState, type ReactNode } from 'react'
 import { CheckCheck, Code2, Copy, XCircle } from 'lucide-react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import rehypeHighlight from 'rehype-highlight'
@@ -101,7 +101,7 @@ const markdownComponents: Components = {
 const remarkPlugins = [remarkGfm, remarkBreaks]
 const rehypePlugins: Array<[typeof rehypeHighlight, { detect: boolean; plainText: string[] }]> = [[rehypeHighlight, { detect: false, plainText: ['text', 'plaintext', 'txt'] }]]
 
-export function MarkdownContent({ content }: { content: string }) {
+function MarkdownContentView({ content }: { content: string }) {
   return <div className="message-content markdown-content">
     <ReactMarkdown
       components={markdownComponents}
@@ -112,3 +112,6 @@ export function MarkdownContent({ content }: { content: string }) {
     </ReactMarkdown>
   </div>
 }
+
+// 历史消息正文不可变时跳过重复 Markdown 解析，避免流式增量导致整段会话重绘。
+export const MarkdownContent = memo(MarkdownContentView)

@@ -19,8 +19,28 @@ from src.context.assembly import (
     retain_recent_atomic_tail,
 )
 from src.context.window import ContextManager
+from src.context.compaction import _provider_visible_messages
 from src.agent.engine import AgentRuntime, RuntimeConfig
 from src.tools.registry import create_default_registry
+
+
+# 测试场景：超大工具结果经过预算外置后，统计应按 provider 实际可见预览计数，而不是原始正文长度。
+def test_provider_visible_context_reuses_tool_output_budget() -> None:
+    raw = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "tool",
+            "tool_call_id": "call-large",
+            "name": "read_file",
+            "content": "x" * 160_000,
+        },
+    ]
+
+    projected = _provider_visible_messages(raw)
+
+    assert len(projected) == len(raw)
+    assert projected[1]["content"].startswith("<persisted-tool-output>")
+    assert sum(len(str(item.get("content") or "")) for item in projected) < 10_000
 
 
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_filesystem_artifact_store_survives_a_new_store_instance 精确标识本用例的具体条件。

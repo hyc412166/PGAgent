@@ -27,7 +27,7 @@ import type { Approval, DelegatedTask, Message, Run, RunEvent, Teammate } from '
 import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../components/ui'
 import { statusText } from '../../components/status'
 import { PenguinMark } from '../../components/penguin'
-import { presentRunEvent } from '../../runEventPresentation'
+import { isHiddenRunEvent, presentRunEvent } from '../../runEventPresentation'
 import { MarkdownContent } from './MarkdownContent'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
 import { formatApprovalArguments } from './approvalPresentation'
@@ -105,7 +105,7 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
   onRetry: () => void
 }) {
   const output = childTaskOutput(selectedTask)
-  const toolEvents = events.filter((event) => ['tool_started', 'tool_finished', 'tool_result'].includes(event.type || event.event_type || ''))
+  const toolEvents = events.filter((event) => !isHiddenRunEvent(event) && ['tool_started', 'tool_call'].includes(event.type || event.event_type || ''))
   return <aside className={`child-agent-panel ${open ? 'is-open' : 'is-closed'}`} aria-label="子 Agent 工作详情" aria-hidden={!open} inert={!open}>
     <header className="child-panel-header"><div><span className="eyebrow">协作执行</span><strong>子 Agent</strong></div><button type="button" className="icon-button" onClick={onClose} aria-label="收起子 Agent 侧栏"><X size={16} /></button></header>
     {!!teammates.length && <section className="teammate-roster" aria-label="持久化队友"><strong>协作队友</strong><div>{teammates.map((teammate) => <span key={teammate.id} className={`teammate teammate-${teammate.status}`} title={teammate.branch_name || teammate.worktree_path || '共享工作区'}><Bot size={12} /><b>{teammate.name}</b><small>{teammate.status}{teammate.workspace_mode === 'worktree' ? ' · worktree' : ''}</small></span>)}</div></section>}
@@ -133,7 +133,7 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
   </aside>
 })
 
-// MessageBubble 根据角色渲染正文、附件和复制动作，是持久消息的统一展示入口。
+// MessageBubble 按“身份与时间、附件、正文”的阅读顺序渲染持久消息及其操作。
 export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId, thoughtTimeline }: { message: Message; thoughtRunId?: string; thoughtTimeline?: ThoughtTimelineState }) {
   const [copied, setCopied] = useState(false)
   const attachments = messageAttachments(message.metadata?.attachments)
@@ -178,15 +178,6 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
             </a>
           })}
         </div>}
-        {!!message.content && (message.role === 'assistant' || (isTool && message.role !== 'user')
-          ? <MarkdownContent content={message.content} />
-          : <div className="message-content">{message.content}</div>)}
-        {!!message.citations?.length && <div className="message-citations" aria-label="参考来源">
-          <strong>参考来源</strong>
-          {message.citations.map((citation, index) => <a key={`${citation.url}-${index}`} href={citation.url} target="_blank" rel="noreferrer">
-            <span>{index + 1}</span>{citation.title || citation.url}
-          </a>)}
-        </div>}
         {!!fileAttachments.length && <div className="message-attachments" aria-label="消息附件">
           {fileAttachments.map((attachment) => {
             const href = message.session_id
@@ -200,6 +191,15 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
               <span><strong>{attachment.name}</strong><small>{formatAttachmentSize(attachment.size_bytes)}</small></span>
             </span>
           })}
+        </div>}
+        {!!message.content && (message.role === 'assistant' || (isTool && message.role !== 'user')
+          ? <MarkdownContent content={message.content} />
+          : <div className="message-content">{message.content}</div>)}
+        {!!message.citations?.length && <div className="message-citations" aria-label="参考来源">
+          <strong>参考来源</strong>
+          {message.citations.map((citation, index) => <a key={`${citation.url}-${index}`} href={citation.url} target="_blank" rel="noreferrer">
+            <span>{index + 1}</span>{citation.title || citation.url}
+          </a>)}
         </div>}
         {message.status && <StatusBadge status={message.status} />}
         <div className="message-actions">

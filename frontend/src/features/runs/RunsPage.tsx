@@ -7,7 +7,7 @@ import { statusText } from '../../components/status'
 import { useApiData } from '../../shared/hooks/useApiData'
 import { formatCost, formatTokens } from '../../shared/lib/display'
 import type { Run, RunEventFilters, RunEventPage, RunUsage } from '../../types'
-import { formatRunEventOffset, formatRunEventTime, presentRunEvent, runDisplayTitle, runSecondaryLabel } from '../../runEventPresentation'
+import { formatRunEventOffset, formatRunEventTime, isHiddenRunEvent, presentRunEvent, runDisplayTitle, runSecondaryLabel } from '../../runEventPresentation'
 import { appendRunEventPage } from './runEventPagination'
 
 // RunRow 将单条运行压缩为可选择的列表行，状态、时间和目标信息均来自 Run。
@@ -85,7 +85,7 @@ function RunDetails({ run }: { run: Run }) {
       {run.stop_reason && <div className="stop-reason"><AlertCircle size={17} /><div><strong>停止原因</strong><p>{run.stop_reason}</p></div></div>}
       <h3>事件时间线</h3>
       <RunEventFilterControls filters={filters} onChange={setFilters} />
-      {events.error ? <ErrorState message={events.error} onRetry={events.reload} /> : events.loading ? <LoadingState /> : timeline?.length ? <div className="timeline run-event-timeline">{timeline.map((event, index) => {
+      {events.error ? <ErrorState message={events.error} onRetry={events.reload} /> : events.loading ? <LoadingState /> : timeline?.filter((event) => !isHiddenRunEvent(event)).length ? <div className="timeline run-event-timeline">{timeline.filter((event) => !isHiddenRunEvent(event)).map((event, index) => {
         const presented = presentRunEvent(event)
         const type = event.type || event.event_type || 'runtime_event'
         return <div className={`run-event tone-${presented.tone}`} key={event.id || index}>

@@ -14,7 +14,7 @@ describe('上下文圆环显示', () => {
     })
     expect(view.percent).toBe(89)
     expect(view.roundedPercent).toBe(89)
-    expect(view.detail).toBe('已用 89,000 Token（标记），共 100,000')
+    expect(view.detail).toBe('已用 89,000 Token，共 100,000；剩余 11,000 Token')
     expect(view.compressionHint).toBe('达到 90% 时自动压缩上下文')
     expect(view.tone).toBe('near-limit')
   })

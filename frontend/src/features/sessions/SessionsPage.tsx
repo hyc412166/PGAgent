@@ -394,7 +394,14 @@ function SessionsPage() {
       if (!token) return
       activeRequests.push({ runId, token })
       try {
-        const events = await api.list<RunEvent>(`/api/runs/${encodeURIComponent(runId)}/events`, ['events'])
+        // 事件接口按游标分页；完整读取后再生成思考时间线，避免长运行只水合最新一页。
+        const events: RunEvent[] = []
+        let before: number | undefined
+        do {
+          const page = await api.listRunEvents(runId, before === undefined ? {} : { before })
+          events.push(...page.items)
+          before = page.next_before === null ? undefined : page.next_before
+        } while (before !== undefined && !cancelled && activeIdRef.current === activeId)
         if (cancelled || activeIdRef.current !== activeId) return
         const timeline = timelineFromRunEvents(events.map((event) => ({ ...event, type: event.type || event.event_type || '' })))
         if (!registry.complete(runId, token)) return
