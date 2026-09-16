@@ -657,6 +657,18 @@
 .tool-activity-group-detail { margin: 2px 0 5px 20px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
 .tool-activity-group-detail strong { display: block; color: var(--ink); font-size: .6875rem; }
 .tool-activity-group-detail pre { max-height: 220px; margin: 5px 0 0; overflow: auto; color: var(--muted); font: .625rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-result-detail { max-height: 260px; margin: 3px 0 5px 20px; padding: 9px 11px; overflow: auto; border: 1px solid var(--line); border-radius: 9px; color: var(--muted); background: var(--surface-soft); font-size: .6875rem; }
+.thought-activity-copy > .tool-result-detail { margin-left: 0; }
+.tool-result-detail[aria-busy="true"] { min-height: 38px; display: flex; align-items: center; }
+.tool-result-detail header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; color: var(--ink); }
+.tool-result-detail header span { color: var(--muted-2); white-space: nowrap; }
+.tool-result-detail dl { display: flex; flex-wrap: wrap; gap: 5px 12px; margin: 7px 0 0; }
+.tool-result-detail dl div { display: inline-flex; gap: 5px; }
+.tool-result-detail dt { color: var(--muted-2); }
+.tool-result-detail dd { margin: 0; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.tool-result-detail pre { margin: 8px 0 0; color: var(--muted); font: .625rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-result-error { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--red); }
+.tool-result-error button { padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--surface); font: inherit; }
 .thought-activity-copy { min-width: 0; flex: 1; line-height: 1.6; }
 .thought-activity-static { min-height: 20px; display: flex; flex-direction: row; align-items: center; gap: 10px; justify-content: space-between; }
 .thought-activity.kind-tool .thought-activity-static { justify-content: flex-start; }

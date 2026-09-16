@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import shutil
 from typing import Any, TypeVar
@@ -66,6 +68,7 @@ from src.api.schemas import (
     SessionRead,
     SessionUpdate,
     TeammateRead,
+    ToolResultPageRead,
     WorkspaceCreate,
     WorkspaceRead,
     WorkspaceUpdate,
@@ -132,6 +135,84 @@ def _message_excerpt(content: str, limit: int = 180) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 1].rstrip() + "…"
+
+
+_TOOL_RESULT_METADATA_FIELDS = (
+    "artifact_id", "offset", "next_offset", "total_chars", "eof",
+    "command", "exit_code", "truncated", "output_truncated",
+    "attachment_id", "extracted_chars",
+)
+_COMMAND_TOOL_NAMES = frozenset({"shell", "bash", "run_command"})
+_BACKGROUND_PAYLOAD_MARKERS = frozenset({
+    "id", "session_id", "run_id", "log_path", "pid", "observed_by_run_id",
+    "waiting_run_id", "created_at", "started_at", "finished_at", "cwd",
+})
+_BACKGROUND_PAYLOAD_FIELDS = (
+    "command", "shell", "exit_code", "output", "error",
+    "output_truncated", "truncated",
+)
+
+
+def _json_object(value: str) -> Mapping[str, Any] | None:
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, Mapping) else None
+
+
+def _project_tool_result(payload: Mapping[str, Any], *, fallback_tool_name: str) -> dict[str, Any]:
+    """将持久化 ToolResult 投影为浏览器可读取的最小安全详情。"""
+
+    tool_name = str(payload.get("tool_name") or fallback_tool_name or "unknown")
+    raw_content = payload.get("content")
+    content = raw_content if isinstance(raw_content, str) else str(raw_content or "")
+
+    if tool_name in _COMMAND_TOOL_NAMES:
+        background = _json_object(content)
+        if (
+            background is not None
+            and ("command" in background or "shell" in background)
+            and _BACKGROUND_PAYLOAD_MARKERS.intersection(background)
+        ):
+            # 后台任务正文混有数据库归属与主机路径；详情只保留命令执行结果。
+            content = json.dumps(
+                {key: background[key] for key in _BACKGROUND_PAYLOAD_FIELDS if key in background},
+                ensure_ascii=False,
+            )
+    elif tool_name == "read_artifact":
+        nested = _json_object(content)
+        if (
+            nested is not None
+            and isinstance(nested.get("tool_name"), str)
+            and "ok" in nested
+            and "content" in nested
+        ):
+            # Artifact 的完整页可能本身是一层 ToolResult；分页碎片解析失败时仍作为正文保留。
+            content = json.dumps(
+                _project_tool_result(nested, fallback_tool_name=str(nested["tool_name"])),
+                ensure_ascii=False,
+            )
+
+    projected: dict[str, Any] = {
+        "tool_name": tool_name,
+        "ok": payload.get("ok") is True,
+        "content": content,
+    }
+    if isinstance(payload.get("changed"), bool):
+        projected["changed"] = payload["changed"]
+    if isinstance(payload.get("error_code"), str) and payload["error_code"]:
+        projected["error_code"] = payload["error_code"]
+    metadata = payload.get("metadata")
+    if isinstance(metadata, Mapping):
+        safe_metadata = {
+            key: metadata[key]
+            for key in _TOOL_RESULT_METADATA_FIELDS
+            if key in metadata
+        }
+        if safe_metadata:
+            projected["metadata"] = safe_metadata
+    return projected
 
 # 函数职责：列出 runs 对应的数据或流程。
 # 参数关系：session_id 表示所属会话标识；run_status 表示当前流程使用的 run_status 集合；limit 表示当前步骤使用的 limit 值；offset 表示当前步骤使用的 offset 值；before_started_at 表示before_started_at 对应的时间信息；before_id 表示before 对象的唯一标识；db 表示当前数据库会话。
@@ -210,6 +291,63 @@ def create_run(payload: RunCreate, db: Session = Depends(get_db)) -> RunRead:
 @router.get("/runs/{run_id}", response_model=RunRead)
 def get_run(run_id: str, db: Session = Depends(get_db)) -> RunRead:
     return _run_read(_require(db, Run, run_id, "Run"), db=db)
+
+
+# 函数职责：按需分页读取某次运行持久化的完整工具结果，同时严格限制消息归属。
+@router.get("/runs/{run_id}/tool-results/{tool_call_id}", response_model=ToolResultPageRead)
+def get_tool_result(
+    run_id: str,
+    tool_call_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=24_000, ge=1, le=24_000),
+    db: Session = Depends(get_db),
+) -> ToolResultPageRead:
+    run = _require(db, Run, run_id, "Run")
+    if not run.session_id:
+        raise HTTPException(status_code=404, detail="Tool result not found")
+
+    # 同一会话的不同运行可能复用 provider 生成的 call id；runtime_run_id 是持久化链路中的运行归属。
+    candidates = db.scalars(
+        select(ChatMessage)
+        .where(
+            ChatMessage.session_id == run.session_id,
+            ChatMessage.role == "tool",
+            ChatMessage.tool_call_id == tool_call_id,
+        )
+        .order_by(ChatMessage.sequence.desc(), ChatMessage.created_at.desc(), ChatMessage.id.desc())
+    )
+    message = next(
+        (
+            candidate
+            for candidate in candidates
+            if isinstance(candidate.extra, dict)
+            and candidate.extra.get("runtime_run_id") == run.id
+        ),
+        None,
+    )
+    if message is None:
+        raise HTTPException(status_code=404, detail="Tool result not found")
+
+    persisted = message.content
+    decoded = _json_object(persisted)
+    if decoded is None:
+        safe_content = persisted
+        projected: Mapping[str, Any] = {}
+    else:
+        projected = _project_tool_result(decoded, fallback_tool_name=message.tool_name or "unknown")
+        safe_content = json.dumps(projected, ensure_ascii=False)
+    total_chars = len(safe_content)
+    end = min(total_chars, offset + limit)
+    return ToolResultPageRead(
+        tool_call_id=tool_call_id,
+        tool_name=message.tool_name or str(projected.get("tool_name") or "unknown"),
+        ok=projected.get("ok") is True,
+        content=safe_content[offset:end],
+        offset=offset,
+        next_offset=end,
+        total_chars=total_chars,
+        eof=end >= total_chars,
+    )
 
 
 # 函数职责：更新 run 对应的数据或流程。

@@ -637,6 +637,18 @@ class RunRead(ORMModel):
     agent_name: str | None = None
 
 
+# 类职责：定义按字符分页返回的持久化工具结果，不携带消息元数据或 provider 私有字段。
+class ToolResultPageRead(BaseModel):
+    tool_call_id: str
+    tool_name: str
+    ok: bool
+    content: str
+    offset: int
+    next_offset: int
+    total_chars: int
+    eof: bool
+
+
 # 类职责：定义 PlanStepRead 在本领域中的数据与行为。
 # 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class PlanStepRead(ORMModel):

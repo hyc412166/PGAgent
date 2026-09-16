@@ -168,4 +168,23 @@ describe('API 客户端', () => {
       expect.objectContaining({ headers: expect.any(Object) }),
     )
   })
+
+  it('工具结果分页请求会编码运行与调用标识', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({
+        tool_call_id: 'call/42', tool_name: 'shell', ok: true, content: 'page',
+        offset: 24_000, next_offset: 24_004, total_chars: 24_004, eof: true,
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.getToolResultPage('run/42', 'call/42', 24_000)).resolves.toMatchObject({
+      content: 'page', next_offset: 24_004, eof: true,
+    })
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/runs/run%2F42/tool-results/call%2F42?offset=24000&limit=24000',
+      expect.objectContaining({ headers: expect.any(Object) }),
+    )
+  })
 })
