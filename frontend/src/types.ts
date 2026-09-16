@@ -348,6 +348,18 @@ export interface RunEventPage {
   next_before: number | null
 }
 
+// ToolResultPage 是历史运行中单次工具结果的字符分页。
+export interface ToolResultPage {
+  tool_call_id: string
+  tool_name: string
+  ok: boolean
+  content: string
+  offset: number
+  next_offset: number
+  total_chars: number
+  eof: boolean
+}
+
 // Run 描述一轮 Agent 执行的生命周期、结果、错误、计划和关联事件。
 export interface Run {
   id: string

@@ -1,5 +1,5 @@
 // 本文件负责 api 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
-import type { ApiRecord, RunEventFilters, RunEventPage } from './types'
+import type { ApiRecord, RunEventFilters, RunEventPage, ToolResultPage } from './types'
 
 // API_BASE 是后端地址前缀；删除末尾斜杠，避免与各接口路径拼接出双斜杠。
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? ''
@@ -96,6 +96,8 @@ export const api = {
     const suffix = query.size ? `?${query.toString()}` : ''
     return request<RunEventPage>(`/api/runs/${encodeURIComponent(runId)}/events${suffix}`)
   },
+  getToolResultPage: (runId: string, toolCallId: string, offset = 0, limit = 24_000) =>
+    request<ToolResultPage>(`/api/runs/${encodeURIComponent(runId)}/tool-results/${encodeURIComponent(toolCallId)}?offset=${offset}&limit=${limit}`),
 }
 
 // 把未知捕获值安全转换为可展示文案，避免页面直接渲染对象。

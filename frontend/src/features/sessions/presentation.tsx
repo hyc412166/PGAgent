@@ -21,7 +21,7 @@ import {
 import { useEffect, useState } from 'react'
 import { memo } from 'react'
 import { formatLiveThinkingDuration, formatThoughtDuration, type ThoughtActivityIcon, type ThoughtActivityItem, type ThoughtTimelineState } from '../../thoughtTimeline'
-import { apiUrl } from '../../api'
+import { apiUrl, describeError } from '../../api'
 import { formatAttachmentSize, messageAttachments } from '../../attachments'
 import type { Approval, DelegatedTask, Message, Run, RunEvent, Teammate } from '../../types'
 import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../components/ui'
@@ -31,6 +31,7 @@ import { isHiddenRunEvent, presentRunEvent } from '../../runEventPresentation'
 import { MarkdownContent } from './MarkdownContent'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
 import { formatApprovalArguments } from './approvalPresentation'
+import { createToolResultDetailLoader, presentToolResult, toolResultRequest, type CompleteToolResult } from '../../toolResultDetails'
 
 // LiveRunView 是运输状态到实时回复组件之间的最小只读接口。
 export type LiveRunView = {
@@ -310,12 +311,14 @@ function orderedContentEntries(items: ThoughtActivityItem[], includeFinalAssista
 function OrderedRunContent({
   items,
   activitiesVisible,
+  runId,
   live,
   activeItemId,
   includeFinalAssistant,
 }: {
   items: ThoughtActivityItem[]
   activitiesVisible: boolean
+  runId?: string
   live?: boolean
   activeItemId?: string
   includeFinalAssistant: boolean
@@ -328,16 +331,52 @@ function OrderedRunContent({
         return <div className="ordered-assistant-content" key={entry.item.id}><MarkdownContent content={entry.item.detail} streaming={Boolean(live && entry.item.status === 'running')} /></div>
       }
       return activitiesVisible
-        ? <ThoughtActivityList key={`activities-${entry.items[0]?.id || index}`} items={entry.items} live={live} activeItemId={activeItemId} />
+        ? <ThoughtActivityList key={`activities-${entry.items[0]?.id || index}`} items={entry.items} runId={runId} live={live} activeItemId={activeItemId} />
         : null
     })}
   </div>
 }
 
-// ThoughtActivityList 统一渲染实时与历史活动，并突出当前活动。
-function ThoughtActivityList({ items, live = false, activeItemId }: { items: ThoughtActivityItem[]; live?: boolean; activeItemId?: string }) {
+type ToolResultDetailState =
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'loaded'; result: CompleteToolResult }
+
+export function ToolResultDetailPanel({ state, fallbackTitle, onRetry }: { state: ToolResultDetailState; fallbackTitle: string; onRetry: () => void }) {
+  if (state.status === 'loading') {
+    return <div className="tool-result-detail" aria-busy="true"><span>正在读取完整结果…</span></div>
+  }
+  if (state.status === 'error') {
+    return <div className="tool-result-detail" aria-busy="false"><div className="tool-result-error" role="alert"><span>{state.message}</span><button type="button" onClick={onRetry}>重试</button></div></div>
+  }
+  const presented = presentToolResult(state.result.content)
+  return <div className="tool-result-detail" aria-busy="false">
+    <header><strong>完整结果 · {state.result.totalChars} 字符</strong><span>{state.result.toolName || fallbackTitle} · {state.result.ok ? '成功' : '失败'}</span></header>
+    {!!presented.status.length && <dl>{presented.status.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>}
+    <pre>{presented.content}</pre>
+  </div>
+}
+
+// ThoughtActivityList 统一渲染实时与历史活动；完整结果缓存只跟随当前列表实例的生命周期。
+export function ThoughtActivityList({ items, runId, live = false, activeItemId }: { items: ThoughtActivityItem[]; runId?: string; live?: boolean; activeItemId?: string }) {
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({})
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({})
+  const [detailStates, setDetailStates] = useState<Record<string, ToolResultDetailState>>({})
+  const [detailLoader] = useState(() => createToolResultDetailLoader())
+  function loadDetail(item: ThoughtActivityItem) {
+    const request = toolResultRequest(runId, live, item.kind, item.id)
+    if (!request || detailStates[item.id]?.status === 'loading' || detailStates[item.id]?.status === 'loaded') return
+    setDetailStates((current) => ({ ...current, [item.id]: { status: 'loading' } }))
+    void detailLoader.load(request.runId, request.toolCallId).then(
+      (result) => setDetailStates((current) => ({ ...current, [item.id]: { status: 'loaded', result } })),
+      (error) => setDetailStates((current) => ({ ...current, [item.id]: { status: 'error', message: describeError(error) } })),
+    )
+  }
+  function toggleItem(item: ThoughtActivityItem) {
+    const expanding = !expandedItems[item.id]
+    setExpandedItems((current) => ({ ...current, [item.id]: !current[item.id] }))
+    if (expanding) loadDetail(item)
+  }
   const entries = groupThoughtActivities(items)
     .filter((entry) => entry.kind === 'tool-group' || (entry.item.kind !== 'context' && entry.item.title !== 'Tool Search' && (entry.item.kind !== 'thought' || Boolean(entry.item.detail.trim()))))
   if (!entries.length) return null
@@ -355,14 +394,17 @@ function ThoughtActivityList({ items, live = false, activeItemId }: { items: Tho
           {expanded && <div className="tool-activity-group-items">
             {entry.items.map((item) => {
               const itemExpanded = Boolean(expandedItems[item.id])
-              const expandable = Boolean(item.detail.trim())
+              const detailRequest = toolResultRequest(runId, live, item.kind, item.id)
+              const expandable = Boolean(item.detail.trim()) || Boolean(detailRequest)
               return <div className={`tool-activity-group-item ${item.status}`} key={item.id}>
-                <button type="button" className="tool-activity-group-item-toggle" aria-expanded={expandable ? itemExpanded : undefined} disabled={!expandable} onClick={() => expandable && setExpandedItems((current) => ({ ...current, [item.id]: !current[item.id] }))}>
+                <button type="button" className="tool-activity-group-item-toggle" aria-expanded={expandable ? itemExpanded : undefined} disabled={!expandable} onClick={() => expandable && toggleItem(item)}>
                   <ToolActivityGlyph icon={item.icon} size={13} />
                   <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>
                   {expandable && <ChevronRight className="tool-activity-item-chevron" size={13} aria-hidden="true" />}
                 </button>
-                {itemExpanded && <div className="tool-activity-group-detail"><strong>{item.title}</strong><pre>{item.detail}</pre></div>}
+                {itemExpanded && (detailRequest
+                  ? <ToolResultDetailPanel state={detailStates[item.id] || { status: 'loading' }} fallbackTitle={item.title} onRetry={() => loadDetail(item)} />
+                  : <div className="tool-activity-group-detail"><strong>{item.title}</strong><pre>{item.detail}</pre></div>)}
               </div>
             })}
           </div>}
@@ -373,14 +415,17 @@ function ThoughtActivityList({ items, live = false, activeItemId }: { items: Tho
       if (item.kind === 'thought') return <p key={item.id} className={`thought-activity-thought ${item.status}`}>{item.detail}</p>
       // 普通联网搜索保持紧凑；当来源 URL 过长时提供展开入口，避免摘要撑坏标题布局。
       const hasLongUrl = /https?:\/\/\S{72,}/i.test(item.detail)
-      const expandable = item.kind === 'tool' && Boolean(item.detail.trim()) && (item.title !== '联网搜索' || hasLongUrl)
+      const detailRequest = toolResultRequest(runId, live, item.kind, item.id)
+      const expandable = item.kind === 'tool' && (Boolean(detailRequest) || (Boolean(item.detail.trim()) && (item.title !== '联网搜索' || hasLongUrl)))
       const expanded = Boolean(expandedItems[item.id])
       return <div key={item.id} className={`thought-activity kind-${item.kind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
         <ThoughtActivityIcon icon={item.icon} />
         <div className="thought-activity-copy">
           {expandable ? <>
-            <button type="button" className="thought-activity-toggle" aria-expanded={expanded} onClick={() => setExpandedItems((current) => ({ ...current, [item.id]: !current[item.id] }))}><span><span className="thought-activity-title">{item.title}</span><span className="thought-activity-summary">{item.detail}</span></span><ChevronRight className="thought-activity-chevron" size={14} aria-hidden="true" /></button>
-            {expanded && <div className="thought-activity-detail">{item.detail}</div>}
+            <button type="button" className="thought-activity-toggle" aria-expanded={expanded} onClick={() => toggleItem(item)}><span><span className="thought-activity-title">{item.title}</span><span className="thought-activity-summary">{item.detail}</span></span><ChevronRight className="thought-activity-chevron" size={14} aria-hidden="true" /></button>
+            {expanded && (detailRequest
+              ? <ToolResultDetailPanel state={detailStates[item.id] || { status: 'loading' }} fallbackTitle={item.title} onRetry={() => loadDetail(item)} />
+              : <div className="thought-activity-detail">{item.detail}</div>)}
           </> : <div className="thought-activity-static"><span className="thought-activity-title">{item.title}</span>{item.detail && item.title !== '准备上下文' && <span className="thought-activity-summary">{item.detail}</span>}</div>}
         </div>
       </div>
@@ -400,7 +445,7 @@ export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({
     {hasDetails ? <button type="button" className="completed-thought-toggle" aria-expanded={expanded} aria-controls={`thought-details-${runId}`} onClick={() => setExpanded((value) => !value)}>
       <span className="completed-thought-duration">执行详情 · 用时 {duration}</span><span className="completed-thought-summary">{summary}</span><ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
     </button> : <span className="completed-thought-duration completed-thought-static">用时 {duration}</span>}
-    {hasDetails && <div id={`thought-details-${runId}`}><OrderedRunContent items={items} activitiesVisible={expanded} includeFinalAssistant={false} /></div>}
+    {hasDetails && <div id={`thought-details-${runId}`}><OrderedRunContent items={items} activitiesVisible={expanded} runId={runId} includeFinalAssistant={false} /></div>}
   </article>
 })
 
@@ -453,10 +498,10 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded }: { liveRun: Li
         {hasDetails
           ? <div className={`live-thought ${expanded ? 'expanded' : ''}`}>
             <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
-            <OrderedRunContent items={executionItems} activitiesVisible={expanded} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} />
+            <OrderedRunContent items={executionItems} activitiesVisible={expanded} runId={liveRun.runId} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} />
           </div>
           : null}
-        {!!finalItems.length && <div className="live-final-content"><OrderedRunContent items={finalItems} activitiesVisible live includeFinalAssistant /></div>}
+        {!!finalItems.length && <div className="live-final-content"><OrderedRunContent items={finalItems} activitiesVisible runId={liveRun.runId} live includeFinalAssistant /></div>}
         {liveRun.error && <p className="live-error">{liveRun.error}</p>}
       </div>
     </article>
