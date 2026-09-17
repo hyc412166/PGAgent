@@ -34,7 +34,6 @@ from src.persistence.database import (
     DurableTask,
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
-    ModelConnection,
     Memory,
     MemoryJob,
     PlanStep,
@@ -46,7 +45,6 @@ from src.persistence.database import (
     UsageRecord,
     Workspace,
 )
-from .configuration import _enabled_connection_models
 from src.agent import (
     AgentRuntime,
     RunOutcome,
@@ -146,6 +144,7 @@ def _delegate_catalog_prompt(db: Any, run: Run) -> str:
         "可委派的子 Agent（仅在任务确实较复杂、专业，或用户明确要求时使用 task 工具）：",
         "- 单个子任务使用 task + agent_id；批量任务使用 tasks 数组中的稳定 id/depends_on 声明依赖，无依赖节点会并行启动。",
         "- 每项任务都必须使用下列精确 agent_id；子 Agent 的实际权限和工具会由系统再次校验。",
+        "- 你可以按任务通过 model_id/thinking_level 分配模型与思考强度；没有确定理由时省略它们，子 Agent 会继承你本轮的实际设置。",
     ]
     for child in children:
         # 变量说明：name 表示当前对象名称。
@@ -189,41 +188,6 @@ def _delegate_catalog_prompt(db: Any, run: Run) -> str:
                     f"status={worker.status} | workspace={worker.workspace_mode}"
                 )
     return "\n".join(lines)
-
-
-# 函数职责：完成 model_id_for_delegate 对应的业务处理。
-# 参数关系：connection 表示当前步骤使用的 connection 值；preferred 表示当前步骤使用的 preferred 值；inherited_model_id 表示inherited_model 对象的唯一标识；may_inherit_model 表示当前步骤使用的 may_inherit_model 值。
-# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def _model_id_for_delegate(
-    connection: ModelConnection,
-    *,
-    preferred: str | None,
-    inherited_model_id: str | None,
-    may_inherit_model: bool,
-) -> str | None:
-    """Resolve a child model without accidentally crossing connections."""
-
-    enabled_models = _enabled_connection_models(connection)
-    disabled_model_ids = set(connection.disabled_models or [])
-    # 变量说明：selected 表示当前步骤使用的 selected 值。
-    selected = str(preferred or "").strip()
-    if selected and selected not in disabled_model_ids:
-        return selected[:255]
-    # 变量说明：selected 表示当前步骤使用的 selected 值。
-    selected = str(connection.default_model or "").strip()
-    if selected and selected not in disabled_model_ids:
-        return selected[:255]
-    for candidate in enabled_models:
-        # 变量说明：normalized 表示当前步骤使用的 normalized 值。
-        normalized = str(candidate or "").strip()
-        if normalized:
-            return normalized[:255]
-    if may_inherit_model:
-        # 变量说明：selected 表示当前步骤使用的 selected 值。
-        selected = str(inherited_model_id or "").strip()
-        if selected:
-            return selected[:255]
-    return None
 
 
 # 函数职责：完成 delegate_result_content 对应的业务处理。

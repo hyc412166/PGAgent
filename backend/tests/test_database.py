@@ -734,7 +734,6 @@ def test_core_resource_crud_and_dashboard(client: TestClient, tmp_path: Path) ->
         json={
             "name": "Builder",
             "workspace_id": workspace["id"],
-            "thinking_level": "medium",
             "workflow_profile_id": "coding",
         },
     )
@@ -1293,7 +1292,7 @@ def test_session_model_connection_must_exist_and_be_enabled(client: TestClient) 
 
 
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_agent_model_connection_must_exist_and_be_enabled 精确标识本用例的具体条件。
-def test_agent_model_connection_must_exist_and_be_enabled(client: TestClient) -> None:
+def test_agent_model_allocation_cannot_be_persisted_on_child_profile(client: TestClient) -> None:
     with database.SessionLocal() as db:
         enabled = ModelConnection(
             name="Enabled child-agent relay",
@@ -1315,27 +1314,28 @@ def test_agent_model_connection_must_exist_and_be_enabled(client: TestClient) ->
 
     assert client.post(
         "/api/agents", json={"name": "Missing connection", "model_connection_id": "missing-connection"}
-    ).status_code == 409
+    ).status_code == 422
     assert client.post(
         "/api/agents", json={"name": "Disabled connection", "model_connection_id": disabled_id}
-    ).status_code == 409
+    ).status_code == 422
 
     created = client.post(
         "/api/agents", json={"name": "Enabled connection", "model_connection_id": enabled_id}
     )
-    assert created.status_code == 201, created.text
-    assert created.json()["model_connection_id"] == enabled_id
+    assert created.status_code == 422, created.text
 
     agent_id = client.post("/api/agents", json={"name": "Unbound child"}).json()["id"]
     assert client.patch(
         f"/api/agents/{agent_id}", json={"model_connection_id": "missing-connection"}
-    ).status_code == 409
+    ).status_code == 422
     assert client.patch(
         f"/api/agents/{agent_id}", json={"model_connection_id": disabled_id}
-    ).status_code == 409
+    ).status_code == 422
     updated = client.patch(f"/api/agents/{agent_id}", json={"model_connection_id": enabled_id})
-    assert updated.status_code == 200, updated.text
-    assert updated.json()["model_connection_id"] == enabled_id
+    assert updated.status_code == 422, updated.text
+    assert client.post(
+        "/api/agents", json={"name": "Fixed thinking", "thinking_level": "high"}
+    ).status_code == 422
 
 
 # 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads 精确标识本用例的具体条件。

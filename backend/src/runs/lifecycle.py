@@ -108,7 +108,6 @@ from .configuration import (
 from .delegation_format import (
     _delegate_catalog_prompt,
     _delegate_result_content,
-    _model_id_for_delegate,
     _single_line,
 )
 from .delegation import _SubagentTaskDelegate

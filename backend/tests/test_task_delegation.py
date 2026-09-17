@@ -141,6 +141,7 @@ def delegated_run(tmp_path: Path) -> dict[str, str]:
             base_url="https://parent.example/v1",
             secret_ref="parent-delegation-secret",
             default_model="parent-model",
+            discovered_models=["parent-model", "child-model"],
             status="connected",
         )
         child_connection = ModelConnection(
@@ -150,6 +151,7 @@ def delegated_run(tmp_path: Path) -> dict[str, str]:
             secret_ref="child-delegation-secret",
             default_model="child-default-model",
             status="connected",
+            enabled=False,
         )
         db.add_all([parent_workspace, child_workspace, parent_connection, child_connection])
         db.flush()
@@ -192,6 +194,26 @@ def delegated_run(tmp_path: Path) -> dict[str, str]:
             "child_root": str(child_root),
         }
     Base.metadata.drop_all(bind=database.engine)
+
+
+def test_child_defaults_to_parent_runtime_model_and_ignores_legacy_profile_binding(
+    delegated_run: dict[str, str],
+) -> None:
+    runtime, context = RunCoordinator._resolve_runtime(delegated_run["run_id"])
+    delegate = runtime.tool_registry._task_delegate  # type: ignore[attr-defined]
+    assert delegate is not None
+
+    with database.SessionLocal() as db:
+        child = db.get(Agent, delegated_run["child_id"])
+        assert child is not None and child.model_connection_id
+        legacy_connection = db.get(ModelConnection, child.model_connection_id)
+        assert legacy_connection is not None and not legacy_connection.enabled
+        provider, binding, _ = delegate._freeze_child_binding(db, child)
+
+    assert provider.model_id == "parent-model"
+    assert provider.thinking_level == context["runtime_binding"]["thinking_level"]
+    assert binding["model_connection_id"] == context["runtime_binding"]["model_connection_id"]
+    assert binding["model_id"] == "parent-model"
 
 
 # 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_concurrent_task_calls_keep_separate_dag_bindings 精确标识本用例的具体条件。
@@ -248,7 +270,12 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
             return ModelTurn(tool_calls=[ModelToolCall(
                 "delegate-1",
                 "task",
-                {"task": "检查当前项目并给出证据", "agent_id": delegated_run["child_id"]},
+                {
+                    "task": "检查当前项目并给出证据",
+                    "agent_id": delegated_run["child_id"],
+                    "model_id": "child-model",
+                    "thinking_level": "high",
+                },
             )])
         tool_messages = [item for item in kwargs["messages"] if item.get("role") == "tool"]
         tool_result = json.loads(tool_messages[-1]["content"])
@@ -333,6 +360,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
         assert task is not None and task.status == "completed"
         assert task.child_agent_id == delegated_run["child_id"]
         assert task.result["binding"]["model_id"] == "child-model"
+        assert task.result["binding"]["thinking_level"] == "high"
         assert task.result["binding"]["workflow_profile_id"] == "review"
         assert task.result["binding"]["allowed_tool_names"] == ["read", "read_artifact"]
         assert task.result["binding"]["recursive_task_enabled"] is False
@@ -378,7 +406,11 @@ async def test_child_approval_stays_recoverable_then_syncs_task_without_duplicat
             return ModelTurn(tool_calls=[ModelToolCall(
                 "delegate-awaits",
                 "task",
-                {"task": "write the delegated result", "agent_id": delegated_run["child_id"]},
+                {
+                    "task": "write the delegated result",
+                    "agent_id": delegated_run["child_id"],
+                    "model_id": "child-model",
+                },
             )])
         updates = [
             item for item in kwargs["messages"]
@@ -689,7 +721,11 @@ async def test_delegated_child_uses_durable_background_job_and_must_observe_it(
             return ModelTurn(tool_calls=[ModelToolCall(
                 "delegate-background",
                 "task",
-                {"task": "run durable background work", "agent_id": delegated_run["child_id"]},
+                {
+                    "task": "run durable background work",
+                    "agent_id": delegated_run["child_id"],
+                    "model_id": "child-model",
+                },
             )])
         return ModelTurn(content="child background work verified")
 

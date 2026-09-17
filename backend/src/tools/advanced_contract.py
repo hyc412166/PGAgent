@@ -46,7 +46,7 @@ ADVANCED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "WebSearch": _schema("Search the public web.", {"query": _STRING, "limit": _INTEGER}, ("query",)),
     "TodoWrite": _schema("Replace the current structured todo list. Keep each id stable across updates.", {"todos": {"type": "array", "items": {"type": "object", "properties": {"id": _STRING, "content": _STRING, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]}, "activeForm": _STRING}, "required": ["id", "content", "status"]}}}, ("todos",)),
     "Skill": _schema("Load the full instructions for an enabled skill.", {"skill": _STRING, "skill_id": _STRING, "name": _STRING}),
-    "Agent": _schema("Delegate a task to an enabled child agent.", {"prompt": _STRING, "description": _STRING, "subagent_type": _STRING, "name": _STRING, "run_in_background": _BOOL}, ("prompt",)),
+    "Agent": _schema("Delegate a task to an enabled child agent.", {"prompt": _STRING, "description": _STRING, "subagent_type": _STRING, "name": _STRING, "run_in_background": _BOOL, "model_id": _STRING, "thinking_level": {"type": "string", "enum": ["low", "medium", "high", "xhigh"]}}, ("prompt",)),
     "ToolSearch": _schema("Search the enabled tool catalog by name or description.", {"query": _STRING, "max_results": _INTEGER}, ("query",)),
     "NotebookEdit": _schema("Insert, replace, or delete a Jupyter notebook cell.", {"notebook_path": _STRING, "cell_id": _STRING, "new_source": _STRING, "cell_type": {"type": "string", "enum": ["code", "markdown"]}, "edit_mode": {"type": "string", "enum": ["replace", "insert", "delete"]}}, ("notebook_path",)),
     "Sleep": _schema("Wait for a bounded number of milliseconds.", {"duration_ms": _INTEGER}, ("duration_ms",)),
