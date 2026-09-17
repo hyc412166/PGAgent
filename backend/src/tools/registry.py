@@ -253,6 +253,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {
                 "task": {"type": "string"},
                 "agent_id": {"type": "string"},
+                "model_id": {"type": "string", "description": "本次委派使用的模型；省略时继承主 Agent 本轮模型。"},
+                "thinking_level": {"type": "string", "enum": ["low", "medium", "high", "xhigh"], "description": "本次委派的思考强度；省略时继承主 Agent 本轮设置。"},
                 "step_id": {"type": "string", "description": "对应 update_plan 中已规划子 Agent 步骤的稳定 id。"},
                 "depends_on": {"type": "array", "items": {"type": "string"}},
                 "tasks": {
@@ -263,6 +265,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "properties": {
                             "task": {"type": "string"},
                             "agent_id": {"type": "string"},
+                            "model_id": {"type": "string"},
+                            "thinking_level": {"type": "string", "enum": ["low", "medium", "high", "xhigh"]},
                             "id": {"type": "string"},
                             "depends_on": {"type": "array", "items": {"type": "string"}},
                             "workspace_mode": {"type": "string", "enum": ["shared", "worktree"]},
@@ -1809,6 +1813,8 @@ class ToolRegistry:
             kwargs = {
                 "task": kwargs.get("prompt"),
                 "agent_id": kwargs.get("subagent_type") or kwargs.get("name"),
+                "model_id": kwargs.get("model_id"),
+                "thinking_level": kwargs.get("thinking_level"),
             }
         if name in PLAN_MODE_MUTATING_TOOLS and advanced.plan_mode_enabled(self.sandbox):
             return ToolResult(
@@ -1821,7 +1827,11 @@ class ToolRegistry:
         # that cannot possibly be dispatched.
         # 变量说明：_ 表示当前步骤使用的 _ 值；validation_error_code 表示当前步骤使用的 validation_error_code 值；validation_error 表示当前步骤使用的 validation_error 值。
         _, validation_error_code, validation_error = builtins.normalize_delegate_requests(
-            kwargs.get("task"), kwargs.get("agent_id"), kwargs.get("tasks")
+            kwargs.get("task"),
+            kwargs.get("agent_id"),
+            kwargs.get("tasks"),
+            kwargs.get("model_id"),
+            kwargs.get("thinking_level"),
         )
         if validation_error_code and validation_error:
             return ToolResult(name, False, validation_error, error_code=validation_error_code)

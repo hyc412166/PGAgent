@@ -329,7 +329,7 @@ class AgentCreate(BaseModel):
     # 变量说明：model_id 表示model 对象的唯一标识。
     model_id: str | None = None
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-    thinking_level: ThinkingLevel = "medium"
+    thinking_level: ThinkingLevel | None = None
     # 变量说明：mode 表示当前步骤使用的 mode 值。
     mode: AgentMode = "auto"
     # 变量说明：workflow_profile_id 表示workflow_profile 对象的唯一标识。
@@ -340,6 +340,16 @@ class AgentCreate(BaseModel):
     tool_ids: list[str] = Field(default_factory=list, max_length=64)
     # 变量说明：skill_ids 表示skill 对象标识集合。
     skill_ids: list[str] = Field(default_factory=list, max_length=128)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_persisted_model_allocation(cls, data: Any) -> Any:
+        # 子 Agent 的模型与思考强度属于单次委派决策，不能固化为角色配置。
+        if isinstance(data, dict) and any(data.get(key) is not None for key in (
+            "model_connection_id", "model_id", "thinking_level"
+        )):
+            raise ValueError("子 Agent 的模型和思考强度由主 Agent 在每次委派时分配")
+        return data
 
 
 # 类职责：定义 AgentUpdate 在本领域中的数据与行为。
@@ -369,6 +379,15 @@ class AgentUpdate(BaseModel):
     tool_ids: list[str] | None = Field(default=None, max_length=64)
     # 变量说明：skill_ids 表示skill 对象标识集合。
     skill_ids: list[str] | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_persisted_model_allocation(cls, data: Any) -> Any:
+        if isinstance(data, dict) and any(data.get(key) is not None for key in (
+            "model_connection_id", "model_id", "thinking_level"
+        )):
+            raise ValueError("子 Agent 的模型和思考强度由主 Agent 在每次委派时分配")
+        return data
 
 
 # 类职责：定义 AgentRead 在本领域中的数据与行为。

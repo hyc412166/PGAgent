@@ -66,12 +66,11 @@ from src.sessions.delivery import (
 from src.context.compaction import _configuration_digest, _utcnow
 from .configuration import (
     _allowed_runtime_tool_names,
-    _explicit_setting,
+    _enabled_connection_models,
     _read_selected_skill_instructions,
 )
 from .delegation_format import (
     _delegate_result_content,
-    _model_id_for_delegate,
     _single_line,
 )
 
@@ -235,13 +234,23 @@ class _SubagentTaskDelegate:
     # 函数职责：完成 task_idempotency_key 对应的业务处理。
     # 参数关系：call_id 表示call 对象的唯一标识；task 表示当前步骤使用的 task 值；agent_id 表示智能体标识。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-    def _task_idempotency_key(self, *, call_id: str | None, task: str, agent_id: str) -> str:
+    def _task_idempotency_key(
+        self,
+        *,
+        call_id: str | None,
+        task: str,
+        agent_id: str,
+        model_id: str | None = None,
+        thinking_level: str | None = None,
+    ) -> str:
         if call_id:
             # 变量说明：call_digest 表示当前步骤使用的 call_digest 值。
             call_digest = hashlib.sha256(str(call_id).encode("utf-8")).hexdigest()[:32]
             return f"delegate:{self.parent_run_id}:call:{call_digest}"
         # 变量说明：digest 表示当前步骤使用的 digest 值。
-        digest = hashlib.sha256(f"{agent_id}\0{task}".encode("utf-8")).hexdigest()[:32]
+        digest = hashlib.sha256(
+            f"{agent_id}\0{task}\0{model_id or ''}\0{thinking_level or ''}".encode("utf-8")
+        ).hexdigest()[:32]
         return f"delegate:{self.parent_run_id}:{digest}"
 
     # 函数职责：完成 task_title 对应的业务处理。
@@ -402,38 +411,28 @@ class _SubagentTaskDelegate:
         db: Any,
         child: Agent,
         *,
+        model_id: str | None = None,
+        thinking_level: str | None = None,
         workspace_root_override: str | None = None,
     ) -> tuple[ProviderConfig, dict[str, Any], list[dict[str, str]]]:
         """Snapshot all execution-relevant child settings before model I/O."""
 
-        # 变量说明：parent_connection_id 表示parent_connection 对象的唯一标识。
+        # 子 Agent 的模型由主 Agent 在本次委派中决定；历史 Agent 行上的模型字段不再参与运行。
         parent_connection_id = str(self.parent_binding.get("model_connection_id") or "")
-        # 变量说明：requested_connection_id 表示requested_connection 对象的唯一标识。
-        requested_connection_id = str(child.model_connection_id or "").strip() or parent_connection_id
-        # 变量说明：connection 表示当前步骤使用的 connection 值。
-        connection = db.get(ModelConnection, requested_connection_id)
+        connection = db.get(ModelConnection, parent_connection_id)
         if connection is None or not connection.enabled:
-            raise ModelConfigurationError("子 Agent 的模型连接不存在或已禁用")
-        # 变量说明：inherits_parent_connection 表示当前步骤使用的 inherits_parent_connection 值。
-        inherits_parent_connection = connection.id == parent_connection_id
-        if inherits_parent_connection and not self._configuration_matches_parent(connection, self.parent_binding):
+            raise ModelConfigurationError("主 Agent 本轮的模型连接不存在或已禁用")
+        if not self._configuration_matches_parent(connection, self.parent_binding):
             raise RuntimeError("主会话冻结的模型连接已变化，拒绝在变化配置中启动子 Agent")
 
-        # 变量说明：model_id 表示model 对象的唯一标识。
-        model_id = _model_id_for_delegate(
-            connection,
-            preferred=child.model_id,
-            inherited_model_id=str(self.parent_binding.get("model_id") or ""),
-            may_inherit_model=inherits_parent_connection,
-        )
-        if not model_id:
-            raise ModelConfigurationError("子 Agent 没有可用模型，请为其配置模型或主会话模型")
-        # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
-        thinking_level = _explicit_setting(
-            child.thinking_level,
-            connection.thinking_level,
-            str(self.parent_binding.get("thinking_level") or ""),
-        ) or "medium"
+        inherited_model_id = str(self.parent_binding.get("model_id") or "").strip()
+        selected_model_id = str(model_id or "").strip() or inherited_model_id
+        if not selected_model_id:
+            raise ModelConfigurationError("主 Agent 本轮没有可供子 Agent 继承的模型")
+        if model_id and selected_model_id not in _enabled_connection_models(connection):
+            raise ModelConfigurationError(f"主 Agent 分配的模型不可用: {selected_model_id}")
+        inherited_thinking_level = str(self.parent_binding.get("thinking_level") or "").strip() or "medium"
+        selected_thinking_level = str(thinking_level or "").strip() or inherited_thinking_level
 
         # A child can only receive the capability intersection. The primary
         # coordinator normally has the full catalog, but this remains safe for
@@ -471,9 +470,9 @@ class _SubagentTaskDelegate:
             provider=connection.provider,
             base_url=connection.base_url,
             secret_ref=connection.secret_ref,
-            model_id=model_id,
+            model_id=selected_model_id,
             model_connection_id=connection.id,
-            thinking_level=thinking_level,
+            thinking_level=selected_thinking_level,
             custom_headers=dict(connection.custom_headers or {}),
             api_protocol=connection.api_protocol,
         )
@@ -495,8 +494,8 @@ class _SubagentTaskDelegate:
             "api_protocol": connection.api_protocol,
             "base_url": connection.base_url,
             "secret_ref": connection.secret_ref,
-            "model_id": model_id,
-            "thinking_level": thinking_level,
+            "model_id": selected_model_id,
+            "thinking_level": selected_thinking_level,
             "permission_mode": self.permission_mode,
             "tool_ids": list(getattr(child, "tool_ids", []) or []),
             "allowed_tool_names": child_tools,
@@ -540,6 +539,8 @@ class _SubagentTaskDelegate:
         task: str,
         *,
         agent_id: str = "",
+        model_id: str | None = None,
+        thinking_level: str | None = None,
         call_id: str | None = None,
         plan_step_external_id: str | None = None,
         graph_call_id: str | None = None,
@@ -549,7 +550,13 @@ class _SubagentTaskDelegate:
         # 变量说明：requested_agent_id 表示requested_agent 对象的唯一标识。
         requested_agent_id = str(agent_id or "").strip()
         # 变量说明：idempotency_key 表示当前步骤使用的 idempotency_key 值。
-        idempotency_key = self._task_idempotency_key(call_id=call_id, task=task, agent_id=requested_agent_id)
+        idempotency_key = self._task_idempotency_key(
+            call_id=call_id,
+            task=task,
+            agent_id=requested_agent_id,
+            model_id=model_id,
+            thinking_level=thinking_level,
+        )
         # 变量说明：child 表示当前步骤使用的 child 值。
         child: Agent | None = None
         # 变量说明：delegation_id 表示delegation 对象的唯一标识。
@@ -637,6 +644,8 @@ class _SubagentTaskDelegate:
                 provider_config, child_binding, child_skill_instructions = self._freeze_child_binding(
                     db,
                     child,
+                    model_id=model_id,
+                    thinking_level=thinking_level,
                     workspace_root_override=(
                         teammate.worktree_path if teammate is not None and teammate.workspace_mode == "worktree" else None
                     ),

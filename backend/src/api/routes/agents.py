@@ -84,7 +84,6 @@ from src.api.routes.shared import (
     _normalized_workspace_root,
     _public_run_event,
     _require,
-    _require_enabled_model_connection,
     _workspace_name_from_root,
 )
 
@@ -107,7 +106,10 @@ def create_agent(payload: AgentCreate, db: Session = Depends(get_db)) -> Agent:
     tool_ids = data.pop("tool_ids", [])
     # 变量说明：skill_ids 表示skill 对象标识集合。
     skill_ids = data.pop("skill_ids", [])
-    _require_enabled_model_connection(db, data.get("model_connection_id"))
+    # 历史列继续保留用于读取旧记录；新建角色不持久化运行时模型分配。
+    data.pop("model_connection_id", None)
+    data.pop("model_id", None)
+    data.pop("thinking_level", None)
     # 变量说明：item 表示当前步骤使用的 item 值。
     item = Agent(**data)
     db.add(item)
@@ -157,8 +159,9 @@ def update_agent(agent_id: str, payload: AgentUpdate, db: Session = Depends(get_
     tool_ids = updates.pop("tool_ids", None)
     # 变量说明：skill_ids 表示skill 对象标识集合。
     skill_ids = updates.pop("skill_ids", None)
-    if "model_connection_id" in updates:
-        _require_enabled_model_connection(db, updates["model_connection_id"])
+    updates.pop("model_connection_id", None)
+    updates.pop("model_id", None)
+    updates.pop("thinking_level", None)
     for key, value in updates.items():
         setattr(item, key, value)
     if "tool_ids" in payload.model_fields_set:

@@ -42,6 +42,8 @@ class InvocationValidationHook:
                 task,
                 agent_id,
                 arguments.get("tasks"),
+                arguments.get("model_id"),
+                arguments.get("thinking_level"),
             )
             if error_code and error:
                 return Reject(error, error_code)

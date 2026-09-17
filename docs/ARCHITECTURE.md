@@ -51,7 +51,7 @@ Review profile 额外形成只读工作流上限：即使 Agent 配置误选了�
 - `bash` 从不启动 shell，只允许裸 allowlist 可执行文件，支持工作区内的显式 `cwd`、超时、进程树终止和输出上限。`validate` 复用相同边界并记录测试、lint、类型检查或构建的结构化结果。`full` 仅跳过审批，不会取消 allowlist 或工作区边界。
 - `webfetch` 使用无环境代理的 HTTP 客户端，只允许公开 HTTP(S) DNS 地址，拒绝私网/回环/保留地址与自动重定向，并限制响应大小和超时；`websearch` 通过 DuckDuckGo HTML 返回真实解析结果，失败时显式返回 provider 不可用。
 - `todowrite` 是 JSON 可序列化的运行/会话待办状态；`skill` 只按 ID 返回会话已选的受管理 `SKILL.md` 文本，不执行脚本；`question` 结束本轮并将澄清问题作为正常助手消息。`task` 会先持久化完整 DAG，再按 ready wave 并发创建幂等委派记录和独立子 `Run`；失败前置节点的后继任务不会被错误启动。
-- 子 Agent 继承父运行已经冻结的权限模式；它的工具为“父运行允许工具”与“子 Agent 自己勾选工具”的交集，并强制移除递归委派、团队管理和共享任务板写入工具。子 Run 若需要二次审批会真实进入 `awaiting_approval`，若其后台 Job 未完成则进入事件等待，绝不把未批准或仅入队的操作说成已完成。
+- 子 Agent 继承父运行已经冻结的权限模式。模型和思考强度由主 Agent 在每次 `task` 委派中决定；未指定时分别继承父运行本轮的实际模型和思考强度，历史子 Agent 配置中的模型字段不参与运行。它的工具为“父运行允许工具”与“子 Agent 自己勾选工具”的交集，并强制移除递归委派、团队管理和共享任务板写入工具。子 Run 若需要二次审批会真实进入 `awaiting_approval`，若其后台 Job 未完成则进入事件等待，绝不把未批准或仅入队的操作说成已完成。
 - `ask`：写入、命令、委派与联网均须批准；`smart`：低风险读取和受限公网读取自动执行，写入、命令和委派须批准；`full`：无需批准，但仍保留上述基础安全边界。
 - 事件流提供 `assistant_message_started/delta/completed`、`model_response_completed`、`model_step_started`、`tool_started`、`tool_finished` 和 Turn 终态事件。delta 只走瞬时 SSE，completed item 进入 RunEvent 供重放；`model_response_completed` 不是终态。事件携带安全参数摘要和耗时；工具结果正文、写入正文、Token/API Key 不写入时间线事件。
 

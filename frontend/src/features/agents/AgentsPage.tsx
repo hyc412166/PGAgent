@@ -58,9 +58,6 @@ function AgentsPage() {
       const payload = {
         name: form.get('name'), description: form.get('description'), system_prompt: form.get('system_prompt'),
         workflow_profile_id: form.get('workflow_profile_id'),
-        model_connection_id: null,
-        model_id: null,
-        thinking_level: 'medium',
         tool_ids: selectedToolIds,
         skill_ids: selectedSkillIds,
       }
@@ -101,7 +98,7 @@ function AgentsPage() {
           ))}
         </section>
       ) : <EmptyState icon={Bot} title="创建你的第一个子 Agent" description="定义专业角色、系统指令与可用能力；主 Agent 会在复杂、专业或你明确要求时委派匹配的子 Agent。" action={<button className="button button-primary" onClick={() => openAgentPanel()}><Plus size={16} />创建子 Agent</button>} />}
-      <SlidePanel open={panelOpen} title={editing ? '编辑子 Agent' : template ? `使用「${template.name}」模板` : '创建子 Agent'} description="配置角色以及允许这个子 Agent 使用的工具和 Skill。模型与推理强度由主 Agent 统一管理。" onClose={closeAgentPanel} onExited={() => { setEditing(null); setTemplate(null) }}>
+      <SlidePanel open={panelOpen} title={editing ? '编辑子 Agent' : template ? `使用「${template.name}」模板` : '创建子 Agent'} description="配置角色以及允许这个子 Agent 使用的工具和 Skill。模型与思考强度由主 Agent 在每次委派时分配，通常继承主 Agent 当前设置。" onClose={closeAgentPanel} onExited={() => { setEditing(null); setTemplate(null) }}>
         <form className="panel-form" onSubmit={saveAgent} key={editing?.id || 'new-agent'}>
           <Field label="名称"><input name="name" required placeholder="例如：代码协作者" autoFocus defaultValue={editing?.name || template?.name || ''} /></Field>
           <Field label="简介"><input name="description" placeholder="简要描述擅长处理的任务" defaultValue={editing?.description || template?.description || ''} /></Field>

@@ -69,6 +69,77 @@ def test_task_batch_runs_child_delegates_concurrently(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_task_batch_forwards_per_child_model_allocation(tmp_path: Path) -> None:
+    async def run() -> None:
+        observed: dict[str, tuple[str | None, str | None]] = {}
+
+        async def delegate(
+            task: str,
+            *,
+            agent_id: str,
+            model_id: str | None = None,
+            thinking_level: str | None = None,
+            **_kwargs,
+        ) -> ToolResult:
+            observed[agent_id] = (model_id, thinking_level)
+            return ToolResult("task", True, json.dumps({"status": "completed", "output": task}))
+
+        result = await delegate_task_async(
+            WorkspaceSandbox(tmp_path),
+            tasks=[
+                {"task": "inherit", "agent_id": "agent-a"},
+                {
+                    "task": "deep review",
+                    "agent_id": "agent-b",
+                    "model_id": "review-model",
+                    "thinking_level": "high",
+                },
+            ],
+            delegate=delegate,
+            call_id="allocated-batch",
+        )
+
+        assert result.ok
+        assert observed == {
+            "agent-a": (None, None),
+            "agent-b": ("review-model", "high"),
+        }
+
+        invalid = await delegate_task_async(
+            WorkspaceSandbox(tmp_path),
+            task="invalid",
+            agent_id="agent-a",
+            thinking_level="extreme",
+            delegate=delegate,
+        )
+        assert not invalid.ok
+        assert invalid.error_code == "invalid_delegate_thinking_level"
+
+        async def legacy_delegate(_task: str, *, agent_id: str, call_id: str | None = None) -> ToolResult:
+            return ToolResult("task", True, agent_id)
+
+        unsupported = await delegate_task_async(
+            WorkspaceSandbox(tmp_path),
+            task="explicit model",
+            agent_id="agent-a",
+            model_id="review-model",
+            delegate=legacy_delegate,
+        )
+        assert not unsupported.ok
+        assert unsupported.error_code == "delegate_allocation_unsupported"
+
+        misplaced = await delegate_task_async(
+            WorkspaceSandbox(tmp_path),
+            tasks=[{"task": "batch", "agent_id": "agent-a"}],
+            thinking_level="high",
+            delegate=delegate,
+        )
+        assert not misplaced.ok
+        assert misplaced.error_code == "invalid_task"
+
+    asyncio.run(run())
+
+
 # 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_task_batch_reports_partial_failure 精确标识本用例的具体条件。
 def test_task_batch_reports_partial_failure(tmp_path: Path) -> None:
     # 辅助方法：run 实现测试替身在此调用阶段需要的最小行为。
