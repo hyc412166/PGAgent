@@ -25,7 +25,7 @@ import { DurableTaskCard } from './components/DurableTaskCard'
 import { ProjectTreeItem } from './components/ProjectTreeItem'
 import { projectDeleteConfirmation } from './projectDeletion'
 import { useRunTransport } from './hooks/useRunTransport'
-import { activeRunStatuses, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, runThinkingStartedAt } from './sessionState'
+import { activeRunStatuses, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, removePendingApproval, runThinkingStartedAt } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
 import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
@@ -885,6 +885,13 @@ function SessionsPage() {
     try {
       await api.post(`/api/approvals/${id}/decide`, { decision })
       if (activeIdRef.current !== approvalSessionId) return
+      // 后端已完成审批并启动续跑；先释放当前卡的锁定，避免下一张卡等待整组刷新。
+      setDecidingApproval('')
+      setApprovalsState({
+        data: removePendingApproval(approvals.data, id),
+        loading: false,
+        error: '',
+      })
       const refreshes: Promise<unknown>[] = [
         refreshApprovalsForSession(approvalSessionId),
         refreshRuns(),
