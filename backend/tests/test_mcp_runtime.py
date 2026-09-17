@@ -21,6 +21,7 @@ from src.api.mcp import mcp_status
 from src.mcp import attach_mcp_tools, mcp_runtime_pool
 from src.mcp.config import McpConfig, load_mcp_config
 from src.mcp.config import McpServerConfig
+from src.mcp.integration import _search_mcp_tools
 from src.mcp.runtime import ConnectedMcpServer, McpRuntimePool, McpSessionRuntime, McpToolBinding, _public_server_info
 from src.mcp.tool_catalog_cache import CachedMcpTool, McpToolCatalogCache, ToolCatalogIdentity
 from src.mcp import runtime as mcp_runtime_module
@@ -29,6 +30,21 @@ from src.tools import create_default_registry
 
 # FIXTURE_SERVER 指向本地 stdio MCP 测试进程入口，运行时用例通过它验证真实子进程发现与调用链路。
 FIXTURE_SERVER = Path(__file__).parent / "fixtures" / "mcp_echo_server.py"
+
+
+def test_browser_tool_search_includes_tab_management_companion() -> None:
+    bindings = [
+        McpToolBinding("playwright", "browser_click", "mcp__playwright__browser_click", "Perform click on a web page", {}, False, False),
+        McpToolBinding("playwright", "browser_navigate", "mcp__playwright__browser_navigate", "Navigate to a URL", {}, False, False),
+        McpToolBinding("playwright", "browser_tabs", "mcp__playwright__browser_tabs", "List, create, close, or select browser tabs", {}, False, False),
+    ]
+
+    matches = _search_mcp_tools(
+        bindings,
+        "Playwright browser navigation, page open, click, fill, and inspect tools",
+    )
+
+    assert "browser_tabs" in {binding.raw_name for binding in matches}
 
 
 # 测试场景：验证时间、容量或上下文预算边界以及达到边界后的可观察处理结果；函数名 test_mcp_tool_timeout_defaults_to_five_minutes 精确标识本用例的具体条件。
@@ -1160,6 +1176,8 @@ async def test_agent_loads_deferred_mcp_tool_on_the_turn_after_search(
             rendered_context = "\n".join(str(item.get("content") or "") for item in kwargs["messages"])
             assert "mcp__echo_server: 3 tools" in rendered_context
             assert "Use McpToolSearch" in rendered_context
+            assert "browser_tabs" in rendered_context
+            assert "不要调用 browser_navigate 重复打开同一 URL" in rendered_context
             return ModelTurn(tool_calls=[
                 ModelToolCall("search-1", "McpToolSearch", {"query": "echo text"}),
             ])

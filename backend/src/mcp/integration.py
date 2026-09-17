@@ -87,7 +87,25 @@ def _search_mcp_tools(
         return []
     # 变量说明：minimum_score 表示当前步骤使用的 minimum_score 值。
     minimum_score = max(1, ranked[0][0] - 3)
-    return [item[2] for item in ranked if item[0] >= minimum_score][:max_results]
+    matches = [item[2] for item in ranked if item[0] >= minimum_score][:max_results]
+    # Playwright 的 click/navigate 可能把目标打开到新标签页；搜索命中交互工具时同步暴露标签页切换能力。
+    interactive_servers = {
+        binding.server_name
+        for binding in matches
+        if binding.raw_name in {"browser_click", "browser_navigate"}
+    }
+    for server_name in interactive_servers:
+        companion = next((
+            binding for binding in bindings
+            if binding.server_name == server_name and binding.raw_name == "browser_tabs"
+        ), None)
+        if companion is None or companion in matches or max_results < 2:
+            continue
+        if len(matches) >= max_results:
+            matches[-1] = companion
+        else:
+            matches.append(companion)
+    return matches
 
 
 # 函数职责：异步完成 attach_mcp_tools 对应的业务处理。

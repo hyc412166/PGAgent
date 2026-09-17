@@ -1824,6 +1824,12 @@ class RunCoordinator:
                     "custom_headers_digest": _configuration_digest(connection.custom_headers or {}),
                 }
 
+            # 会话选择 MCP server 即代表当前 Run 允许建立对应 MCP runtime；
+            # 具体工具仍由 attach_mcp_tools 按 server 选择动态发现并延迟暴露。
+            if configured_mcp_server_names and "MCP" not in allowed_tool_names:
+                allowed_tool_names.append("MCP")
+                frozen_binding["allowed_tool_names"] = allowed_tool_names
+
             if memory_use_enabled:
                 for tool_name in ("MemorySearch", "MemoryRead", "MemoryList"):
                     if tool_name not in allowed_tool_names:

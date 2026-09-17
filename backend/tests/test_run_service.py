@@ -1734,6 +1734,40 @@ def test_runtime_freezes_global_and_chat_memory_preferences(
     assert len(calls) == 1
 
 
+# 测试场景：会话选中 MCP 时，即使 Agent 没有把 MCP 写入静态工具绑定，运行时也必须启用 MCP 门控工具。
+@pytest.mark.parametrize(
+    ("mcp_server_names", "expected_enabled"),
+    [(["playwright"], True), ([], False)],
+)
+def test_session_mcp_selection_enables_runtime_mcp_capability(
+    seeded_run: tuple[str, str],
+    mcp_server_names: list[str],
+    expected_enabled: bool,
+) -> None:
+    run_id, session_id = seeded_run
+    with database.SessionLocal() as db:
+        session = db.get(Session, session_id)
+        assert session is not None
+        connection = ModelConnection(
+            name="MCP runtime connection",
+            provider="openai_compatible",
+            base_url="https://example.test/v1",
+            secret_ref="mcp-runtime-secret",
+            default_model="mcp-runtime-model",
+            status="connected",
+        )
+        db.add(connection)
+        db.flush()
+        session.model_connection_id = connection.id
+        session.mcp_server_names = mcp_server_names
+        db.commit()
+
+    runtime, context = RunCoordinator._resolve_runtime(run_id)
+
+    assert ("MCP" in context["allowed_tool_names"]) is expected_enabled
+    assert ("MCP" in runtime.tool_registry.enabled_tool_names) is expected_enabled
+
+
 @pytest.mark.parametrize("global_enabled, expected_jobs", [(False, 0), (True, 1)])
 # 测试场景：验证非法、越界或不满足前置条件的操作会被明确拒绝，且不会产生错误状态；函数名 test_global_memory_preference_controls_extraction_but_chat_preference_does_not 精确标识本用例的具体条件。
 def test_global_memory_preference_controls_extraction_but_chat_preference_does_not(

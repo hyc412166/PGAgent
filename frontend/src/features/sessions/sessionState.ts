@@ -18,6 +18,11 @@ export const emptyDraftContext: SessionContext = { active_context_tokens: 0, aut
 export const noDelegatedTasks: DelegatedTask[] = []
 export const noTeammates: Teammate[] = []
 
+// 审批提交成功后先移除已处理项；后台刷新仍负责把后端权威状态同步回来。
+export function removePendingApproval<T extends { id: string }>(approvals: T[], approvalId: string): T[] {
+  return approvals.filter((approval) => approval.id !== approvalId)
+}
+
 // 创建全新的实时运行状态，避免上一轮草稿、错误或思考时间线泄漏到下一轮。
 export function emptyLiveRun(): LiveRunState {
   return { runId: '', phase: '', draft: '', assistantItems: [], status: 'idle', error: '', thought: emptyThoughtTimeline, thinkingStatus: '' }
@@ -37,7 +42,7 @@ export const runStreamEventNames = [
   'run_state', 'run_received', 'context_prepared', 'context_resumed', 'context_compacted',
   'context_compaction_started', 'context_compaction_finished', 'context_compaction_failed',
   'model_step_started', 'model_retry', 'progress', 'agent_progress', 'thought_summary',
-  'mcp_connecting', 'mcp_server_ready', 'mcp_ready', 'mcp_degraded',
+  'mcp_catalog_loading', 'mcp_connecting', 'mcp_server_ready', 'mcp_ready', 'mcp_degraded',
   'thought_delta', 'activity_update', 'assistant_delta', 'tool_started', 'tool_call',
   'assistant_message_started', 'assistant_message_delta', 'assistant_message_completed', 'model_response_completed',
   'tool_finished', 'tool_result', 'completion_verification_started',

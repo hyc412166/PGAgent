@@ -1534,6 +1534,7 @@ class ToolRegistry:
             return "\n".join(lines)
         lines.extend([
             "MCP tools are loaded on demand. Use McpToolSearch before attempting an MCP operation.",
+            "浏览器操作若打开新标签页，先用 McpToolSearch 查找 browser_tabs 并切换到新标签页；不要调用 browser_navigate 重复打开同一 URL。",
             "Available MCP namespaces:",
         ])
         for source in sources:
