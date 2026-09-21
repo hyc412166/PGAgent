@@ -1268,6 +1268,10 @@ class AgentRuntime:
             if skill_catalog:
                 # 变量说明：rendered 表示当前步骤使用的 rendered 值。
                 rendered = f"{rendered}\n{skill_catalog}"
+            selected_skill_prompt = self.tool_registry.selected_skill_prompt
+            if selected_skill_prompt:
+                # 已选择 Skill 的正文直接进入上下文；Skill 不再依赖模型调用隐藏工具才能生效。
+                rendered = f"{rendered}\n{selected_skill_prompt}"
             # 变量说明：deferred_tool_catalog 表示当前步骤使用的 deferred_tool_catalog 值。
             deferred_tool_catalog = self.tool_registry.deferred_tool_catalog_prompt
             if deferred_tool_catalog:

@@ -27,6 +27,20 @@ from src.tools import create_default_registry
 from src.tools.types import ToolResult
 
 
+def test_apply_patch_format_error_explains_relative_path_and_plus_prefix() -> None:
+    """模型生成非法新增文件补丁时，错误应直接给出可执行的修复规则。"""
+
+    with pytest.raises(patch_module.PatchError, match="工作区相对路径") as exc_info:
+        patch_module.parse_patch(
+            """*** Begin Patch
+*** Add File: C:/workspace/new.txt
+line without prefix
+*** End Patch"""
+        )
+
+    assert exc_info.value.code == "invalid_patch"
+    assert "每一行都必须以 '+' 开头" in str(exc_info.value)
+
 # 辅助函数：_init_git_repository 封装本组测试重复使用的输入准备、状态查询或测试替身行为。
 def _init_git_repository(path) -> None:
     subprocess.run(["git", "init", "--quiet"], cwd=path, check=True)

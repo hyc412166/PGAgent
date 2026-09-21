@@ -200,6 +200,66 @@ describe('助手消息中的思考过程展示', () => {
     expect(sessionsCss).toContain('.tool-activity-group-item-line > span:not(.tool-activity-icon) {')
   })
 
+  it('把等待下一条可见输出的状态放进执行详情，并复用工具行动效规范', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2_000))
+    try {
+      const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+        liveRun: {
+          runId: 'run-thinking-wait',
+          phase: '思考中…',
+          draft: '',
+          status: 'live',
+          error: '',
+          thinkingStatus: '正在整理思路中… (•̀ᴗ•́)و',
+          thought: {
+            startedAt: 1_000,
+            activeStepStartedAt: 1_000,
+            activeStepHasVisibleContent: false,
+            elapsedMs: 0,
+            finished: false,
+            conclusion: '',
+            tools: [],
+            items: [],
+          },
+        },
+      }))
+
+      expect(markup).toContain('class="thought-waiting"')
+      expect(markup).toContain('正在整理思路中… (•̀ᴗ•́)و')
+      expect(markup).toContain('1 秒')
+      expect(markup).not.toMatch(/<span class="live-phase">[^<]*正在整理思路/)
+      expect(sessionsCss).toContain('@keyframes thought-wait-character')
+      expect(sessionsCss).toContain('@keyframes thought-wait-breathe')
+      expect(sessionsCss).toContain('@keyframes thought-wait-shimmer')
+      expect(sessionsCss).toContain('.thought-waiting::after')
+
+      const withVisibleSummary = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+        liveRun: {
+          runId: 'run-thinking-visible',
+          phase: '执行中',
+          draft: '',
+          status: 'live',
+          error: '',
+          thinkingStatus: '正在整理思路中… (•̀ᴗ•́)و',
+          thought: {
+            startedAt: 1_000,
+            activeStepStartedAt: 1_000,
+            activeStepHasVisibleContent: true,
+            elapsedMs: 0,
+            finished: false,
+            conclusion: '',
+            tools: [],
+            items: [{ id: 'summary-1', kind: 'thought', icon: 'think', title: '思考', detail: '已完成扫描。', status: 'running' }],
+          },
+        },
+      }))
+      expect(withVisibleSummary).not.toContain('class="thought-waiting"')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('文件总结超过三个时默认收起并提供展开入口', () => {
     const markup = renderToStaticMarkup(createElement(FileChangeActivity, {
       runId: 'run-file-summary',

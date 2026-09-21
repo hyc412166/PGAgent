@@ -45,7 +45,6 @@ ADVANCED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "WebFetch": _schema("Fetch one public HTTP or HTTPS resource.", {"url": _STRING, "timeout_seconds": _NUMBER}, ("url",)),
     "WebSearch": _schema("Search the public web.", {"query": _STRING, "limit": _INTEGER}, ("query",)),
     "TodoWrite": _schema("Replace the current structured todo list. Keep each id stable across updates.", {"todos": {"type": "array", "items": {"type": "object", "properties": {"id": _STRING, "content": _STRING, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]}, "activeForm": _STRING}, "required": ["id", "content", "status"]}}}, ("todos",)),
-    "Skill": _schema("Load the full instructions for an enabled skill.", {"skill": _STRING, "skill_id": _STRING, "name": _STRING}),
     "Agent": _schema("Delegate a task to an enabled child agent.", {"prompt": _STRING, "description": _STRING, "subagent_type": _STRING, "name": _STRING, "run_in_background": _BOOL, "model_id": _STRING, "thinking_level": {"type": "string", "enum": ["low", "medium", "high", "xhigh"]}}, ("prompt",)),
     "ToolSearch": _schema("Search the enabled tool catalog by name or description.", {"query": _STRING, "max_results": _INTEGER}, ("query",)),
     "NotebookEdit": _schema("Insert, replace, or delete a Jupyter notebook cell.", {"notebook_path": _STRING, "cell_id": _STRING, "new_source": _STRING, "cell_type": {"type": "string", "enum": ["code", "markdown"]}, "edit_mode": {"type": "string", "enum": ["replace", "insert", "delete"]}}, ("notebook_path",)),
@@ -97,11 +96,10 @@ ADVANCED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "MemorySearch": _schema("Search visible durable memories relevant to a query.", {"query": _STRING, "limit": _INTEGER}, ("query",)),
 
     # Learn Claude Code contracts.
-    "load_skill": _schema("Load one enabled skill by id or name.", {"skill_id": _STRING, "name": _STRING}),
     "compress": _schema("Request a full conversation compaction at the next safe boundary.", {"reason": _STRING}),
     "background_run": _schema("Start a durable bounded background command and return immediately.", {"command": _STRING, "timeout": _INTEGER, "shell": {"type": "string", "enum": ["command", "powershell"]}, "plan_step_id": _STRING}, ("command",)),
     "check_background": _schema("Check one or all background commands. Waiting only yields control; a wait timeout never stops the process.", {"task_id": _STRING, "wait": _BOOL, "wait_timeout": {"type": "number", "minimum": 0}, "output_offset": {"type": "integer", "minimum": 0}}),
-    "write_stdin": _schema("Send input to a running background command, then optionally wait for and read new output.", {"task_id": _STRING, "input": _STRING, "close": _BOOL, "wait_ms": {"type": "integer", "minimum": 0, "maximum": 300000}, "output_offset": {"type": "integer", "minimum": 0}}, ("task_id", "input")),
+    "write_stdin": _schema("Send input to a running background command, then optionally wait for and read new output. Use task_id equal to the session_id returned by shell or background_run; after background_job_failed, inspect output before retrying the command.", {"task_id": {**_STRING, "description": "The session_id returned by shell/background_run."}, "input": _STRING, "close": _BOOL, "wait_ms": {"type": "integer", "minimum": 0, "maximum": 300000}, "output_offset": {"type": "integer", "minimum": 0}}, ("task_id", "input")),
     "task_create": _schema("Create a durable shared task.", {"subject": _STRING, "description": _STRING}, ("subject",)),
     "task_get": _schema("Get one durable shared task.", {"task_id": {"oneOf": [_STRING, _INTEGER]}}, ("task_id",)),
     "task_update": _schema("Update one durable shared task.", {"task_id": {"oneOf": [_STRING, _INTEGER]}, "status": _STRING, "message": _STRING, "add_blocked_by": _STRINGS, "remove_blocked_by": _STRINGS, "output": _STRING}, ("task_id",)),
@@ -121,7 +119,7 @@ ADVANCED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 
 # 变量说明：CLAW_TOOL_NAMES 表示当前流程使用的 CLAW_TOOL_NAMES 集合。
 CLAW_TOOL_NAMES: tuple[str, ...] = (
-    "edit_file", "glob_search", "grep_search", "WebFetch", "WebSearch", "TodoWrite", "Skill", "Agent",
+    "edit_file", "glob_search", "grep_search", "WebFetch", "WebSearch", "TodoWrite", "Agent",
     "ToolSearch", "NotebookEdit", "Sleep", "SendUserMessage", "Config", "EnterPlanMode", "ExitPlanMode",
     "StructuredOutput", "REPL", "PowerShell", "AskUserQuestion", "TaskCreate", "RunTaskPacket", "TaskGet",
     "TaskList", "TaskStop", "TaskUpdate", "TaskOutput", "WorkerCreate", "WorkerGet", "WorkerObserve",
@@ -133,7 +131,7 @@ CLAW_TOOL_NAMES: tuple[str, ...] = (
 
 # 变量说明：LEARN_TOOL_NAMES 表示当前流程使用的 LEARN_TOOL_NAMES 集合。
 LEARN_TOOL_NAMES: tuple[str, ...] = (
-    "load_skill", "compress", "background_run", "check_background", "write_stdin", "task_create", "task_get", "task_update",
+    "compress", "background_run", "check_background", "write_stdin", "task_create", "task_get", "task_update",
     "task_list", "spawn_teammate", "list_teammates", "send_message", "read_inbox", "broadcast",
     "shutdown_request", "integrate_teammate", "plan_approval", "idle", "claim_task",
 )

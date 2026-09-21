@@ -24,7 +24,6 @@ CODING_PROFILE = WorkflowProfile(
         "grep",
         "question",
         "read_artifact",
-        "skill",
         "task",
         "update_plan",
         "validate",

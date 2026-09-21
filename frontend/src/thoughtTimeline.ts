@@ -40,6 +40,9 @@ export interface ThoughtTimelineState {
   tools: ThoughtToolItem[]
   items: ThoughtActivityItem[]
   activeItemId?: string
+  // 当前模型轮次单独计时，只驱动等待提示；整次执行耗时仍由 startedAt/elapsedMs 维护。
+  activeStepStartedAt?: number | null
+  activeStepHasVisibleContent?: boolean
   conclusion?: string
 }
 
@@ -394,7 +397,13 @@ function updateAssistantTimelineItem(
       status: type === 'assistant_message_completed' ? 'completed' : current.status,
     }
   }
-  return { ...state, startedAt: state.startedAt, items, activeItemId: undefined }
+  return {
+    ...state,
+    startedAt: state.startedAt,
+    items,
+    activeItemId: undefined,
+    activeStepHasVisibleContent: state.activeStepHasVisibleContent || Boolean(content),
+  }
 }
 
 function safeArgumentDetail(event: RunStreamEvent): string {
@@ -604,7 +613,13 @@ export function updateThoughtTimeline(
     const index = items.findIndex((item) => item.id === id)
     if (index >= 0) items[index] = { ...items[index], detail: `${items[index].detail}${text}`, status: 'running' }
     else items.push({ id, kind: 'thought', icon: 'think', title: '思考', detail: text, status: 'running' })
-    return { ...state, startedAt: start ?? now, items, activeItemId: id }
+    return {
+      ...state,
+      startedAt: start ?? now,
+      items,
+      activeItemId: id,
+      activeStepHasVisibleContent: true,
+    }
   }
   if (type === 'thought_summary' && (event.complete === true || payload?.complete === true)) {
     return start === state.startedAt ? state : { ...state, startedAt: start }
@@ -632,6 +647,7 @@ export function updateThoughtTimeline(
       startedAt: start ?? now,
       items,
       activeItemId: resolvedId,
+      activeStepHasVisibleContent: true,
     }
   }
   if (toolStartTypes.has(type)) {
@@ -656,6 +672,7 @@ export function updateThoughtTimeline(
         status: 'running',
       }],
       activeItemId: id,
+      activeStepHasVisibleContent: true,
     }
   }
 
@@ -753,6 +770,10 @@ export function updateThoughtTimeline(
       startedAt: start,
       items,
       activeItemId: activity.status === 'running' ? activity.id : (state.activeItemId === activity.id ? undefined : state.activeItemId),
+      activeStepStartedAt: type === 'model_step_started' ? now : state.activeStepStartedAt,
+      activeStepHasVisibleContent: type === 'model_step_started'
+        ? Boolean(activity.detail.trim())
+        : state.activeStepHasVisibleContent || Boolean(activity.detail.trim()) || activity.kind !== 'thought',
     }
   }
 

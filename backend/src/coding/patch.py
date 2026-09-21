@@ -128,7 +128,11 @@ def parse_patch(value: str) -> list[FilePatch]:
 
         if operation == "add":
             if any(not line.startswith("+") for line in body):
-                raise PatchError(f"added file lines must start with +: {path}")
+                absolute_path_hint = " 路径必须使用工作区相对路径。" if _looks_absolute(path) else ""
+                raise PatchError(
+                    f"新增文件补丁格式错误：Add File 区段的每一行都必须以 '+' 开头。"
+                    f"{absolute_path_hint} 当前路径：{path}"
+                )
             file_patches.append(FilePatch(operation, path, added_lines=tuple(line[1:] for line in body)))
             continue
         if operation == "delete":
@@ -161,6 +165,17 @@ def parse_patch(value: str) -> list[FilePatch]:
             raise PatchError(f"update file section has no hunks: {path}")
         file_patches.append(FilePatch(operation, path, hunks=tuple(hunks)))
     return file_patches
+
+
+def _looks_absolute(path: str) -> bool:
+    """识别跨平台补丁文本中的绝对路径，供错误信息提供具体修复方向。"""
+
+    candidate = str(path or "")
+    return Path(candidate).is_absolute() or (
+        len(candidate) >= 3
+        and candidate[1] == ":"
+        and candidate[2] in {"/", "\\"}
+    )
 
 
 # 函数职责：完成 decode_text 对应的业务处理。

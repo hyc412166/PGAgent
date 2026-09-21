@@ -415,11 +415,11 @@ def test_edit_glob_and_grep_are_real_sandboxed_tools(tmp_path) -> None:
     assert "notes/sample.txt:1" in searched.content
 
 
-# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_todo_skill_and_task_behavior_is_honest 精确标识本用例的具体条件。
-def test_todo_skill_and_task_behavior_is_honest(tmp_path) -> None:
+# 测试场景：验证 todo 与 task 的执行结果保持诚实，Skill 只通过上下文注入而不再作为工具调用。
+def test_todo_and_task_behavior_is_honest(tmp_path) -> None:
     registry = create_default_registry(
         str(tmp_path),
-        allowed_tool_names=["todowrite", "skill", "task"],
+        allowed_tool_names=["todowrite", "task"],
         permission_mode="full",
         skill_instructions=[
             {
@@ -446,10 +446,12 @@ def test_todo_skill_and_task_behavior_is_honest(tmp_path) -> None:
         {"todos": [{"content": "Unstable step", "status": "pending"}]},
     )
     assert not missing_id.ok and missing_id.error_code == "invalid_todos"
-    skill = registry.execute("skill", {"skill_id": "review"})
-    assert skill.ok
-    assert "Read the diff" in skill.content
-    assert registry.execute("skill", {"skill_id": "not-selected"}).error_code == "skill_not_selected"
+    assert "skill" not in registry.enabled_tool_names
+    assert "skill" not in registry.model_visible_tool_names
+    assert "skill" not in {item["function"]["name"] for item in registry.schemas}
+    assert "Review skill" in registry.skill_catalog_prompt
+    assert "Read the diff, test the changed path" in registry.selected_skill_prompt
+    assert "调用 skill 工具" not in registry.skill_catalog_prompt
     task = registry.execute("task", {"task": "delegate this", "agent_id": "child-agent"})
     assert not task.ok
     assert task.error_code == "delegated_task_unavailable"
@@ -566,6 +568,43 @@ async def test_initial_model_context_includes_runtime_date(tmp_path) -> None:
     assert outcome.status == "completed"
     rendered = "\n".join(str(item.get("content") or "") for item in model_messages)
     assert re.search(r"<current_date>\d{4}-\d{2}-\d{2}</current_date>", rendered)
+
+
+@pytest.mark.asyncio
+# 测试场景：验证已选择 Skill 的正文直接进入首轮上下文，而不是等待模型调用 Skill 工具。
+async def test_selected_skill_instructions_are_injected_into_initial_model_context(tmp_path) -> None:
+    model_messages: list[dict] = []
+
+    async def model_call(**kwargs):  # type: ignore[no-untyped-def]
+        model_messages.extend(kwargs["messages"])
+        return ModelTurn(content="done")
+
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=[],
+        skill_instructions=[
+            {
+                "id": "review",
+                "name": "Review skill",
+                "description": "Review a patch before delivery.",
+                "path": str(tmp_path / "skills" / "review" / "SKILL.md"),
+                "resource_root": str(tmp_path / "skills" / "review"),
+                "content": "Read the diff, then run the focused test.",
+            }
+        ],
+    )
+    runtime = AgentRuntime(model_call=model_call, tool_registry=registry)
+    outcome = await runtime.run(
+        system_prompt="rules",
+        recent_messages=[{"role": "user", "content": "review this change"}],
+    )
+
+    assert outcome.status == "completed"
+    rendered = "\n".join(str(item.get("content") or "") for item in model_messages)
+    assert "Review skill" in rendered
+    assert "Read the diff, then run the focused test." in rendered
+    assert "SKILL.md:" in rendered
+    assert "skill" not in registry.model_visible_tool_names
 
 
 @pytest.mark.asyncio

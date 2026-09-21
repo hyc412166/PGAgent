@@ -1,17 +1,19 @@
 // 本文件实现 ProjectTreeItem 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
-import { ChevronRight, Folder, LoaderCircle, Trash2 } from 'lucide-react'
+import { ChevronRight, Folder, LoaderCircle, MessageSquarePlus, Trash2 } from 'lucide-react'
 import type { FocusEvent, MouseEvent, ReactNode } from 'react'
 import type { Workspace } from '../../../types'
 
-// ProjectTreeItemProps 包含项目节点、其会话子项以及悬浮/删除交互回调。
+// ProjectTreeItemProps 包含项目节点、其会话子项以及悬浮/项目操作回调。
 type ProjectTreeItemProps = {
   workspace: Workspace
   expanded: boolean
   deleting: boolean
   deleteDisabled: boolean
+  newConversationDisabled: boolean
   hoverCardVisible: boolean
   children: ReactNode
   onToggle: () => void
+  onNewConversation: () => void
   onDelete: () => void
   onShowHoverCard: (event: MouseEvent<HTMLButtonElement> | FocusEvent<HTMLButtonElement>) => void
   onHideHoverCard: () => void
@@ -23,9 +25,11 @@ export function ProjectTreeItem({
   expanded,
   deleting,
   deleteDisabled,
+  newConversationDisabled,
   hoverCardVisible,
   children,
   onToggle,
+  onNewConversation,
   onDelete,
   onShowHoverCard,
   onHideHoverCard,
@@ -45,6 +49,16 @@ export function ProjectTreeItem({
         <ChevronRight className="project-chevron" size={13} />
         <Folder size={15} />
         <span>{workspace.name}</span>
+      </button>
+      <button
+        type="button"
+        className="project-new-conversation"
+        aria-label={`在项目 ${workspace.name} 下新建对话`}
+        title="在此项目下新建对话"
+        disabled={newConversationDisabled}
+        onClick={onNewConversation}
+      >
+        <MessageSquarePlus size={13} />
       </button>
       <button
         type="button"
