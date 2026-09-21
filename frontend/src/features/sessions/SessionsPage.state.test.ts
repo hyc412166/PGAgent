@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { SessionsPageState } from './SessionsPage'
 import type { DelegatedTask, Session } from '../../types'
 
-const { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveExpandedWorkspaceIds, resolveMenuOpen } = SessionsPageState
+const { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveExpandedWorkspaceIds, resolveMenuOpen, clampSidePanelWidth, sidePanelWidthAfterDrag } = SessionsPageState
 
 describe('SessionsPage 会话级状态', () => {
   it('会话列表首次到达时选择第一项，但草稿模式保持未选择', () => {
@@ -43,5 +43,14 @@ describe('SessionsPage 会话级状态', () => {
     expect(resolveMenuOpen(true, 'session-a:idle', 'session-b:idle', false)).toBe(false)
     expect(resolveMenuOpen(true, 'session-a:idle', 'session-a:run-a', true)).toBe(false)
     expect(resolveMenuOpen(false, 'session-a:idle', 'session-a:idle', false)).toBe(false)
+  })
+
+  it('侧栏宽度拖动向左增大、向右减小，并被边界夹紧', () => {
+    const bounds = { min: 240, max: 620 }
+
+    expect(sidePanelWidthAfterDrag(290, 500, 420, bounds)).toBe(370)
+    expect(sidePanelWidthAfterDrag(290, 500, 560, bounds)).toBe(240)
+    expect(sidePanelWidthAfterDrag(590, 500, 100, bounds)).toBe(620)
+    expect(clampSidePanelWidth(320, bounds)).toBe(320)
   })
 })

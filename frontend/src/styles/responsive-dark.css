@@ -91,9 +91,11 @@
   .agent-template-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .agent-starter-strip { grid-template-columns: 160px minmax(0, 1fr); }
   .usage-card-grid { grid-template-columns: 1fr 1fr; }
+  .chat-shell { --session-side-panel-width: 270px; }
   .chat-shell:not(.child-panel-open) { grid-template-columns: 205px minmax(0, 1fr) 0; }
-  .chat-shell.child-panel-open { grid-template-columns: 205px minmax(0, 1fr) 270px; }
-  .child-agent-panel { width: 270px; }
+  .chat-shell.child-panel-open { grid-template-columns: 205px minmax(0, 1fr) var(--session-side-panel-width); }
+  .child-agent-panel,
+  .file-change-panel { width: 100%; }
 }
 
 @media (max-width: 860px) {
@@ -109,6 +111,7 @@
   .chat-shell.child-panel-open { height: calc(100dvh - 72px); grid-template-columns: 190px minmax(0, 1fr); }
   .child-agent-panel,
   .file-change-panel { position: fixed; z-index: 45; top: 54px; right: 0; bottom: 0; width: min(340px, 90vw); box-shadow: var(--shadow-md); transform: translateX(100%); }
+  .side-panel-resizer { display: none; }
   .child-agent-panel.is-open,
   .file-change-panel.is-open { transform: translateX(0); }
 }
