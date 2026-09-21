@@ -399,6 +399,24 @@ def test_outcome_does_not_duplicate_completed_assistant_item_with_runtime_metada
                 "item_id": "item-1",
             },
         ))
+        db.add(RunEvent(
+            run_id=run_id,
+            event_type="tool_result",
+            payload={
+                "tool_call_id": "patch-1",
+                "change_set": {
+                    "status": "applied",
+                    "source": "file_tool",
+                    "files": [{
+                        "path": "src/example.py",
+                        "operation": "update",
+                        "added_lines": 1,
+                        "deleted_lines": 1,
+                        "diff": "@@ -1 +1 @@\n-old\n+new\n",
+                    }],
+                },
+            },
+        ))
         db.commit()
 
     RunCoordinator._persist_outcome(run_id, RunOutcome(
@@ -892,6 +910,61 @@ def test_every_terminal_root_turn_has_one_delivered_terminal_message(
         )))
         assert len(replies) == 1
         assert replies[0].turn_id == turn.id
+
+
+# 测试场景：终态助手消息附带本轮文件名、增删行数和可打开的 diff 摘要。
+def test_terminal_message_includes_file_change_summary(accepted_run: tuple[str, str]) -> None:
+    run_id, _session_id = accepted_run
+    with database.SessionLocal() as db:
+        db.add(RunEvent(
+            run_id=run_id,
+            event_type="tool_finished",
+            payload={
+                "tool_call_id": "patch-1",
+                "change_set": {
+                    "status": "applied",
+                    "source": "file_tool",
+                    "files": [{
+                        "path": "src/example.py",
+                        "operation": "update",
+                        "added_lines": 1,
+                        "deleted_lines": 1,
+                        "diff": "@@ -1 +1 @@\n-old\n+new\n",
+                    }],
+                },
+            },
+        ))
+        db.commit()
+
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="已完成",
+        messages=[{"role": "assistant", "content": "已完成"}],
+        transcript_delta=[],
+        events=[{"type": "run_completed"}],
+        steps=1,
+        tool_calls=1,
+    ))
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.turn_id is not None
+        reply = db.scalar(select(ChatMessage).where(ChatMessage.terminal_for_turn_id == run.turn_id))
+        assert reply is not None
+        assert reply.extra["change_summary"] == {
+            "status": "applied",
+            "source": "file_tool",
+            "file_count": 1,
+            "added_lines": 1,
+            "deleted_lines": 1,
+            "files": [{
+                "path": "src/example.py",
+                "operation": "update",
+                "added_lines": 1,
+                "deleted_lines": 1,
+                "diff": "@@ -1 +1 @@\n-old\n+new\n",
+            }],
+        }
 
 
 # 测试场景：默认生命周期不再安装完成验收器，TurnLedger 负责结构化终态边界。

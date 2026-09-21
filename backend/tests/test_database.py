@@ -851,6 +851,32 @@ def test_workspace_filesystem_root_uses_project_fallback_name(client: TestClient
     assert created.json()["name"] == "项目"
 
 
+# 测试场景：文件变更侧栏只能读取运行所属工作区内的当前文本。
+def test_run_file_content_reads_workspace_file_and_rejects_traversal(client: TestClient, tmp_path: Path) -> None:
+    root = tmp_path / "change-panel-project"
+    root.mkdir()
+    (root / "src").mkdir()
+    (root / "src" / "example.py").write_bytes(b"first\nsecond\n")
+    workspace = client.post("/api/workspaces", json={"root_path": str(root)}).json()
+    session = client.post("/api/sessions", json={"workspace_id": workspace["id"]}).json()
+    run = client.post("/api/runs", json={"session_id": session["id"], "workspace_id": workspace["id"]}).json()
+
+    response = client.get(f"/api/runs/{run['id']}/file-content", params={"path": "src/example.py"})
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "run_id": run["id"],
+        "path": "src/example.py",
+        "content": "first\nsecond\n",
+        "line_count": 2,
+        "truncated": False,
+        "binary": False,
+    }
+    rejected = client.get(f"/api/runs/{run['id']}/file-content", params={"path": "../outside.txt"})
+    assert rejected.status_code == 400
+    nul_rejected = client.get(f"/api/runs/{run['id']}/file-content", params={"path": "src/example.py\x00.txt"})
+    assert nul_rejected.status_code == 400
+
+
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_run_listing_supports_stable_pagination 精确标识本用例的具体条件。
 def test_run_listing_supports_stable_pagination(client: TestClient) -> None:
     session_id = client.post("/api/sessions", json={}).json()["id"]
@@ -1411,6 +1437,20 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
                     "duration_ms": 5,
                     "elapsed_ms": 25,
                     "result_summary": "来源：https://api.open-meteo.com/v1/forecast",
+                    "change_set": {
+                        "status": "applied",
+                        "source": "file_tool",
+                        "files": [
+                            {
+                                "path": "src/example.py",
+                                "operation": "update",
+                                "added_lines": 1,
+                                "deleted_lines": 1,
+                                "diff": "@@ -1 +1 @@\n-old\n+new\n",
+                            },
+                            {"path": "../private.txt", "operation": "update", "diff": "secret-diff"},
+                        ],
+                    },
                     "output": "private tool output",
                     "messages": [{"content": "private"}],
                 },
@@ -1453,6 +1493,20 @@ def test_run_event_read_hides_private_snapshots_and_sanitizes_timeline_payloads(
         "tool_name": "read",
         "tool_call_id": "call-1",
         "result_summary": "来源：https://api.open-meteo.com/v1/forecast",
+        "change_set": {
+            "status": "applied",
+            "source": "file_tool",
+            "file_count": 1,
+            "added_lines": 1,
+            "deleted_lines": 1,
+            "files": [{
+                "path": "src/example.py",
+                "operation": "update",
+                "added_lines": 1,
+                "deleted_lines": 1,
+                "diff": "@@ -1 +1 @@\n-old\n+new\n",
+            }],
+        },
     }
     thought = events_by_type["thought_summary"]["payload"]
     assert thought["complete"] is True

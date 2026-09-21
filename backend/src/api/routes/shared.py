@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.config import settings
+from src.coding.changes import sanitize_change_set
 from src.persistence.database import (
     Agent,
     Approval,
@@ -419,6 +420,9 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
             result_summary = _public_event_text(source.get("result_summary"), limit=480)
             if result_summary is not None:
                 public["result_summary"] = result_summary
+            change_set = sanitize_change_set(source.get("change_set"))
+            if change_set is not None:
+                public["change_set"] = change_set
 
     if event_type in {"assistant_message_started", "assistant_message_delta", "assistant_message_completed", "model_response_completed"}:
         for key in ("response_id", "item_id"):

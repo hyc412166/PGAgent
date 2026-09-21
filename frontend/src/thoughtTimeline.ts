@@ -1,5 +1,6 @@
 // 本文件负责 thoughtTimeline 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
 import type { RunStreamEvent } from './sessionStream'
+import type { FileChangeRecord, FileChangeSet } from './types'
 
 // ThoughtToolItem 表示思考时间线中一次工具调用的开始、结束和结果摘要。
 export interface ThoughtToolItem {
@@ -15,7 +16,7 @@ export interface ThoughtToolItem {
  * reasoning summaries remain outside the presentation timeline.
  */
 // ActivityKind/Icon 分别表达活动语义和对应的视觉图标类别。
-export type ThoughtActivityKind = 'thought' | 'tool' | 'context' | 'approval' | 'task' | 'event' | 'assistant'
+export type ThoughtActivityKind = 'thought' | 'tool' | 'file-change' | 'context' | 'approval' | 'task' | 'event' | 'assistant'
 export type ThoughtActivityIcon = 'think' | 'read' | 'write' | 'edit' | 'search' | 'shell' | 'task' | 'approval' | 'context' | 'generic'
 
 // ThoughtActivityItem 是用户可见的单条推理活动摘要。
@@ -28,6 +29,7 @@ export interface ThoughtActivityItem {
   status: 'running' | 'completed' | 'failed'
   // assistant 条目承载模型明确标记为 commentary/final_answer 的可见正文。
   phase?: 'commentary' | 'final_answer' | 'unknown' | string
+  changeSet?: FileChangeSet
 }
 
 // ThoughtTimelineState 聚合当前运行的思考文本、活动、工具项和计时边界。
@@ -104,6 +106,7 @@ export function thinkingStatusForRun(runId: string): string {
 // 事件类型集合用于识别工具生命周期和整轮终态。
 const toolStartTypes = new Set(['tool_started', 'tool_call'])
 const toolFinishTypes = new Set(['tool_finished', 'tool_result'])
+const fileMutationTools = new Set(['apply_patch', 'edit', 'edit_file', 'write', 'write_file', 'delete'])
 const assistantEventTypes = new Set(['assistant_message_started', 'assistant_message_delta', 'assistant_message_completed', 'assistant_delta'])
 const terminalTypes = new Set(['turn_completed', 'turn_failed', 'turn_stopped', 'run_completed', 'completed', 'run_interrupted', 'run_stopped', 'stopped', 'model_failed', 'integration_failed', 'failed'])
 const terminalStatuses = new Set(['completed', 'stopped', 'failed', 'cancelled'])
@@ -213,6 +216,48 @@ function cleanThoughtText(value: string, maxLength = 20_000): string {
     return !(code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31))
   }).join('').replace(/\r\n?/g, '\n')
   return cleaned.slice(0, maxLength)
+}
+
+export function parseFileChangeSet(value: unknown): FileChangeSet | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const candidate = value as Record<string, unknown>
+  if (!Array.isArray(candidate.files)) return undefined
+  const files = candidate.files.flatMap((value): FileChangeRecord[] => {
+    const item = record(value)
+    const path = typeof item?.path === 'string' ? item.path.trim() : ''
+    if (!path) return []
+    const operation = item?.operation === 'add' || item?.operation === 'delete' ? item.operation : 'update'
+    const change: FileChangeRecord = { path, operation }
+    for (const key of ['added_lines', 'deleted_lines', 'line_count', 'first_changed_line'] as const) {
+      const raw = item?.[key]
+      if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) change[key] = Math.floor(raw)
+      else if ((key === 'line_count' || key === 'first_changed_line') && raw === null) change[key] = null
+    }
+    if (typeof item?.diff === 'string') change.diff = item.diff
+    if (typeof item?.diff_truncated === 'boolean') change.diff_truncated = item.diff_truncated
+    if (typeof item?.binary === 'boolean') change.binary = item.binary
+    return [change]
+  })
+  if (!files.length) return undefined
+  return {
+    status: typeof candidate.status === 'string' ? candidate.status : undefined,
+    source: typeof candidate.source === 'string' ? candidate.source : undefined,
+    file_count: typeof candidate.file_count === 'number' && Number.isFinite(candidate.file_count)
+      ? Math.max(0, Math.floor(candidate.file_count))
+      : files.length,
+    added_lines: typeof candidate.added_lines === 'number' && Number.isFinite(candidate.added_lines) ? Math.max(0, Math.floor(candidate.added_lines)) : undefined,
+    deleted_lines: typeof candidate.deleted_lines === 'number' && Number.isFinite(candidate.deleted_lines) ? Math.max(0, Math.floor(candidate.deleted_lines)) : undefined,
+    files,
+  }
+}
+
+function fileChangeSet(event: RunStreamEvent): FileChangeSet | undefined {
+  const payload = record(event.payload)
+  return parseFileChangeSet(event.change_set ?? payload?.change_set)
+}
+
+function isFileMutationTool(name: string): boolean {
+  return fileMutationTools.has(name.trim().toLowerCase())
 }
 
 function thoughtItemId(event: RunStreamEvent, itemIndex: number): string {
@@ -594,12 +639,22 @@ export function updateThoughtTimeline(
     if (name.trim().toLowerCase() === 'tool_search' || name.trim().toLowerCase() === 'toolsearch') return { ...state, startedAt: start }
     const id = firstString(event.tool_call_id, event.call_id, event.id, event.event_id) || `${name}-${state.tools.length}`
     if (state.tools.some((tool) => tool.id === id)) return { ...state, startedAt: start }
-    const detail = safeActivityDetail(event, name)
+    const fileMutation = isFileMutationTool(name)
+    const target = safeToolTarget(event)
+    const detail = fileMutation ? '' : safeActivityDetail(event, name)
     return {
       ...state,
       startedAt: start,
       tools: [...state.tools, { id, name: displayToolName(name), target: safeToolTarget(event), status: 'running' }],
-      items: [...(state.items || []), { id, kind: 'tool', icon: thoughtIconForTool(name), title: displayToolName(name), detail, status: 'running' }],
+      items: [...(state.items || []), {
+        id,
+        // 文件工具和 Shell/搜索一样进入普通活动流，完成时只更新这一行。
+        kind: 'tool',
+        icon: thoughtIconForTool(name),
+        title: fileMutation ? `正在编辑${target ? ` ${target}` : '文件'}` : displayToolName(name),
+        detail,
+        status: 'running',
+      }],
       activeItemId: id,
     }
   }
@@ -615,13 +670,54 @@ export function updateThoughtTimeline(
     if (matchIndex < 0) return state
     const failed = Boolean(event.error) || (event.ok === false && event.pending_approval !== true)
     const resultSummary = firstString(event.result_summary, record(event.payload)?.result_summary)
+    const changes = fileChangeSet(event)
     const tools = state.tools.map((tool, index) => index === matchIndex
       ? { ...tool, status: failed ? 'failed' as const : 'completed' as const }
       : tool)
     const matchedId = state.tools[matchIndex]?.id
-    const items = (state.items || []).map((item) => item.id === matchedId
-      ? { ...item, status: failed ? 'failed' as const : 'completed' as const, detail: resultSummary ? `${item.detail}${item.detail ? ' · ' : ''}${resultSummary}` : item.detail }
-      : item)
+    const matchedItem = (state.items || []).find((item) => item.id === matchedId)
+    const fileMutation = isFileMutationTool(rawName)
+      || matchedItem?.title.startsWith('正在编辑')
+      || matchedItem?.title.startsWith('已编辑')
+    let items = (state.items || []).map((item) => {
+      if (item.id !== matchedId) return item
+      if (changes?.files?.length && fileMutation) {
+        const firstFile = changes.files.length === 1 ? changes.files[0] : undefined
+        const added = changes.added_lines ?? changes.files.reduce((sum, file) => sum + (file.added_lines || 0), 0)
+        const deleted = changes.deleted_lines ?? changes.files.reduce((sum, file) => sum + (file.deleted_lines || 0), 0)
+        return {
+          ...item,
+          kind: 'tool' as const,
+          icon: 'edit' as const,
+          title: failed
+            ? '文件编辑失败'
+            : firstFile ? `已编辑 ${firstFile.path}` : `已编辑 ${changes.files.length} 个文件`,
+          detail: failed ? resultSummary || '文件未修改' : `+${added} −${deleted}`,
+          changeSet: changes,
+          status: failed ? 'failed' as const : 'completed' as const,
+        }
+      }
+      if (fileMutation && failed) {
+        return {
+          ...item,
+          title: '文件编辑失败',
+          detail: resultSummary || '文件未修改',
+          status: 'failed' as const,
+        }
+      }
+      return { ...item, status: failed ? 'failed' as const : 'completed' as const, detail: resultSummary ? `${item.detail}${item.detail ? ' · ' : ''}${resultSummary}` : item.detail }
+    })
+    if (changes?.files?.length && !fileMutation) {
+      items = [...items, ...changes.files.map((file, index) => ({
+        id: `${matchedId}:change:${index}`,
+        kind: 'tool' as const,
+        icon: 'edit' as const,
+        title: failed ? '文件编辑失败' : `已编辑 ${file.path}`,
+        detail: failed ? resultSummary || '文件未修改' : `+${file.added_lines || 0} −${file.deleted_lines || 0}`,
+        changeSet: { ...changes, file_count: 1, files: [file] },
+        status: failed ? 'failed' as const : 'completed' as const,
+      }))]
+    }
     return { ...state, tools, items, activeItemId: state.activeItemId === matchedId ? undefined : state.activeItemId }
   }
 

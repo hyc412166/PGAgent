@@ -334,6 +334,44 @@ export interface RunEvent {
   payload?: ApiRecord
 }
 
+// FileChangeRecord 是运行时间线和最终回复共用的单文件变更契约。
+export interface FileChangeRecord {
+  path: string
+  operation: 'add' | 'update' | 'delete' | string
+  added_lines?: number
+  deleted_lines?: number
+  line_count?: number | null
+  first_changed_line?: number | null
+  diff?: string
+  diff_truncated?: boolean
+  binary?: boolean
+}
+
+export interface FileChangeSelection {
+  runId: string
+  change: FileChangeRecord
+}
+
+// FileChangeSet 聚合一次工具调用或一轮运行产生的文件变化。
+export interface FileChangeSet {
+  status?: string
+  source?: string
+  file_count: number
+  added_lines?: number
+  deleted_lines?: number
+  files: FileChangeRecord[]
+}
+
+// FileContentRead 是右侧文件阅读器读取当前工作区文本的返回值。
+export interface FileContentRead {
+  run_id: string
+  path: string
+  content: string
+  line_count: number
+  truncated?: boolean
+  binary?: boolean
+}
+
 // RunEventFilters 与 RunEventPage 对应运行诊断接口的筛选条件和游标分页结果。
 export interface RunEventFilters {
   event_type?: string

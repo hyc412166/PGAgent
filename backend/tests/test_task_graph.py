@@ -114,7 +114,43 @@ def test_dependency_graph_unlocks_parallel_steps_in_waves(graph_db) -> None:
         assert task is not None and task.status == "completed"
 
 
-# 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_atomic_claim_allows_only_one_worker 精确标识本用例的具体条件。
+# 测试场景：验证计划工具把子 Agent 步骤误标为进行中时仍能交给 task 委派；函数名 test_subagent_plan_in_progress_remains_ready_for_delegation 精确标识本用例的具体条件。
+def test_subagent_plan_in_progress_remains_ready_for_delegation(graph_db) -> None:
+    run_id = _create_run()
+    sync_todos_for_run(run_id, [{
+        "id": "delegate-me",
+        "content": "Ask the coding Agent to implement the fix",
+        "status": "in_progress",
+        "executor_kind": "subagent",
+        "agent_id": DEFAULT_AGENT_ID,
+    }])
+
+    with database.SessionLocal() as db:
+        run = db.get(database.Run, run_id)
+        assert run is not None and run.task_id
+        step = db.query(PlanStep).filter_by(task_id=run.task_id, external_id="delegate-me").one()
+        assert step.status == "pending"
+        assert step.assigned_run_id is None
+        assert [ready.external_id for ready in ready_steps(db, run.task_id, executor_kind="subagent")] == [
+            "delegate-me"
+        ]
+        step_id = step.id
+
+    assert claim_step(step_id, assigned_run_id=run_id, assigned_agent_id=DEFAULT_AGENT_ID)
+    sync_todos_for_run(run_id, [{
+        "id": "delegate-me",
+        "content": "Ask the coding Agent to implement the fix",
+        "status": "in_progress",
+        "executor_kind": "subagent",
+        "agent_id": DEFAULT_AGENT_ID,
+    }])
+    with database.SessionLocal() as db:
+        step = db.get(PlanStep, step_id)
+        assert step is not None and step.status == "in_progress"
+        assert step.assigned_run_id == run_id
+
+
+# 测试场景：验证并发领取同一步骤时只有一个执行者成功；函数名 test_atomic_claim_allows_only_one_worker 精确标识本用例的具体条件。
 def test_atomic_claim_allows_only_one_worker(graph_db) -> None:
     run_id = _create_run()
     sync_todos_for_run(run_id, [

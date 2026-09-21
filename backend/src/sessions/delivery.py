@@ -19,6 +19,7 @@ from src.persistence.database import (
     next_chat_message_sequence,
 )
 from src.persistence.run_events import append_run_event
+from src.coding.changes import aggregate_change_sets
 
 
 # 变量说明：TERMINAL_RUN_STATUSES 表示当前流程使用的 TERMINAL_RUN_STATUSES 集合。
@@ -53,6 +54,35 @@ def is_terminal_delivery(status: str, stop_reason: str | None = None) -> bool:
     return status in TERMINAL_RUN_STATUSES and not (
         status == "stopped" and stop_reason in NON_TERMINAL_STOP_REASONS
     )
+
+
+def run_change_summary(db: Any, run_id: str) -> dict[str, Any] | None:
+    """Aggregate structured file changes already persisted for one run."""
+
+    events = db.scalars(
+        select(RunEvent)
+        .where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type.in_(("tool_finished", "tool_result")),
+        )
+        .order_by(RunEvent.sequence.asc(), RunEvent.created_at.asc(), RunEvent.id.asc())
+    )
+    values: list[object] = []
+    call_indexes: dict[str, int] = {}
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        change_set = payload.get("change_set")
+        if change_set is None:
+            continue
+        call_id = str(payload.get("tool_call_id") or "").strip()
+        if call_id and call_id in call_indexes:
+            # 兼容同时持久化 tool_finished/tool_result 的旧链路，同一次调用只计一次。
+            values[call_indexes[call_id]] = change_set
+            continue
+        if call_id:
+            call_indexes[call_id] = len(values)
+        values.append(change_set)
+    return aggregate_change_sets(values)
 
 
 # 函数职责：查找 turn_by_client_message 对应的数据或流程。
@@ -537,6 +567,9 @@ def persist_terminal_response(
         error_code=error_code or run.error_code,
     )
     if existing is not None:
+        change_summary = run_change_summary(db, run.id)
+        if change_summary is not None:
+            existing.extra = {**dict(existing.extra or {}), "change_summary": change_summary}
         if provider_payload:
             # 变量说明：provider_payload 表示当前步骤使用的 provider_payload 值。
             existing.provider_payload = dict(provider_payload)
@@ -564,6 +597,18 @@ def persist_terminal_response(
         output=output,
         error_code=normalized_code,
     )
+    change_summary = run_change_summary(db, run.id)
+    message_extra = {
+        "run_id": run.id,
+        "turn_id": turn.id,
+        "trace_id": turn.trace_id,
+        "source": source,
+        "terminal_status": run.status,
+        "execution_status": execution_status,
+        "error_code": normalized_code,
+    }
+    if change_summary is not None:
+        message_extra["change_summary"] = change_summary
     # 变量说明：message 表示当前消息。
     message = ChatMessage(
         session_id=run.session_id,
@@ -573,15 +618,7 @@ def persist_terminal_response(
         message_kind="terminal",
         terminal_for_turn_id=turn.id,
         sequence=next_chat_message_sequence(db, run.session_id),
-        extra={
-            "run_id": run.id,
-            "turn_id": turn.id,
-            "trace_id": turn.trace_id,
-            "source": source,
-            "terminal_status": run.status,
-            "execution_status": execution_status,
-            "error_code": normalized_code,
-        },
+        extra=message_extra,
         provider_payload=dict(provider_payload or {}),
     )
     db.add(message)

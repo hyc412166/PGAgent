@@ -1,5 +1,5 @@
 // 本文件负责 sessionStream 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
-import type { AssistantStreamItem } from './types'
+import type { AssistantStreamItem, FileChangeSet } from './types'
 
 // RunStreamEvent 是后端 SSE 事件的宽松前端模型；索引签名保留不同事件携带的扩展字段。
 export interface RunStreamEvent {
@@ -10,6 +10,7 @@ export interface RunStreamEvent {
   reason?: string
   status?: string
   terminal?: boolean
+  change_set?: FileChangeSet
   event_id?: string
   [key: string]: unknown
 }

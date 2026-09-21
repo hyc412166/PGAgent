@@ -735,6 +735,8 @@ class ToolRegistry:
         self._attachment_store = attachment_store
         # 变量说明：_background_store 表示当前步骤使用的 _background_store 值。
         self._background_store = background_store
+        # 后台 shell 首次让出控制权时保留内存快照，终态查询才能生成同一命令的文件 diff。
+        self._background_worktree_states: dict[str, Any] = {}
         # 变量说明：_team_store 表示当前步骤使用的 _team_store 值。
         self._team_store = team_store
         # 变量说明：_task_store 表示当前步骤使用的 _task_store 值。
@@ -965,10 +967,10 @@ class ToolRegistry:
                 lambda _sandbox, **kwargs: self._background_store.start(**kwargs)
             ) if self._background_store is not None else advanced.background_run,
             "check_background": (
-                lambda _sandbox, **kwargs: self._background_store.check(**kwargs)
+                self._check_background
             ) if self._background_store is not None else advanced.check_background,
             "write_stdin": (
-                lambda _sandbox, **kwargs: self._background_store.write_stdin(**kwargs)
+                self._write_background_stdin
             ) if self._background_store is not None else lambda _sandbox, **_kwargs: ToolResult(
                 "write_stdin", False, "background runtime is unavailable", error_code="tool_unavailable"
             ),
@@ -1059,6 +1061,8 @@ class ToolRegistry:
             result.metadata = {**started.metadata, **result.metadata, "shell": "powershell", "cwd": cwd}
             if before is not None and not result.metadata.get("background_job_active"):
                 return annotate_command_changes(result, sandbox.root, before, source="shell")
+            if before is not None:
+                self._background_worktree_states[job_id] = before
             return result
 
         result = advanced.powershell(
@@ -1107,6 +1111,8 @@ class ToolRegistry:
             result.metadata = {**started.metadata, **result.metadata}
             if before is not None and not result.metadata.get("background_job_active"):
                 return annotate_command_changes(result, sandbox.root, before, source="shell")
+            if before is not None:
+                self._background_worktree_states[job_id] = before
             return result
         if self.workflow_profile_id not in {"coding", "debug"}:
             return builtins.run_command(sandbox, approved=True, _cancel_event=cancel_event, **kwargs)
@@ -1115,6 +1121,28 @@ class ToolRegistry:
         # 变量说明：result 表示本步骤产生的结果。
         result = builtins.run_command(sandbox, approved=True, _cancel_event=cancel_event, **kwargs)
         return annotate_command_changes(result, sandbox.root, before, source="shell")
+
+    def _finish_background_change_observation(self, result: ToolResult, task_id: str) -> ToolResult:
+        """Attach the deferred shell diff exactly once when a background job becomes terminal."""
+
+        if result.metadata.get("background_job_active"):
+            return result
+        before = self._background_worktree_states.pop(task_id, None)
+        if before is None:
+            return result
+        from src.coding.worktree import annotate_command_changes
+
+        return annotate_command_changes(result, self.sandbox.root, before, source="shell")
+
+    def _check_background(self, _sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+        task_id = str(kwargs.get("task_id") or "")
+        result = self._background_store.check(**kwargs)
+        return self._finish_background_change_observation(result, task_id) if task_id else result
+
+    def _write_background_stdin(self, _sandbox: WorkspaceSandbox, **kwargs: Any) -> ToolResult:
+        task_id = str(kwargs.get("task_id") or "")
+        result = self._background_store.write_stdin(**kwargs)
+        return self._finish_background_change_observation(result, task_id) if task_id else result
 
     # 函数职责：完成 powershell 对应的业务处理。
     # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；kwargs 表示当前流程使用的 kwargs 集合。

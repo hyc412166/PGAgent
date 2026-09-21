@@ -22,12 +22,13 @@ import { stringId } from '../../shared/lib/display'
 import { ComposerTextArea } from './components/ComposerTextArea'
 import type { ComposerTextAreaHandle } from './components/ComposerTextArea'
 import { DurableTaskCard } from './components/DurableTaskCard'
+import { FileChangePanel } from './components/FileChangePanel'
 import { ProjectTreeItem } from './components/ProjectTreeItem'
 import { projectDeleteConfirmation } from './projectDeletion'
 import { useRunTransport } from './hooks/useRunTransport'
 import { activeRunStatuses, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, removePendingApproval, runThinkingStartedAt } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
-import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
+import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 type ChildPanelState = { sessionId: string; open: boolean; autoOpened: boolean }
 type WorkspaceExpansion = { contextKey: string; ids: Set<string> }
@@ -124,6 +125,7 @@ function SessionsPage() {
   const [completedThoughtsByRun, setCompletedThoughtsByRun] = useState<Record<string, ThoughtTimelineState>>({})
   const [childPanelState, setChildPanelState] = useState<ChildPanelState>({ sessionId: '', open: false, autoOpened: false })
   const [selectedChildTaskId, setSelectedChildTaskId] = useState('')
+  const [fileChangeSelection, setFileChangeSelection] = useState<FileChangeSelection | null>(null)
   // 运输层 refs 跨渲染保存 EventSource、计时器、事件去重集合和当前运行 ID，交给 useRunTransport 管理。
   const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRun)
   const eventSourceRef = useRef<EventSource | null>(null)
@@ -157,6 +159,10 @@ function SessionsPage() {
     liveRunRef.current = liveRun
     pendingAttachmentsRef.current = pendingAttachments
   }, [activeId, liveRun, pendingAttachments])
+
+  useEffect(() => {
+    setFileChangeSelection(null)
+  }, [activeId])
 
   useEffect(() => () => {
     pendingAttachmentsRef.current.forEach((item) => {
@@ -289,6 +295,11 @@ function SessionsPage() {
       return { ...current, open }
     })
   }, [])
+  const openFileChange = useCallback((selection: FileChangeSelection) => {
+    setFileChangeSelection(selection)
+    setChildPanelOpen(false)
+  }, [setChildPanelOpen])
+  const sidePanelOpen = childPanelOpen || Boolean(fileChangeSelection)
   const sessionNavigation = buildSessionNavigation(workspaces.data, mergePendingSession(sessions.data, pendingSession))
   const activeChildTask = visibleChildTasks.find((task) => task.id === selectedChildTaskId) ?? visibleChildTasks[0]
   const childTaskRunId = stringId(activeChildTask?.child_run_id) || stringId(activeChildTask?.result?.child_run_id)
@@ -1108,7 +1119,7 @@ function SessionsPage() {
   const dependencyErrors = [agents.error, workspaces.error, connections.error].filter(Boolean)
   return (
     <div className="page page-chat">
-      <div className={`chat-shell ${childPanelOpen ? 'child-panel-open' : ''}`}>
+      <div className={`chat-shell ${sidePanelOpen ? 'child-panel-open' : ''}`}>
           <aside className="session-list project-session-sidebar" onScroll={() => setProjectHoverCard(null)}>
             <section className="draft-tree-section">
               <button type="button" className="new-draft-button" disabled={sending} onClick={beginDraft}><Plus size={14} />新建对话</button>
@@ -1151,8 +1162,8 @@ function SessionsPage() {
             {!!dependencyErrors.length && <div className="session-list-error"><AlertCircle size={14} /><span>{dependencyErrors.join('；')}</span><button type="button" onClick={() => { void Promise.all([agents.reload(), workspaces.reload(), connections.reload()]) }}>重试</button></div>}
             {sessions.loading && !sessions.data.length && <LoadingState />}
           </aside>
-          <section className={`conversation ${childPanelOpen ? 'with-child-panel' : ''}`}>
-            {(activeSession || draftActive) && <button type="button" className="child-panel-toggle conversation-side-toggle" aria-label={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} title={childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} aria-expanded={childPanelOpen} onClick={() => setChildPanelOpen((open) => !open)}>{childPanelOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}</button>}
+          <section className={`conversation ${sidePanelOpen ? 'with-child-panel' : ''}`}>
+            {(activeSession || draftActive) && <button type="button" className="child-panel-toggle conversation-side-toggle" aria-label={fileChangeSelection ? '关闭文件变更面板' : childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} title={fileChangeSelection ? '关闭文件变更面板' : childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} aria-expanded={sidePanelOpen} onClick={() => fileChangeSelection ? setFileChangeSelection(null) : setChildPanelOpen((open) => !open)}>{fileChangeSelection ? <X size={14} /> : childPanelOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}</button>}
             {activeSession || draftActive ? <>
               <div
                 className="messages"
@@ -1180,7 +1191,7 @@ function SessionsPage() {
                 {draftActive ? liveRun.status === 'idle' && <EmptyState icon={MessageSquare} title="开始一次新任务" description="直接描述目标；需要处理本地文件时，可以在输入框中选择一个项目文件夹。" /> : messages.error && !visibleMessages.length ? <ErrorState message={messages.error} onRetry={messages.reload} /> : messages.loading && !visibleMessages.length ? <LoadingState /> : visibleMessages.length ? visibleMessages.map((message) => {
                   const messageRunId = message.role === 'assistant' ? stringId(message.metadata?.run_id) : ''
                   const completedThought = messageRunId ? completedThoughtsByRun[messageRunId] : undefined
-                  return <MessageBubble key={message.id} message={message} thoughtRunId={messageRunId || undefined} thoughtTimeline={completedThought} />
+                  return <MessageBubble key={message.id} message={message} thoughtRunId={messageRunId || undefined} thoughtTimeline={completedThought} onOpenFileChange={openFileChange} />
                 }) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
                 {!draftActive && messages.error && !!visibleMessages.length && <p className="inline-error" role="alert">消息同步失败：{messages.error}</p>}
                 {!draftActive && durableTask.data && <DurableTaskCard
@@ -1193,7 +1204,7 @@ function SessionsPage() {
                 {!draftActive && stoppedRunNotices.map((run) => <div key={`run-notice:${run.id}`} className="stopped-run-notice" role="status"><AlertCircle size={16} /><div><strong>{run.status === 'failed' ? '本次运行失败，未生成最终回复' : '本次运行已停止，未生成最终回复'}</strong><p>{run.error_message || run.stop_reason || 'Agent 未能继续执行，请调整指令后重试。'}</p></div></div>)}
                 {liveRun.status !== 'idle' && !liveReplyPersisted
                   && (!completedThoughtsByRun[liveRun.runId] || (canEditInterrupted && liveRun.runId === interruptedRunId))
-                  && <LiveAssistantMessage liveRun={liveRun} />}
+                  && <LiveAssistantMessage liveRun={liveRun} onOpenFileChange={openFileChange} />}
                 {canEditInterrupted && <div className="interrupted-run-actions">
                   <button type="button" className="interrupted-edit-button" onClick={editInterruptedPrompt}>
                     <Pencil size={12} />重新编辑本次输入
@@ -1329,7 +1340,7 @@ function SessionsPage() {
               </div>
             </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={beginDraft}>新建对话</button>} />}
           </section>
-          <ChildAgentPanel
+          {fileChangeSelection ? <FileChangePanel selection={fileChangeSelection} onClose={() => setFileChangeSelection(null)} /> : <ChildAgentPanel
             open={childPanelOpen}
             tasks={visibleChildTasks}
             teammates={visibleTeammates}
@@ -1343,7 +1354,7 @@ function SessionsPage() {
             onClose={() => setChildPanelOpen(false)}
             onSelect={setSelectedChildTaskId}
             onRetry={() => { void childTasks.reload(); void teammates.reload(); void childTaskEvents.reload() }}
-          />
+          />}
       </div>
       {projectHoverCard && createPortal(
         <div className="project-hover-card" id="project-hover-card" role="tooltip" style={{ left: projectHoverCard.left, top: projectHoverCard.top }}>

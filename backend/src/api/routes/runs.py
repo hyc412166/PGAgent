@@ -55,6 +55,7 @@ from src.api.schemas import (
     DashboardRead,
     DelegatedTaskRead,
     DurableTaskRead,
+    FileContentRead,
     MemoryCreate,
     MemoryRead,
     MemoryUpdate,
@@ -291,6 +292,64 @@ def create_run(payload: RunCreate, db: Session = Depends(get_db)) -> RunRead:
 @router.get("/runs/{run_id}", response_model=RunRead)
 def get_run(run_id: str, db: Session = Depends(get_db)) -> RunRead:
     return _run_read(_require(db, Run, run_id, "Run"), db=db)
+
+
+@router.get("/runs/{run_id}/file-content", response_model=FileContentRead)
+def get_run_file_content(
+    run_id: str,
+    path: str = Query(..., min_length=1, max_length=1_000),
+    db: Session = Depends(get_db),
+) -> FileContentRead:
+    """Read one current workspace file for the change inspector."""
+
+    run = _require(db, Run, run_id, "Run")
+    workspace = db.get(Workspace, run.workspace_id) if run.workspace_id else None
+    if workspace is None or not workspace.root_path:
+        raise HTTPException(status_code=404, detail="该运行没有可读取的工作区")
+    relative = path.replace("\\", "/").strip()
+    if any(ord(character) < 32 for character in relative):
+        raise HTTPException(status_code=400, detail="文件路径包含非法控制字符")
+    candidate_input = Path(relative)
+    if candidate_input.is_absolute() or any(part in {"", ".", ".."} for part in candidate_input.parts if part != "."):
+        raise HTTPException(status_code=400, detail="文件路径必须是工作区内的相对路径")
+    try:
+        root = Path(workspace.root_path).expanduser().resolve()
+        target = (root / candidate_input).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="文件路径无效") from exc
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="文件路径越过工作区边界") from exc
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在或已被删除")
+    try:
+        max_bytes = 1_000_000
+        with target.open("rb") as handle:
+            raw = handle.read(max_bytes + 1)
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail="读取文件失败") from exc
+    if b"\x00" in raw[:8192]:
+        return FileContentRead(run_id=run_id, path=relative, content="", line_count=0, binary=True)
+    truncated = len(raw) > max_bytes
+    text = raw[:max_bytes].decode("utf-8", errors="replace")
+    max_chars = 1_000_000
+    max_lines = 20_000
+    if len(text) > max_chars:
+        text = text[:max_chars]
+        truncated = True
+    lines = text.splitlines(keepends=True)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        truncated = True
+    content = "".join(lines)
+    return FileContentRead(
+        run_id=run_id,
+        path=relative,
+        content=content,
+        line_count=len(lines),
+        truncated=truncated,
+    )
 
 
 # 函数职责：按需分页读取某次运行持久化的完整工具结果，同时严格限制消息归属。
