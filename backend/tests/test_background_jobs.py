@@ -10,6 +10,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import subprocess
 import time
 from types import SimpleNamespace
 
@@ -221,6 +222,47 @@ def test_bash_yields_a_durable_session_without_starting_a_second_process(backgro
     with database.SessionLocal() as db:
         assert db.query(BackgroundJob).filter_by(id=job_id).count() == 1
         assert running.pid is not None
+
+
+def test_background_shell_reports_file_changes_when_terminal_check_finishes_job(background_store) -> None:
+    """长命令让出控制权后，check_background 仍使用原始快照生成文件 diff。"""
+
+    store, _manager = background_store
+    workspace = Path(store.workspace_root)
+    (workspace / "value.txt").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "init", "--quiet"], cwd=workspace, check=True)
+    subprocess.run(["git", "config", "user.email", "pgagent-test@example.com"], cwd=workspace, check=True)
+    subprocess.run(["git", "config", "user.name", "PGAgent Test"], cwd=workspace, check=True)
+    subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "baseline"], cwd=workspace, check=True)
+    registry = create_default_registry(
+        store.workspace_root,
+        allowed_tool_names=["shell", "check_background"],
+        workflow_profile_id="coding",
+        permission_mode="full",
+        background_store=store,
+    )
+
+    yielded = registry.execute(
+        "shell",
+        {
+            "command": "Start-Sleep -Milliseconds 250; Set-Content -Path value.txt -Value after",
+            "yield_time_ms": 10,
+            "timeout_seconds": 30,
+        },
+        approved=True,
+    )
+    terminal = registry.execute(
+        "check_background",
+        {"task_id": yielded.metadata["background_job_id"], "wait": True, "wait_timeout": 10},
+        approved=True,
+    )
+
+    assert yielded.metadata["background_job_active"] is True
+    assert terminal.metadata["background_job_active"] is False
+    assert terminal.metadata["change_set"]["files"][0]["path"] == "value.txt"
+    assert "-before" in terminal.metadata["change_set"]["files"][0]["diff"]
+    assert "+after" in terminal.metadata["change_set"]["files"][0]["diff"]
 
 
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_bash_returns_terminal_output_when_command_finishes_inside_yield_window 精确标识本用例的具体条件。

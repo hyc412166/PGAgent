@@ -14,6 +14,13 @@ import subprocess
 import pytest
 
 from src.coding import patch as patch_module
+from src.coding.changes import (
+    MAX_CHANGE_FILES,
+    MAX_CHANGE_SET_DIFF_CHARS,
+    MAX_CHANGE_SOURCE_BYTES,
+    aggregate_change_sets,
+)
+from src.coding.worktree import capture_worktree_state
 from src.coding import validation_runtime as validation_runtime_module
 from src.coding.profiles import resolve_workflow_profile
 from src.tools import create_default_registry
@@ -27,6 +34,67 @@ def _init_git_repository(path) -> None:
     subprocess.run(["git", "config", "user.name", "PGAgent Test"], cwd=path, check=True)
     subprocess.run(["git", "add", "."], cwd=path, check=True)
     subprocess.run(["git", "commit", "--quiet", "-m", "baseline"], cwd=path, check=True)
+
+
+def test_worktree_snapshot_skips_oversized_untracked_content(tmp_path) -> None:
+    """命令变更观察只保留大文件元数据，不把完整正文读入 diff 内存。"""
+
+    (tmp_path / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    (tmp_path / "large.txt").write_bytes(b"x" * (MAX_CHANGE_SOURCE_BYTES + 1))
+
+    state = capture_worktree_state(tmp_path)
+
+    assert state is not None
+    entry = next(item for item in state.untracked_files if item[0] == "large.txt")
+    assert entry[1] == MAX_CHANGE_SOURCE_BYTES + 1
+    assert entry[-1] is None
+
+
+def test_change_summary_enforces_global_file_and_diff_limits() -> None:
+    """多次工具事件聚合后仍遵守最终消息的全局容量上限。"""
+
+    values = [
+        {
+            "files": [
+                {
+                    "path": f"src/{batch}-{index}.py",
+                    "operation": "update",
+                    "added_lines": 1,
+                    "deleted_lines": 0,
+                    "diff": "+" + ("x" * 3_999),
+                }
+                for index in range(150)
+            ],
+        }
+        for batch in range(2)
+    ]
+
+    result = aggregate_change_sets(values)
+
+    assert result is not None
+    assert result["file_count"] == MAX_CHANGE_FILES
+    assert sum(len(str(item.get("diff") or "")) for item in result["files"]) <= MAX_CHANGE_SET_DIFF_CHARS
+
+
+def test_worktree_snapshot_does_not_follow_file_symlink(tmp_path) -> None:
+    """文件链接只记录自身元数据，绝不把工作区外目标内容带入事件。"""
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    outside.write_text("external-secret\n", encoding="utf-8")
+    (tmp_path / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    _init_git_repository(tmp_path)
+    link = tmp_path / "linked.txt"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("当前 Windows 环境未开放符号链接权限")
+
+    state = capture_worktree_state(tmp_path)
+
+    assert state is not None
+    entry = next(item for item in state.untracked_files if item[0] == "linked.txt")
+    assert entry[-1] is None
 
 
 # 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_apply_patch_updates_multiple_files_and_records_change_evidence 精确标识本用例的具体条件。
@@ -350,9 +418,11 @@ def test_coding_bash_detects_real_tracked_file_changes(tmp_path) -> None:
 
     assert result.ok and result.changed
     assert result.metadata["change_set"]["source"] == "shell"
-    assert result.metadata["change_set"]["files"] == [
-        {"path": "value.txt", "operation": "update"}
-    ]
+    files = result.metadata["change_set"]["files"]
+    assert [(item["path"], item["operation"]) for item in files] == [("value.txt", "update")]
+    assert files[0]["added_lines"] == 1
+    assert files[0]["deleted_lines"] == 1
+    assert "-before\n+after" in files[0]["diff"]
     state = registry.runtime_state()["coding_state"]
     assert state["changes"][-1]["tool"] == "bash"
     assert "Changed paths: value.txt" in registry.workflow_prompt
@@ -388,9 +458,10 @@ def test_coding_bash_detects_existing_untracked_file_content_changes(tmp_path) -
 
     assert validated.ok
     assert result.ok and result.changed
-    assert result.metadata["change_set"]["files"] == [
-        {"path": "scratch.txt", "operation": "add"}
-    ]
+    files = result.metadata["change_set"]["files"]
+    assert [(item["path"], item["operation"]) for item in files] == [("scratch.txt", "add")]
+    assert files[0]["added_lines"] == 1
+    assert files[0]["deleted_lines"] == 1
     assert "Validation status: stale" in registry.workflow_prompt
 
 
@@ -421,9 +492,8 @@ def test_coding_bash_reports_only_files_changed_by_this_command(tmp_path) -> Non
     )
 
     assert result.ok and result.changed
-    assert result.metadata["change_set"]["files"] == [
-        {"path": "agent.txt", "operation": "update"}
-    ]
+    files = result.metadata["change_set"]["files"]
+    assert [(item["path"], item["operation"]) for item in files] == [("agent.txt", "update")]
 
 
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_coding_bash_detects_same_size_untracked_change_with_restored_mtime 精确标识本用例的具体条件。
@@ -451,9 +521,10 @@ def test_coding_bash_detects_same_size_untracked_change_with_restored_mtime(tmp_
     )
 
     assert result.ok and result.changed
-    assert result.metadata["change_set"]["files"] == [
-        {"path": "scratch.txt", "operation": "add"}
-    ]
+    files = result.metadata["change_set"]["files"]
+    assert [(item["path"], item["operation"]) for item in files] == [("scratch.txt", "add")]
+    assert files[0]["added_lines"] == 1
+    assert files[0]["deleted_lines"] == 1
 
 
 @pytest.mark.parametrize(
@@ -493,9 +564,8 @@ def test_coding_bash_reports_unicode_paths(
     )
 
     assert result.ok and result.changed
-    assert result.metadata["change_set"]["files"] == [
-        {"path": file_name, "operation": operation}
-    ]
+    files = result.metadata["change_set"]["files"]
+    assert [(item["path"], item["operation"]) for item in files] == [(file_name, operation)]
 
 
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_validate_baseline_runs_in_isolated_head_worktree 精确标识本用例的具体条件。

@@ -872,6 +872,16 @@ class RunEventPage(BaseModel):
     next_before: int | None = None
 
 
+# 类职责：定义 FileContentRead，为文件变更侧栏提供当前工作区文本读取契约。
+class FileContentRead(BaseModel):
+    run_id: str
+    path: str
+    content: str
+    line_count: int
+    truncated: bool = False
+    binary: bool = False
+
+
 # 类职责：定义 ApprovalCreate 在本领域中的数据与行为。
 # 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class ApprovalCreate(BaseModel):

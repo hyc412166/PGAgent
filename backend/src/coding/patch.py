@@ -12,6 +12,8 @@ from tempfile import NamedTemporaryFile
 from src.tools.sandbox import SandboxViolation, WorkspaceSandbox
 from src.tools.types import ApprovalRequest, ToolResult
 
+from .changes import build_file_change
+
 
 # 类职责：表示 PatchError 场景的领域异常。
 # 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
@@ -311,7 +313,10 @@ def _stage_bytes(target: Path, content: bytes, mode: int | None) -> Path:
 # 参数关系：change 表示当前步骤使用的 change 值。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def _change_record(change: PreparedChange) -> dict[str, object]:
+    after = None if change.operation == "delete" else (change.content or "").encode("utf-8")
+    record = build_file_change(change.path, change.operation, change.original_bytes, after)
     return {
+        **record,
         "path": change.path,
         "operation": change.operation,
         "hunks": change.hunks,

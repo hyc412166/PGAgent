@@ -30,6 +30,68 @@ describe('实时 Thought 时间线', () => {
     expect(completed.items.find((item) => item.kind === 'tool')?.detail).toContain('读取：.gitignore')
   })
 
+  // 测试场景：文件修改工具只展示用户可读的文件记录，不泄露 apply_patch 工具名。
+  it('把文件修改工具转换为可点击的文件变更活动', () => {
+    const running = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'tool_started', tool_name: 'apply_patch', tool_call_id: 'patch-1',
+      arguments: { patch: '*** Begin Patch' },
+    }, 1_000)
+    const completed = updateThoughtTimeline(running, {
+      type: 'tool_finished', tool_name: 'apply_patch', tool_call_id: 'patch-1', ok: true,
+      change_set: {
+        file_count: 1,
+        added_lines: 2,
+        deleted_lines: 1,
+        files: [{ path: 'src/example.ts', operation: 'update', added_lines: 2, deleted_lines: 1, diff: '@@ -1 +1,2 @@\n-old\n+new\n+line\n' }],
+      },
+    }, 1_100)
+
+    expect(running.items[0]).toMatchObject({ kind: 'tool', title: '正在编辑文件', detail: '' })
+    expect(completed.items[0]).toMatchObject({
+      kind: 'tool',
+      title: '已编辑 src/example.ts',
+      detail: '+2 −1',
+      status: 'completed',
+      changeSet: expect.objectContaining({ added_lines: 2, deleted_lines: 1 }),
+    })
+    expect(completed.items[0]?.title).not.toContain('apply_patch')
+  })
+
+  it('文件修改失败时结束进行中文案并保留失败摘要', () => {
+    const running = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'tool_started', tool_name: 'apply_patch', tool_call_id: 'patch-failed',
+    }, 1_000)
+    const failed = updateThoughtTimeline(running, {
+      type: 'tool_finished', tool_name: 'apply_patch', tool_call_id: 'patch-failed', ok: false,
+      result_summary: '上下文不匹配',
+    }, 1_100)
+
+    expect(failed.items[0]).toMatchObject({
+      kind: 'tool',
+      title: '文件编辑失败',
+      detail: '上下文不匹配',
+      status: 'failed',
+    })
+  })
+
+  it('命令修改文件时同时保留命令记录和文件变更记录', () => {
+    const running = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'tool_started', tool_name: 'shell', tool_call_id: 'shell-change-1',
+      arguments: { command: { executable: 'python', argument_count: 2 } },
+    }, 1_000)
+    const completed = updateThoughtTimeline(running, {
+      type: 'tool_finished', tool_name: 'shell', tool_call_id: 'shell-change-1', ok: true,
+      change_set: {
+        file_count: 1,
+        files: [{ path: 'src/example.py', operation: 'update', added_lines: 1, deleted_lines: 1 }],
+      },
+    }, 1_100)
+
+    expect(completed.items).toHaveLength(2)
+    expect(completed.items[0]).toMatchObject({ kind: 'tool', title: 'Shell', status: 'completed' })
+    expect(completed.items[1]).toMatchObject({ kind: 'tool', title: '已编辑 src/example.py', detail: '+1 −1', status: 'completed' })
+  })
+
   it('按真实事件顺序保留中间回复、工具调用和后续回复', () => {
     let timeline = updateThoughtTimeline(emptyThoughtTimeline, {
       type: 'assistant_message_completed',

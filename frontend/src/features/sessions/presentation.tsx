@@ -3,6 +3,7 @@ import {
   Brain,
   Bot,
   CheckCheck,
+  ChevronDown,
   ChevronRight,
   Copy,
   FileText,
@@ -20,10 +21,10 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { memo } from 'react'
-import { formatLiveThinkingDuration, formatThoughtDuration, type ThoughtActivityIcon, type ThoughtActivityItem, type ThoughtTimelineState } from '../../thoughtTimeline'
+import { formatLiveThinkingDuration, formatThoughtDuration, parseFileChangeSet, type ThoughtActivityIcon, type ThoughtActivityItem, type ThoughtTimelineState } from '../../thoughtTimeline'
 import { apiUrl, describeError } from '../../api'
 import { formatAttachmentSize, messageAttachments } from '../../attachments'
-import type { Approval, DelegatedTask, Message, Run, RunEvent, Teammate } from '../../types'
+import type { Approval, DelegatedTask, FileChangeRecord, FileChangeSelection, FileChangeSet, Message, Run, RunEvent, Teammate } from '../../types'
 import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../components/ui'
 import { statusText } from '../../components/status'
 import { PenguinMark } from '../../components/penguin'
@@ -135,7 +136,7 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
 })
 
 // MessageBubble 按“身份与时间、附件、正文”的阅读顺序渲染持久消息及其操作。
-export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId, thoughtTimeline }: { message: Message; thoughtRunId?: string; thoughtTimeline?: ThoughtTimelineState }) {
+export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId, thoughtTimeline, onOpenFileChange }: { message: Message; thoughtRunId?: string; thoughtTimeline?: ThoughtTimelineState; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const [copied, setCopied] = useState(false)
   const attachments = messageAttachments(message.metadata?.attachments)
   const imageAttachments = message.session_id
@@ -156,6 +157,8 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
       : isDelegatedChild
         ? `${childAgentName}（子 Agent）`
         : 'PGAgent'
+  const finalChangeSet = message.role === 'assistant' ? parseFileChangeSet(message.metadata?.change_summary) : undefined
+  const messageRunId = thoughtRunId || (typeof message.metadata?.run_id === 'string' ? message.metadata.run_id : undefined)
   async function copyMessage() {
     try {
       await navigator.clipboard.writeText(message.content || '')
@@ -170,7 +173,7 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
       <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <PenguinMark size={21} />}</div>
       <div className="message-body">
         <div className="message-meta"><strong>{speaker}</strong><time>{formatUiDate(message.created_at)}</time></div>
-        {thoughtRunId && thoughtTimeline && <CompletedThoughtTimeline runId={thoughtRunId} timeline={thoughtTimeline} />}
+        {thoughtRunId && thoughtTimeline && <CompletedThoughtTimeline runId={thoughtRunId} timeline={thoughtTimeline} onOpenFileChange={onOpenFileChange} />}
         {!!imageAttachments.length && <div className="message-image-gallery" aria-label="消息图片">
           {imageAttachments.map((attachment) => {
             const href = apiUrl(`/api/sessions/${message.session_id}/attachments/${attachment.id}/content`)
@@ -196,6 +199,13 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
         {!!message.content && (message.role === 'assistant' || (isTool && message.role !== 'user')
           ? <MarkdownContent content={message.content} />
           : <div className="message-content">{message.content}</div>)}
+        {finalChangeSet && <FileChangeActivity
+          runId={messageRunId}
+          title={`已编辑 ${finalChangeSet.files.length} 个文件`}
+          status="completed"
+          changeSet={finalChangeSet}
+          onOpenFileChange={onOpenFileChange}
+        />}
         {!!message.citations?.length && <div className="message-citations" aria-label="参考来源">
           <strong>参考来源</strong>
           {message.citations.map((citation, index) => <a key={`${citation.url}-${index}`} href={citation.url} target="_blank" rel="noreferrer">
@@ -210,6 +220,67 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
     </article>
   )
 })
+
+function fileChangeOperationLabel(operation?: string) {
+  if (operation === 'add') return '新增'
+  if (operation === 'delete') return '删除'
+  return '编辑'
+}
+
+// FileChangeActivity 只展示用户关心的文件和行数，不暴露底层 apply_patch 工具名。
+export function FileChangeActivity({
+  runId,
+  title,
+  status,
+  changeSet,
+  onOpenFileChange,
+}: {
+  runId?: string
+  title: string
+  status: ThoughtActivityItem['status']
+  changeSet?: FileChangeSet
+  onOpenFileChange?: (selection: FileChangeSelection) => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const files = changeSet?.files || []
+  const added = changeSet?.added_lines ?? files.reduce((sum, item) => sum + (item.added_lines || 0), 0)
+  const deleted = changeSet?.deleted_lines ?? files.reduce((sum, item) => sum + (item.deleted_lines || 0), 0)
+  const visibleFiles = expanded ? files : files.slice(0, 3)
+  const hiddenCount = Math.max(0, files.length - visibleFiles.length)
+  const open = (change: FileChangeRecord) => {
+    if (runId && onOpenFileChange) onOpenFileChange({ runId, change })
+  }
+  return <section className={`file-change-activity ${status}`} aria-label="文件变更">
+    <div className="file-change-activity-heading">
+      <Pencil size={13} aria-hidden="true" />
+      <strong>{title}</strong>
+      <span className="file-change-totals" aria-label={`新增 ${added} 行，删除 ${deleted} 行`}><b>+{added}</b><em>−{deleted}</em></span>
+    </div>
+    {!!files.length && <div className="file-change-activity-list">
+      {visibleFiles.map((change) => <button
+        type="button"
+        className="file-change-activity-row"
+        key={`${change.path}:${change.operation}`}
+        onClick={() => open(change)}
+        disabled={!runId || !onOpenFileChange}
+        title={`打开 ${change.path} 的${fileChangeOperationLabel(change.operation)}详情`}
+      >
+        <span className={`file-change-kind is-${change.operation}`} aria-hidden="true">{change.operation === 'add' ? '+' : change.operation === 'delete' ? '−' : '✎'}</span>
+        <span className="file-change-path">{change.path}</span>
+        <span className="file-change-line-count"><b>+{change.added_lines || 0}</b><em>−{change.deleted_lines || 0}</em></span>
+      </button>)}
+      {files.length > 3 && <button
+        type="button"
+        className={`file-change-activity-more ${expanded ? 'is-expanded' : ''}`}
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+      >
+        <span>{expanded ? '收起文件' : `再显示 ${hiddenCount} 个文件`}</span>
+        <ChevronDown size={13} aria-hidden="true" />
+      </button>}
+    </div>}
+  </section>
+}
 
 // ThoughtActivityIcon 将时间线语义图标映射为具体 Lucide 图形。
 function ThoughtActivityIcon({ icon }: { icon: ThoughtActivityIcon }) {
@@ -276,6 +347,9 @@ function toolGroupLabel(items: ThoughtActivityItem[]) {
 }
 
 function groupedToolStatus(item: ThoughtActivityItem) {
+  if (item.icon === 'edit' || item.title.startsWith('正在编辑') || item.title.startsWith('已编辑') || item.title === '文件编辑失败') {
+    return item.title
+  }
   if (item.status === 'running') return item.icon === 'shell' ? '正在运行' : '正在调用'
   if (item.status === 'failed') return item.icon === 'shell' ? '运行失败' : '调用失败'
   return item.icon === 'shell' ? '已运行' : '已调用'
@@ -315,6 +389,7 @@ function OrderedRunContent({
   live,
   activeItemId,
   includeFinalAssistant,
+  onOpenFileChange,
 }: {
   items: ThoughtActivityItem[]
   activitiesVisible: boolean
@@ -322,6 +397,7 @@ function OrderedRunContent({
   live?: boolean
   activeItemId?: string
   includeFinalAssistant: boolean
+  onOpenFileChange?: (selection: FileChangeSelection) => void
 }) {
   return <div className="ordered-run-content">
     {orderedContentEntries(items, includeFinalAssistant).map((entry, index) => {
@@ -331,7 +407,7 @@ function OrderedRunContent({
         return <div className="ordered-assistant-content" key={entry.item.id}><MarkdownContent content={entry.item.detail} streaming={Boolean(live && entry.item.status === 'running')} /></div>
       }
       return activitiesVisible
-        ? <ThoughtActivityList key={`activities-${entry.items[0]?.id || index}`} items={entry.items} runId={runId} live={live} activeItemId={activeItemId} />
+        ? <ThoughtActivityList key={`activities-${entry.items[0]?.id || index}`} items={entry.items} runId={runId} live={live} activeItemId={activeItemId} onOpenFileChange={onOpenFileChange} />
         : null
     })}
   </div>
@@ -358,7 +434,7 @@ export function ToolResultDetailPanel({ state, fallbackTitle, onRetry }: { state
 }
 
 // ThoughtActivityList 统一渲染实时与历史活动；完整结果缓存只跟随当前列表实例的生命周期。
-export function ThoughtActivityList({ items, runId, live = false, activeItemId }: { items: ThoughtActivityItem[]; runId?: string; live?: boolean; activeItemId?: string }) {
+export function ThoughtActivityList({ items, runId, live = false, activeItemId, onOpenFileChange }: { items: ThoughtActivityItem[]; runId?: string; live?: boolean; activeItemId?: string; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({})
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({})
   const [detailStates, setDetailStates] = useState<Record<string, ToolResultDetailState>>({})
@@ -376,6 +452,10 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId }
     const expanding = !expandedItems[item.id]
     setExpandedItems((current) => ({ ...current, [item.id]: !current[item.id] }))
     if (expanding) loadDetail(item)
+  }
+  function openInlineChange(item: ThoughtActivityItem) {
+    const change = item.changeSet?.files?.[0]
+    if (runId && change && onOpenFileChange) onOpenFileChange({ runId, change })
   }
   const entries = groupThoughtActivities(items)
     .filter((entry) => entry.kind === 'tool-group' || (entry.item.kind !== 'context' && entry.item.title !== 'Tool Search' && (entry.item.kind !== 'thought' || Boolean(entry.item.detail.trim()))))
@@ -395,16 +475,22 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId }
             {entry.items.map((item) => {
               const itemExpanded = Boolean(expandedItems[item.id])
               const detailRequest = toolResultRequest(runId, live, item.kind, item.id)
-              const expandable = Boolean(item.detail.trim()) || Boolean(detailRequest)
+              const expandable = !item.changeSet && (Boolean(item.detail.trim()) || Boolean(detailRequest))
               return <div className={`tool-activity-group-item ${item.status}`} key={item.id}>
-                <button type="button" className="tool-activity-group-item-toggle" aria-expanded={expandable ? itemExpanded : undefined} disabled={!expandable} onClick={() => expandable && toggleItem(item)}>
+                {item.changeSet?.files?.[0] && runId && onOpenFileChange ? <button type="button" className="tool-activity-group-item-line is-clickable" onClick={() => openInlineChange(item)}>
                   <ToolActivityGlyph icon={item.icon} size={13} />
                   <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>
-                  {expandable && <ChevronRight className="tool-activity-item-chevron" size={13} aria-hidden="true" />}
-                </button>
-                {itemExpanded && (detailRequest
-                  ? <ToolResultDetailPanel state={detailStates[item.id] || { status: 'loading' }} fallbackTitle={item.title} onRetry={() => loadDetail(item)} />
-                  : <div className="tool-activity-group-detail"><strong>{item.title}</strong><pre>{item.detail}</pre></div>)}
+                </button> : expandable ? <button type="button" className="tool-activity-group-item-toggle" aria-expanded={itemExpanded} onClick={() => toggleItem(item)}>
+                  <ToolActivityGlyph icon={item.icon} size={13} />
+                  <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>
+                  <ChevronRight className="tool-activity-item-chevron" size={13} aria-hidden="true" />
+                </button> : <div className="tool-activity-group-item-line">
+                  <ToolActivityGlyph icon={item.icon} size={13} />
+                  <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>
+                </div>}
+                {expandable && itemExpanded && (detailRequest
+                    ? <ToolResultDetailPanel state={detailStates[item.id] || { status: 'loading' }} fallbackTitle={item.title} onRetry={() => loadDetail(item)} />
+                    : <div className="tool-activity-group-detail"><strong>{item.title}</strong><pre>{item.detail}</pre></div>)}
               </div>
             })}
           </div>}
@@ -412,16 +498,16 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId }
       }
       const item = entry.item
       if (item.kind === 'assistant') return <div key={item.id} className="ordered-assistant-content"><MarkdownContent content={item.detail} streaming={Boolean(live && item.status === 'running')} /></div>
+      if (item.kind === 'file-change') return <FileChangeActivity key={item.id} runId={runId} title={item.title} status={item.status} changeSet={item.changeSet} onOpenFileChange={onOpenFileChange} />
       if (item.kind === 'thought') return <p key={item.id} className={`thought-activity-thought ${item.status}`}>{item.detail}</p>
-      // 普通联网搜索保持紧凑；当来源 URL 过长时提供展开入口，避免摘要撑坏标题布局。
-      const hasLongUrl = /https?:\/\/\S{72,}/i.test(item.detail)
       const detailRequest = toolResultRequest(runId, live, item.kind, item.id)
-      const expandable = item.kind === 'tool' && (Boolean(detailRequest) || (Boolean(item.detail.trim()) && (item.title !== '联网搜索' || hasLongUrl)))
+      const hasLongUrl = /https?:\/\/\S{72,}/i.test(item.detail)
+      const expandable = item.kind === 'tool' && !item.changeSet && (Boolean(detailRequest) || (Boolean(item.detail.trim()) && (item.title !== '联网搜索' || hasLongUrl)))
       const expanded = Boolean(expandedItems[item.id])
       return <div key={item.id} className={`thought-activity kind-${item.kind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
         <ThoughtActivityIcon icon={item.icon} />
         <div className="thought-activity-copy">
-          {expandable ? <>
+          {item.changeSet?.files?.[0] && runId && onOpenFileChange ? <button type="button" className="thought-activity-static is-clickable" onClick={() => openInlineChange(item)}><span className="thought-activity-title">{item.title}</span>{item.detail && item.title !== '准备上下文' && <span className="thought-activity-summary">{item.detail}</span>}</button> : expandable ? <>
             <button type="button" className="thought-activity-toggle" aria-expanded={expanded} onClick={() => toggleItem(item)}><span><span className="thought-activity-title">{item.title}</span><span className="thought-activity-summary">{item.detail}</span></span><ChevronRight className="thought-activity-chevron" size={14} aria-hidden="true" /></button>
             {expanded && (detailRequest
               ? <ToolResultDetailPanel state={detailStates[item.id] || { status: 'loading' }} fallbackTitle={item.title} onRetry={() => loadDetail(item)} />
@@ -434,7 +520,7 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId }
 }
 
 // CompletedThoughtTimeline 在助手历史消息上方展示可折叠的执行详情。
-export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({ runId, timeline }: { runId: string; timeline: ThoughtTimelineState }) {
+export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({ runId, timeline, onOpenFileChange }: { runId: string; timeline: ThoughtTimelineState; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const [expanded, setExpanded] = useState(false)
   const duration = formatThoughtDuration(timeline.elapsedMs)
   const items = fallbackThoughtItems(timeline)
@@ -445,12 +531,12 @@ export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({
     {hasDetails ? <button type="button" className="completed-thought-toggle" aria-expanded={expanded} aria-controls={`thought-details-${runId}`} onClick={() => setExpanded((value) => !value)}>
       <span className="completed-thought-duration">执行详情 · 用时 {duration}</span><span className="completed-thought-summary">{summary}</span><ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
     </button> : <span className="completed-thought-duration completed-thought-static">用时 {duration}</span>}
-    {hasDetails && <div id={`thought-details-${runId}`}><OrderedRunContent items={items} activitiesVisible={expanded} runId={runId} includeFinalAssistant={false} /></div>}
+    {hasDetails && <div id={`thought-details-${runId}`}><OrderedRunContent items={items} activitiesVisible={expanded} runId={runId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} /></div>}
   </article>
 })
 
 // 每个运行阶段以独立实例持有计时和展开状态：新运行默认展开，进入终态时默认收起且仍允许用户再次展开。
-function LiveAssistantMessageState({ liveRun, initiallyExpanded }: { liveRun: LiveRunView; initiallyExpanded: boolean }) {
+function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChange }: { liveRun: LiveRunView; initiallyExpanded: boolean; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const [now, setNow] = useState(() => Date.now())
   const [expanded, setExpanded] = useState(initiallyExpanded)
   useEffect(() => {
@@ -498,7 +584,7 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded }: { liveRun: Li
         {hasDetails
           ? <div className={`live-thought ${expanded ? 'expanded' : ''}`}>
             <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
-            <OrderedRunContent items={executionItems} activitiesVisible={expanded} runId={liveRun.runId} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} />
+            <OrderedRunContent items={executionItems} activitiesVisible={expanded} runId={liveRun.runId} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} />
           </div>
           : null}
         {!!finalItems.length && <div className="live-final-content"><OrderedRunContent items={finalItems} activitiesVisible runId={liveRun.runId} live includeFinalAssistant /></div>}
@@ -509,10 +595,10 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded }: { liveRun: Li
 }
 
 // LiveAssistantMessage 合并阶段、实时耗时、活动时间线和逐字回复草稿。
-export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun }: { liveRun: LiveRunView }) {
+export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun, onOpenFileChange }: { liveRun: LiveRunView; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const terminal = liveRun.thought.finished || liveRun.status === 'terminal'
   const stateKey = `${liveRun.runId}:${liveRun.thought.startedAt ?? 'pending'}:${terminal ? 'terminal' : 'active'}`
-  return <LiveAssistantMessageState key={stateKey} liveRun={liveRun} initiallyExpanded={!terminal} />
+  return <LiveAssistantMessageState key={stateKey} liveRun={liveRun} initiallyExpanded={!terminal} onOpenFileChange={onOpenFileChange} />
 })
 
 // ApprovalCard 展示待执行动作及风险信息，并将批准/拒绝决策回传会话协调器。

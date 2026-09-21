@@ -107,8 +107,10 @@
   .page-chat { height: calc(100dvh - 54px); padding: 8px 10px 10px; }
   .chat-shell,
   .chat-shell.child-panel-open { height: calc(100dvh - 72px); grid-template-columns: 190px minmax(0, 1fr); }
-  .child-agent-panel { position: fixed; z-index: 45; top: 54px; right: 0; bottom: 0; width: min(340px, 90vw); box-shadow: var(--shadow-md); transform: translateX(100%); }
-  .child-agent-panel.is-open { transform: translateX(0); }
+  .child-agent-panel,
+  .file-change-panel { position: fixed; z-index: 45; top: 54px; right: 0; bottom: 0; width: min(340px, 90vw); box-shadow: var(--shadow-md); transform: translateX(100%); }
+  .child-agent-panel.is-open,
+  .file-change-panel.is-open { transform: translateX(0); }
 }
 
 @media (max-width: 700px) {

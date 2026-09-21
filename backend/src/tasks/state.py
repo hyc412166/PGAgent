@@ -292,6 +292,15 @@ def sync_todos_for_run(run_id: str, todos: Iterable[Mapping[str, Any]]) -> None:
             step.description = item["active_form"]
             # 变量说明：requested_status 表示当前流程使用的 requested_status 集合。
             requested_status = item["status"]
+            # 子 Agent 步骤由 task 委派动作负责领取；计划工具可能会沿用主 Agent
+            # 的“当前进行中”习惯，但在真正委派前不能把该步骤标成已被占用。
+            # 已经存在 assigned_run_id 的步骤属于真实子运行，不回退其运行状态。
+            if (
+                item["executor_kind"] == "subagent"
+                and requested_status == "in_progress"
+                and step.assigned_run_id is None
+            ):
+                requested_status = "pending"
             # 变量说明：status 表示当前对象或运行的状态。
             step.status = (
                 "completed"

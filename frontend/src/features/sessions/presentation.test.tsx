@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 
-import { ChildAgentPanel, CompletedThoughtTimeline, LiveAssistantMessage, MessageBubble } from './presentation'
+import { ChildAgentPanel, CompletedThoughtTimeline, FileChangeActivity, LiveAssistantMessage, MessageBubble } from './presentation'
 import { createLiveMarkdownCoalescer } from './liveMarkdownCoalescer'
 import { formatApprovalArguments } from './approvalPresentation'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
@@ -196,8 +196,50 @@ describe('助手消息中的思考过程展示', () => {
     expect(sessionsCss).toMatch(/\.tool-activity-icon\s*\{[^}]*align-self:\s*center;/s)
     expect(sessionsCss).toContain('.thought-activity.kind-tool { align-items: start; }')
     expect(sessionsCss).toContain('.thought-activity.kind-tool .thought-activity-icon { align-self: start; transform: translateY(1px); }')
-    expect(sessionsCss).toContain('.tool-activity-group-item-toggle > .tool-activity-icon { flex: 0 0 20px; transform: translateY(1px); }')
-    expect(sessionsCss).toContain('.tool-activity-group-item-toggle > span:not(.tool-activity-icon) {')
+    expect(sessionsCss).toContain('.tool-activity-group-item-line > .tool-activity-icon { flex: 0 0 20px; transform: translateY(1px); }')
+    expect(sessionsCss).toContain('.tool-activity-group-item-line > span:not(.tool-activity-icon) {')
+  })
+
+  it('文件总结超过三个时默认收起并提供展开入口', () => {
+    const markup = renderToStaticMarkup(createElement(FileChangeActivity, {
+      runId: 'run-file-summary',
+      title: '已编辑 4 个文件',
+      status: 'completed',
+      changeSet: {
+        file_count: 4,
+        files: [
+          { path: 'one.py', operation: 'update', added_lines: 1, deleted_lines: 0 },
+          { path: 'two.py', operation: 'update', added_lines: 2, deleted_lines: 1 },
+          { path: 'three.py', operation: 'update', added_lines: 3, deleted_lines: 2 },
+          { path: 'four.py', operation: 'update', added_lines: 4, deleted_lines: 3 },
+        ],
+      },
+      onOpenFileChange: vi.fn(),
+    }))
+
+    expect(markup).toContain('one.py')
+    expect(markup).toContain('three.py')
+    expect(markup).not.toContain('four.py')
+    expect(markup).toContain('再显示 1 个文件')
+  })
+
+  it('执行中的文件编辑行使用普通灰色工具样式且不显示详情箭头', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-inline-file', phase: '执行中', draft: '', status: 'live', error: '', thinkingStatus: '处理中',
+        thought: {
+          startedAt: 1_000, elapsedMs: 0, finished: false, conclusion: '', tools: [],
+          items: [{
+            id: 'edit-config', kind: 'tool', icon: 'edit', title: '已编辑 config.py', detail: '+12 −3', status: 'completed',
+            changeSet: { file_count: 1, files: [{ path: 'config.py', operation: 'update', added_lines: 12, deleted_lines: 3 }] },
+          }],
+        },
+      },
+    }))
+
+    expect(markup).toContain('已编辑 config.py')
+    expect(markup).toContain('+12 −3')
+    expect(markup).not.toContain('thought-activity-chevron')
   })
 
   it('将助手 Markdown 代码块渲染为带语言标签和语法高亮的代码面板', () => {
@@ -647,7 +689,7 @@ describe('助手消息中的思考过程展示', () => {
     expect(markup).toContain('执行详情 · 用时 4s')
   })
 
-  it('普通步骤直接展示且只有工具调用可以展开', () => {
+  it('普通步骤直接展示，Shell 工具保留单条详情展开箭头', () => {
     const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
       liveRun: {
         runId: 'run-2',

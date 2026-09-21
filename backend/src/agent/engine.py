@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from src.context.window import ContextManager, message_tokens
 from src.memory.protocol import memory_system_message, split_memory_citation
+from src.coding.changes import sanitize_change_set
 from .completion import CompletionDecision
 from src.context.assembly import (
     ArtifactStore,
@@ -293,6 +294,15 @@ def safe_tool_result_summary(tool_name: str, content: object, metadata: Mapping[
     if name in {'read', 'read_file', 'read_artifact'}:
         return f'读取完成（{len(text)} 字符）'
     return _safe_argument_text(text, 480) or '执行完成'
+
+
+def _change_event_fields(result: ToolResult) -> dict[str, Any]:
+    """Expose structured file changes without leaking arbitrary tool metadata."""
+
+    if not result.changed:
+        return {}
+    change_set = sanitize_change_set(result.metadata.get("change_set"))
+    return {"change_set": change_set} if change_set is not None else {}
 
 
 # 函数职责：完成 safe_approval_request_summary 对应的智能体处理。
@@ -2849,6 +2859,7 @@ class AgentRuntime:
                     changed=result.changed,
                     error_code=result.error_code,
                     result_summary=safe_tool_result_summary(call.name, result.content, result.metadata),
+                    **_change_event_fields(result),
                     duration_ms=round((self.clock() - tool_started_at) * 1000),
                     elapsed_ms=round((self.clock() - active_started_at) * 1000),
                 )
@@ -3278,6 +3289,7 @@ class AgentRuntime:
             changed=result.changed,
             error_code=result.error_code,
             result_summary=safe_tool_result_summary(tool_name, result.content, result.metadata),
+            **_change_event_fields(result),
             duration_ms=round((self.clock() - tool_started_at) * 1000),
             elapsed_ms=elapsed_ms(),
         )
@@ -3507,6 +3519,8 @@ class AgentRuntime:
                 ok=remaining_result.ok,
                 changed=remaining_result.changed,
                 error_code=remaining_result.error_code,
+                result_summary=safe_tool_result_summary(call.name, remaining_result.content, remaining_result.metadata),
+                **_change_event_fields(remaining_result),
                 duration_ms=round((self.clock() - tool_started_at) * 1000),
                 elapsed_ms=elapsed_ms(),
             )
@@ -3858,6 +3872,7 @@ class AgentRuntime:
                 changed=result.changed,
                 error_code=result.error_code,
                 resumed_after_delegated_child=True,
+                **_change_event_fields(result),
                 duration_ms=round((self.clock() - tool_started_at) * 1000),
                 elapsed_ms=elapsed_ms(),
             )

@@ -291,6 +291,10 @@ def test_write_requires_approval_then_writes(tmp_path: Path) -> None:
     result = write_file(sandbox, "notes/result.txt", "hello", approved=True)
     assert result.ok and result.changed
     assert (tmp_path / "notes" / "result.txt").read_text(encoding="utf-8") == "hello"
+    change = result.metadata["change_set"]["files"][0]
+    assert (change["path"], change["operation"], change["added_lines"], change["deleted_lines"]) == (
+        "notes/result.txt", "add", 1, 0,
+    )
 
 
 # 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_delete_requires_approval_then_deletes_one_file 精确标识本用例的具体条件。
@@ -305,7 +309,12 @@ def test_delete_requires_approval_then_deletes_one_file(tmp_path: Path) -> None:
 
     result = delete_file(sandbox, "old.txt", approved=True)
     assert result.ok and result.changed
-    assert result.metadata == {"path": "old.txt", "kind": "file"}
+    assert result.metadata["path"] == "old.txt"
+    assert result.metadata["kind"] == "file"
+    change = result.metadata["change_set"]["files"][0]
+    assert (change["path"], change["operation"], change["added_lines"], change["deleted_lines"]) == (
+        "old.txt", "delete", 0, 1,
+    )
     assert not target.exists()
 
 

@@ -795,12 +795,19 @@ def edit_file(
             stream.write(updated)
         # 变量说明：replacements 表示当前流程使用的 replacements 集合。
         replacements = matches if replace_all else 1
+        from src.coding.changes import build_file_change
+        relative = sandbox.relative(target)
+        change = build_file_change(relative, "update", original, updated)
         return ToolResult(
             "edit",
             True,
-            f"已修改 {sandbox.relative(target)}，替换 {replacements} 处",
+            f"已修改 {relative}，替换 {replacements} 处",
             changed=updated != original,
-            metadata={"path": sandbox.relative(target), "replacements": replacements},
+            metadata={
+                "path": relative,
+                "replacements": replacements,
+                "change_set": {"status": "applied", "source": "file_tool", "file_count": 1, "files": [change]},
+            },
         )
     except (SandboxViolation, FileNotFoundError, OSError) as exc:
         return ToolResult("edit", False, str(exc), error_code="edit_error")
@@ -2875,14 +2882,18 @@ def write_file(
         target.write_text(content, encoding="utf-8")
         # 变量说明：changed 表示当前步骤使用的 changed 值。
         changed = previous != content
+        from src.coding.changes import build_file_change
+        relative = sandbox.relative(target)
+        change = build_file_change(relative, "update" if previous is not None else "add", previous, content)
         return ToolResult(
             "write_file",
             True,
-            f"已写入 {sandbox.relative(target)} ({len(content.encode('utf-8'))} bytes)",
+            f"已写入 {relative} ({len(content.encode('utf-8'))} bytes)",
             changed=changed,
             metadata={
-                "path": sandbox.relative(target),
+                "path": relative,
                 "operation": "update" if previous is not None else "add",
+                "change_set": {"status": "applied", "source": "file_tool", "file_count": 1, "files": [change]},
             },
         )
     except (SandboxViolation, OSError) as exc:
@@ -2949,6 +2960,11 @@ def delete_file(
         if not approved:
             return _approval("delete", arguments, f"删除文件需要批准: {relative_path}")
         # 变量说明：deleted_path 表示deleted_path 对应的文件系统位置。
+        # 在安全删除前读取快照，供历史变更面板展示被删除内容。
+        try:
+            previous_bytes = target.read_bytes()
+        except OSError:
+            previous_bytes = None
         deleted_path = _atomic_delete_regular_file(sandbox, path)
         if deleted_path is None:
             return ToolResult(
@@ -2957,12 +2973,18 @@ def delete_file(
                 f"文件不存在，无需删除: {relative_path}",
                 metadata={"path": relative_path, "kind": "missing"},
             )
+        from src.coding.changes import build_file_change
+        change = build_file_change(deleted_path, "delete", previous_bytes, None)
         return ToolResult(
             "delete",
             True,
             f"已删除 {deleted_path}",
             changed=True,
-            metadata={"path": deleted_path, "kind": "file"},
+            metadata={
+                "path": deleted_path,
+                "kind": "file",
+                "change_set": {"status": "applied", "source": "file_tool", "file_count": 1, "files": [change]},
+            },
         )
     except (SandboxViolation, OSError, ValueError) as exc:
         return ToolResult("delete", False, str(exc), error_code="path_error")
