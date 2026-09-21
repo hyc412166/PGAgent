@@ -9,6 +9,8 @@
 
 .chat-shell {
   height: calc(100dvh - 24px);
+  position: relative;
+  --session-side-panel-width: 290px;
   display: grid;
   grid-template-columns: 226px minmax(0, 1fr) 0;
   overflow: hidden;
@@ -20,7 +22,40 @@
 }
 
 .chat-shell:not(.child-panel-open) { grid-template-columns: 226px minmax(0, 1fr) 0; }
-.chat-shell.child-panel-open { grid-template-columns: 226px minmax(0, 1fr) 290px; }
+.chat-shell.child-panel-open { grid-template-columns: 226px minmax(0, 1fr) var(--session-side-panel-width); }
+
+.chat-shell.is-resizing { transition: none; }
+
+.side-panel-resizer {
+  position: absolute;
+  z-index: 6;
+  top: 0;
+  right: var(--session-side-panel-width);
+  width: 10px;
+  height: 100%;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.side-panel-resizer::before {
+  position: absolute;
+  inset: 0 auto 0 4px;
+  width: 2px;
+  content: '';
+  border-radius: 999px;
+  background: transparent;
+  transition: background-color .16s ease, box-shadow .16s ease;
+}
+
+.side-panel-resizer:hover::before,
+.side-panel-resizer:focus-visible::before,
+.side-panel-resizer.is-dragging::before {
+  background: var(--ocean-500);
+  box-shadow: 0 0 0 3px rgb(23 111 142 / 12%);
+}
+
+.side-panel-resizer:focus-visible { outline: 0; }
 
 .session-list {
   padding: 11px 8px 13px;
@@ -968,7 +1003,7 @@
 .context-compacting .context-ring-value { stroke: var(--scarf); }
 
 .child-agent-panel {
-  width: 290px;
+  width: 100%;
   border-left-color: var(--line);
   background: rgb(232 248 253 / 78%);
   opacity: 0;
@@ -981,7 +1016,7 @@
 
 /* 文件变更面板复用协作侧栏的空间节奏，但采用更高密度的代码阅读表面。 */
 .file-change-panel {
-  width: 290px;
+  width: 100%;
   min-width: 0;
   overflow: hidden;
   border-left: 1px solid var(--line);

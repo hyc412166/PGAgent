@@ -1,6 +1,6 @@
 // 本文件实现 SessionsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { AlertCircle, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
-import { type FormEvent, type SetStateAction, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type SetStateAction, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, describeError } from '../../api'
 import { attachmentForm, attachmentSignature, formatAttachmentSize, selectAttachmentFiles } from '../../attachments'
@@ -32,6 +32,22 @@ import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, Fi
 
 type ChildPanelState = { sessionId: string; open: boolean; autoOpened: boolean }
 type WorkspaceExpansion = { contextKey: string; ids: Set<string> }
+type SidePanelResizeBounds = { min: number; max: number }
+type SidePanelResizeInteraction = SidePanelResizeBounds & { pointerId: number; startX: number; startWidth: number }
+
+const SIDE_PANEL_DEFAULT_WIDTH = 290
+const SIDE_PANEL_MIN_WIDTH = 240
+const SIDE_PANEL_MAX_WIDTH = 620
+const CONVERSATION_MIN_WIDTH = 320
+
+// 分隔条的计算保持为纯函数，鼠标和键盘调整共用同一套边界规则。
+function clampSidePanelWidth(width: number, bounds: SidePanelResizeBounds): number {
+  return Math.min(bounds.max, Math.max(bounds.min, width))
+}
+
+function sidePanelWidthAfterDrag(startWidth: number, startX: number, currentX: number, bounds: SidePanelResizeBounds): number {
+  return clampSidePanelWidth(startWidth + startX - currentX, bounds)
+}
 
 // 首次加载会话列表时直接派生选中项，草稿模式则始终保持未持久化状态。
 function resolveActiveSessionId(selectedSessionId: string, draftActive: boolean, sessions: Session[]): string {
@@ -108,6 +124,8 @@ function SessionsPage() {
   const thinkingSubmenuRef = useRef<HTMLDivElement>(null)
   const addMenuRef = useRef<HTMLDivElement>(null)
   const permissionMenuRef = useRef<HTMLDivElement>(null)
+  const chatShellRef = useRef<HTMLDivElement>(null)
+  const sidePanelResizeRef = useRef<SidePanelResizeInteraction | null>(null)
   // actionError 汇集会话动作失败；draft* 表示尚未持久化的新会话及其项目/设置。
   const [decidingApproval, setDecidingApproval] = useState('')
   const [actionError, setActionError] = useState('')
@@ -126,6 +144,9 @@ function SessionsPage() {
   const [childPanelState, setChildPanelState] = useState<ChildPanelState>({ sessionId: '', open: false, autoOpened: false })
   const [selectedChildTaskId, setSelectedChildTaskId] = useState('')
   const [fileChangeSelection, setFileChangeSelection] = useState<FileChangeSelection | null>(null)
+  const [sidePanelWidth, setSidePanelWidth] = useState<number | null>(null)
+  const [sidePanelResizing, setSidePanelResizing] = useState(false)
+  const [sidePanelResizeBounds, setSidePanelResizeBounds] = useState<SidePanelResizeBounds>({ min: SIDE_PANEL_MIN_WIDTH, max: SIDE_PANEL_MAX_WIDTH })
   // 运输层 refs 跨渲染保存 EventSource、计时器、事件去重集合和当前运行 ID，交给 useRunTransport 管理。
   const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRun)
   const eventSourceRef = useRef<EventSource | null>(null)
@@ -300,6 +321,73 @@ function SessionsPage() {
     setChildPanelOpen(false)
   }, [setChildPanelOpen])
   const sidePanelOpen = childPanelOpen || Boolean(fileChangeSelection)
+  const chatShellStyle = sidePanelWidth === null
+    ? undefined
+    : { '--session-side-panel-width': `${sidePanelWidth}px` } as CSSProperties
+
+  function resolveSidePanelResizeBounds(): SidePanelResizeBounds {
+    const shell = chatShellRef.current
+    if (!shell) return { min: SIDE_PANEL_MIN_WIDTH, max: SIDE_PANEL_MAX_WIDTH }
+    const sessionList = shell.querySelector<HTMLElement>('.session-list')
+    const availableWidth = shell.clientWidth - (sessionList?.offsetWidth ?? 226) - CONVERSATION_MIN_WIDTH
+    return { min: SIDE_PANEL_MIN_WIDTH, max: Math.max(SIDE_PANEL_MIN_WIDTH, Math.min(SIDE_PANEL_MAX_WIDTH, availableWidth)) }
+  }
+
+  function readSidePanelWidth(): number {
+    const shell = chatShellRef.current
+    const cssWidth = shell ? Number.parseFloat(getComputedStyle(shell).getPropertyValue('--session-side-panel-width')) : Number.NaN
+    return Number.isFinite(cssWidth) ? cssWidth : SIDE_PANEL_DEFAULT_WIDTH
+  }
+
+  function handleSidePanelPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
+    const bounds = resolveSidePanelResizeBounds()
+    const startWidth = sidePanelWidth ?? readSidePanelWidth()
+    sidePanelResizeRef.current = { ...bounds, pointerId: event.pointerId, startX: event.clientX, startWidth }
+    setSidePanelResizeBounds(bounds)
+    setSidePanelResizing(true)
+    event.currentTarget.setPointerCapture(event.pointerId)
+    event.preventDefault()
+  }
+
+  function handleSidePanelPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const interaction = sidePanelResizeRef.current
+    if (!interaction || interaction.pointerId !== event.pointerId) return
+    setSidePanelWidth(sidePanelWidthAfterDrag(interaction.startWidth, interaction.startX, event.clientX, interaction))
+  }
+
+  function finishSidePanelPointerResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const interaction = sidePanelResizeRef.current
+    if (!interaction || interaction.pointerId !== event.pointerId) return
+    sidePanelResizeRef.current = null
+    setSidePanelResizing(false)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+  }
+
+  function handleSidePanelKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return
+    const bounds = resolveSidePanelResizeBounds()
+    const currentWidth = sidePanelWidth ?? readSidePanelWidth()
+    const delta = event.shiftKey ? 32 : 16
+    const nextWidth = currentWidth + (event.key === 'ArrowLeft' ? delta : -delta)
+    setSidePanelResizeBounds(bounds)
+    setSidePanelWidth(clampSidePanelWidth(nextWidth, bounds))
+    event.preventDefault()
+  }
+
+  // 窗口缩放后重新计算可用空间，避免已拖宽的侧栏挤压对话区或造成横向溢出。
+  useLayoutEffect(() => {
+    if (!sidePanelOpen) return
+    const syncSidePanelBounds = () => {
+      const bounds = resolveSidePanelResizeBounds()
+      setSidePanelResizeBounds(bounds)
+      setSidePanelWidth((current) => current === null ? current : clampSidePanelWidth(current, bounds))
+    }
+    syncSidePanelBounds()
+    window.addEventListener('resize', syncSidePanelBounds)
+    return () => window.removeEventListener('resize', syncSidePanelBounds)
+  }, [sidePanelOpen])
+
   const sessionNavigation = buildSessionNavigation(workspaces.data, mergePendingSession(sessions.data, pendingSession))
   const activeChildTask = visibleChildTasks.find((task) => task.id === selectedChildTaskId) ?? visibleChildTasks[0]
   const childTaskRunId = stringId(activeChildTask?.child_run_id) || stringId(activeChildTask?.result?.child_run_id)
@@ -1119,7 +1207,7 @@ function SessionsPage() {
   const dependencyErrors = [agents.error, workspaces.error, connections.error].filter(Boolean)
   return (
     <div className="page page-chat">
-      <div className={`chat-shell ${sidePanelOpen ? 'child-panel-open' : ''}`}>
+      <div ref={chatShellRef} className={`chat-shell ${sidePanelOpen ? 'child-panel-open' : ''}${sidePanelResizing ? ' is-resizing' : ''}`} style={chatShellStyle}>
           <aside className="session-list project-session-sidebar" onScroll={() => setProjectHoverCard(null)}>
             <section className="draft-tree-section">
               <button type="button" className="new-draft-button" disabled={sending} onClick={beginDraft}><Plus size={14} />新建对话</button>
@@ -1340,6 +1428,21 @@ function SessionsPage() {
               </div>
             </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={beginDraft}>新建对话</button>} />}
           </section>
+          {sidePanelOpen && <div
+            className={`side-panel-resizer${sidePanelResizing ? ' is-dragging' : ''}`}
+            role="separator"
+            tabIndex={0}
+            aria-label="调整侧栏宽度"
+            aria-orientation="vertical"
+            aria-valuemin={sidePanelResizeBounds.min}
+            aria-valuemax={sidePanelResizeBounds.max}
+            aria-valuenow={Math.round(sidePanelWidth ?? readSidePanelWidth())}
+            onPointerDown={handleSidePanelPointerDown}
+            onPointerMove={handleSidePanelPointerMove}
+            onPointerUp={finishSidePanelPointerResize}
+            onPointerCancel={finishSidePanelPointerResize}
+            onKeyDown={handleSidePanelKeyDown}
+          />}
           {fileChangeSelection ? <FileChangePanel selection={fileChangeSelection} onClose={() => setFileChangeSelection(null)} /> : <ChildAgentPanel
             open={childPanelOpen}
             tasks={visibleChildTasks}
@@ -1369,6 +1472,6 @@ function SessionsPage() {
 }
 
 
-const SessionsPageState = { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveExpandedWorkspaceIds, resolveMenuOpen }
+const SessionsPageState = { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveExpandedWorkspaceIds, resolveMenuOpen, clampSidePanelWidth, sidePanelWidthAfterDrag }
 
 export { SessionsPage, SessionsPageState }
