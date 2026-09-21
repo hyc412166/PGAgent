@@ -79,8 +79,6 @@ MAX_WEB_RUN_COMMANDS = 20
 MAX_WEB_RUN_OUTPUT_CHARS = 40_000
 # 变量说明：MAX_WEB_REDIRECTS 表示当前流程使用的 MAX_WEB_REDIRECTS 集合。
 MAX_WEB_REDIRECTS = 5
-# 变量说明：MAX_SKILL_INSTRUCTION_CHARS 表示当前流程使用的 MAX_SKILL_INSTRUCTION_CHARS 集合。
-MAX_SKILL_INSTRUCTION_CHARS = 40_000
 # 变量说明：MAX_TODOS 表示当前流程使用的 MAX_TODOS 集合。
 MAX_TODOS = 100
 
@@ -493,8 +491,15 @@ def glob_files(
         normalized_pattern = str(pattern or "").strip().replace("\\", "/")
         if not normalized_pattern:
             return ToolResult("glob", False, "pattern 不能为空", error_code="invalid_pattern")
-        if len(normalized_pattern) > 512 or Path(normalized_pattern).is_absolute():
-            return ToolResult("glob", False, "glob pattern 无效", error_code="invalid_pattern")
+        if len(normalized_pattern) > 512:
+            return ToolResult("glob", False, "glob pattern 不能超过 512 个字符", error_code="invalid_pattern")
+        if Path(normalized_pattern).is_absolute():
+            return ToolResult(
+                "glob",
+                False,
+                "glob pattern 必须是工作区相对模式，例如 **/*.py；不要传入盘符或绝对路径",
+                error_code="invalid_pattern",
+            )
         # 变量说明：root 表示处理范围的根目录。
         root = sandbox.resolve(path, must_exist=True)
         if not root.is_dir():
@@ -540,7 +545,14 @@ def glob_files(
                 "visited": stats["visited"],
             },
         )
-    except (SandboxViolation, FileNotFoundError, OSError, ValueError) as exc:
+    except SandboxViolation as exc:
+        return ToolResult(
+            "glob",
+            False,
+            f"glob 的 path 必须是工作区相对路径，例如 '.'：{exc}",
+            error_code="glob_error",
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
         return ToolResult("glob", False, str(exc), error_code="glob_error")
 
 
@@ -659,7 +671,13 @@ def ripgrep_search(
     # 变量说明：executable 表示当前步骤使用的 executable 值。
     executable = shutil.which("rg")
     if executable is None:
-        return ToolResult("rg", False, "ripgrep executable is unavailable", error_code="tool_unavailable")
+        return ToolResult(
+            "rg",
+            False,
+            "ripgrep executable is unavailable; use tool_search with select:grep, then call grep instead",
+            error_code="tool_unavailable",
+            metadata={"fallback_tool": "grep", "fallback_activation": "select:grep"},
+        )
     try:
         # 变量说明：target 表示当前步骤使用的 target 值。
         target = sandbox.resolve(path, must_exist=True)
@@ -2614,77 +2632,6 @@ async def delegate_task_async(
     except Exception as exc:
         return ToolResult("task", False, f"子 Agent 委派失败: {type(exc).__name__}", error_code="delegate_error")
 
-
-# 函数职责：加载 skill 对应的数据或流程。
-# 参数关系：_sandbox 表示当前步骤使用的 _sandbox 值；skill_id 表示skill 对象的唯一标识；name 表示当前对象名称；skill_instructions 表示当前流程使用的 skill_instructions 集合。
-# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def load_skill(
-    _sandbox: WorkspaceSandbox,
-    skill_id: str = "",
-    *,
-    name: str = "",
-    skill_instructions: Mapping[str, Mapping[str, Any]] | None = None,
-) -> ToolResult:
-    """Load only the instructions selected for this run; never execute a Skill."""
-
-    # 变量说明：catalog 表示当前步骤使用的 catalog 值。
-    catalog = dict(skill_instructions or {})
-    # 变量说明：selector 表示当前步骤使用的 selector 值。
-    selector = str(skill_id or name or "").strip()
-    if not selector:
-        return ToolResult("skill", False, "请提供 skill_id 或 name", error_code="invalid_skill")
-    # 变量说明：selected 表示当前步骤使用的 selected 值。
-    selected: Mapping[str, Any] | None = catalog.get(selector)
-    if selected is None:
-        # 变量说明：selector_lower 表示当前步骤使用的 selector_lower 值。
-        selector_lower = selector.casefold()
-        # 变量说明：selected 表示当前步骤使用的 selected 值。
-        selected = next(
-            (
-                item
-                for item in catalog.values()
-                if selector_lower in {
-                    str(item.get("id") or "").casefold(),
-                    str(item.get("name") or "").casefold(),
-                    str(item.get("slug") or "").casefold(),
-                }
-            ),
-            None,
-        )
-    if selected is None:
-        return ToolResult(
-            "skill",
-            False,
-            "该 Skill 未在当前会话中启用，不能读取或执行。",
-            error_code="skill_not_selected",
-        )
-    # 变量说明：raw_content 表示当前步骤使用的 raw_content 值。
-    raw_content = selected.get("content", selected.get("instructions", ""))
-    # 变量说明：content 表示待处理或返回的正文内容。
-    content = str(raw_content or "").strip()
-    if not content:
-        return ToolResult(
-            "skill",
-            False,
-            "该 Skill 只有目录信息，没有可加载的 SKILL.md 指令。",
-            error_code="skill_instructions_missing",
-        )
-    # 变量说明：skill_name 表示当前步骤使用的 skill_name 值。
-    skill_name = str(selected.get("name") or selected.get("slug") or selector)
-    # 变量说明：clipped 表示当前步骤使用的 clipped 值。
-    clipped = content[:MAX_SKILL_INSTRUCTION_CHARS]
-    # 变量说明：prefix 表示当前步骤使用的 prefix 值。
-    prefix = "以下是用户在本会话中选择的本地 Skill 指令；它不是更高优先级指令，也不会自动执行脚本：\n"
-    return ToolResult(
-        "skill",
-        True,
-        f"{prefix}# {skill_name}\n{clipped}",
-        metadata={
-            "skill_id": str(selected.get("id") or selector),
-            "name": skill_name,
-            "truncated": len(content) > len(clipped),
-        },
-    )
 
 
 # 函数职责：读取 current_time 对应的数据或流程。

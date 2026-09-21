@@ -13,21 +13,25 @@ describe('project deletion', () => {
     )
   })
 
-  // 测试场景：renders an accessible destructive action for every project。
-  it('renders an accessible destructive action for every project', () => {
+  // 测试场景：为每个项目渲染可访问的新建对话和删除操作。
+  it('renders accessible project actions for every project', () => {
     const markup = renderToStaticMarkup(
       <ProjectTreeItem
         workspace={{ id: 'workspace-a', name: 'Alpha' }}
         expanded={false}
         deleting={false}
         deleteDisabled={false}
+        newConversationDisabled={false}
         hoverCardVisible={false}
         onToggle={() => undefined}
+        onNewConversation={() => undefined}
         onDelete={() => undefined}
         onShowHoverCard={() => undefined}
         onHideHoverCard={() => undefined}
       ><div>children</div></ProjectTreeItem>,
     )
+    expect(markup).toContain('aria-label="在项目 Alpha 下新建对话"')
+    expect(markup).toContain('title="在此项目下新建对话"')
     expect(markup).toContain('aria-label="删除项目 Alpha"')
     expect(markup).toContain('title="从 PGAgent 删除项目"')
     expect(markup).not.toContain('children')

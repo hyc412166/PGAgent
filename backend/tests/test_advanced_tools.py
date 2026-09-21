@@ -17,7 +17,7 @@ from src.tools import create_default_registry
 # CLAW_TOOL_NAMES 是需要兼容执行但不暴露给新模型的 Claw 工具集合；用于核对回放契约与可见工具面分离。
 CLAW_TOOL_NAMES = {
     "bash", "read_file", "write_file", "edit_file", "glob_search", "grep_search",
-    "WebFetch", "WebSearch", "TodoWrite", "Skill", "Agent", "ToolSearch",
+    "WebFetch", "WebSearch", "TodoWrite", "Agent", "ToolSearch",
     "NotebookEdit", "Sleep", "SendUserMessage", "Config", "EnterPlanMode",
     "ExitPlanMode", "StructuredOutput", "REPL", "PowerShell", "AskUserQuestion",
     "TaskCreate", "RunTaskPacket", "TaskGet", "TaskList", "TaskStop", "TaskUpdate",
@@ -31,7 +31,7 @@ CLAW_TOOL_NAMES = {
 
 # LEARN_TOOL_NAMES 是 Learn 兼容工具集合，与上方 Claw 集合共同验证旧轨迹仍可执行。
 LEARN_TOOL_NAMES = {
-    "load_skill", "compress", "background_run", "check_background", "task_create",
+    "compress", "background_run", "check_background", "task_create",
     "task_get", "task_update", "task_list", "spawn_teammate", "list_teammates",
     "send_message", "read_inbox", "broadcast", "shutdown_request", "plan_approval",
     "integrate_teammate", "idle", "claim_task",

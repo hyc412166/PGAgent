@@ -24,7 +24,6 @@ DEBUG_PROFILE = WorkflowProfile(
         "grep",
         "question",
         "read_artifact",
-        "skill",
         "update_plan",
         "validate",
         "validate_baseline",

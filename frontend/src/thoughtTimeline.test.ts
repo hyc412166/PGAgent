@@ -30,6 +30,18 @@ describe('实时 Thought 时间线', () => {
     expect(completed.items.find((item) => item.kind === 'tool')?.detail).toContain('读取：.gitignore')
   })
 
+  it('为每个模型轮次重置等待计时，但保留整次执行总耗时', () => {
+    const firstStep = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+    const firstSummary = updateThoughtTimeline(firstStep, { type: 'thought_summary', step: 1, summary: '先检查项目结构。' }, 1_450)
+    const secondStep = updateThoughtTimeline(firstSummary, { type: 'model_step_started', step: 2 }, 2_000)
+    const completed = updateThoughtTimeline(secondStep, { type: 'run_completed' }, 2_750)
+
+    expect(firstStep).toMatchObject({ activeStepStartedAt: 1_000, activeStepHasVisibleContent: false })
+    expect(firstSummary).toMatchObject({ startedAt: 1_000, activeStepStartedAt: 1_000, activeStepHasVisibleContent: true })
+    expect(secondStep).toMatchObject({ startedAt: 1_000, activeStepStartedAt: 2_000, activeStepHasVisibleContent: false })
+    expect(completed).toMatchObject({ startedAt: 1_000, elapsedMs: 1_750, finished: true })
+  })
+
   // 测试场景：文件修改工具只展示用户可读的文件记录，不泄露 apply_patch 工具名。
   it('把文件修改工具转换为可点击的文件变更活动', () => {
     const running = updateThoughtTimeline(emptyThoughtTimeline, {

@@ -21,6 +21,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { memo } from 'react'
+import type { ReactNode } from 'react'
 import { formatLiveThinkingDuration, formatThoughtDuration, parseFileChangeSet, type ThoughtActivityIcon, type ThoughtActivityItem, type ThoughtTimelineState } from '../../thoughtTimeline'
 import { apiUrl, describeError } from '../../api'
 import { formatAttachmentSize, messageAttachments } from '../../attachments'
@@ -311,6 +312,19 @@ function ToolActivityGlyph({ icon, size }: { icon: ThoughtActivityIcon; size: nu
   return <span className={className}>{glyph}</span>
 }
 
+// ThinkingWaitLine 只在当前模型轮次尚无可见输出时出现；逐字动效不改变可访问名称。
+function ThinkingWaitLine({ status, elapsedMs }: { status: string; elapsedMs: number }) {
+  const characters = Array.from(status)
+  const duration = formatLiveThinkingDuration(elapsedMs)
+  return <div className="thought-waiting" aria-label={`${status}，已等待 ${duration}`}>
+    <span className="thought-waiting-dot" aria-hidden="true" />
+    <span className="thought-waiting-text" aria-hidden="true">
+      {characters.map((character, index) => <span key={`${character}-${index}`} style={{ animationDelay: `${(index % 18) * 55}ms` }}>{character === ' ' ? '\u00a0' : character}</span>)}
+    </span>
+    <time className="thought-waiting-duration" aria-hidden="true">{duration}</time>
+  </div>
+}
+
 // 同类工具组沿用共同语义；混合工具组使用通用图标，避免标题偏向其中任意一种工具。
 function groupedActivityIcon(items: ThoughtActivityItem[]): ThoughtActivityIcon {
   const firstIcon = items[0]?.icon || 'generic'
@@ -433,10 +447,19 @@ export function ToolResultDetailPanel({ state, fallbackTitle, onRetry }: { state
   </div>
 }
 
+// CollapsibleRegion 只在首次打开后保留内容，让 CSS 可以完成可打断的收起并保留详情缓存。
+function CollapsibleRegion({ expanded, mounted = expanded, children, id, className = '' }: { expanded: boolean; mounted?: boolean; children: ReactNode; id?: string; className?: string }) {
+  return <div id={id} className={`collapsible-region ${expanded ? 'is-expanded' : ''} ${className}`.trim()} aria-hidden={!expanded}>
+    <div className="collapsible-region-inner">{mounted ? children : null}</div>
+  </div>
+}
+
 // ThoughtActivityList 统一渲染实时与历史活动；完整结果缓存只跟随当前列表实例的生命周期。
 export function ThoughtActivityList({ items, runId, live = false, activeItemId, onOpenFileChange }: { items: ThoughtActivityItem[]; runId?: string; live?: boolean; activeItemId?: string; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({})
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({})
+  const [mountedItems, setMountedItems] = useState<Record<string, boolean>>({})
+  const [mountedGroups, setMountedGroups] = useState<Record<string, boolean>>({})
   const [detailStates, setDetailStates] = useState<Record<string, ToolResultDetailState>>({})
   const [detailLoader] = useState(() => createToolResultDetailLoader())
   function loadDetail(item: ThoughtActivityItem) {
@@ -450,8 +473,14 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
   }
   function toggleItem(item: ThoughtActivityItem) {
     const expanding = !expandedItems[item.id]
+    if (expanding) setMountedItems((current) => ({ ...current, [item.id]: true }))
     setExpandedItems((current) => ({ ...current, [item.id]: !current[item.id] }))
     if (expanding) loadDetail(item)
+  }
+  function toggleGroup(id: string) {
+    const expanding = !expandedGroups[id]
+    if (expanding) setMountedGroups((current) => ({ ...current, [id]: true }))
+    setExpandedGroups((current) => ({ ...current, [id]: !current[id] }))
   }
   function openInlineChange(item: ThoughtActivityItem) {
     const change = item.changeSet?.files?.[0]
@@ -466,12 +495,13 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
         const expanded = Boolean(expandedGroups[entry.id])
         const label = toolGroupLabel(entry.items)
         return <section className={`tool-activity-group ${expanded ? 'expanded' : ''}`} key={entry.id}>
-          <button type="button" className="tool-activity-group-toggle" aria-expanded={expanded} onClick={() => setExpandedGroups((current) => ({ ...current, [entry.id]: !current[entry.id] }))}>
+          <button type="button" className="tool-activity-group-toggle" aria-expanded={expanded} onClick={() => toggleGroup(entry.id)}>
             <ToolActivityGlyph icon={groupedActivityIcon(entry.items)} size={14} />
             <span>{label}</span>
             <ChevronRight className="tool-activity-group-chevron" size={14} aria-hidden="true" />
           </button>
-          {expanded && <div className="tool-activity-group-items">
+          <CollapsibleRegion expanded={expanded} mounted={Boolean(mountedGroups[entry.id]) || expanded} className="tool-activity-group-collapse">
+            <div className="tool-activity-group-items">
             {entry.items.map((item) => {
               const itemExpanded = Boolean(expandedItems[item.id])
               const detailRequest = toolResultRequest(runId, live, item.kind, item.id)
@@ -488,12 +518,15 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
                   <ToolActivityGlyph icon={item.icon} size={13} />
                   <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>
                 </div>}
-                {expandable && itemExpanded && (detailRequest
+                {expandable && <CollapsibleRegion expanded={itemExpanded} mounted={Boolean(mountedItems[item.id]) || itemExpanded} className="tool-activity-item-collapse">
+                  {detailRequest
                     ? <ToolResultDetailPanel state={detailStates[item.id] || { status: 'loading' }} fallbackTitle={item.title} onRetry={() => loadDetail(item)} />
-                    : <div className="tool-activity-group-detail"><strong>{item.title}</strong><pre>{item.detail}</pre></div>)}
+                    : <div className="tool-activity-group-detail"><strong>{item.title}</strong><pre>{item.detail}</pre></div>}
+                </CollapsibleRegion>}
               </div>
             })}
-          </div>}
+            </div>
+          </CollapsibleRegion>
         </section>
       }
       const item = entry.item
@@ -509,9 +542,11 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
         <div className="thought-activity-copy">
           {item.changeSet?.files?.[0] && runId && onOpenFileChange ? <button type="button" className="thought-activity-static is-clickable" onClick={() => openInlineChange(item)}><span className="thought-activity-title">{item.title}</span>{item.detail && item.title !== '准备上下文' && <span className="thought-activity-summary">{item.detail}</span>}</button> : expandable ? <>
             <button type="button" className="thought-activity-toggle" aria-expanded={expanded} onClick={() => toggleItem(item)}><span><span className="thought-activity-title">{item.title}</span><span className="thought-activity-summary">{item.detail}</span></span><ChevronRight className="thought-activity-chevron" size={14} aria-hidden="true" /></button>
-            {expanded && (detailRequest
+            <CollapsibleRegion expanded={expanded} mounted={Boolean(mountedItems[item.id]) || expanded} className="thought-activity-detail-collapse">
+              {detailRequest
               ? <ToolResultDetailPanel state={detailStates[item.id] || { status: 'loading' }} fallbackTitle={item.title} onRetry={() => loadDetail(item)} />
-              : <div className="thought-activity-detail">{item.detail}</div>)}
+              : <div className="thought-activity-detail">{item.detail}</div>}
+            </CollapsibleRegion>
           </> : <div className="thought-activity-static"><span className="thought-activity-title">{item.title}</span>{item.detail && item.title !== '准备上下文' && <span className="thought-activity-summary">{item.detail}</span>}</div>}
         </div>
       </div>
@@ -522,16 +557,21 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
 // CompletedThoughtTimeline 在助手历史消息上方展示可折叠的执行详情。
 export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({ runId, timeline, onOpenFileChange }: { runId: string; timeline: ThoughtTimelineState; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const [expanded, setExpanded] = useState(false)
+  const [mounted, setMounted] = useState(false)
   const duration = formatThoughtDuration(timeline.elapsedMs)
   const items = fallbackThoughtItems(timeline)
   const hasDetails = hasActivityDetails(items)
   const summary = timeline.conclusion || '执行完成'
+  const toggleExpanded = () => {
+    if (!expanded) setMounted(true)
+    setExpanded((value) => !value)
+  }
 
   return <article className={`completed-thought ${hasDetails && expanded ? 'expanded' : ''} ${hasDetails ? '' : 'no-details'}`}>
-    {hasDetails ? <button type="button" className="completed-thought-toggle" aria-expanded={expanded} aria-controls={`thought-details-${runId}`} onClick={() => setExpanded((value) => !value)}>
+    {hasDetails ? <button type="button" className="completed-thought-toggle" aria-expanded={expanded} aria-controls={`thought-details-${runId}`} onClick={toggleExpanded}>
       <span className="completed-thought-duration">执行详情 · 用时 {duration}</span><span className="completed-thought-summary">{summary}</span><ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
     </button> : <span className="completed-thought-duration completed-thought-static">用时 {duration}</span>}
-    {hasDetails && <div id={`thought-details-${runId}`}><OrderedRunContent items={items} activitiesVisible={expanded} runId={runId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} /></div>}
+    {hasDetails && <CollapsibleRegion id={`thought-details-${runId}`} expanded={expanded} mounted={mounted || expanded} className="completed-thought-collapse"><OrderedRunContent items={items} activitiesVisible runId={runId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} /></CollapsibleRegion>}
   </article>
 })
 
@@ -539,20 +579,13 @@ export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({
 function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChange }: { liveRun: LiveRunView; initiallyExpanded: boolean; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const [now, setNow] = useState(() => Date.now())
   const [expanded, setExpanded] = useState(initiallyExpanded)
+  const [mounted, setMounted] = useState(initiallyExpanded)
   useEffect(() => {
     if (liveRun.thought.startedAt === null || liveRun.thought.finished) return
     const timer = window.setInterval(() => setNow(Date.now()), 1_000)
     return () => window.clearInterval(timer)
   }, [liveRun.thought.finished, liveRun.thought.startedAt])
-  const liveThoughtMs = liveRun.thought.startedAt === null ? 0 : Math.max(0, now - liveRun.thought.startedAt)
-  const operationalPhase = liveRun.phase.startsWith('正在连接 MCP') || liveRun.phase.startsWith('MCP ')
-  const phase = liveRun.phase.includes('子 Agent')
-    ? liveRun.phase
-    : operationalPhase
-      ? liveRun.phase
-    : !liveRun.thought.finished && liveRun.status !== 'awaiting_approval' && liveRun.thinkingStatus
-      ? `${liveRun.thinkingStatus} ${formatLiveThinkingDuration(liveThoughtMs)}`
-      : liveRun.phase || '已完成'
+  const phase = liveRun.phase || (liveRun.thought.finished ? '已完成' : '思考中…')
   const items = fallbackThoughtItems(liveRun.thought)
   const assistantItems = liveRun.assistantItems?.length
     ? liveRun.assistantItems
@@ -577,14 +610,29 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChang
   const executionItems = displayItems.filter((item) => item.kind !== 'assistant' || item.phase !== 'final_answer')
   const finalItems = displayItems.filter((item) => item.kind === 'assistant' && item.phase === 'final_answer')
   const hasDetails = hasActivityDetails(executionItems)
+  const activeStepStartedAt = liveRun.thought.activeStepStartedAt ?? liveRun.thought.startedAt
+  const activeStepHasVisibleContent = liveRun.thought.activeStepHasVisibleContent ?? hasDetails
+  const waitingForVisibleContent = !liveRun.thought.finished
+    && liveRun.status !== 'awaiting_approval'
+    && activeStepStartedAt !== null
+    && Boolean(liveRun.thinkingStatus)
+    && !activeStepHasVisibleContent
+  const activeStepElapsedMs = activeStepStartedAt === null ? 0 : Math.max(0, now - activeStepStartedAt)
+  const showExecutionDetails = hasDetails || waitingForVisibleContent
+  const toggleExpanded = () => {
+    if (!expanded) setMounted(true)
+    setExpanded((value) => !value)
+  }
   return (
     <article className={`message assistant live-message ${liveRun.status === 'terminal' ? 'live-message-terminal' : ''}`}>
       <div className="message-avatar"><PenguinMark size={21} /></div>
       <div className="message-body"><div className="message-meta"><strong>PGAgent</strong><span className="live-phase">{phase}</span></div>
-        {hasDetails
+        {showExecutionDetails
           ? <div className={`live-thought ${expanded ? 'expanded' : ''}`}>
-            <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
-            <OrderedRunContent items={executionItems} activitiesVisible={expanded} runId={liveRun.runId} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} />
+            <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={toggleExpanded}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
+            <CollapsibleRegion expanded={expanded} mounted={mounted || expanded} className="live-thought-collapse"><OrderedRunContent items={executionItems} activitiesVisible runId={liveRun.runId} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} />
+              {waitingForVisibleContent && <ThinkingWaitLine status={liveRun.thinkingStatus} elapsedMs={activeStepElapsedMs} />}
+            </CollapsibleRegion>
           </div>
           : null}
         {!!finalItems.length && <div className="live-final-content"><OrderedRunContent items={finalItems} activitiesVisible runId={liveRun.runId} live includeFinalAssistant /></div>}

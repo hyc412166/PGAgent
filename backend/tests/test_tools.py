@@ -18,10 +18,12 @@ from src.tools.builtins import (
     delete_file,
     delegate_task_async,
     file_info,
+    glob_files,
     git_diff,
     git_status,
     list_files,
     read_file,
+    ripgrep_search,
     run_command,
     search_files,
     write_file,
@@ -278,6 +280,25 @@ def test_search_reports_when_scan_limit_was_reached(tmp_path: Path) -> None:
     assert result.ok
     assert result.metadata["truncated"] is True
     assert result.metadata["visited"] == 2
+
+
+# 测试场景：验证 glob 对绝对路径给出可行动的工作区相对路径提示。
+def test_glob_rejects_absolute_pattern_with_relative_path_guidance(tmp_path: Path) -> None:
+    result = glob_files(WorkspaceSandbox(tmp_path), str(tmp_path / "**" / "*.py"))
+    assert not result.ok
+    assert result.error_code == "invalid_pattern"
+    assert "工作区相对模式" in result.content
+    assert "**/*.py" in result.content
+
+
+# 测试场景：验证 rg 不可用时明确暴露 grep 降级工具，而不是要求模型盲目重试。
+def test_rg_unavailable_exposes_grep_fallback(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("src.tools.builtins.shutil.which", lambda _name: None)
+    result = ripgrep_search(WorkspaceSandbox(tmp_path), "needle")
+    assert not result.ok
+    assert result.error_code == "tool_unavailable"
+    assert result.metadata["fallback_tool"] == "grep"
+    assert "select:grep" in result.content
 
 
 # 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_write_requires_approval_then_writes 精确标识本用例的具体条件。

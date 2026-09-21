@@ -222,6 +222,8 @@ def _read_selected_skill_instructions(db: Any, skill_ids: list[str]) -> list[dic
                 "slug": skill.slug,
                 "name": skill.name,
                 "description": skill.description[:1_000],
+                "path": str(skill_file),
+                "resource_root": str(root),
                 "content": content,
             }
         )

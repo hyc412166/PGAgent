@@ -101,7 +101,6 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
         "update_plan",
         "tool_search",
         "question",
-        "skill",
         "git_status",
         "git_diff",
         "apply_patch",
@@ -115,17 +114,31 @@ def test_tool_catalog_and_fixed_master_advertise_stable_tool_ids(
     assert by_id["read"]["risk_level"] == "low"
     assert by_id["apply_patch"]["risk_level"] == "adaptive"
     assert by_id["git_diff"]["risk_level"] == "low"
+    assert "工作区相对路径" in by_id["apply_patch"]["description"]
+    assert "每一行都必须以 + 开头" in by_id["apply_patch"]["description"]
+    assert "Git 仓库" in by_id["git_status"]["description"]
+    assert "工作区相对路径" in by_id["glob"]["description"]
+    assert "tool_search" in by_id["rg"]["description"]
+    assert "unsafe_url" in by_id["web_run"]["description"]
+    assert "后台失败" in by_id["shell"]["description"]
     assert by_id["web_search"]["availability"] == "available"
     assert by_id["web_run"]["runtime_tool_id"] == "web_run"
     assert by_id["web_open"]["runtime_tool_id"] == "web_open"
     assert by_id["review_finding"]["risk_level"] == "low"
     assert by_id["debug_evidence"]["runtime_tool_id"] == "debug_evidence"
-    assert {"availability", "enabled", "is_builtin"}.issubset(by_id["skill"])
 
     default_agent = test_client.get(f"/api/agents/{DEFAULT_AGENT_ID}")
     assert default_agent.status_code == 200
     assert default_agent.json()["tool_ids"] == sorted(BUILTIN_TOOL_IDS)
     assert default_agent.json()["skill_ids"] == []
+    system_prompt = default_agent.json()["system_prompt"]
+    assert "Get-Command" in system_prompt
+    assert "tar 或 7z" in system_prompt
+    assert "apply_patch 只能使用工作区相对路径" in system_prompt
+    assert "git_status 和 git_diff" in system_prompt
+    assert "select:grep" in system_prompt
+    assert "approval_required" in system_prompt
+    assert "不要自行拼接 searchN/ref_id" in system_prompt
     locked = test_client.patch(f"/api/agents/{DEFAULT_AGENT_ID}", json={"tool_ids": ["read"]})
     assert locked.status_code == 409
 

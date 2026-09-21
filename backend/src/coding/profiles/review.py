@@ -22,7 +22,6 @@ REVIEW_PROFILE = WorkflowProfile(
         "read_artifact",
         "review_finding",
         "rg",
-        "skill",
         "validate",
         "web_run",
     }),

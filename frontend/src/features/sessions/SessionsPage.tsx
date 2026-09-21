@@ -581,14 +581,14 @@ function SessionsPage() {
     draftIdempotencyKeyRef.current = ''
   }
 
-  // 进入新会话模式，关闭现有会话运输和菜单，并准备默认能力设置。
-  function beginDraft() {
+  // 进入新会话模式；传入项目时直接把草稿归属到该项目，避免依赖当前会话推断目录。
+  function beginDraft(workspace?: Workspace) {
     if (sendingRef.current) return
     closeAllMenus()
     setPendingSession(null)
     clearPendingAttachments()
-    const selectedProjectRoot = projectRootForSession(workspaces.data, activeSession)
-    const selectedProjectId = selectedProjectRoot ? activeSession?.workspace_id : ''
+    const selectedProjectRoot = workspace ? (workspace.root_path || workspace.path || '') : projectRootForSession(workspaces.data, activeSession)
+    const selectedProjectId = workspace?.id || (selectedProjectRoot ? activeSession?.workspace_id : '')
     draftVersionRef.current += 1
     setActionError('')
     setCompletedThoughtsByRun({})
@@ -636,7 +636,7 @@ function SessionsPage() {
     })
   }
 
-  // 根据触发元素位置计算项目悬浮卡片坐标，并限制在视口内。
+  // 以项目行容器右边界计算悬浮卡片坐标，只避开最右侧删除按钮，并限制在视口内。
   function showProjectHoverCard(
     event: React.MouseEvent<HTMLButtonElement> | React.FocusEvent<HTMLButtonElement>,
     workspace: Workspace,
@@ -644,6 +644,7 @@ function SessionsPage() {
     path: string,
   ) {
     const rect = event.currentTarget.getBoundingClientRect()
+    const rowRect = event.currentTarget.parentElement?.getBoundingClientRect()
     const cardWidth = 280
     const cardHeight = 118
     setProjectHoverCard({
@@ -651,7 +652,7 @@ function SessionsPage() {
       name: workspace.name,
       path,
       conversationCount,
-      left: Math.min(rect.right + 10, window.innerWidth - cardWidth - 12),
+      left: Math.min((rowRect?.right ?? rect.right) + 8, window.innerWidth - cardWidth - 12),
       top: Math.max(12, Math.min(rect.top - 4, window.innerHeight - cardHeight - 12)),
     })
   }
@@ -1210,7 +1211,7 @@ function SessionsPage() {
       <div ref={chatShellRef} className={`chat-shell ${sidePanelOpen ? 'child-panel-open' : ''}${sidePanelResizing ? ' is-resizing' : ''}`} style={chatShellStyle}>
           <aside className="session-list project-session-sidebar" onScroll={() => setProjectHoverCard(null)}>
             <section className="draft-tree-section">
-              <button type="button" className="new-draft-button" disabled={sending} onClick={beginDraft}><Plus size={14} />新建对话</button>
+              <button type="button" className="new-draft-button" disabled={sending} onClick={() => beginDraft()}><Plus size={14} />新建对话</button>
             </section>
             <section className="project-tree-section">
               <header className="sidebar-section-heading"><strong>项目</strong><button type="button" aria-label="从文件夹添加项目" title="从文件夹添加项目" disabled={addingProject || (draftActive && sending)} onClick={() => void addProjectFromFolder()}>{addingProject ? <LoaderCircle className="spin" size={14} /> : <Plus size={15} />}</button></header>
@@ -1226,8 +1227,10 @@ function SessionsPage() {
                   expanded={expanded}
                   deleting={deleting}
                   deleteDisabled={deleting || !!deletingWorkspaceId || activeProjectRun}
+                  newConversationDisabled={sending || !!deletingWorkspaceId}
                   hoverCardVisible={projectHoverCard?.id === workspace.id}
                   onToggle={() => toggleProject(workspace.id)}
+                  onNewConversation={() => beginDraft(workspace)}
                   onDelete={() => void deleteProject(workspace, projectSessions)}
                   onShowHoverCard={(event) => showProjectHoverCard(event, workspace, projectSessions.length, path)}
                   onHideHoverCard={() => setProjectHoverCard((current) => current?.id === workspace.id ? null : current)}
@@ -1426,7 +1429,7 @@ function SessionsPage() {
                 </div>
               </section>
               </div>
-            </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={beginDraft}>新建对话</button>} />}
+            </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={() => beginDraft()}>新建对话</button>} />}
           </section>
           {sidePanelOpen && <div
             className={`side-panel-resizer${sidePanelResizing ? ' is-dragging' : ''}`}
