@@ -223,10 +223,15 @@ def _normalize_todos(todos: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]
 
 
 # 函数职责：完成 sync_todos_for_run 对应的业务处理。
-# 参数关系：run_id 表示当前运行标识；todos 表示当前流程使用的 todos 集合。
+# 参数关系：run_id 表示当前运行标识；todos 表示当前流程使用的 todos 集合；create_if_missing 控制是否允许由计划清单创建持久任务。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def sync_todos_for_run(run_id: str, todos: Iterable[Mapping[str, Any]]) -> None:
-    """Persist one successful TodoWrite as the run's semantic task plan."""
+def sync_todos_for_run(
+    run_id: str,
+    todos: Iterable[Mapping[str, Any]],
+    *,
+    create_if_missing: bool = True,
+) -> None:
+    """Sync one successful TodoWrite into an existing or explicitly requested durable task."""
 
     # 变量说明：normalized 表示当前步骤使用的 normalized 值。
     normalized = _normalize_todos(todos)
@@ -247,7 +252,7 @@ def sync_todos_for_run(run_id: str, todos: Iterable[Mapping[str, Any]]) -> None:
             return
         # 变量说明：task 表示当前步骤使用的 task 值。
         task = db.get(DurableTask, run.task_id) if run.task_id else None
-        if task is None and not normalized:
+        if task is None and (not normalized or not create_if_missing):
             return
         if task is None:
             # 变量说明：task 表示当前步骤使用的 task 值。

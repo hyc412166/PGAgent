@@ -114,6 +114,7 @@ _PUBLIC_RUN_EVENT_TYPES = frozenset({
     "mcp_server_ready",
     "mcp_ready",
     "mcp_degraded",
+    "plan_updated",
     "completion_verification_started",
     "completion_verification_rejected",
     "completion_verification_passed",
@@ -423,6 +424,23 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
             change_set = sanitize_change_set(source.get("change_set"))
             if change_set is not None:
                 public["change_set"] = change_set
+
+    if event_type == "plan_updated":
+        # RunEvent 同时承担内部检查点职责；这里只公开轻量步骤文本和状态，
+        # 不透传 executor、agent、工作区或依赖图等调度字段。
+        plan: list[dict[str, str]] = []
+        raw_plan = source.get("plan")
+        if isinstance(raw_plan, list):
+            for raw_step in raw_plan[:64]:
+                if not isinstance(raw_step, dict):
+                    continue
+                step_id = _public_event_text(raw_step.get("id"), limit=160)
+                content = _public_event_text(raw_step.get("content"), limit=480)
+                status = raw_step.get("status")
+                if step_id is None or content is None or status not in {"pending", "in_progress", "completed", "cancelled"}:
+                    continue
+                plan.append({"id": step_id, "content": content, "status": status})
+        public["plan"] = plan
 
     if event_type in {"assistant_message_started", "assistant_message_delta", "assistant_message_completed", "model_response_completed"}:
         for key in ("response_id", "item_id"):

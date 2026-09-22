@@ -4,7 +4,8 @@ import type { ThoughtTimelineState } from '../../thoughtTimeline'
 import type { AssistantStreamItem, DelegatedTask, Message, PermissionMode, Run, Session, SessionContext, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 // 以下类型明确会话页各状态块的所有权：ownerSessionId 用于隔离切换会话前后的异步结果。
-export type LiveRunState = { runId: string; phase: string; draft: string; assistantItems: AssistantStreamItem[]; status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'; error: string; thought: ThoughtTimelineState; thinkingStatus: string }
+export type RunPlanStep = { id: string; content: string; status: 'pending' | 'in_progress' | 'completed' | 'cancelled' }
+export type LiveRunState = { runId: string; phase: string; draft: string; assistantItems: AssistantStreamItem[]; plan: RunPlanStep[]; status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'; error: string; thought: ThoughtTimelineState; thinkingStatus: string }
 export type OwnedSessionMessages = { ownerSessionId: string; items: Message[] }
 export type OwnedSessionRuns = { ownerSessionId: string; items: Run[] }
 export type OwnedSessionDelegations = { ownerSessionId: string; items: DelegatedTask[] }
@@ -25,7 +26,39 @@ export function removePendingApproval<T extends { id: string }>(approvals: T[], 
 
 // 创建全新的实时运行状态，避免上一轮草稿、错误或思考时间线泄漏到下一轮。
 export function emptyLiveRun(): LiveRunState {
-  return { runId: '', phase: '', draft: '', assistantItems: [], status: 'idle', error: '', thought: emptyThoughtTimeline, thinkingStatus: '' }
+  return { runId: '', phase: '', draft: '', assistantItems: [], plan: [], status: 'idle', error: '', thought: emptyThoughtTimeline, thinkingStatus: '' }
+}
+
+// 从实时或持久化 plan_updated 事件读取公开计划；null 表示该事件与计划无关，空数组表示显式清空。
+export function runPlanFromEvent(value: unknown): RunPlanStep[] | null {
+  if (!value || typeof value !== 'object') return null
+  const event = value as Record<string, unknown>
+  const type = String(event.type || event.event_type || '')
+  if (type !== 'plan_updated') return null
+  const payload = event.payload && typeof event.payload === 'object'
+    ? event.payload as Record<string, unknown>
+    : undefined
+  const rawPlan = Array.isArray(event.plan) ? event.plan : payload?.plan
+  if (!Array.isArray(rawPlan)) return []
+  return rawPlan.flatMap((raw): RunPlanStep[] => {
+    if (!raw || typeof raw !== 'object') return []
+    const step = raw as Record<string, unknown>
+    const id = typeof step.id === 'string' ? step.id.trim() : ''
+    const content = typeof step.content === 'string' ? step.content.trim() : ''
+    const status = step.status
+    if (!id || !content || !['pending', 'in_progress', 'completed', 'cancelled'].includes(String(status))) return []
+    return [{ id, content, status: status as RunPlanStep['status'] }]
+  })
+}
+
+// 持久事件按时间顺序回放时，以最后一次 plan_updated 为当前 Run 的计划状态。
+export function latestRunPlanFromEvents(events: unknown[]): RunPlanStep[] | null {
+  let latest: RunPlanStep[] | null = null
+  for (const event of events) {
+    const plan = runPlanFromEvent(event)
+    if (plan !== null) latest = plan
+  }
+  return latest
 }
 
 // 页面重新进入活动运行时，以后端持久化时间恢复计时；仅在时间缺失或无效时使用当前时间。
@@ -45,7 +78,7 @@ export const runStreamEventNames = [
   'mcp_catalog_loading', 'mcp_connecting', 'mcp_server_ready', 'mcp_ready', 'mcp_degraded',
   'thought_delta', 'activity_update', 'assistant_delta', 'tool_started', 'tool_call',
   'assistant_message_started', 'assistant_message_delta', 'assistant_message_completed', 'model_response_completed',
-  'tool_finished', 'tool_result', 'completion_verification_started',
+  'tool_finished', 'tool_result', 'plan_updated', 'completion_verification_started',
   'completion_verification_rejected', 'completion_verification_passed', 'approval_requested',
   'approval_granted', 'delegated_child_started', 'delegated_child_continuation_started',
   'delegated_child_awaiting_approval', 'delegated_child_waiting_background',

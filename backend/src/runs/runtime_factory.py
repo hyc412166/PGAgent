@@ -137,7 +137,9 @@ class RunRuntimeFactory:
             skill_instructions=context["skill_instructions"],
             todo_state=context["todo_state"],
             todo_change_sink=(
-                (lambda todos, key=run_id: sync_todos_for_run(key, todos))
+                # 普通 update_plan 只属于当前 Run；只有显式任务图或恢复链路已经绑定
+                # DurableTask 时，才把同一组稳定步骤同步到跨运行任务状态。
+                (lambda todos, key=run_id: sync_todos_for_run(key, todos, create_if_missing=False))
                 if not delegated
                 else None
             ),

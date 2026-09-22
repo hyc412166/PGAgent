@@ -305,6 +305,24 @@ def _change_event_fields(result: ToolResult) -> dict[str, Any]:
     return {"change_set": change_set} if change_set is not None else {}
 
 
+def _plan_event_steps(value: Any) -> list[dict[str, str]]:
+    """把工具内部 todo 状态收敛为可持久化、可展示的轻量计划事件。"""
+
+    if not isinstance(value, list):
+        return []
+    steps: list[dict[str, str]] = []
+    for raw in value[:64]:
+        if not isinstance(raw, Mapping):
+            continue
+        step_id = _safe_event_text(raw.get("id"), 160)
+        content = _safe_event_text(raw.get("content"), 480)
+        status = str(raw.get("status") or "")
+        if not step_id or not content or status not in {"pending", "in_progress", "completed", "cancelled"}:
+            continue
+        steps.append({"id": step_id, "content": content, "status": status})
+    return steps
+
+
 # 函数职责：完成 safe_approval_request_summary 对应的智能体处理。
 # 参数关系：pending 表示当前步骤使用的 pending 值。
 # 返回关系：结果用于更新运行状态、形成模型输入或发送给上层调用方。
@@ -2867,6 +2885,18 @@ class AgentRuntime:
                     duration_ms=round((self.clock() - tool_started_at) * 1000),
                     elapsed_ms=round((self.clock() - active_started_at) * 1000),
                 )
+                if (
+                    result.ok
+                    and call.name.casefold() in {"update_plan", "todowrite"}
+                    and isinstance(result.metadata.get("todos"), list)
+                ):
+                    # 计划是当前 Run 的独立公开状态，不借用 tool_finished 的摘要，
+                    # 以便 SSE 重连和持久事件回放都能恢复最新清单。
+                    state["events"] = await self._publish(
+                        {**state, "messages": messages},
+                        "plan_updated",
+                        plan=_plan_event_steps(result.metadata["todos"]),
+                    )
                 if result.metadata.get("delegated_child_awaiting_approval"):
                     if parallel_results is not None:
                         parallel_child_waits.append(result)
