@@ -21,6 +21,7 @@ import { useApiData } from '../../shared/hooks/useApiData'
 import { stringId } from '../../shared/lib/display'
 import { ComposerTextArea } from './components/ComposerTextArea'
 import type { ComposerTextAreaHandle } from './components/ComposerTextArea'
+import { ConversationTurnTimeline } from './components/ConversationTurnTimeline'
 import { DurableTaskCard } from './components/DurableTaskCard'
 import { FileChangePanel } from './components/FileChangePanel'
 import { ProjectTreeItem } from './components/ProjectTreeItem'
@@ -28,6 +29,7 @@ import { projectDeleteConfirmation } from './projectDeletion'
 import { useRunTransport } from './hooks/useRunTransport'
 import { activeRunStatuses, draftSettingsWithPermission, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, removePendingApproval, runThinkingStartedAt } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
+import { buildConversationTurnSummaries } from './turnTimeline'
 import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, PermissionSettings, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 type ChildPanelState = { sessionId: string; open: boolean; autoOpened: boolean }
@@ -285,6 +287,7 @@ function SessionsPage() {
     .filter((message) => message.metadata?.runtime_run_id == null)
     .filter((message) => message.metadata?.delegated_result_revision !== true)
     .filter((message) => !(message.role === 'assistant' && Array.isArray(message.metadata?.tool_calls)))
+  const conversationTurns = buildConversationTurnSummaries(visibleMessages)
   const repliedRunIds = new Set(visibleMessages.flatMap((message) => {
     if (message.role !== 'assistant') return []
     const runId = stringId(message.metadata?.run_id)
@@ -1273,6 +1276,7 @@ function SessionsPage() {
           </aside>
           <section className={`conversation ${sidePanelOpen ? 'with-child-panel' : ''}`}>
             {(activeSession || draftActive) && <button type="button" className="child-panel-toggle conversation-side-toggle" aria-label={fileChangeSelection ? '关闭文件变更面板' : childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} title={fileChangeSelection ? '关闭文件变更面板' : childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} aria-expanded={sidePanelOpen} onClick={() => fileChangeSelection ? setFileChangeSelection(null) : setChildPanelOpen((open) => !open)}>{fileChangeSelection ? <X size={14} /> : childPanelOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}</button>}
+            <ConversationTurnTimeline turns={conversationTurns} />
             {activeSession || draftActive ? <>
               <div
                 className="messages"

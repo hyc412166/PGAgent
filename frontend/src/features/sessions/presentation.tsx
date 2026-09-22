@@ -177,6 +177,9 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
         : 'PGAgent'
   const finalChangeSet = message.role === 'assistant' ? parseFileChangeSet(message.metadata?.change_summary) : undefined
   const messageRunId = thoughtRunId || (typeof message.metadata?.run_id === 'string' ? message.metadata.run_id : undefined)
+  const conversationTurnId = typeof message.turn_id === 'string' && message.turn_id.trim()
+    ? message.turn_id.trim()
+    : typeof message.metadata?.turn_id === 'string' ? message.metadata.turn_id : ''
   async function copyMessage() {
     try {
       await navigator.clipboard.writeText(message.content || '')
@@ -187,7 +190,7 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
     }
   }
   return (
-    <article className={`message ${message.role} ${isTool ? 'tool-message' : ''} ${attachments.length ? 'has-attachments' : ''}`}>
+    <article id={`conversation-message-${message.id}`} data-conversation-turn-id={conversationTurnId || undefined} className={`message ${message.role} ${isTool ? 'tool-message' : ''} ${attachments.length ? 'has-attachments' : ''}`}>
       <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <PenguinMark size={21} />}</div>
       <div className="message-body">
         <div className="message-meta"><strong>{speaker}</strong><time>{formatUiDate(message.created_at)}</time></div>

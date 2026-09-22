@@ -123,6 +123,130 @@
   background: #d9f3fa;
 }
 
+/* 轮次轨道固定在对话列边缘，不参与消息流布局；预览卡只覆盖内容，不改变滚动高度。 */
+.conversation-turn-timeline {
+  position: absolute;
+  z-index: 3;
+  top: 50%;
+  left: 9px;
+  width: 18px;
+  max-height: min(68%, 560px);
+  transform: translateY(-50%);
+}
+
+.conversation-turn-timeline-list {
+  display: grid;
+  max-height: inherit;
+  gap: 1px;
+  overflow-y: auto;
+  padding: 2px 1px;
+  scrollbar-width: none;
+}
+
+.conversation-turn-timeline-list::-webkit-scrollbar { display: none; }
+
+.conversation-turn-marker {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 11px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.conversation-turn-marker > span {
+  position: relative;
+  z-index: 1;
+  width: 10px;
+  height: 2px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ocean-700) 42%, transparent);
+  transform-origin: center;
+  transition: transform .16s ease, background-color .16s ease, opacity .16s ease, box-shadow .16s ease;
+}
+
+.conversation-turn-marker:hover > span,
+.conversation-turn-marker:focus-visible > span,
+.conversation-turn-marker.is-previewing > span {
+  background: var(--ocean-800);
+  box-shadow: 0 0 0 1px rgb(23 111 142 / 12%), 0 0 9px rgb(23 111 142 / 42%);
+  opacity: 1;
+  transform: translateX(1px) scale(1.5, 2);
+}
+
+/* 邻近轮次按距离渐进抬高，保持轨道紧凑且不改变实际布局高度。 */
+.conversation-turn-marker.is-near-1 > span {
+  background: color-mix(in srgb, var(--ocean-700) 78%, transparent);
+  opacity: .84;
+  transform: scaleY(1.55);
+}
+.conversation-turn-marker.is-near-2 > span {
+  background: color-mix(in srgb, var(--ocean-700) 58%, transparent);
+  opacity: .68;
+  transform: scaleY(1.3);
+}
+
+.conversation-turn-marker.is-pending > span { background: var(--beak); opacity: .8; }
+.conversation-turn-marker.is-pending:hover > span,
+.conversation-turn-marker.is-pending:focus-visible > span,
+.conversation-turn-marker.is-pending.is-previewing > span {
+  background: var(--beak);
+  opacity: 1;
+}
+.conversation-turn-marker.is-pending.is-near-1 > span { background: color-mix(in srgb, var(--beak) 82%, transparent); }
+.conversation-turn-marker.is-pending.is-near-2 > span { background: color-mix(in srgb, var(--beak) 64%, transparent); }
+.conversation-turn-marker:focus-visible { outline: 2px solid var(--ocean-700); outline-offset: 1px; }
+
+.conversation-turn-preview {
+  position: absolute;
+  left: 29px;
+  width: min(304px, calc(100vw - 52px));
+  min-height: 84px;
+  padding: 10px 12px 9px;
+  overflow: hidden;
+  border: 1px solid rgb(24 45 54 / 68%);
+  border-radius: 14px;
+  color: #f1f7f9;
+  background: rgb(20 22 23 / 97%);
+  box-shadow: 0 12px 28px rgb(7 20 26 / 28%);
+  pointer-events: none;
+  animation: conversation-turn-preview-in .16s ease-out;
+}
+
+.conversation-turn-preview p {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  color: rgb(237 245 247 / 78%);
+  font-size: .61rem;
+  line-height: 1.48;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.conversation-turn-preview-prompt {
+  color: rgb(247 250 251 / 92%) !important;
+}
+
+.conversation-turn-preview-reply {
+  margin-top: 3px !important;
+  color: rgb(190 210 216 / 66%) !important;
+}
+
+@keyframes conversation-turn-preview-in {
+  from { opacity: 0; transform: translateY(4px) scale(.985); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conversation-turn-marker > span { transition: none; }
+  .conversation-turn-preview { animation: none; }
+}
+
 .conversation-side-toggle {
   position: absolute;
   z-index: 4;
