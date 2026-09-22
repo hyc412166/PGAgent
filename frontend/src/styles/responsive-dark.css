@@ -58,32 +58,30 @@
   .app-shell.sidebar-collapsed .sidebar { width: 72px; padding-inline: 10px; }
   .sidebar-collapsed .brand {
     z-index: 3;
-    min-height: 90px;
     align-items: flex-start;
-    justify-content: center;
-    padding-inline: 0;
+    justify-content: flex-start;
+    padding: 0 8px 15px;
   }
   .sidebar-collapsed .brand-copy,
-  .sidebar-collapsed .nav-label,
   .sidebar-collapsed .nav-item span,
   .sidebar-collapsed .service-pill div,
   .sidebar-collapsed .theme-toggle { display: none; }
-  .sidebar-collapsed .collapse-button {
-    z-index: 6;
-    top: 59px;
-    right: 13px;
-    left: auto;
-    width: 24px;
-    height: 24px;
-    border-color: rgb(205 238 249 / 38%);
-    border-radius: 9px;
-    color: var(--ocean-900);
-    background: var(--ice);
-    box-shadow: 0 4px 12px rgb(0 17 31 / 20%), inset 0 1px 0 rgb(255 255 255 / 82%);
+  /* 保留分组标题的原始占位，避免侧栏宽度动画期间导航图标发生纵向重排。 */
+  .sidebar-collapsed .nav-label {
+    display: block;
+    overflow: hidden;
+    color: transparent;
+    white-space: nowrap;
   }
-  .sidebar-collapsed .sidebar nav { padding-top: 14px; }
-  .sidebar-collapsed .nav-item { justify-content: center; padding: 0; }
-  .sidebar-collapsed .nav-label-spaced { display: block; height: 1px; margin: 14px 6px; overflow: hidden; background: rgb(210 243 255 / 14%); }
+  /* 收起态也沿用展开态的图标左侧基线，文字隐藏不会造成横向跳位。 */
+  .sidebar-collapsed .nav-item { justify-content: flex-start; padding: 0 0 0 14px; }
+  .sidebar-collapsed .nav-label-spaced {
+    display: block;
+    height: auto;
+    margin: 18px 10px 8px;
+    overflow: hidden;
+    background: linear-gradient(rgb(210 243 255 / 14%), rgb(210 243 255 / 14%)) center / 100% 1px no-repeat;
+  }
   .sidebar-collapsed .service-pill { justify-content: center; padding-inline: 0; }
 }
 

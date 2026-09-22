@@ -1,5 +1,5 @@
 // 本文件负责 AppShell 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
-import { Bot, BookOpen, Cable, ChartNoAxesCombined, Database, History, LayoutDashboard, Menu, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Settings2, Sparkles, Sun, Type } from 'lucide-react'
+import { Bot, BookOpen, Cable, ChartNoAxesCombined, Database, History, LayoutDashboard, Menu, MessageSquare, Moon, Settings2, Sparkles, Sun, Type } from 'lucide-react'
 import { useEffect, useLayoutEffect, useState } from 'react'
 import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { api } from '../api'
@@ -86,7 +86,7 @@ function AppShell() {
       {mobileOpen && <button className="mobile-backdrop" aria-label="关闭导航" onClick={() => setMobileMenu({ routeKey: location.key, open: false })} />}
       <aside className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
           <div className="brand">
-            <div className="brand-mark"><PenguinMark size={27} /></div>
+            <button className="brand-mark" type="button" onClick={() => setCollapsed((value) => !value)} aria-label={collapsed ? '展开导航' : '收起导航'} title={collapsed ? '展开工作台' : '收起工作台'}><PenguinMark size={27} /></button>
             <div className="brand-copy"><strong>PGAgent</strong><span>企鹅工作台</span></div>
             <button
               className="theme-toggle icon-button"
@@ -96,9 +96,6 @@ function AppShell() {
               onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}
             >
               {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
-            </button>
-            <button className="collapse-button" type="button" onClick={() => setCollapsed((value) => !value)} aria-label={collapsed ? '展开导航' : '收起导航'} title={collapsed ? '展开工作台' : '收起工作台'}>
-              {collapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
             </button>
           </div>
         <nav aria-label="主导航">
