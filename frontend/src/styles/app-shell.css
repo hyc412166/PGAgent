@@ -6,6 +6,7 @@
   isolation: isolate;
   min-height: 100dvh;
   grid-template-columns: 220px minmax(0, 1fr);
+  transition: grid-template-columns .2s ease;
   background: transparent;
 }
 
@@ -58,6 +59,7 @@
 }
 
 .brand-mark {
+  padding: 0;
   width: 42px;
   height: 42px;
   border: 2px solid rgb(255 255 255 / 74%);
@@ -65,12 +67,16 @@
   color: var(--penguin);
   background: linear-gradient(145deg, #fff, var(--ice));
   box-shadow: 0 8px 18px rgb(0 12 24 / 24%);
+  cursor: pointer;
 }
 
 .brand-copy strong {
+  overflow: hidden;
   color: #f7fdff;
   font-size: 0.9375rem;
   letter-spacing: -.03em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .brand-copy span {
@@ -82,13 +88,11 @@
   white-space: nowrap;
 }
 
-.theme-toggle,
-.collapse-button {
+.theme-toggle {
   color: #a8cfdd;
 }
 
 .theme-toggle:hover,
-.collapse-button:hover,
 .sidebar .icon-button:hover {
   color: #fff;
   background: rgb(210 243 255 / 12%);
@@ -100,11 +104,21 @@
   padding-top: 16px;
 }
 
+@media (min-width: 861px) {
+  /* 固定侧栏内部轨道，宽度动画只裁剪外层，不重新计算图标布局。 */
+  .sidebar > .brand,
+  .sidebar > nav,
+  .sidebar > .sidebar-footer {
+    min-width: 194px;
+  }
+}
+
 .nav-label {
   margin: 0 10px 8px;
   color: #76a5b8;
   font-size: 0.5625rem;
   letter-spacing: .12em;
+  white-space: nowrap;
 }
 
 .nav-label-spaced {

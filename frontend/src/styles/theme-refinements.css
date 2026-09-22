@@ -79,7 +79,6 @@ select:focus-visible {
 
 .button,
 .icon-button,
-.collapse-button,
 .composer-tool-button,
 .session-settings-trigger,
 .send-button,
@@ -93,7 +92,6 @@ select:focus-visible {
 
 .button:active:not(:disabled),
 .icon-button:active:not(:disabled),
-.collapse-button:active:not(:disabled),
 .composer-tool-button:active:not(:disabled),
 .session-settings-trigger:active:not(:disabled),
 .send-button:active:not(:disabled) { scale: .96; }
