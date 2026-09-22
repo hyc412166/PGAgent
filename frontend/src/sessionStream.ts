@@ -38,6 +38,18 @@ function waitingRunPhase(reason: string): string {
   return reason === 'waiting_background' ? '等待后台任务完成…' : '等待子 Agent 返回…'
 }
 
+// assistant_message 事件的 phase 区分可折叠的中间思考摘要和最终回复；
+// 兼容旧服务把 phase 放在 payload 内的传输形态。
+function assistantMessagePhase(event: RunStreamEvent): string {
+  if (typeof event.phase === 'string' && event.phase.trim()) return event.phase.trim()
+  const payload = event.payload
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const phase = (payload as Record<string, unknown>).phase
+    if (typeof phase === 'string' && phase.trim()) return phase.trim()
+  }
+  return ''
+}
+
 // 解析 SSE data；assistant_delta 允许纯文本，以兼容无法包装成 JSON 的增量片段。
 export function parseRunStreamEvent(raw: string, fallbackType = ''): RunStreamEvent | null {
   try {
@@ -72,10 +84,10 @@ export function runStreamPhase(event: RunStreamEvent): string {
       ? `MCP 已就绪（${Number(event.tool_count)} 个工具）`
       : 'MCP 已连接'
     case 'mcp_degraded': return '部分 MCP 服务不可用，本轮继续使用已连接工具'
-    case 'assistant_delta': return '正在回复…'
+    case 'assistant_delta': return assistantMessagePhase(event) === 'commentary' ? '思考中…' : '正在回复…'
     case 'assistant_message_started':
-    case 'assistant_message_delta': return '正在回复…'
-    case 'assistant_message_completed': return '已生成一段回复'
+    case 'assistant_message_delta': return assistantMessagePhase(event) === 'commentary' ? '思考中…' : '正在回复…'
+    case 'assistant_message_completed': return assistantMessagePhase(event) === 'commentary' ? '思考中…' : '已生成一段回复'
     case 'model_response_completed': return '正在整理回复…'
     case 'tool_started':
     case 'tool_call': return event.tool_name ? `正在调用 ${event.tool_name}…` : '正在调用工具…'
@@ -111,6 +123,15 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'failed': return '运行失败'
     default: return '处理中…'
   }
+}
+
+const internalModelLifecycleTypes = new Set(['model_response_completed', 'model_step_finished'])
+
+// 内部模型生命周期事件不代表新的用户可见阶段，避免覆盖刚显示的思考/回复状态。
+export function nextRunStreamPhase(previousPhase: string, event: RunStreamEvent): string {
+  return internalModelLifecycleTypes.has(event.type) && previousPhase
+    ? previousPhase
+    : runStreamPhase(event)
 }
 
 // 综合显式 terminal、事件类型和状态识别终态，同时排除可恢复等待点。

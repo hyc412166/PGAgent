@@ -1,6 +1,6 @@
 // 本测试文件验证 sessionStream 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
-import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, composerSurface, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, restoreAssistantItemsFromEvents, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
+import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, composerSurface, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, nextRunStreamPhase, parseRunStreamEvent, rememberRunStreamEvent, restoreAssistantItemsFromEvents, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
 import { removePendingApproval } from './features/sessions/sessionState'
 
 // 测试分组：会话 SSE 事件。
@@ -36,6 +36,15 @@ describe('会话 SSE 事件', () => {
     expect(delta).toEqual({ type: 'assistant_delta', delta: '你好' })
     expect(appendAssistantDelta('开始：', delta!)).toBe('开始：你好')
     expect(runStreamPhase(delta!)).toBe('正在回复…')
+  })
+
+  it('把 commentary 中间回复显示为思考，并保留它直到下一条可见阶段事件', () => {
+    const commentary = { type: 'assistant_message_completed', phase: 'commentary' }
+    expect(runStreamPhase(commentary)).toBe('思考中…')
+    expect(nextRunStreamPhase('思考中…', { type: 'model_response_completed' })).toBe('思考中…')
+    expect(nextRunStreamPhase('思考中…', { type: 'model_step_finished' })).toBe('思考中…')
+    expect(nextRunStreamPhase('思考中…', { type: 'tool_started', tool_name: 'update_plan' })).toBe('正在调用 update_plan…')
+    expect(runStreamPhase({ type: 'assistant_message_completed', phase: 'final_answer' })).toBe('已生成一段回复')
   })
 
   it('按 response/item 保留有序助手正文，工具事件不会清空此前内容', () => {
