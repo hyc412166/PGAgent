@@ -83,6 +83,34 @@ if (Test-Path -LiteralPath $LocalEnvironmentFile) {
     }
 }
 
+# 本机模型中转服务由 localhost/回环地址提供，不能再次送入外部代理；
+# 远程 API 仍沿用 HTTP_PROXY/HTTPS_PROXY（例如 127.0.0.1:7897）。
+$loopbackNoProxyHosts = @('localhost', '127.0.0.1', '::1')
+$existingNoProxyHosts = @()
+if ($env:NO_PROXY) {
+    $existingNoProxyHosts = $env:NO_PROXY -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+}
+$env:NO_PROXY = (@($existingNoProxyHosts + $loopbackNoProxyHosts) | Select-Object -Unique) -join ','
+$env:no_proxy = $env:NO_PROXY
+
+# Uvicorn 会在绑定端口前执行应用启动恢复；重复启动若不先拦截，可能把旧进程
+# 正在执行的 Run 误判为重启中断。仅在确认目标确实是 PGAgent 时复用现有实例。
+$reuseExistingPgAgent = $false
+try {
+    $existingResponse = Invoke-WebRequest -UseBasicParsing -Uri "$Url/api/health" -TimeoutSec 2
+    $existingHealth = $existingResponse.Content | ConvertFrom-Json
+    if ($existingResponse.StatusCode -eq 200 -and $existingHealth.status -eq 'ok' -and $existingHealth.name -eq 'PGAgent') {
+        $reuseExistingPgAgent = $true
+    }
+} catch {
+    # 没有健康实例时继续正常启动；真实启动错误仍由下面的 uvicorn 输出。
+}
+if ($reuseExistingPgAgent) {
+    Write-Host "PGAgent is already running at $Url" -ForegroundColor Green
+    Start-Process $Url
+    return
+}
+
 # 后台探测任务：服务健康检查通过后自动打开浏览器，主进程仍由 uvicorn 负责。
 $BrowserJob = Start-Job -ScriptBlock {
     param($TargetUrl)

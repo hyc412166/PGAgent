@@ -56,6 +56,21 @@ def is_terminal_delivery(status: str, stop_reason: str | None = None) -> bool:
     )
 
 
+def is_stale_restart_terminal_response(message: ChatMessage, run: Run) -> bool:
+    """Return whether a restart fallback was superseded by this run's real outcome."""
+
+    extra = dict(message.extra or {})
+    was_restart_fallback = (
+        str(extra.get("terminal_status") or "") == "stopped"
+        and str(extra.get("error_code") or "") == "interrupted_restart"
+    )
+    remains_restart_interrupted = (
+        str(run.status or "") == "stopped"
+        and str(run.stop_reason or "") == "interrupted_restart"
+    )
+    return was_restart_fallback and not remains_restart_interrupted
+
+
 def run_change_summary(db: Any, run_id: str) -> dict[str, Any] | None:
     """Aggregate structured file changes already persisted for one run."""
 
@@ -568,9 +583,48 @@ def persist_terminal_response(
     )
     if existing is not None:
         change_summary = run_change_summary(db, run.id)
-        if change_summary is not None:
+        revise_restart_terminal = is_stale_restart_terminal_response(existing, run)
+        if revise_restart_terminal:
+            # 重复启动可能先写入“重启中断”，而原执行进程随后仍会返回真实终态。
+            # 这里复用同一消息主键，只修正被后续事实推翻的重启兜底内容。
+            content, source = _terminal_content(
+                db,
+                run=run,
+                turn=turn,
+                output=output,
+                error_code=normalized_code,
+            )
+            revised_extra = {
+                "run_id": run.id,
+                "turn_id": turn.id,
+                "trace_id": turn.trace_id,
+                "source": source,
+                "terminal_status": run.status,
+                "execution_status": execution_status,
+                "error_code": normalized_code,
+            }
+            if change_summary is not None:
+                revised_extra["change_summary"] = change_summary
+            existing.content = content
+            existing.extra = revised_extra
+            existing.provider_payload = dict(provider_payload or {})
+            append_run_event(
+                db,
+                run_id=run.id,
+                event_type="terminal_response_revised",
+                payload={
+                    "turn_id": turn.id,
+                    "message_id": existing.id,
+                    "trace_id": turn.trace_id,
+                    "status": run.status,
+                    "error_code": normalized_code,
+                    "source": source,
+                    "previous_error_code": "interrupted_restart",
+                },
+            )
+        elif change_summary is not None:
             existing.extra = {**dict(existing.extra or {}), "change_summary": change_summary}
-        if provider_payload:
+        if provider_payload and not revise_restart_terminal:
             # 变量说明：provider_payload 表示当前步骤使用的 provider_payload 值。
             existing.provider_payload = dict(provider_payload)
         # 变量说明：terminal_message_id 表示terminal_message 对象的唯一标识。
