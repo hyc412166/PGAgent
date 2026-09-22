@@ -50,6 +50,28 @@
   color-scheme: light;
 }
 
+/* 统一可见滚动条的颜色，保留各容器已有的尺寸和滚动方式。 */
+* {
+  scrollbar-color: var(--ocean-800) transparent;
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: var(--ocean-800);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--ocean-900);
+  background-clip: padding-box;
+}
+
 .sr-only {
   position: absolute;
   width: 1px;
