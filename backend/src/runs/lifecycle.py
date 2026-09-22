@@ -79,6 +79,7 @@ from src.sessions.delivery import (
     classify_error_details,
     classify_exception,
     ensure_run_turn,
+    is_stale_restart_terminal_response,
     is_terminal_delivery,
     persist_terminal_response,
     public_error_message,
@@ -1241,7 +1242,16 @@ class RunCoordinator:
                     continue
                 # 变量说明：turn 表示当前步骤使用的 turn 值。
                 turn = ensure_run_turn(db, run)
-                if turn is None or turn.reply_status == "delivered":
+                if turn is None:
+                    continue
+                existing_terminal = db.scalar(select(ChatMessage).where(
+                    ChatMessage.terminal_for_turn_id == turn.id
+                ))
+                stale_restart_terminal = (
+                    existing_terminal is not None
+                    and is_stale_restart_terminal_response(existing_terminal, run)
+                )
+                if turn.reply_status == "delivered" and not stale_restart_terminal:
                     continue
                 # 变量说明：snapshot 表示当前步骤使用的 snapshot 值。
                 snapshot = db.scalar(
@@ -2598,8 +2608,15 @@ class RunCoordinator:
             # Responses output items are durable replay facts.  Only the
             # bounded assistant projection is stored here; token deltas stay
             # transient in the stream broker.
+            # transcript_delta 为空列表时表示本轮没有新增消息，不能回退到
+            # 包含历史轮次的 provider messages；只有旧快照缺少该字段时才兼容回退。
+            transcript_messages = (
+                outcome.messages
+                if outcome.transcript_delta is None
+                else outcome.transcript_delta
+            )
             assistant_items = [
-                item for item in (outcome.transcript_delta or outcome.messages)
+                item for item in transcript_messages
                 if isinstance(item, dict) and item.get("role") == "assistant"
             ]
             if not assistant_items and str(outcome.output or "").strip():
@@ -2755,7 +2772,7 @@ class RunCoordinator:
             terminal_provider_message = next(
                 (
                     message
-                    for message in reversed(list(outcome.transcript_delta or outcome.messages))
+                    for message in reversed(list(transcript_messages))
                     if isinstance(message, dict)
                     and message.get("role") == "assistant"
                     and not message.get("tool_calls")

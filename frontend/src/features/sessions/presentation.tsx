@@ -649,8 +649,8 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChang
           ? <div className={`live-thought ${expanded ? 'expanded' : ''}`}>
             <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={toggleExpanded}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
             <CollapsibleRegion expanded={expanded} mounted={mounted || expanded} className="live-thought-collapse">
-              {waitingForVisibleContent && <ThinkingWaitLine status={waitingStatus} elapsedMs={activeStepElapsedMs} />}
               <OrderedRunContent items={executionItems} activitiesVisible runId={liveRun.runId} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} />
+              {waitingForVisibleContent && <ThinkingWaitLine status={waitingStatus} elapsedMs={activeStepElapsedMs} />}
             </CollapsibleRegion>
           </div>
           : null}

@@ -54,6 +54,18 @@ def test_windows_launch_scripts_bootstrap_the_independent_node_runtime() -> None
         assert "pnpm" not in script
 
 
+def test_start_script_reuses_a_healthy_pgagent_before_starting_uvicorn() -> None:
+    """重复双击入口时必须在 Uvicorn 启动恢复之前复用现有服务。"""
+
+    script = (PROJECT_ROOT / "scripts" / "start.ps1").read_text(encoding="utf-8-sig")
+    health_check = 'Invoke-WebRequest -UseBasicParsing -Uri "$Url/api/health"'
+    uvicorn_start = "-m uvicorn src.main:app"
+
+    assert health_check in script
+    assert "$existingHealth.name -eq 'PGAgent'" in script
+    assert script.index(health_check) < script.index(uvicorn_start)
+
+
 def test_pgagent_bundled_ripgrep_is_usable_and_precedes_inherited_path() -> None:
     """PGAgent 必须运行自己携带的 rg，而不是偶然继承 Codex 或系统版本。"""
 

@@ -278,7 +278,7 @@ describe('助手消息中的思考过程展示', () => {
     }
   })
 
-  it('旧工具详情存在但当前轮元数据缺失时仍显示等待行，并将等待行置于详情顶部', () => {
+  it('旧工具详情存在但当前轮元数据缺失时仍显示等待行，并将等待行置于时间线末尾', () => {
     const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
       liveRun: {
         runId: 'run-missing-step-boundary',
@@ -300,7 +300,7 @@ describe('助手消息中的思考过程展示', () => {
 
     expect(markup).toContain('class="thought-waiting"')
     expect(markup).toContain('思考中…')
-    expect(markup.indexOf('class="thought-waiting"')).toBeLessThan(markup.indexOf('Get-ChildItem'))
+    expect(markup.indexOf('class="thought-waiting"')).toBeGreaterThan(markup.indexOf('Get-ChildItem'))
   })
 
   it('文件总结超过三个时默认收起并提供展开入口', () => {

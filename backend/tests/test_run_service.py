@@ -351,6 +351,46 @@ def test_outcome_persists_completed_assistant_item_but_not_delta(accepted_run: t
         )) is None
 
 
+def test_failed_outcome_with_empty_transcript_delta_does_not_replay_provider_history(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="failed",
+        output=None,
+        # provider messages 含上一轮历史；本轮模型请求重试耗尽前没有产生 transcript 条目。
+        messages=[
+            {"role": "assistant", "content": "上一轮已经完成的结果"},
+            {"role": "user", "content": "本轮新请求"},
+        ],
+        transcript_delta=[],
+        events=[{
+            "type": "model_failed",
+            "error_type": "InternalServerError",
+            "status_code": 502,
+            "retryable": True,
+            "retry_exhausted": True,
+        }],
+        error="upstream unavailable",
+        steps=1,
+        tool_calls=0,
+    ))
+
+    with database.SessionLocal() as db:
+        replayed = list(db.scalars(select(RunEvent).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "assistant_message_completed",
+        )))
+        assert replayed == []
+        terminal = db.scalar(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+            ChatMessage.terminal_for_turn_id.is_not(None),
+        ))
+        assert terminal is not None
+        assert "模型服务暂时不可用" in terminal.content
+
+
 def test_completed_assistant_item_preserves_provider_output_index(accepted_run: tuple[str, str]) -> None:
     run_id, _session_id = accepted_run
     RunCoordinator._persist_outcome(run_id, RunOutcome(
@@ -864,6 +904,77 @@ def test_restart_recovery_persists_exactly_one_terminal_reply(
         assert len(replies) == 1
         assert replies[0].extra["error_code"] == "interrupted_restart"
         assert "执行期间重启" in replies[0].content
+
+
+def test_late_completed_outcome_revises_restart_terminal_reply(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+    RunCoordinator.reconcile_interrupted_runs()
+
+    RunCoordinator._persist_outcome(run_id, RunOutcome(
+        status="completed",
+        output="任务最终完成。",
+        messages=[{"role": "assistant", "content": "任务最终完成。"}],
+        transcript_delta=[{"role": "assistant", "content": "任务最终完成。"}],
+        events=[{"type": "run_completed"}],
+        steps=2,
+        tool_calls=1,
+    ))
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.status == "completed"
+        turn = db.get(ConversationTurn, run.turn_id)
+        assert turn is not None and turn.execution_status == "completed"
+        replies = list(db.scalars(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.terminal_for_turn_id == turn.id,
+        )))
+        assert len(replies) == 1
+        assert replies[0].content == "任务最终完成。"
+        assert replies[0].extra["terminal_status"] == "completed"
+        assert replies[0].extra["error_code"] is None
+        revised = db.scalar(select(RunEvent).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "terminal_response_revised",
+        ))
+        assert revised is not None
+
+
+def test_startup_reconciler_repairs_stale_restart_terminal_reply(
+    accepted_run: tuple[str, str],
+) -> None:
+    run_id, session_id = accepted_run
+    RunCoordinator.reconcile_interrupted_runs()
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None
+        run.status = "completed"
+        run.stop_reason = None
+        run.error_code = None
+        run.error_message = None
+        run.finished_at = datetime.now(timezone.utc)
+        db.add(RunEvent(
+            run_id=run_id,
+            event_type="runtime_snapshot",
+            payload={"status": "completed", "output": "历史任务已经完成。"},
+        ))
+        db.commit()
+
+    assert RunCoordinator.reconcile_terminal_deliveries() == 1
+    assert RunCoordinator.reconcile_terminal_deliveries() == 0
+
+    with database.SessionLocal() as db:
+        replies = list(db.scalars(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.terminal_for_turn_id.is_not(None),
+        )))
+        assert len(replies) == 1
+        assert replies[0].content == "历史任务已经完成。"
+        assert replies[0].extra["terminal_status"] == "completed"
+        assert replies[0].extra["error_code"] is None
 
 
 @pytest.mark.parametrize(
