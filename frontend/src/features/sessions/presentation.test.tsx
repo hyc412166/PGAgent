@@ -260,6 +260,31 @@ describe('助手消息中的思考过程展示', () => {
     }
   })
 
+  it('旧工具详情存在但当前轮元数据缺失时仍显示等待行，并将等待行置于详情顶部', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-missing-step-boundary',
+        phase: '正在回复…',
+        draft: '',
+        status: 'live',
+        error: '',
+        thinkingStatus: '',
+        thought: {
+          startedAt: 1_000,
+          elapsedMs: 0,
+          finished: false,
+          conclusion: '',
+          tools: [{ id: 'tool-1', name: 'Shell', target: 'Get-ChildItem', status: 'completed' }],
+          items: [{ id: 'tool-1', kind: 'tool', icon: 'shell', title: 'Shell', detail: 'Get-ChildItem', status: 'completed' }],
+        },
+      },
+    }))
+
+    expect(markup).toContain('class="thought-waiting"')
+    expect(markup).toContain('思考中…')
+    expect(markup.indexOf('class="thought-waiting"')).toBeLessThan(markup.indexOf('Get-ChildItem'))
+  })
+
   it('文件总结超过三个时默认收起并提供展开入口', () => {
     const markup = renderToStaticMarkup(createElement(FileChangeActivity, {
       runId: 'run-file-summary',

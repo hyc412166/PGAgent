@@ -4,7 +4,7 @@ import type { Dispatch, SetStateAction } from 'react'
 import { api, apiUrl } from '../../../api'
 import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, hasPersistedRunReply, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, restoreAssistantItemsFromEvents, runStreamPhase } from '../../../sessionStream'
 import type { RunStreamEvent } from '../../../sessionStream'
-import { emptyThoughtTimeline, hasVisibleCompletedThought, thinkingStatusForRun, updateThoughtTimeline } from '../../../thoughtTimeline'
+import { emptyThoughtTimeline, hasVisibleCompletedThought, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from '../../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../../thoughtTimeline'
 import type { Approval, Run, RunEvent } from '../../../types'
 import { emptyLiveRun, runStreamEventNames, runThinkingStartedAt } from '../sessionState'
@@ -276,11 +276,33 @@ export function useRunTransport(options: RunTransportOptions) {
         const eventId = String(event.id || '')
         if (eventId) seenStreamEventsRef.current.eventIds.add(eventId)
       }
+      const restoredThought = timelineFromRunEvents(events.map((event) => ({ ...event, type: event.type || event.event_type || '' })))
+      const orderedEvents = [...events].sort((left, right) => {
+        const leftSequence = typeof left.sequence === 'number' ? left.sequence : Number.MAX_SAFE_INTEGER
+        const rightSequence = typeof right.sequence === 'number' ? right.sequence : Number.MAX_SAFE_INTEGER
+        return leftSequence - rightSequence
+      })
+      const latestEvent = orderedEvents.at(-1)
+      const latestEventType = latestEvent?.type || latestEvent?.event_type || ''
       const restored = restoreAssistantItemsFromEvents(events.map((event) => ({ ...event, type: event.type || event.event_type || '' })))
-      if (!restored.length) return
       setLiveRun((previous) => {
-        if (previous.runId !== runId || previous.assistantItems.length) return previous
-        return { ...previous, assistantItems: restored, draft: assistantItemsText(restored) }
+        if (previous.runId !== runId) return previous
+        // 重连或晚连接可能错过当前轮的 model_step_started；持久化时间线补齐轮次边界，
+        // 但已有实时轮次优先，避免旧分页结果覆盖刚到达的 SSE 活动。
+        const hasLiveStepBoundary = typeof previous.thought.activeStepStartedAt === 'number'
+        const hasRestoredThought = restoredThought.startedAt !== null || restoredThought.items.length > 0
+        const shouldRestoreThought = !hasLiveStepBoundary && hasRestoredThought && (!restoredThought.finished || previous.status === 'terminal')
+        const nextThought = shouldRestoreThought ? restoredThought : previous.thought
+        const nextPhase = shouldRestoreThought && latestEventType ? runStreamPhase({ type: latestEventType, ...((latestEvent?.payload || {}) as Record<string, unknown>) }) : previous.phase
+        const shouldRestoreAssistant = !previous.assistantItems.length && restored.length > 0
+        if (!shouldRestoreThought && !shouldRestoreAssistant) return previous
+        return {
+          ...previous,
+          phase: nextPhase || previous.phase,
+          thought: nextThought,
+          assistantItems: shouldRestoreAssistant ? restored : previous.assistantItems,
+          draft: shouldRestoreAssistant ? assistantItemsText(restored) : previous.draft,
+        }
       })
     })().catch(() => {
       // SSE/轮询仍是主链路；持久化恢复失败保持可见的实时错误路径，不吞掉后续流。
