@@ -611,11 +611,12 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChang
   const finalItems = displayItems.filter((item) => item.kind === 'assistant' && item.phase === 'final_answer')
   const hasDetails = hasActivityDetails(executionItems)
   const activeStepStartedAt = liveRun.thought.activeStepStartedAt ?? liveRun.thought.startedAt
-  const activeStepHasVisibleContent = liveRun.thought.activeStepHasVisibleContent ?? hasDetails
+  // 缺少轮次元数据时不能把旧工具详情当作当前轮输出，否则模型长时间无可见事件会静默。
+  const activeStepHasVisibleContent = liveRun.thought.activeStepHasVisibleContent ?? false
+  const waitingStatus = liveRun.thinkingStatus || '思考中…'
   const waitingForVisibleContent = !liveRun.thought.finished
     && liveRun.status !== 'awaiting_approval'
     && activeStepStartedAt !== null
-    && Boolean(liveRun.thinkingStatus)
     && !activeStepHasVisibleContent
   const activeStepElapsedMs = activeStepStartedAt === null ? 0 : Math.max(0, now - activeStepStartedAt)
   const showExecutionDetails = hasDetails || waitingForVisibleContent
@@ -630,8 +631,9 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChang
         {showExecutionDetails
           ? <div className={`live-thought ${expanded ? 'expanded' : ''}`}>
             <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={toggleExpanded}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
-            <CollapsibleRegion expanded={expanded} mounted={mounted || expanded} className="live-thought-collapse"><OrderedRunContent items={executionItems} activitiesVisible runId={liveRun.runId} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} />
-              {waitingForVisibleContent && <ThinkingWaitLine status={liveRun.thinkingStatus} elapsedMs={activeStepElapsedMs} />}
+            <CollapsibleRegion expanded={expanded} mounted={mounted || expanded} className="live-thought-collapse">
+              {waitingForVisibleContent && <ThinkingWaitLine status={waitingStatus} elapsedMs={activeStepElapsedMs} />}
+              <OrderedRunContent items={executionItems} activitiesVisible runId={liveRun.runId} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} />
             </CollapsibleRegion>
           </div>
           : null}
