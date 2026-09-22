@@ -2,7 +2,7 @@
 import { useCallback } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { api, apiUrl } from '../../../api'
-import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, hasPersistedRunReply, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, parseRunStreamEvent, rememberRunStreamEvent, restoreAssistantItemsFromEvents, runStreamPhase } from '../../../sessionStream'
+import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, hasPersistedRunReply, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, nextRunStreamPhase, parseRunStreamEvent, rememberRunStreamEvent, restoreAssistantItemsFromEvents, runStreamPhase } from '../../../sessionStream'
 import type { RunStreamEvent } from '../../../sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from '../../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../../thoughtTimeline'
@@ -348,7 +348,7 @@ export function useRunTransport(options: RunTransportOptions) {
         return ({
         ...previous,
         runId,
-        phase: runStreamPhase(parsed),
+        phase: nextRunStreamPhase(previous.phase, parsed),
         // 正文是按 response/item 维护的持久化候选；工具开始、response 完成都不能清空它。
         assistantItems,
         draft: assistantItemsText(assistantItems) || appendAssistantDelta(previous.draft, parsed),
