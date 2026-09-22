@@ -55,6 +55,7 @@ from src.persistence.models import (
     MemorySettings,
     MemorySkill,
     ModelConnection,
+    PermissionSettings,
     PlanStep,
     PlanStepDependency,
     Run,
@@ -681,6 +682,8 @@ def _seed_defaults() -> None:
 
         if db.get(MemorySettings, "global") is None:
             db.add(MemorySettings(id="global", enabled=True))
+        if db.get(PermissionSettings, "global") is None:
+            db.add(PermissionSettings(id="global", permission_mode="smart"))
 
         # The system-owned coordinator always advertises the complete built-in
         # catalog.  User-created Agents keep their own persisted selections.

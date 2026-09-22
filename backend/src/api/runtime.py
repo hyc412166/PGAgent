@@ -51,6 +51,7 @@ from src.runs.service import (
 )
 from src.runs.stream import TERMINAL_EVENT_TYPES, run_stream_broker
 from src.mcp.config import load_mcp_config_source, validate_mcp_server_names
+from src.permissions.preferences import get_permission_mode, set_permission_mode
 from src.skills.registry import replace_session_skills, validate_skill_ids
 from src.tasks.state import (
     bind_recovery_task,
@@ -468,6 +469,9 @@ async def _launch_draft_core(
                 db.flush()
 
         # 变量说明：chat_session 表示当前步骤使用的 chat_session 值。
+        permission_mode = payload.permission_mode or get_permission_mode(db)
+        if payload.permission_mode is not None:
+            set_permission_mode(db, payload.permission_mode)
         chat_session = Session(
             title=payload.title,
             workspace_id=workspace.id,
@@ -475,7 +479,7 @@ async def _launch_draft_core(
             model_connection_id=payload.model_connection_id,
             model_id=payload.model_id,
             thinking_level=payload.thinking_level,
-            permission_mode=payload.permission_mode,
+            permission_mode=permission_mode,
             use_memories=payload.use_memories,
             mcp_server_names=mcp_server_names,
             status="active",

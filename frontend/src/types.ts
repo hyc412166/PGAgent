@@ -70,6 +70,11 @@ export interface MemorySettings {
   enabled: boolean
 }
 
+// PermissionSettings 保存后续新会话继承的最近一次权限选择。
+export interface PermissionSettings {
+  permission_mode: PermissionMode
+}
+
 // AgentProfile 聚合角色提示、默认模型/思考等级以及允许使用的工具和技能。
 export interface AgentProfile {
   id: string

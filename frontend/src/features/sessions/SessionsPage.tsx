@@ -26,9 +26,9 @@ import { FileChangePanel } from './components/FileChangePanel'
 import { ProjectTreeItem } from './components/ProjectTreeItem'
 import { projectDeleteConfirmation } from './projectDeletion'
 import { useRunTransport } from './hooks/useRunTransport'
-import { activeRunStatuses, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, removePendingApproval, runThinkingStartedAt } from './sessionState'
+import { activeRunStatuses, draftSettingsWithPermission, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, removePendingApproval, runThinkingStartedAt } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
-import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
+import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, PermissionSettings, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 type ChildPanelState = { sessionId: string; open: boolean; autoOpened: boolean }
 type WorkspaceExpansion = { contextKey: string; ids: Set<string> }
@@ -97,6 +97,7 @@ function SessionsPage() {
   const skills = useApiData<SkillCatalogItem[]>([], () => api.list<SkillCatalogItem>('/api/skills', ['skills']), [])
   const mcpServers = useApiData<McpServer[]>([], () => api.list<McpServer>('/api/mcp/servers', ['mcp-servers']), [])
   const memorySettings = useApiData<MemorySettings | null>(null, () => api.get<MemorySettings>('/api/memories/settings'), [])
+  const permissionSettings = useApiData<PermissionSettings | null>(null, () => api.get<PermissionSettings>('/api/permissions/settings'), [])
   // activeId 选择当前会话；编辑器、发送、中断和删除状态共同描述当前用户操作。
   const [composerHasValue, setComposerHasValue] = useState(false)
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([])
@@ -576,7 +577,7 @@ function SessionsPage() {
     clearPendingAttachments()
     setDraftActive(false)
     setDraftRootPath('')
-    setDraftSettings(emptyDraftSettings)
+    setDraftSettings(draftSettingsWithPermission(permissionSettings.data?.permission_mode ?? 'smart'))
     setLiveRun(emptyLiveRun())
     draftIdempotencyKeyRef.current = ''
   }
@@ -597,7 +598,7 @@ function SessionsPage() {
     setChildPanelState((current) => ({ ...current, sessionId: '', autoOpened: false }))
     setHistoryHydration({ sessionId: '', complete: false })
     setDraftRootPath(selectedProjectRoot)
-    setDraftSettings(emptyDraftSettings)
+    setDraftSettings(draftSettingsWithPermission(permissionSettings.data?.permission_mode ?? 'smart'))
     setLiveRun(emptyLiveRun())
     draftIdempotencyKeyRef.current = createDraftIdempotencyKey()
     setExpandedWorkspaceIds(selectedProjectId ? new Set([selectedProjectId]) : new Set())
@@ -1038,6 +1039,19 @@ function SessionsPage() {
   async function updateSessionCapabilities(payload: { skill_ids?: string[]; mcp_server_names?: string[]; permission_mode?: PermissionMode }) {
     if (settingsLocked || sending || capabilitySaving) return
     if (draftActive) {
+      if (payload.permission_mode !== undefined) {
+        setCapabilitySaving(true); setActionError('')
+        try {
+          const result = await api.put<PermissionSettings>('/api/permissions/settings', { permission_mode: payload.permission_mode })
+          permissionSettings.setState({ data: result, loading: false, error: '' })
+          setDraftSettings((current) => ({ ...current, permission_mode: result.permission_mode }))
+        } catch (error) {
+          setActionError(describeError(error))
+        } finally {
+          setCapabilitySaving(false)
+        }
+        return
+      }
       setDraftSettings((current) => ({
         ...current,
         skill_ids: payload.skill_ids ?? current.skill_ids,
@@ -1048,7 +1062,11 @@ function SessionsPage() {
     }
     if (!activeId) return
     setCapabilitySaving(true); setActionError('')
-    try { await api.patch(`/api/sessions/${activeId}`, payload); await sessions.reload() }
+    try {
+      const updated = await api.patch<Session>(`/api/sessions/${activeId}`, payload)
+      if (payload.permission_mode !== undefined) permissionSettings.setState({ data: { permission_mode: updated.permission_mode || payload.permission_mode }, loading: false, error: '' })
+      await sessions.reload()
+    }
     catch (error) { setActionError(describeError(error)) } finally { setCapabilitySaving(false) }
   }
 

@@ -15,6 +15,10 @@ export type DraftLaunchResponse = { session: Session; run: Run; workspace?: Work
 
 // 新会话草稿、上下文和空集合的稳定初值，供 SessionsPage 重置状态时复用。
 export const emptyDraftSettings: DraftSessionSettings = { model_connection_id: null, model_id: null, thinking_level: 'medium', skill_ids: [], mcp_server_names: [], permission_mode: 'smart', use_memories: true }
+// 新草稿只替换权限默认值，其余编辑器设置保持统一初始值。
+export function draftSettingsWithPermission(permissionMode: PermissionMode): DraftSessionSettings {
+  return { ...emptyDraftSettings, permission_mode: permissionMode }
+}
 export const emptyDraftContext: SessionContext = { active_context_tokens: 0, auto_compact_scope_tokens: 180_000, auto_compact_scope_limit: 180_000, full_context_window_limit: 200_000, base_window_tokens_remaining: 200_000, token_limit_reached: false, used_tokens: 0, limit_tokens: 200_000, compact_threshold_tokens: 180_000, percent: 0 }
 export const noDelegatedTasks: DelegatedTask[] = []
 export const noTeammates: Teammate[] = []

@@ -443,7 +443,7 @@ class SessionCreate(BaseModel):
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
     thinking_level: ThinkingLevel = "medium"
     # 变量说明：permission_mode 表示当前步骤使用的 permission_mode 值。
-    permission_mode: PermissionMode = "smart"
+    permission_mode: PermissionMode | None = None
     # 变量说明：use_memories 表示当前流程使用的 use_memories 集合。
     use_memories: bool = True
     # 变量说明：skill_ids 表示skill 对象标识集合。
@@ -777,7 +777,7 @@ class DraftLaunchRequest(BaseModel):
     # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
     thinking_level: ThinkingLevel = "medium"
     # 变量说明：permission_mode 表示当前步骤使用的 permission_mode 值。
-    permission_mode: PermissionMode = "smart"
+    permission_mode: PermissionMode | None = None
     # 变量说明：use_memories 表示当前流程使用的 use_memories 集合。
     use_memories: bool = True
     # 变量说明：skill_ids 表示skill 对象标识集合。
@@ -941,6 +941,16 @@ class MemorySettingsRead(BaseModel):
 class MemorySettingsUpdate(BaseModel):
     # 变量说明：enabled 表示当前步骤使用的 enabled 值。
     enabled: bool
+
+
+# 类职责：定义 PermissionSettingsRead 在本领域中的数据与行为。
+class PermissionSettingsRead(BaseModel):
+    permission_mode: PermissionMode
+
+
+# 类职责：定义 PermissionSettingsUpdate 在本领域中的数据与行为。
+class PermissionSettingsUpdate(BaseModel):
+    permission_mode: PermissionMode
 
 
 # 类职责：定义 MemoryCreate 在本领域中的数据与行为。

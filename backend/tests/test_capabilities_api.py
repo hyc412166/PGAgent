@@ -265,6 +265,39 @@ def test_agent_and_session_capability_relations_persist_through_api(
     assert updated_session.json()["skill_ids"] == []
 
 
+# 测试场景：权限模式修改后成为后续新会话和草稿启动的默认值。
+def test_permission_mode_preference_is_reused_by_new_sessions_and_drafts(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, _launched = client
+    assert test_client.get("/api/permissions/settings").json() == {"permission_mode": "smart"}
+
+    changed = test_client.put("/api/permissions/settings", json={"permission_mode": "full"})
+    assert changed.status_code == 200
+    assert changed.json() == {"permission_mode": "full"}
+
+    session = test_client.post("/api/sessions", json={"title": "Inherited permission"})
+    assert session.status_code == 201, session.text
+    assert session.json()["permission_mode"] == "full"
+
+    changed_session = test_client.patch(
+        f"/api/sessions/{session.json()['id']}", json={"permission_mode": "ask"}
+    )
+    assert changed_session.status_code == 200
+    assert changed_session.json()["permission_mode"] == "ask"
+
+    next_session = test_client.post("/api/sessions", json={"title": "Ask inherited"})
+    assert next_session.status_code == 201, next_session.text
+    assert next_session.json()["permission_mode"] == "ask"
+
+    draft = test_client.post(
+        "/api/drafts/launch",
+        json={"idempotency_key": "permission-inherited-draft", "title": "Inherited draft", "content": "hello"},
+    )
+    assert draft.status_code == 202, draft.text
+    assert draft.json()["session"]["permission_mode"] == "ask"
+
+
 # 测试场景：验证状态能够可靠持久化、重放或在重启后恢复，并保持记录之间的关联；函数名 test_draft_launch_persists_permission_and_skills_and_binds_them_to_idempotency 精确标识本用例的具体条件。
 def test_draft_launch_persists_permission_and_skills_and_binds_them_to_idempotency(
     client: tuple[TestClient, dict[str, list]], tmp_path: Path

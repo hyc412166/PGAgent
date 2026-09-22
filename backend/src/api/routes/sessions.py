@@ -62,6 +62,8 @@ from src.api.schemas import (
     SessionCreate,
     SessionRead,
     SessionUpdate,
+    PermissionSettingsRead,
+    PermissionSettingsUpdate,
     TeammateRead,
     WorkspaceCreate,
     WorkspaceRead,
@@ -71,6 +73,7 @@ from src.memory.service import recall_memories, refresh_memory_markdown_projecti
 from src.config import settings
 from src.mcp.config import load_mcp_config_source, validate_mcp_server_names
 from src.mcp.runtime import mcp_runtime_pool
+from src.permissions.preferences import get_permission_mode, set_permission_mode
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
 from src.tasks.state import cancel_durable_task, latest_resumable_task, task_payload
 from src.agents.collaboration import cleanup_session_worktrees
@@ -94,6 +97,23 @@ from src.api.routes.shared import (
     _require_enabled_model_connection,
     _workspace_name_from_root,
 )
+
+
+# 函数职责：读取用户最后一次选择的权限模式，作为后续新会话的默认值。
+@router.get("/permissions/settings", response_model=PermissionSettingsRead)
+def read_permission_settings(db: Session = Depends(get_db)) -> PermissionSettingsRead:
+    return PermissionSettingsRead(permission_mode=get_permission_mode(db))
+
+
+# 函数职责：保存用户最后一次选择的权限模式。
+@router.put("/permissions/settings", response_model=PermissionSettingsRead)
+def update_permission_settings(
+    payload: PermissionSettingsUpdate,
+    db: Session = Depends(get_db),
+) -> PermissionSettingsRead:
+    item = set_permission_mode(db, payload.permission_mode)
+    _commit(db)
+    return PermissionSettingsRead(permission_mode=item.permission_mode)
 
 # 函数职责：列出 sessions 对应的数据或流程。
 # 参数关系：workspace_id 表示工作区标识；agent_id 表示智能体标识；db 表示当前数据库会话。
@@ -122,6 +142,8 @@ def list_sessions(
 def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> ChatSession:
     # 变量说明：data 表示当前处理的数据。
     data = payload.model_dump()
+    requested_permission_mode = data.pop("permission_mode", None)
+    data["permission_mode"] = requested_permission_mode or get_permission_mode(db)
     # 变量说明：skill_ids 表示skill 对象标识集合。
     skill_ids = data.pop("skill_ids", [])
     try:
@@ -145,6 +167,8 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> Cha
     # 变量说明：item 表示当前步骤使用的 item 值。
     item = ChatSession(**data)
     db.add(item)
+    if requested_permission_mode is not None:
+        set_permission_mode(db, requested_permission_mode)
     db.flush()
     replace_session_skills(db, item, skill_ids)
     _commit(db)
@@ -436,6 +460,8 @@ async def update_session(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if "permission_mode" in updates:
+        set_permission_mode(db, updates["permission_mode"])
     if "model_connection_id" in updates:
         _require_enabled_model_connection(db, updates["model_connection_id"])
     # 变量说明：runtime_settings_changed 表示当前步骤使用的 runtime_settings_changed 值。
