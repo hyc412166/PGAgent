@@ -980,6 +980,15 @@ class MemorySettings(TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
+# 类职责：保存用户最近一次选择的权限模式，供后续新会话继承。
+# 运行中的会话仍使用自己的冻结快照，不会因该全局偏好变化而改变。
+class PermissionSettings(TimestampMixin, Base):
+    __tablename__ = "permission_settings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    permission_mode: Mapped[str] = mapped_column(String(16), default="smart", nullable=False)
+
+
 # 类职责：定义 Memory 在本领域中的数据与行为。
 # 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class Memory(TimestampMixin, Base):

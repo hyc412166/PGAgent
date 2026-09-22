@@ -1,7 +1,7 @@
 // 本测试文件验证 draftLaunch 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
 import { buildDraftLaunchPayload, createDraftIdempotencyKey, createTurnIdempotencyKey } from './draftLaunch'
-import { emptyDraftSettings } from './features/sessions/sessionState'
+import { draftSettingsWithPermission, emptyDraftSettings } from './features/sessions/sessionState'
 
 // 测试分组：临时草稿原子启动。
 describe('临时草稿原子启动', () => {
@@ -58,5 +58,11 @@ describe('临时草稿原子启动', () => {
   // 测试场景：新草稿默认使用已有记忆。
   it('新草稿默认使用已有记忆', () => {
     expect(emptyDraftSettings.use_memories).toBe(true)
+  })
+
+  // 测试场景：新草稿继承用户最近一次权限选择，而不是固定回退到 smart。
+  it('新草稿继承持久化的权限模式', () => {
+    expect(draftSettingsWithPermission('full').permission_mode).toBe('full')
+    expect(draftSettingsWithPermission('ask').use_memories).toBe(true)
   })
 })
