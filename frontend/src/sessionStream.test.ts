@@ -105,6 +105,7 @@ describe('会话 SSE 事件', () => {
     expect(runStreamPhase({ type: 'tool_started', tool_name: 'read_file' })).toBe('正在调用 read_file…')
     expect(runStreamPhase({ type: 'tool_call', tool_name: 'webfetch' })).toBe('正在调用 webfetch…')
     expect(runStreamPhase({ type: 'tool_call', tool_name: 'web_search' })).toBe('正在调用 web_search…')
+    expect(runStreamPhase({ type: 'plan_updated' })).toBe('正在按计划推进…')
     expect(runStreamPhase({ type: 'approval_requested' })).toBe('等待你的审批')
     expect(runStreamPhase({ type: 'delegated_child_awaiting_approval' })).toBe('子 Agent 正等待你的审批')
     expect(isTerminalRunStreamEvent({ type: 'run_completed' })).toBe(true)

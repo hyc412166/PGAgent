@@ -81,6 +81,7 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'tool_call': return event.tool_name ? `正在调用 ${event.tool_name}…` : '正在调用工具…'
     case 'tool_finished':
     case 'tool_result': return '正在读取工具结果…'
+    case 'plan_updated': return '正在按计划推进…'
     case 'completion_verification_started': return '正在验收任务结果…'
     case 'completion_verification_rejected': return '验收未通过，正在继续改进…'
     case 'completion_verification_passed': return '验收通过，正在完成…'

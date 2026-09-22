@@ -95,7 +95,7 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
     _tool("web_search", "联网搜索", "使用模型连接提供的原生联网搜索能力并保留来源。", "network", "medium"),
     _tool("web_open", "打开网页", "提取公开网页的标题、发布时间和有限正文；支持分页续读。", "network", "medium"),
     _tool("web_run", "联网工具", "Codex 风格联网入口，支持搜索、打开、查找、截图、财经、天气、体育和时间查询。open 只能使用真实 http(s) URL 或先前结果返回的 ref_id；unsafe_url、无效参数和无效 ref_id 不要原样重试，站点 401/403/404/429 时改用其他来源。", "network", "medium"),
-    _tool("update_plan", "更新计划", "创建或更新本次运行的结构化任务计划。", "planning"),
+    _tool("update_plan", "更新计划", "创建或更新本次运行的轻量任务进度；简单任务无需调用。", "planning"),
     _tool("task", "委派任务", "把独立任务委派给已启用的用户创建子 Agent。", "orchestration", "medium"),
     _tool("tool_search", "搜索工具", "按需搜索并激活当前 Agent 已选择的低频工具。", "extension"),
     _tool("question", "向用户提问", "信息不足时提出澄清问题并等待用户回复。", "interaction"),

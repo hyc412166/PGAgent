@@ -4,12 +4,30 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 
-import { ChildAgentPanel, CompletedThoughtTimeline, FileChangeActivity, LiveAssistantMessage, MessageBubble } from './presentation'
+import { ChildAgentPanel, CompletedThoughtTimeline, FileChangeActivity, LiveAssistantMessage, MessageBubble, RunPlanProgress } from './presentation'
 import { createLiveMarkdownCoalescer } from './liveMarkdownCoalescer'
 import { formatApprovalArguments } from './approvalPresentation'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
 
 const sessionsCss = readFileSync(new URL('../../styles/sessions.css', import.meta.url), 'utf8')
+
+describe('当前运行计划展示', () => {
+  it('显示轻量进度且不冒充持久化任务控制卡片', () => {
+    const markup = renderToStaticMarkup(createElement(RunPlanProgress, {
+      plan: [
+        { id: 'inspect', content: '检查实现', status: 'completed' },
+        { id: 'change', content: '完成修改', status: 'in_progress' },
+      ],
+    }))
+
+    expect(markup).toContain('任务进度')
+    expect(markup).toContain('1/2')
+    expect(markup).toContain('检查实现')
+    expect(markup).toContain('完成修改')
+    expect(markup).not.toContain('持久化任务')
+    expect(markup).not.toContain('<button')
+  })
+})
 
 describe('子 Agent 运行事件展示', () => {
   it('将审批参数格式化为可读内容并脱敏敏感字段', () => {

@@ -249,7 +249,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "task": {
-        "description": "把一个或多个相互独立的子任务并行委派给已启用的子 Agent。单任务使用 task+agent_id；如果该任务已由 update_plan 规划为 subagent，必须把其稳定 id 作为 step_id。多个任务使用 tasks 数组并为已规划项沿用 id。系统会并行启动并在全部结束后返回结构化结果。子 Agent 只能使用它自身被勾选且不超过当前会话权限的工具，且不能再次委派。",
+        "description": "把一个或多个相互独立的子任务并行委派给已启用的子 Agent。单任务使用 task+agent_id；step_id 可用于关联已有持久任务步骤。多个任务使用 tasks 数组，系统会并行启动并在全部结束后返回结构化结果。子 Agent 只能使用它自身被勾选且不超过当前会话权限的工具，且不能再次委派。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -257,7 +257,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "agent_id": {"type": "string"},
                 "model_id": {"type": "string", "description": "本次委派使用的模型；省略时继承主 Agent 本轮模型。"},
                 "thinking_level": {"type": "string", "enum": ["low", "medium", "high", "xhigh"], "description": "本次委派的思考强度；省略时继承主 Agent 本轮设置。"},
-                "step_id": {"type": "string", "description": "对应 update_plan 中已规划子 Agent 步骤的稳定 id。"},
+                "step_id": {"type": "string", "description": "可选的已有持久任务步骤标识。"},
                 "depends_on": {"type": "array", "items": {"type": "string"}},
                 "tasks": {
                     "type": "array",
@@ -284,7 +284,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "todowrite": {
-        "description": "更新本次运行的结构化任务清单；每一步必须提供跨更新保持不变的 id。executor_kind=subagent 只表示规划，随后仍须调用 task，并把同一 id 作为 step_id。",
+        "description": "更新本次运行的轻量任务进度；仅用于具有明显阶段、依赖或中途校验点的任务，简单任务不要调用。每一步必须提供在本次运行内跨更新保持不变的 id。",
         "parameters": {
             "type": "object",
             "properties": {

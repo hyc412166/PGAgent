@@ -34,6 +34,7 @@ import { MarkdownContent } from './MarkdownContent'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
 import { formatApprovalArguments } from './approvalPresentation'
 import { createToolResultDetailLoader, presentToolResult, toolResultRequest, type CompleteToolResult } from '../../toolResultDetails'
+import type { RunPlanStep } from './sessionState'
 
 // LiveRunView 是运输状态到实时回复组件之间的最小只读接口。
 export type LiveRunView = {
@@ -41,10 +42,26 @@ export type LiveRunView = {
   phase: string
   draft: string
   assistantItems?: Array<{ id: string; content: string; status: 'streaming' | 'completed'; responseId?: string; itemId?: string; outputIndex?: number; phase?: string }>
+  plan?: RunPlanStep[]
   status: 'idle' | 'connecting' | 'live' | 'fallback' | 'awaiting_approval' | 'terminal'
   error: string
   thought: ThoughtTimelineState
   thinkingStatus: string
+}
+
+// RunPlanProgress 只呈现当前运行的轻量检查清单，不提供持久任务的暂停、恢复或取消语义。
+export function RunPlanProgress({ plan }: { plan: RunPlanStep[] }) {
+  if (!plan.length) return null
+  const completed = plan.filter((step) => step.status === 'completed').length
+  return <section className="run-plan-progress" aria-label="本次运行任务进度">
+    <header><strong>任务进度</strong><span>{completed}/{plan.length}</span></header>
+    <ol>{plan.map((step, index) => <li key={step.id} className={`run-plan-step step-${step.status}`}>
+      <span className="run-plan-node" aria-hidden="true">
+        {step.status === 'completed' ? <CheckCircle2 size={14} /> : step.status === 'in_progress' ? <LoaderCircle className="spin" size={14} /> : step.status === 'cancelled' ? <XCircle size={14} /> : index + 1}
+      </span>
+      <span>{step.content}</span>
+    </li>)}</ol>
+  </section>
 }
 
 // 将后端时间转换为当前语言环境下的短日期时间。
@@ -637,6 +654,7 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChang
             </CollapsibleRegion>
           </div>
           : null}
+        {!!liveRun.plan?.length && <RunPlanProgress plan={liveRun.plan} />}
         {!!finalItems.length && <div className="live-final-content"><OrderedRunContent items={finalItems} activitiesVisible runId={liveRun.runId} live includeFinalAssistant /></div>}
         {liveRun.error && <p className="live-error">{liveRun.error}</p>}
       </div>

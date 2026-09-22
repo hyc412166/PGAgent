@@ -143,6 +143,43 @@ def test_empty_todowrite_does_not_create_a_phantom_task(task_db) -> None:
         assert db.query(DurableTask).count() == 0
 
 
+# 测试场景：普通运行的轻量计划不得隐式升级为跨运行持久任务。
+def test_run_local_todowrite_does_not_create_durable_task(task_db) -> None:
+    _session_id, run_id = _stage("检查并修复一个明确问题")
+
+    sync_todos_for_run(run_id, [
+        {"id": "inspect", "content": "检查问题", "status": "in_progress"},
+        {"id": "fix", "content": "完成修复", "status": "pending"},
+    ], create_if_missing=False)
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.task_id is None and run.plan_step_id is None
+        assert db.query(DurableTask).count() == 0
+        assert db.query(PlanStep).count() == 0
+
+
+# 测试场景：已绑定 DurableTask 的恢复运行仍可使用同一轻量计划更新持久步骤。
+def test_run_local_todowrite_updates_existing_durable_task(task_db) -> None:
+    _session_id, run_id = _stage("继续已有持久任务")
+    sync_todos_for_run(run_id, [
+        {"id": "inspect", "content": "检查问题", "status": "in_progress"},
+        {"id": "fix", "content": "完成修复", "status": "pending"},
+    ])
+
+    sync_todos_for_run(run_id, [
+        {"id": "inspect", "content": "检查问题", "status": "completed"},
+        {"id": "fix", "content": "完成修复", "status": "in_progress"},
+    ], create_if_missing=False)
+
+    with database.SessionLocal() as db:
+        run = db.get(Run, run_id)
+        assert run is not None and run.task_id
+        steps = list(db.query(PlanStep).filter_by(task_id=run.task_id).order_by(PlanStep.position))
+        assert [step.status for step in steps] == ["completed", "in_progress"]
+        assert run.plan_step_id == steps[1].id
+
+
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_continuation_request_accepts_common_resume_wording 精确标识本用例的具体条件。
 def test_continuation_request_accepts_common_resume_wording() -> None:
     assert is_continuation_request("继续刚刚没完成的工作？")

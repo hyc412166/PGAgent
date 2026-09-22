@@ -824,6 +824,19 @@
 .live-thought-chevron { color: var(--muted-2); transition: transform 160ms cubic-bezier(.2, 0, 0, 1); }
 .live-thought.expanded .live-thought-chevron { transform: rotate(90deg); }
 .live-thought .thought-activity-list { max-width: min(720px, 100%); }
+.run-plan-progress { width: min(620px, 100%); margin: 6px 0 13px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-soft); }
+.run-plan-progress > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; color: var(--muted); font-size: .6875rem; }
+.run-plan-progress > header strong { color: var(--ink); font-size: .75rem; }
+.run-plan-progress > header span { font-variant-numeric: tabular-nums; }
+.run-plan-progress ol { display: flex; flex-direction: column; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.run-plan-step { min-width: 0; display: grid; grid-template-columns: 19px minmax(0, 1fr); align-items: start; gap: 7px; color: var(--muted); font-size: .6875rem; line-height: 1.45; }
+.run-plan-node { width: 19px; height: 19px; display: grid; place-items: center; color: var(--muted-2); font-size: .5rem; font-weight: 750; }
+.run-plan-step.step-in_progress { color: var(--ink); }
+.run-plan-step.step-in_progress .run-plan-node { color: var(--ocean-700); }
+.run-plan-step.step-completed { color: var(--muted-2); }
+.run-plan-step.step-completed .run-plan-node { color: var(--green); }
+.run-plan-step.step-cancelled { color: var(--muted-2); text-decoration: line-through; }
+.run-plan-step.step-cancelled .run-plan-node { color: var(--red); }
 .thought-waiting {
   position: relative;
   width: max-content;

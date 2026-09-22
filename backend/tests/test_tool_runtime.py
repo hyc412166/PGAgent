@@ -15,6 +15,7 @@ import pytest
 from src.context.window import ContextManager
 from src.context.assembly import COMPACTION_SECTION_TITLES, ContextAssembler, ConversationCompactor
 from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, safe_tool_argument_summary, safe_tool_result_summary
+from src.api.routes.shared import _public_run_event_payload
 from src.tools import create_default_registry
 from src.tools.catalog import BUILTIN_TOOL_IDS
 from src.tools.policy import assess_tool_call
@@ -455,6 +456,66 @@ def test_todo_and_task_behavior_is_honest(tmp_path) -> None:
     task = registry.execute("task", {"task": "delegate this", "agent_id": "child-agent"})
     assert not task.ok
     assert task.error_code == "delegated_task_unavailable"
+
+
+@pytest.mark.asyncio
+# 测试场景：update_plan 产生独立可回放事件，且事件不携带内部调度字段。
+async def test_update_plan_emits_lightweight_plan_event(tmp_path) -> None:
+    calls = 0
+    persisted_events: list[dict] = []
+
+    async def model_call(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelTurn(tool_calls=[ModelToolCall("plan-1", "update_plan", {
+                "todos": [
+                    {"id": "inspect", "content": "检查实现", "status": "completed", "executor_kind": "main"},
+                    {"id": "change", "content": "完成修改", "status": "in_progress", "agent_id": "private-agent"},
+                ],
+            })])
+        return ModelTurn(content="done")
+
+    runtime = AgentRuntime(
+        model_call=model_call,
+        tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=["update_plan"]),
+        event_sink=lambda event: persisted_events.append(dict(event)),
+    )
+    outcome = await runtime.run(system_prompt="", recent_messages=[])
+
+    assert outcome.status == "completed"
+    event_types = [event["type"] for event in persisted_events]
+    assert event_types.index("tool_finished") < event_types.index("plan_updated")
+    plan_event = next(event for event in persisted_events if event["type"] == "plan_updated")
+    assert plan_event == {
+        "type": "plan_updated",
+        "plan": [
+            {"id": "inspect", "content": "检查实现", "status": "completed"},
+            {"id": "change", "content": "完成修改", "status": "in_progress"},
+        ],
+    }
+
+
+# 测试场景：公开事件边界只允许计划步骤的稳定标识、文本和状态通过。
+def test_public_plan_event_filters_internal_or_invalid_fields() -> None:
+    public = _public_run_event_payload("plan_updated", {
+        "plan": [
+            {
+                "id": "inspect",
+                "content": "检查实现",
+                "status": "in_progress",
+                "agent_id": "private-agent",
+                "workspace_mode": "worktree",
+                "depends_on": ["secret-step"],
+            },
+            {"id": "invalid", "content": "非法状态", "status": "blocked"},
+        ],
+        "runtime_binding": {"workspace_root": "C:/private"},
+    })
+
+    assert public == {
+        "plan": [{"id": "inspect", "content": "检查实现", "status": "in_progress"}],
+    }
 
 @pytest.mark.asyncio
 # 测试场景：验证权限、审批或敏感数据边界在完整调用链路中保持有效；函数名 test_task_delegate_is_not_started_until_parent_approval 精确标识本用例的具体条件。

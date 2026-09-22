@@ -7,7 +7,7 @@ import type { RunStreamEvent } from '../../../sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from '../../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../../thoughtTimeline'
 import type { Approval, Run, RunEvent } from '../../../types'
-import { emptyLiveRun, runStreamEventNames, runThinkingStartedAt } from '../sessionState'
+import { emptyLiveRun, latestRunPlanFromEvents, runPlanFromEvent, runStreamEventNames, runThinkingStartedAt } from '../sessionState'
 import type { LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns } from '../sessionState'
 
 // MutableRef 和 LoadState 描述该 Hook 接收的可变引用及 useApiData 状态形状。
@@ -138,6 +138,7 @@ export function useRunTransport(options: RunTransportOptions) {
       error: resolvedEvent?.error ? String(resolvedEvent.error) : previous.error,
       assistantItems: resolvedEvent ? applyAssistantStreamEvent(previous.assistantItems, resolvedEvent) : previous.assistantItems,
       draft: resolvedEvent ? assistantItemsText(applyAssistantStreamEvent(previous.assistantItems, resolvedEvent)) || appendAssistantDelta(previous.draft, resolvedEvent) : previous.draft,
+      plan: [],
       thought: resolvedEvent ? updateThoughtTimeline(previous.thought, resolvedEvent) : previous.thought,
     }))
 
@@ -254,6 +255,7 @@ export function useRunTransport(options: RunTransportOptions) {
       phase: previous.runId === runId && previous.phase ? previous.phase : '思考中…',
       draft: previous.runId === runId ? previous.draft : '',
       assistantItems: previous.runId === runId ? previous.assistantItems : [],
+      plan: previous.runId === runId ? previous.plan : [],
       status: 'connecting',
       error: '',
       thought: previous.runId === runId
@@ -285,6 +287,7 @@ export function useRunTransport(options: RunTransportOptions) {
       const latestEvent = orderedEvents.at(-1)
       const latestEventType = latestEvent?.type || latestEvent?.event_type || ''
       const restored = restoreAssistantItemsFromEvents(events.map((event) => ({ ...event, type: event.type || event.event_type || '' })))
+      const restoredPlan = latestRunPlanFromEvents(orderedEvents)
       setLiveRun((previous) => {
         if (previous.runId !== runId) return previous
         // 重连或晚连接可能错过当前轮的 model_step_started；持久化时间线补齐轮次边界，
@@ -295,13 +298,15 @@ export function useRunTransport(options: RunTransportOptions) {
         const nextThought = shouldRestoreThought ? restoredThought : previous.thought
         const nextPhase = shouldRestoreThought && latestEventType ? runStreamPhase({ type: latestEventType, ...((latestEvent?.payload || {}) as Record<string, unknown>) }) : previous.phase
         const shouldRestoreAssistant = !previous.assistantItems.length && restored.length > 0
-        if (!shouldRestoreThought && !shouldRestoreAssistant) return previous
+        const shouldRestorePlan = restoredPlan !== null && previous.plan.length === 0
+        if (!shouldRestoreThought && !shouldRestoreAssistant && !shouldRestorePlan) return previous
         return {
           ...previous,
           phase: nextPhase || previous.phase,
           thought: nextThought,
           assistantItems: shouldRestoreAssistant ? restored : previous.assistantItems,
           draft: shouldRestoreAssistant ? assistantItemsText(restored) : previous.draft,
+          plan: shouldRestorePlan ? restoredPlan : previous.plan,
         }
       })
     })().catch(() => {
@@ -339,6 +344,7 @@ export function useRunTransport(options: RunTransportOptions) {
         || (parsed.type === 'run_state' && parsed.status === 'awaiting_approval')
       setLiveRun((previous) => {
         const assistantItems = applyAssistantStreamEvent(previous.assistantItems, parsed)
+        const updatedPlan = runPlanFromEvent(parsed)
         return ({
         ...previous,
         runId,
@@ -346,15 +352,13 @@ export function useRunTransport(options: RunTransportOptions) {
         // 正文是按 response/item 维护的持久化候选；工具开始、response 完成都不能清空它。
         assistantItems,
         draft: assistantItemsText(assistantItems) || appendAssistantDelta(previous.draft, parsed),
+        plan: updatedPlan === null ? previous.plan : updatedPlan,
         status: terminal ? 'terminal' : waitingApproval ? 'awaiting_approval' : 'live',
         error: parsed.error ? String(parsed.error) : previous.error,
         thought: updateThoughtTimeline(previous.thought, parsed),
         })
       })
       if (waitingApproval) void refreshApprovalsForSession(sessionId)
-      if (parsed.type === 'tool_finished' && ['update_plan', 'todowrite', 'TodoWrite'].includes(String(parsed.tool_name || ''))) {
-        void refreshDurableTask()
-      }
       if (delegatedChildEvent) {
         void refreshRuns()
         void refreshChildTasks()
@@ -383,7 +387,7 @@ export function useRunTransport(options: RunTransportOptions) {
     }
   }, [
     activeIdRef, eventSourceRef, fallbackTimerRef, refreshApprovalsForSession, refreshChildTasks,
-    refreshDurableTask, refreshRuns, refreshTeammates, seenStreamEventsRef, setChildPanelOpen,
+    refreshRuns, refreshTeammates, seenStreamEventsRef, setChildPanelOpen,
     setLiveRun, startRunFallback, streamErrorCountRef, streamReconnectTimerRef, streamRunIdRef,
     syncTerminalRun,
   ])
