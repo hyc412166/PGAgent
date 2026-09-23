@@ -1555,6 +1555,13 @@ async def test_structured_assistant_stream_keeps_item_identity_and_response_boun
             output_index=1,
             content="先检查",
         ))
+        await kwargs["on_assistant_item_completed"](AssistantMessageItem(
+            response_id="resp-1",
+            item_id="item-1",
+            output_index=1,
+            content="先检查",
+            phase=OutputPhase.FINAL_ANSWER,
+        ))
         return {
             "_pgagent_normalized_response": NormalizedModelResponse(
                 response_id="resp-1",
@@ -1584,8 +1591,9 @@ async def test_structured_assistant_stream_keeps_item_identity_and_response_boun
         "assistant_message_started",
         "assistant_message_delta",
         "assistant_message_delta",
+        "assistant_message_completed",
     ]
-    assert [event.get("delta") for event in transient_events[1:]] == ["先", "检查"]
+    assert [event.get("delta") for event in transient_events[1:3]] == ["先", "检查"]
     assert all(event.get("response_id") == "resp-1" for event in transient_events)
     assert all(event.get("item_id") == "item-1" for event in transient_events)
     event_types = [event["type"] for event in durable_events]

@@ -33,7 +33,8 @@ def create_model_call(config: ProviderConfig, *, credentials):
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     async def call(*, messages: list[dict], tools: list[dict], mode: str,
                    on_delta=None, on_thought_delta=None, on_activity=None,
-                   prompt_cache_key=None, on_retry=None, on_assistant_item=None, on_item=None):
+                   prompt_cache_key=None, on_retry=None, on_assistant_item=None,
+                   on_assistant_item_completed=None, on_item=None):
         # 变量说明：api_key 表示当前步骤使用的 api_key 值。
         api_key = credentials(config.secret_ref)
         if not api_key:
@@ -113,11 +114,16 @@ def create_model_call(config: ProviderConfig, *, credentials):
                                         result = callback(item)
                                         if inspect.isawaitable(result):
                                             await result
+                                        if on_assistant_item_completed is not None:
+                                            result = on_assistant_item_completed(item)
+                                            if inspect.isawaitable(result):
+                                                await result
                         else:
                             # 变量说明：payload 表示跨层传递的数据载荷。
                             normalized_response = await responses.consume(stream, idle_seconds=settings.model_timeout_seconds,
                                 on_delta=on_delta, on_thought_delta=on_thought_delta,
                                 on_activity=on_activity, on_assistant_item=on_assistant_item,
+                                on_assistant_item_completed=on_assistant_item_completed,
                                 on_item=on_item)
                             payload = responses.to_legacy_payload(normalized_response)
                         # 变量说明：items 表示待处理的元素集合。

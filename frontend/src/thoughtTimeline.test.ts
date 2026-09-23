@@ -42,6 +42,61 @@ describe('实时 Thought 时间线', () => {
     expect(completed).toMatchObject({ startedAt: 1_000, elapsedMs: 1_750, finished: true })
   })
 
+  it('中间回复完成后立即开启新的等待周期，重复完成事件不重置计时', () => {
+    let timeline = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+    timeline = updateThoughtTimeline(timeline, {
+      type: 'assistant_message_started', response_id: 'response-1', item_id: 'commentary-1',
+      output_index: 0, phase: 'commentary',
+    }, 1_100)
+    timeline = updateThoughtTimeline(timeline, {
+      type: 'assistant_message_delta', response_id: 'response-1', item_id: 'commentary-1',
+      output_index: 0, phase: 'commentary', delta: '已经完成第一段检查。',
+    }, 1_200)
+    timeline = updateThoughtTimeline(timeline, {
+      type: 'assistant_message_completed', response_id: 'response-1', item_id: 'commentary-1',
+      output_index: 0, phase: 'commentary', content: '已经完成第一段检查。',
+    }, 1_500)
+
+    expect(timeline).toMatchObject({ activeStepStartedAt: 1_500, activeStepHasVisibleContent: false })
+    const replayed = updateThoughtTimeline(timeline, {
+      type: 'assistant_message_completed', response_id: 'response-1', item_id: 'commentary-1',
+      output_index: 0, phase: 'commentary', content: '已经完成第一段检查。',
+    }, 2_000)
+    expect(replayed).toMatchObject({ activeStepStartedAt: 1_500, activeStepHasVisibleContent: false })
+  })
+
+  it('模型重试后重新显示本轮等待提示', () => {
+    const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+    const visible = updateThoughtTimeline(started, { type: 'thought_summary', step: 1, summary: '正在检查文件。' }, 1_200)
+    const retried = updateThoughtTimeline(visible, { type: 'model_retry', attempt: 2 }, 1_500)
+
+    expect(retried.items.at(-1)).toMatchObject({ id: 'model-retry', title: '重试模型', status: 'running' })
+    expect(retried).toMatchObject({ activeStepStartedAt: 1_500, activeStepHasVisibleContent: false })
+  })
+
+  it('显示上下文压缩并在完成后继续独立等待，隐藏准备事件不抑制提示', () => {
+    const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 9 }, 1_000)
+    const prepared = updateThoughtTimeline(started, { type: 'context_prepared' }, 1_050)
+    expect(prepared.activeStepHasVisibleContent).toBe(false)
+
+    const compacting = updateThoughtTimeline(prepared, {
+      type: 'context_compaction_started', phase: 'before_model', reason: 'threshold',
+    }, 1_100)
+    expect(compacting.items.at(-1)).toMatchObject({
+      kind: 'event', icon: 'context', title: '正在压缩上下文', status: 'running',
+    })
+    expect(compacting.activeStepHasVisibleContent).toBe(true)
+
+    const compacted = updateThoughtTimeline(compacting, {
+      type: 'context_compaction_finished', phase: 'before_model', reason: 'threshold',
+    }, 3_000)
+    expect(compacted.items.filter((item) => item.icon === 'context')).toHaveLength(2)
+    expect(compacted.items.at(-1)).toMatchObject({
+      kind: 'event', icon: 'context', title: '上下文压缩完成', status: 'completed',
+    })
+    expect(compacted).toMatchObject({ activeStepStartedAt: 3_000, activeStepHasVisibleContent: false })
+  })
+
   // 测试场景：文件修改工具只展示用户可读的文件记录，不泄露 apply_patch 工具名。
   it('把文件修改工具转换为可点击的文件变更活动', () => {
     const running = updateThoughtTimeline(emptyThoughtTimeline, {
