@@ -943,6 +943,9 @@ class AgentRuntime:
             self._model_accepts_assistant_item = (
                 "on_assistant_item" in model_signature.parameters or accepts_var_kwargs
             )
+            self._model_accepts_assistant_item_completed = (
+                "on_assistant_item_completed" in model_signature.parameters or accepts_var_kwargs
+            )
         except (TypeError, ValueError):
             # 变量说明：_model_accepts_delta 表示当前步骤使用的 _model_accepts_delta 值。
             self._model_accepts_delta = False
@@ -954,6 +957,7 @@ class AgentRuntime:
             # 变量说明：_model_accepts_retry 表示当前步骤使用的 _model_accepts_retry 值。
             self._model_accepts_retry = False
             self._model_accepts_assistant_item = False
+            self._model_accepts_assistant_item_completed = False
         # 变量说明：tool_registry 表示当前步骤使用的 tool_registry 值。
         self.tool_registry = tool_registry
         # 变量说明：tool_router 表示当前步骤使用的 tool_router 值。
@@ -1847,6 +1851,28 @@ class AgentRuntime:
                                 step=guard.steps,
                             )
 
+                    async def on_assistant_item_completed(item: Any) -> None:
+                        await on_activity()
+                        if self.completion_verifier is not None:
+                            return
+                        from src.model.output import AssistantMessageItem
+
+                        if not isinstance(item, AssistantMessageItem):
+                            raise TypeError("on_assistant_item_completed 必须接收 AssistantMessageItem")
+                        item_payload: dict[str, Any] = {
+                            "content": item.content[:100_000],
+                            "output_index": item.output_index,
+                            "phase": str(item.phase),
+                            "step": guard.steps,
+                        }
+                        if item.response_id:
+                            item_payload["response_id"] = item.response_id
+                        if item.item_id:
+                            item_payload["item_id"] = item.item_id
+                        # output_item.done 是一段中间回复真正结束的边界；立即通知前端开启下一段等待，
+                        # 持久化完成事件仍在整个 provider response 完成后统一落盘。
+                        await self._publish_transient("assistant_message_completed", **item_payload)
+
                     async def on_thought_delta(delta: str) -> None:
                         # provider reasoning summary 属于模型内部摘要，仅用于组装下一轮请求，不进入用户可见时间线。
                         await on_activity()
@@ -1902,6 +1928,8 @@ class AgentRuntime:
                         kwargs["on_retry"] = provider_retry
                     if self._model_accepts_assistant_item and self._model_emits_assistant_items:
                         kwargs["on_assistant_item"] = on_assistant_item
+                    if self._model_accepts_assistant_item_completed and self._model_emits_assistant_items:
+                        kwargs["on_assistant_item_completed"] = on_assistant_item_completed
                     # 变量说明：is_async_call 表示是否满足 is_async_call 条件。
                     is_async_call = inspect.iscoroutinefunction(self.model_call)
 

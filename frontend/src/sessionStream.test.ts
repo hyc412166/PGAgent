@@ -47,6 +47,14 @@ describe('会话 SSE 事件', () => {
     expect(runStreamPhase({ type: 'assistant_message_completed', phase: 'final_answer' })).toBe('已生成一段回复')
   })
 
+  it('明确展示上下文压缩阶段并在完成后回到等待模型', () => {
+    expect(runStreamPhase({ type: 'context_compaction_started' })).toBe('正在压缩上下文…')
+    expect(runStreamPhase({ type: 'context_compaction_finished' })).toBe('上下文压缩完成，继续思考…')
+    expect(runStreamPhase({ type: 'context_compacted' })).toBe('上下文压缩完成，继续思考…')
+    expect(runStreamPhase({ type: 'context_compaction_failed' })).toBe('上下文压缩失败，继续处理…')
+    expect(runStreamPhase({ type: 'context_prepared' })).toBe('正在准备上下文…')
+  })
+
   it('按 response/item 保留有序助手正文，工具事件不会清空此前内容', () => {
     let items = applyAssistantStreamEvent([], { type: 'assistant_message_started', response_id: 'resp-1', item_id: 'item-1', output_index: 0 })
     items = applyAssistantStreamEvent(items, { type: 'assistant_message_delta', response_id: 'resp-1', item_id: 'item-1', delta: '先检查 ' })

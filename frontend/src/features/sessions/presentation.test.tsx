@@ -157,6 +157,64 @@ describe('助手消息中的思考过程展示', () => {
     expect(markup).not.toContain('pnpm test')
   })
 
+  it('多个工具中仍有调用运行时保持可见动效状态', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-shell-group-running',
+        phase: '执行中',
+        draft: '',
+        status: 'live',
+        error: '',
+        thinkingStatus: '处理中',
+        thought: {
+          startedAt: 1_000,
+          elapsedMs: 0,
+          finished: false,
+          conclusion: '',
+          tools: [],
+          items: [
+            { id: 'shell-failed', kind: 'tool', icon: 'shell', title: 'Shell', detail: 'Get-Command winword', status: 'failed' },
+            { id: 'shell-running', kind: 'tool', icon: 'shell', title: 'Shell', detail: 'Get-ChildItem -Recurse', status: 'running' },
+          ],
+        },
+      },
+    }))
+
+    expect(markup).toContain('正在运行命令')
+    expect(markup).toMatch(/class="tool-activity-group [^"]*is-running[^"]*"/)
+    expect(markup).toContain('aria-busy="true"')
+    expect(markup).toContain('tool-activity-running-indicator')
+  })
+
+  it('多个工具都结束后立即移除运行动效状态', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-shell-group-finished',
+        phase: '执行中',
+        draft: '',
+        status: 'live',
+        error: '',
+        thinkingStatus: '处理中',
+        thought: {
+          startedAt: 1_000,
+          elapsedMs: 0,
+          finished: false,
+          conclusion: '',
+          tools: [],
+          items: [
+            { id: 'shell-failed', kind: 'tool', icon: 'shell', title: 'Shell', detail: 'Get-Command winword', status: 'failed' },
+            { id: 'shell-completed', kind: 'tool', icon: 'shell', title: 'Shell', detail: 'Get-ChildItem -Recurse', status: 'completed' },
+          ],
+        },
+      },
+    }))
+
+    expect(markup).toContain('运行命令时出错')
+    expect(markup).not.toContain('is-running')
+    expect(markup).not.toContain('aria-busy="true"')
+    expect(markup).not.toContain('tool-activity-running-indicator')
+  })
+
   it('连续联网搜索默认使用放大镜图标而不是终端图标', () => {
     const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
       liveRun: {
@@ -216,6 +274,14 @@ describe('助手消息中的思考过程展示', () => {
     expect(sessionsCss).toContain('.thought-activity.kind-tool .thought-activity-icon { align-self: start; transform: translateY(1px); }')
     expect(sessionsCss).toContain('.tool-activity-group-item-line > .tool-activity-icon { flex: 0 0 20px; transform: translateY(1px); }')
     expect(sessionsCss).toContain('.tool-activity-group-item-line > span:not(.tool-activity-icon) {')
+  })
+
+  it('工具分组运行动效同时覆盖折叠标题、展开行和减少动态效果', () => {
+    expect(sessionsCss).toContain('.tool-activity-group.is-running .tool-activity-group-label {')
+    expect(sessionsCss).toContain('.tool-activity-group-item.is-running .tool-activity-group-item-line strong,')
+    expect(sessionsCss).toContain('@keyframes tool-running-pulse')
+    expect(sessionsCss).toContain('@keyframes tool-running-dot')
+    expect(sessionsCss).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*\.tool-activity-group\.is-running \.tool-activity-group-label,[\s\S]*animation: none;/)
   })
 
   it('把等待下一条可见输出的状态放进执行详情，并复用工具行动效规范', () => {

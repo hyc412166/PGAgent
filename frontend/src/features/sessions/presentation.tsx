@@ -514,10 +514,13 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
       if (entry.kind === 'tool-group') {
         const expanded = Boolean(expandedGroups[entry.id])
         const label = toolGroupLabel(entry.items)
-        return <section className={`tool-activity-group ${expanded ? 'expanded' : ''}`} key={entry.id}>
+        // 分组工具可以并行处于运行态，不能仅依赖单个 activeItemId 判断是否应展示活动反馈。
+        const running = live && entry.items.some((item) => item.status === 'running')
+        return <section className={`tool-activity-group ${expanded ? 'expanded' : ''} ${running ? 'is-running' : ''}`} aria-busy={running || undefined} key={entry.id}>
           <button type="button" className="tool-activity-group-toggle" aria-expanded={expanded} onClick={() => toggleGroup(entry.id)}>
             <ToolActivityGlyph icon={groupedActivityIcon(entry.items)} size={14} />
-            <span>{label}</span>
+            <span className="tool-activity-group-label">{label}</span>
+            {running && <span className="tool-activity-running-indicator" aria-hidden="true"><span /><span /><span /></span>}
             <ChevronRight className="tool-activity-group-chevron" size={14} aria-hidden="true" />
           </button>
           <CollapsibleRegion expanded={expanded} mounted={Boolean(mountedGroups[entry.id]) || expanded} className="tool-activity-group-collapse">
@@ -526,7 +529,8 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
               const itemExpanded = Boolean(expandedItems[item.id])
               const detailRequest = toolResultRequest(runId, live, item.kind, item.id)
               const expandable = !item.changeSet && (Boolean(item.detail.trim()) || Boolean(detailRequest))
-              return <div className={`tool-activity-group-item ${item.status}`} key={item.id}>
+              const itemRunning = live && item.status === 'running'
+              return <div className={`tool-activity-group-item ${item.status} ${itemRunning ? 'is-running' : ''}`} key={item.id}>
                 {item.changeSet?.files?.[0] && runId && onOpenFileChange ? <button type="button" className="tool-activity-group-item-line is-clickable" onClick={() => openInlineChange(item)}>
                   <ToolActivityGlyph icon={item.icon} size={13} />
                   <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>

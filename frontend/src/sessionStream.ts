@@ -70,11 +70,11 @@ export function runStreamPhase(event: RunStreamEvent): string {
       reason: String(event.reason || event.stop_reason || ''),
     }) ? waitingRunPhase(String(event.reason || event.stop_reason || '')) : runStatusPhase(event.status)
     case 'context_prepared':
-    case 'context_resumed':
-    case 'context_compaction_started':
+    case 'context_resumed': return '正在准备上下文…'
+    case 'context_compaction_started': return '正在压缩上下文…'
     case 'context_compaction_finished':
-    case 'context_compaction_failed':
-    case 'context_compacted': return '正在准备上下文…'
+    case 'context_compacted': return '上下文压缩完成，继续思考…'
+    case 'context_compaction_failed': return '上下文压缩失败，继续处理…'
     case 'model_step_started':
     case 'model_retry': return '思考中…'
     case 'mcp_catalog_loading': return '正在准备 MCP 工具目录…'

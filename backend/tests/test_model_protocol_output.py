@@ -135,6 +135,49 @@ async def test_assistant_item_callback_emits_each_content_state_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_responses_preserves_added_phase_and_completes_item_before_response() -> None:
+    message_started = {
+        "type": "message", "id": "msg-commentary", "status": "in_progress",
+        "role": "assistant", "phase": "commentary", "content": [],
+    }
+    message_done = {
+        **message_started,
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "先检查项目结构。"}],
+    }
+    trace: list[tuple[str, str, OutputPhase] | str] = []
+
+    async def stream() -> AsyncIterator[dict[str, Any]]:
+        yield {
+            "type": "response.output_item.added", "response_id": "resp-1",
+            "output_index": 0, "item": message_started,
+        }
+        yield {
+            "type": "response.output_text.delta", "response_id": "resp-1",
+            "output_index": 0, "item_id": "msg-commentary", "delta": "先检查项目结构。",
+        }
+        yield {
+            "type": "response.output_item.done", "response_id": "resp-1",
+            "output_index": 0, "item": message_done,
+        }
+        trace.append("response.completed")
+        yield {
+            "type": "response.completed",
+            "response": {"id": "resp-1", "status": "completed", "output": [message_done]},
+        }
+
+    await responses.consume(
+        stream(),
+        idle_seconds=1,
+        on_assistant_item=lambda item: trace.append(("stream", item.content, item.phase)),
+        on_assistant_item_completed=lambda item: trace.append(("completed", item.content, item.phase)),
+    )
+
+    assert ("stream", "先检查项目结构。", OutputPhase.COMMENTARY) in trace
+    assert trace.index(("completed", "先检查项目结构。", OutputPhase.COMMENTARY)) < trace.index("response.completed")
+
+
+@pytest.mark.asyncio
 async def test_chat_completions_normalizes_content_and_tool_fragments_with_unknown_hints() -> None:
     async def stream() -> AsyncIterator[dict[str, Any]]:
         yield {"id": "chat-1", "choices": [{"delta": {"content": "答"}}]}

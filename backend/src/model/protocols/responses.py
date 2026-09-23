@@ -325,7 +325,8 @@ def to_legacy_payload(response: NormalizedModelResponse) -> dict[str, Any]:
 # 参数关系：stream 表示当前步骤使用的 stream 值；idle_seconds 表示当前流程使用的 idle_seconds 集合；on_delta 表示当前步骤使用的 on_delta 值；on_thought_delta 表示当前步骤使用的 on_thought_delta 值；on_activity 表示当前步骤使用的 on_activity 值。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought_delta=None,
-                  on_activity=None, on_assistant_item=None, on_item=None) -> NormalizedModelResponse:
+                  on_activity=None, on_assistant_item=None, on_assistant_item_completed=None,
+                  on_item=None) -> NormalizedModelResponse:
     # 变量说明：completed 表示当前步骤使用的 completed 值。
     completed: list[dict[str, Any]] = []
     completed_keys: set[tuple[str, Any]] = set()
@@ -336,17 +337,32 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
     summary_lengths: dict[tuple[str, int], int] = {}
     response_id: str | None = None
     assistant_contents: dict[str, str] = {}
+    assistant_metadata: dict[str, dict[str, Any]] = {}
     assistant_emitted_content: dict[str, str] = {}
+    assistant_completed_keys: set[str] = set()
     assistant_callback = on_assistant_item or on_item
+    assistant_completed_callback = on_assistant_item_completed
+
+    def assistant_key(item_id: str | None, output_index: int | None) -> str:
+        return item_id or f"index:{output_index}"
 
     async def emit_assistant(item: AssistantMessageItem) -> None:
         if assistant_callback is None:
             return
-        key = item.item_id or f"index:{item.output_index}"
+        key = assistant_key(item.item_id, item.output_index)
         if assistant_emitted_content.get(key) == item.content:
             return
         assistant_emitted_content[key] = item.content
         await _emit_assistant_item(assistant_callback, item)
+
+    async def complete_assistant(item: AssistantMessageItem) -> None:
+        if assistant_completed_callback is None:
+            return
+        key = assistant_key(item.item_id, item.output_index)
+        if key in assistant_completed_keys:
+            return
+        assistant_completed_keys.add(key)
+        await _emit_assistant_item(assistant_completed_callback, item)
 
     # 函数职责：异步发送 summary 对应的数据或流程。
     # 参数关系：item_id 表示item 对象的唯一标识；index 表示当前元素的位置索引；text 表示当前步骤使用的 text 值。
@@ -378,21 +394,42 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
             kind = event.get("type")
             if event.get("response_id"):
                 response_id = str(event["response_id"])
-            if kind == "response.output_text.delta":
+            if kind == "response.output_item.added":
+                item = _as_mapping(event["item"])
+                if item.get("type") == "message":
+                    output_index = event.get("output_index")
+                    if not isinstance(output_index, int) or isinstance(output_index, bool):
+                        output_index = item.get("output_index")
+                    item_id = str(item["id"]) if item.get("id") else None
+                    key = assistant_key(item_id, output_index)
+                    assistant_metadata[key] = item
+                    await emit_assistant(AssistantMessageItem(
+                        response_id=response_id,
+                        item_id=item_id,
+                        output_index=output_index,
+                        content=assistant_contents.get(item_id or key, ""),
+                        phase=item.get("phase", OutputPhase.UNKNOWN),
+                        end_turn=item.get("end_turn", EndTurn.UNKNOWN),
+                    ))
+            elif kind == "response.output_text.delta":
                 delta = str(event.get("delta") or "")
                 await _emit_delta(on_delta, delta)
                 item_id = str(event.get("item_id") or "message-0")
                 assistant_contents[item_id] = assistant_contents.get(item_id, "") + delta
                 if assistant_callback is not None:
+                    output_index = (
+                        event.get("output_index")
+                        if isinstance(event.get("output_index"), int)
+                        and not isinstance(event.get("output_index"), bool)
+                        else None
+                    )
+                    metadata = assistant_metadata.get(assistant_key(item_id, output_index), {})
                     await emit_assistant(AssistantMessageItem(
                         response_id=response_id, item_id=item_id,
-                        output_index=(
-                            event.get("output_index")
-                            if isinstance(event.get("output_index"), int)
-                            and not isinstance(event.get("output_index"), bool)
-                            else None
-                        ),
+                        output_index=output_index,
                         content=assistant_contents[item_id],
+                        phase=metadata.get("phase", OutputPhase.UNKNOWN),
+                        end_turn=metadata.get("end_turn", EndTurn.UNKNOWN),
                     ))
             elif kind == "response.reasoning_summary_text.delta":
                 # 变量说明：delta 表示当前步骤使用的 delta 值。
@@ -431,6 +468,10 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
                         completed_call_ids.add(call_id)
                     completed.append(item)
                     await emit_item_summary(item)
+                    if item.get("type") == "message":
+                        normalized_item = _normalize_item(item, response_id, len(completed) - 1)
+                        await emit_assistant(normalized_item)
+                        await complete_assistant(normalized_item)
             elif kind == "response.completed":
                 # 变量说明：finished 表示当前步骤使用的 finished 值。
                 finished = _as_mapping(event["response"])
@@ -479,7 +520,9 @@ async def consume(stream: Any, *, idle_seconds: float, on_delta=None, on_thought
         await emit_item_summary(item)
     for index, item in enumerate(items):
         if item.get("type") == "message":
-            await emit_assistant(_normalize_item(item, response_id, index))
+            assistant_item = _normalize_item(item, response_id, index)
+            await emit_assistant(assistant_item)
+            await complete_assistant(assistant_item)
     normalized = NormalizedModelResponse(
         response_id=response_id,
         items=[_normalize_item(item, response_id, index) for index, item in enumerate(items)],

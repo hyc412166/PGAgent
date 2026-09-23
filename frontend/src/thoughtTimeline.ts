@@ -365,6 +365,7 @@ function updateAssistantTimelineItem(
   state: ThoughtTimelineState,
   event: RunStreamEvent,
   type: string,
+  now: number,
 ): ThoughtTimelineState {
   const items = [...(state.items || [])]
   const identity = assistantItemIdentity(event, items.length)
@@ -374,7 +375,11 @@ function updateAssistantTimelineItem(
   }
   const content = assistantContent(event)
   const deltaEvent = type === 'assistant_message_delta' || type === 'assistant_delta'
-  const phase = assistantPhase(event, type)
+  const eventPhase = assistantPhase(event, type)
+  const existingPhase = index >= 0 ? items[index].phase : undefined
+  const phase = eventPhase === 'unknown' && existingPhase ? existingPhase : eventPhase
+  const wasCompleted = index >= 0 && items[index].status === 'completed'
+  const commentaryCompleted = type === 'assistant_message_completed' && phase === 'commentary'
   const status = type === 'assistant_message_completed' ? 'completed' as const : 'running' as const
   if (index < 0) {
     items.push({
@@ -402,7 +407,12 @@ function updateAssistantTimelineItem(
     startedAt: state.startedAt,
     items,
     activeItemId: undefined,
-    activeStepHasVisibleContent: state.activeStepHasVisibleContent || Boolean(content),
+    activeStepStartedAt: commentaryCompleted && !wasCompleted
+      ? now
+      : state.activeStepStartedAt,
+    activeStepHasVisibleContent: commentaryCompleted
+      ? wasCompleted ? state.activeStepHasVisibleContent : false
+      : state.activeStepHasVisibleContent || Boolean(content),
   }
 }
 
@@ -573,8 +583,28 @@ function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): Tho
     }
   }
   if (contextActivityTypes.has(type)) {
-    const title = type.includes('compact') ? '整理上下文' : '准备上下文'
-    return { id: firstString(event.event_id, event.id) || `context-${itemIndex}`, kind: 'context', icon: 'context', title, detail: progress || '正在整理本轮需要的信息', status: 'running' }
+    if (type === 'context_compaction_started') {
+      return {
+        id: firstString(event.compaction_id, event.event_id, event.id) || `context-compaction-${itemIndex}`,
+        kind: 'event', icon: 'context', title: '正在压缩上下文',
+        detail: progress || '正在保留任务状态并缩短上下文', status: 'running',
+      }
+    }
+    if (type === 'context_compaction_finished' || type === 'context_compacted') {
+      return {
+        id: firstString(event.compaction_id, event.event_id, event.id) || `context-compaction-${itemIndex}`,
+        kind: 'event', icon: 'context', title: '上下文压缩完成',
+        detail: progress || '任务状态已保留，继续执行', status: 'completed',
+      }
+    }
+    if (type === 'context_compaction_failed') {
+      return {
+        id: firstString(event.compaction_id, event.event_id, event.id) || `context-compaction-${itemIndex}`,
+        kind: 'event', icon: 'context', title: '上下文压缩失败',
+        detail: progress || '压缩未完成，将继续处理', status: 'failed',
+      }
+    }
+    return { id: firstString(event.event_id, event.id) || `context-${itemIndex}`, kind: 'context', icon: 'context', title: '准备上下文', detail: progress || '正在整理本轮需要的信息', status: 'running' }
   }
   if (type === 'approval_requested' || type === 'approval_granted') {
     const granted = type === 'approval_granted'
@@ -603,7 +633,7 @@ export function updateThoughtTimeline(
   const start = state.startedAt ?? (type === 'model_step_started' || type === 'mcp_connecting' || toolStartTypes.has(type) || assistantEventTypes.has(type) ? now : null)
   const payload = record(event.payload)
   if (assistantEventTypes.has(type)) {
-    return updateAssistantTimelineItem({ ...state, startedAt: start }, event, type)
+    return updateAssistantTimelineItem({ ...state, startedAt: start }, event, type, now)
   }
   if (type === 'thought_delta') {
     const text = cleanThoughtText(firstString(event.delta, payload?.delta))
@@ -745,17 +775,25 @@ export function updateThoughtTimeline(
   if (activity?.kind === 'event' && type.startsWith('completion_verification_')) activity = null
   if (activity) {
     const items = [...(state.items || [])]
-    const existingIndex = items.findIndex((item) => item.id === activity.id)
+    const compactionFinished = type === 'context_compaction_finished'
+      || type === 'context_compacted'
+      || type === 'context_compaction_failed'
+    if (compactionFinished) {
+      const activeCompaction = items.findLast((item) => item.icon === 'context' && item.kind === 'event' && item.status === 'running')
+      if (activeCompaction) activity = { ...activity, id: activeCompaction.id }
+    }
+    const currentActivity = activity
+    const existingIndex = items.findIndex((item) => item.id === currentActivity.id)
     if (existingIndex >= 0) {
       const existing = items[existingIndex]
       items[existingIndex] = {
         ...existing,
-        ...activity,
-        detail: activity.detail || existing.detail,
+        ...currentActivity,
+        detail: currentActivity.detail || existing.detail,
       }
     } else {
       // 新模型步骤结束上一条进度标记，工具条目则继续独立跟踪。
-      if (activity.kind === 'thought') {
+      if (currentActivity.kind === 'thought') {
         for (let index = items.length - 1; index >= 0; index -= 1) {
           if (items[index].kind === 'thought' && items[index].status === 'running') {
             items[index] = { ...items[index], status: 'completed' }
@@ -763,17 +801,22 @@ export function updateThoughtTimeline(
           }
         }
       }
-      items.push(activity)
+      items.push(currentActivity)
     }
+    const resetWaiting = type === 'model_retry' || compactionFinished
+    const visibleActivity = currentActivity.kind !== 'context'
+      && (Boolean(currentActivity.detail.trim()) || currentActivity.kind !== 'thought')
     return {
       ...state,
       startedAt: start,
       items,
-      activeItemId: activity.status === 'running' ? activity.id : (state.activeItemId === activity.id ? undefined : state.activeItemId),
-      activeStepStartedAt: type === 'model_step_started' ? now : state.activeStepStartedAt,
-      activeStepHasVisibleContent: type === 'model_step_started'
-        ? Boolean(activity.detail.trim())
-        : state.activeStepHasVisibleContent || Boolean(activity.detail.trim()) || activity.kind !== 'thought',
+      activeItemId: currentActivity.status === 'running' ? currentActivity.id : (state.activeItemId === currentActivity.id ? undefined : state.activeItemId),
+      activeStepStartedAt: type === 'model_step_started' || resetWaiting ? now : state.activeStepStartedAt,
+      activeStepHasVisibleContent: resetWaiting
+        ? false
+        : type === 'model_step_started'
+        ? Boolean(currentActivity.detail.trim())
+        : state.activeStepHasVisibleContent || visibleActivity,
     }
   }
 
