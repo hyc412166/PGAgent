@@ -16,10 +16,23 @@ from src.context.window import ContextManager
 from src.context.assembly import COMPACTION_SECTION_TITLES, ContextAssembler, ConversationCompactor
 from src.agent.engine import AgentRuntime, ModelToolCall, ModelTurn, RuntimeConfig, safe_tool_argument_summary, safe_tool_result_summary
 from src.api.routes.shared import _public_run_event_payload
+from src.persistence.defaults import DEFAULT_AGENT_SYSTEM_PROMPT
 from src.tools import create_default_registry
 from src.tools.catalog import BUILTIN_TOOL_IDS
 from src.tools.policy import assess_tool_call
 from src.tools.types import ToolResult
+
+
+# 这条契约针对真实运行中跨过多个步骤却只在结尾批量打勾的失败场景；类型约束无法表达调用时序。
+def test_update_plan_contract_requires_progressive_step_transitions(tmp_path) -> None:
+    registry = create_default_registry(str(tmp_path), allowed_tool_names=["update_plan"])
+    schema = next(item for item in registry.schemas if item["function"]["name"] == "update_plan")
+    description = schema["function"]["description"]
+
+    assert "在调用后续步骤的工具之前先更新计划" in description
+    assert "不得在任务结尾批量补记" in description
+    assert "必须在调用任何属于后续步骤的工具之前" in DEFAULT_AGENT_SYSTEM_PROMPT
+    assert "非并行计划同一时刻只保留一个 in_progress" in DEFAULT_AGENT_SYSTEM_PROMPT
 
 
 # 测试场景：默认能力目录应让完全访问会话直接看到 Codex 风格 web_run，而不是退回工具搜索。
