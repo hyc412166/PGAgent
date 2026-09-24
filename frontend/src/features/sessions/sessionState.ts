@@ -1,7 +1,7 @@
 // 本文件实现 sessionState 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import { emptyThoughtTimeline } from '../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../thoughtTimeline'
-import type { AssistantStreamItem, DelegatedTask, Message, PermissionMode, Run, Session, SessionContext, Teammate, ThinkingLevel, Workspace } from '../../types'
+import type { AssistantStreamItem, DelegatedTask, DurableTask, Message, PermissionMode, Run, Session, SessionContext, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 // 以下类型明确会话页各状态块的所有权：ownerSessionId 用于隔离切换会话前后的异步结果。
 export type RunPlanStep = { id: string; content: string; status: 'pending' | 'in_progress' | 'completed' | 'cancelled' }
@@ -22,6 +22,20 @@ export function draftSettingsWithPermission(permissionMode: PermissionMode): Dra
 export const emptyDraftContext: SessionContext = { active_context_tokens: 0, auto_compact_scope_tokens: 180_000, auto_compact_scope_limit: 180_000, full_context_window_limit: 200_000, base_window_tokens_remaining: 200_000, token_limit_reached: false, used_tokens: 0, limit_tokens: 200_000, compact_threshold_tokens: 180_000, percent: 0 }
 export const noDelegatedTasks: DelegatedTask[] = []
 export const noTeammates: Teammate[] = []
+
+// 活动任务固定在任务入口首行；历史任务按创建顺序保留，避免完成时间改变用户熟悉的计划顺序。
+export function orderDurableTasks(tasks: DurableTask[]): DurableTask[] {
+  const active = tasks.filter((task) => ['planning', 'running', 'waiting', 'paused', 'needs_recovery', 'blocked'].includes(task.status))
+  const historical = tasks.filter((task) => !active.includes(task))
+  const byCreated = (left: DurableTask, right: DurableTask) => {
+    const leftTime = left.created_at ? Date.parse(left.created_at) : Number.POSITIVE_INFINITY
+    const rightTime = right.created_at ? Date.parse(right.created_at) : Number.POSITIVE_INFINITY
+    if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime
+    if (Number.isFinite(leftTime) !== Number.isFinite(rightTime)) return Number.isFinite(leftTime) ? -1 : 1
+    return left.id.localeCompare(right.id)
+  }
+  return [...active.sort(byCreated), ...historical.sort(byCreated)]
+}
 
 // 审批提交成功后先移除已处理项；后台刷新仍负责把后端权威状态同步回来。
 export function removePendingApproval<T extends { id: string }>(approvals: T[], approvalId: string): T[] {

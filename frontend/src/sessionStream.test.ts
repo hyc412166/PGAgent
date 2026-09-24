@@ -20,6 +20,11 @@ describe('会话 SSE 事件', () => {
     expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'completed' }, new Set())).toBe(false)
   })
 
+  it('从 run_state 的 code 读取可恢复等待原因', () => {
+    expect(isTerminalRunStreamEvent({ type: 'run_state', status: 'stopped', code: 'waiting_background', reason: '后台作业仍在运行' })).toBe(false)
+    expect(runStreamPhase({ type: 'run_state', status: 'stopped', code: 'delegated_child_waiting_event' })).toContain('等待子 Agent')
+  })
+
   // 测试场景：按 run 或 turn 标识判断当前运行是否已有持久化终态回复。
   it('按 run 或 turn 标识判断当前运行是否已有持久化终态回复', () => {
     const messages = [

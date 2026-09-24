@@ -67,7 +67,7 @@ export function runStreamPhase(event: RunStreamEvent): string {
   switch (event.type) {
     case 'run_state': return isResumableWaitingRun({
       status: event.status,
-      reason: String(event.reason || event.stop_reason || ''),
+      reason: String(event.code || event.reason || event.stop_reason || ''),
     }) ? waitingRunPhase(String(event.reason || event.stop_reason || '')) : runStatusPhase(event.status)
     case 'context_prepared':
     case 'context_resumed': return '正在准备上下文…'
@@ -140,7 +140,7 @@ export function isTerminalRunStreamEvent(event: RunStreamEvent): boolean {
   const inferredStatus = event.status || (event.type === 'run_stopped' || event.type === 'turn_stopped' || event.type === 'stopped' ? 'stopped' : '')
   if (isResumableWaitingRun({
     status: inferredStatus,
-    reason: String(event.reason || event.stop_reason || ''),
+    reason: String(event.code || event.stop_reason || event.reason || ''),
   })) return false
   return event.terminal === true || terminalTypes.has(event.type) || (event.type === 'run_state' && isTerminalRunStatus(event.status))
 }

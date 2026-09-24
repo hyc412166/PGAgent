@@ -38,6 +38,7 @@ type RunTransportOptions = {
   refreshChildTasks: () => Promise<OwnedSessionDelegations | undefined>
   refreshTeammates: () => Promise<unknown>
   refreshDurableTask: () => Promise<unknown>
+  refreshDurableTasks?: () => Promise<unknown>
 }
 
 // 管理单次运行的 SSE 生命周期，并在流不可用时回退为轮询；会话页只负责触发和展示。
@@ -47,7 +48,7 @@ export function useRunTransport(options: RunTransportOptions) {
     streamRunIdRef, seenStreamEventsRef, terminalSyncVersionRef, liveRunRef, setRunsState,
     setApprovalsState, setInterruptedRunId, setCompletedThoughtsByRun, setLiveRun, setActionError,
     setChildPanelOpen, refreshMessages, refreshRuns, refreshContext, refreshChildTasks,
-    refreshTeammates, refreshDurableTask,
+    refreshTeammates, refreshDurableTask, refreshDurableTasks,
   } = options
 
   // 关闭全部运输资源并清空重连计数，供切换会话、终态和组件卸载共同调用。
@@ -153,7 +154,7 @@ export function useRunTransport(options: RunTransportOptions) {
     }
     if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
 
-    await Promise.all([refreshRuns(), refreshContext(), refreshChildTasks(), refreshTeammates(), refreshDurableTask(), refreshApprovalsForSession(sessionId)])
+    await Promise.all([refreshRuns(), refreshContext(), refreshChildTasks(), refreshTeammates(), refreshDurableTask(), refreshDurableTasks?.(), refreshApprovalsForSession(sessionId)])
     if (syncVersion !== terminalSyncVersionRef.current || activeIdRef.current !== sessionId) return
 
     const hasPersistedReply = Boolean(
@@ -167,7 +168,7 @@ export function useRunTransport(options: RunTransportOptions) {
     }
   }, [
     activeIdRef, closeRunTransport, liveRunRef, refreshApprovalsForSession, refreshChildTasks,
-    refreshContext, refreshDurableTask, refreshMessages, refreshRuns, refreshTeammates,
+    refreshContext, refreshDurableTask, refreshDurableTasks, refreshMessages, refreshRuns, refreshTeammates,
     setActionError, setCompletedThoughtsByRun, setInterruptedRunId, setLiveRun,
     terminalSyncVersionRef,
   ])

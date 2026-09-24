@@ -19,23 +19,29 @@ export function DurableTaskCard({
   onCancel,
   cancelling = false,
   resuming = false,
+  compact = false,
 }: {
   task: DurableTask
   onResume: () => void
   onCancel: () => void
   cancelling?: boolean
   resuming?: boolean
+  compact?: boolean
 }) {
   const resumable = task.status === 'paused' || task.status === 'needs_recovery' || task.status === 'blocked'
   const cancellable = ['planning', 'running', 'waiting', 'paused', 'needs_recovery', 'blocked'].includes(task.status)
+  const activeStep = task.steps.find((step) => step.id === task.active_step_id)
+    ?? task.steps.find((step) => !['completed', 'cancelled'].includes(step.status))
+    ?? task.steps[task.steps.length - 1]
+  const visibleSteps = compact ? (activeStep ? [activeStep] : []) : task.steps
   return <article className={`durable-task-card task-${task.status}`}>
     <header>
       <span className="durable-task-mark"><Workflow size={15} /></span>
       <div><small>持久化任务</small><strong>{task.goal}</strong></div>
       <StatusBadge status={taskStatusLabels[task.status] || task.status} />
     </header>
-    <ol className="durable-plan-track">
-      {task.steps.map((step) => <li key={step.id} className={`step-${step.status}`}>
+    <ol className={`durable-plan-track${compact ? ' is-compact' : ''}`}>
+      {visibleSteps.map((step) => <li key={step.id} className={`step-${step.status}`}>
         <span className="plan-step-node">{step.status === 'completed' ? <Check size={11} /> : step.position}</span>
         <div><strong>{step.title}</strong><span className="durable-step-meta">{step.executor_kind === 'subagent' ? '子 Agent' : step.executor_kind === 'background' ? '后台' : '主 Agent'}{step.depends_on?.length ? ` · 依赖 ${step.depends_on.join(', ')}` : ' · 可立即执行'}{step.workspace_mode === 'worktree' ? ' · 独立 worktree' : ''}</span>{step.next_action && step.status !== 'completed' ? <small>{step.next_action}</small> : null}</div>
       </li>)}

@@ -1368,5 +1368,47 @@
 .teammate-roster .teammate-working svg { color: var(--ocean-600); }
 .teammate-roster .teammate-failed svg { color: var(--scarf-dark); }
 
+/* 分支与来源入口把代码摘要、外部资料和持久任务收纳到同一层级。 */
+.persistent-task-source { margin: 10px 12px; }
+.persistent-source-trigger { width: 100%; display: grid; grid-template-columns: 28px minmax(0, 1fr) 17px; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: var(--surface); text-align: left; }
+.persistent-source-trigger:hover,
+.persistent-source-trigger.is-open { border-color: var(--ocean-500); background: var(--surface-soft); }
+.persistent-source-trigger-icon { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; color: var(--ocean-700); background: var(--blue-soft); }
+.persistent-source-trigger strong,
+.persistent-source-trigger small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.persistent-source-trigger strong { font-size: .62rem; }
+.persistent-source-trigger small { margin-top: 2px; color: var(--muted-2); font-size: .51rem; }
+.persistent-source-chevron { color: var(--muted-2); transition: transform .18s ease; }
+.persistent-source-trigger.is-open .persistent-source-chevron { transform: rotate(90deg); }
+.persistent-source-popover { margin-top: 6px; overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); box-shadow: 0 10px 25px rgb(7 25 35 / 12%); }
+.persistent-source-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 11px; border-bottom: 1px solid var(--line); background: var(--glass-strong); }
+.persistent-source-header strong { display: block; margin-top: 2px; overflow: hidden; font-size: .67rem; text-overflow: ellipsis; white-space: nowrap; }
+.persistent-source-branch { padding: 8px 11px; border-bottom: 1px solid var(--line); }
+.persistent-source-branch-row { display: flex; align-items: center; gap: 7px; color: var(--muted); font: .58rem/1 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.persistent-source-branch-row svg { color: var(--ocean-700); }
+.persistent-source-branch-row .change-added { margin-left: auto; color: #3c9f5f; font-weight: 700; }
+.persistent-source-branch-row .change-removed { color: #bd5862; font-weight: 700; }
+.persistent-source-list,
+.persistent-task-list { padding: 9px 11px; border-bottom: 1px solid var(--line); }
+.persistent-source-list > strong { display: block; margin-bottom: 5px; color: var(--muted-2); font-size: .54rem; }
+.persistent-source-row { display: flex; align-items: center; gap: 7px; min-height: 28px; color: var(--ink); font-size: .58rem; text-decoration: none; }
+.persistent-source-row:hover { color: var(--ocean-800); }
+.persistent-source-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.persistent-source-row > svg:last-child { margin-left: auto; color: var(--muted-2); }
+.persistent-task-list-title { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; color: var(--muted-2); font-size: .54rem; }
+.persistent-task-row { width: 100%; display: grid; grid-template-columns: 21px minmax(0, 1fr) auto; align-items: center; gap: 7px; padding: 6px 5px; border: 1px solid transparent; border-radius: 7px; color: var(--ink); background: transparent; text-align: left; }
+.persistent-task-row:hover,
+.persistent-task-row.is-selected { border-color: var(--line); background: var(--surface-soft); }
+.persistent-task-row-mark { display: grid; place-items: center; width: 19px; height: 19px; border-radius: 6px; color: var(--muted-2); background: var(--surface-soft); font: .53rem/1 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.persistent-task-row.is-pinned .persistent-task-row-mark { color: var(--ocean-700); background: var(--blue-soft); }
+.persistent-task-row strong,
+.persistent-task-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.persistent-task-row strong { font-size: .59rem; }
+.persistent-task-row small { margin-top: 2px; color: var(--muted-2); font-size: .5rem; }
+.persistent-task-row .status-badge { font-size: .48rem; }
+.persistent-task-detail-popover { padding: 9px 11px 11px; background: var(--surface-soft); }
+.persistent-task-detail-popover .durable-task-card { margin: 0; box-shadow: none; }
+.durable-plan-track.is-compact { max-height: 90px; overflow: hidden; }
+
 /* 舞台容器负责外边距，两个表面保持完全相同的可用宽度。 */
 .composer-stage .composer-surface { width: 100%; margin: 0; }

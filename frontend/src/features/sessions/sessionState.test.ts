@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import { latestRunPlanFromEvents, runPlanFromEvent } from './sessionState'
+import { latestRunPlanFromEvents, orderDurableTasks, runPlanFromEvent } from './sessionState'
+import type { DurableTask } from '../../types'
 
 describe('当前运行计划事件', () => {
   it('同时读取实时事件和持久化事件的公开计划', () => {
@@ -32,5 +33,17 @@ describe('当前运行计划事件', () => {
         { id: 'invalid', content: '未知状态', status: 'blocked' },
       ],
     })).toEqual([])
+  })
+})
+
+describe('持久任务展示顺序', () => {
+  it('将活动任务置顶，其余任务按创建时间和 id 稳定排列', () => {
+    const tasks = [
+      { id: 'task-3', status: 'completed', created_at: '2026-09-03T00:00:00Z' },
+      { id: 'task-1', status: 'completed', created_at: '2026-09-01T00:00:00Z' },
+      { id: 'task-2', status: 'running', created_at: '2026-09-02T00:00:00Z' },
+    ] as DurableTask[]
+
+    expect(orderDurableTasks(tasks).map((task) => task.id)).toEqual(['task-2', 'task-1', 'task-3'])
   })
 })
