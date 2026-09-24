@@ -5,9 +5,12 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 
 import { ChildAgentPanel, CompletedThoughtTimeline, FileChangeActivity, LiveAssistantMessage, MessageBubble, RunPlanProgress } from './presentation'
+import { DurableTaskCard } from './components/DurableTaskCard'
+import { PersistentTaskSource } from './components/PersistentTaskSource'
 import { createLiveMarkdownCoalescer } from './liveMarkdownCoalescer'
 import { formatApprovalArguments } from './approvalPresentation'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
+import type { DurableTask } from '../../types'
 
 const sessionsCss = readFileSync(new URL('../../styles/sessions.css', import.meta.url), 'utf8')
 
@@ -26,6 +29,45 @@ describe('当前运行计划展示', () => {
     expect(markup).toContain('完成修改')
     expect(markup).not.toContain('持久化任务')
     expect(markup).not.toContain('<button')
+  })
+})
+
+describe('持久任务来源入口', () => {
+  const task = {
+    id: 'task-1',
+    session_id: 'session-1',
+    goal: '整理项目结构',
+    status: 'running',
+    active_step_id: 'step-2',
+    steps: [
+      { id: 'step-1', position: 1, title: '读取目录', status: 'completed' },
+      { id: 'step-2', position: 2, title: '整理模块', status: 'in_progress' },
+    ],
+  } as DurableTask
+
+  it('紧凑任务详情只显示当前步骤，并保留分支来源入口', () => {
+    const card = renderToStaticMarkup(createElement(DurableTaskCard, {
+      task,
+      compact: true,
+      onResume: vi.fn(),
+      onCancel: vi.fn(),
+    }))
+    expect(card).toContain('整理模块')
+    expect(card).not.toContain('读取目录')
+
+    const source = renderToStaticMarkup(createElement(PersistentTaskSource, {
+      tasks: [task],
+      branchName: 'pgagent/task-1',
+      open: true,
+      selectedTaskId: task.id,
+      onToggle: vi.fn(),
+      onSelectTask: vi.fn(),
+      onResume: vi.fn(),
+      onCancel: vi.fn(),
+    }))
+    expect(source).toContain('分支与来源')
+    expect(source).toContain('pgagent/task-1')
+    expect(source).toContain('整理项目结构')
   })
 })
 

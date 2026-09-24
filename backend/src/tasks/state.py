@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 from sqlalchemy import select, text
 
 from src.persistence import database as database_module
-from src.persistence.database import ChatMessage, DurableTask, PlanStep, Run
+from src.persistence.database import ChatMessage, ConversationTurn, DurableTask, PlanStep, Run, Session
 from src.tasks.graph import dependency_map, replace_dependencies, validate_dependency_graph
 
 
@@ -114,6 +114,43 @@ def latest_resumable_task(db: Any, session_id: str) -> DurableTask | None:
         .order_by(DurableTask.updated_at.desc(), DurableTask.created_at.desc(), DurableTask.id.desc())
         .limit(1)
     )
+
+
+# 函数职责：为明确指定的持久任务准备一次无用户消息的恢复运行。
+# 内部回执保证最终回复可靠落盘，但不创建用户消息。
+def prepare_durable_task_resume(db: Any, task: DurableTask) -> Run:
+    if task.status not in {"paused", "needs_recovery", "blocked"}:
+        raise ValueError("当前持久任务不可继续")
+    session = db.get(Session, task.session_id)
+    if session is None:
+        raise ValueError("持久任务所属会话不存在")
+    previous = db.scalar(
+        select(Run)
+        .where(Run.task_id == task.id)
+        .order_by(Run.started_at.desc(), Run.id.desc())
+        .limit(1)
+    )
+    receipt = ConversationTurn(session_id=session.id, request_fingerprint="", execution_status="received", reply_status="pending")
+    db.add(receipt)
+    db.flush()
+    run = Run(
+        turn_id=receipt.id,
+        session_id=session.id,
+        workspace_id=session.workspace_id,
+        agent_id=session.agent_id,
+        task_id=task.id,
+        plan_step_id=task.active_step_id,
+        run_kind="recovery",
+        resumed_from_run_id=previous.id if previous is not None else None,
+        mode="auto",
+        status="received",
+    )
+    db.add(run)
+    task.status = "running"
+    task.completed_at = None
+    task.resume_summary = "用户直接继续了此持久任务；运行时将从当前步骤恢复。"
+    db.flush()
+    return run
 
 
 # 函数职责：完成 goal_for_run 对应的业务处理。

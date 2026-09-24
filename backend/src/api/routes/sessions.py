@@ -10,7 +10,7 @@ from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -75,7 +75,8 @@ from src.mcp.config import load_mcp_config_source, validate_mcp_server_names
 from src.mcp.runtime import mcp_runtime_pool
 from src.permissions.preferences import get_permission_mode, set_permission_mode
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
-from src.tasks.state import cancel_durable_task, latest_resumable_task, task_payload
+from src.tasks.state import cancel_durable_task, latest_resumable_task, prepare_durable_task_resume, task_payload
+from src.persistence.run_events import append_run_event
 from src.agents.collaboration import cleanup_session_worktrees
 from src.runs.service import coordinator
 from src.sessions.deletion import (
@@ -208,6 +209,58 @@ def get_session_active_task(session_id: str, db: Session = Depends(get_db)) -> d
     # 变量说明：task 表示当前步骤使用的 task 值。
     task = latest_resumable_task(db, session_id)
     return task_payload(db, task) if task is not None else None
+
+
+# 函数职责：直接恢复指定持久任务，不创建用户消息或伪造“继续”提示词。
+@router.post("/sessions/{session_id}/tasks/{task_id}/resume", response_model=RunRead, status_code=status.HTTP_202_ACCEPTED)
+async def resume_session_task(session_id: str, task_id: str, db: Session = Depends(get_db)) -> Run:
+    # SQLite 写事务串行化检查与创建，避免双击或并发请求启动两个恢复运行。
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(text("BEGIN IMMEDIATE"))
+    _require(db, ChatSession, session_id, "Session")
+    task = db.get(DurableTask, task_id)
+    if task is None or task.session_id != session_id:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status not in {"paused", "needs_recovery", "blocked"}:
+        raise HTTPException(status_code=409, detail="当前持久任务不可继续")
+    active = db.scalar(
+        select(Run.id).where(
+            Run.session_id == session_id,
+            Run.status.in_(_ACTIVE_SESSION_RUN_STATUSES | {"awaiting_approval"}),
+        ).limit(1)
+    )
+    if active is not None:
+        raise HTTPException(status_code=409, detail="当前会话已有运行或待审批工具，请先处理后再继续任务")
+    try:
+        run = prepare_durable_task_resume(db, task)
+        append_run_event(
+            db,
+            run_id=run.id,
+            event_type="durable_task_resume_requested",
+            payload={"task_id": task.id, "plan_step_id": task.active_step_id},
+        )
+        db.commit()
+        db.refresh(run)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    launch_error = None
+    try:
+        scheduled = coordinator.launch(run.id)
+    except Exception as exc:
+        scheduled = False
+        launch_error = str(exc)
+    if not scheduled:
+        db.refresh(run)
+        run.status = "failed"
+        run.error_code = "resume_not_scheduled"
+        run.error_message = launch_error or "恢复任务暂时无法启动，请稍后重试。"
+        run.finished_at = datetime.now(timezone.utc)
+        task.status = "needs_recovery"
+        task.resume_summary = run.error_message
+        db.commit()
+        raise HTTPException(status_code=503, detail=run.error_message)
+    return run
 
 
 # 函数职责：异步完成 cancel_session_task 对应的业务处理。

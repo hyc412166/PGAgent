@@ -22,7 +22,6 @@ import { stringId } from '../../shared/lib/display'
 import { ComposerTextArea } from './components/ComposerTextArea'
 import type { ComposerTextAreaHandle } from './components/ComposerTextArea'
 import { ConversationTurnTimeline } from './components/ConversationTurnTimeline'
-import { DurableTaskCard } from './components/DurableTaskCard'
 import { FileChangePanel } from './components/FileChangePanel'
 import { ProjectTreeItem } from './components/ProjectTreeItem'
 import { projectDeleteConfirmation } from './projectDeletion'
@@ -146,6 +145,8 @@ function SessionsPage() {
   const [completedThoughtsByRun, setCompletedThoughtsByRun] = useState<Record<string, ThoughtTimelineState>>({})
   const [childPanelState, setChildPanelState] = useState<ChildPanelState>({ sessionId: '', open: false, autoOpened: false })
   const [selectedChildTaskId, setSelectedChildTaskId] = useState('')
+  const [durableSourceOpen, setDurableSourceOpen] = useState(false)
+  const [selectedDurableTaskId, setSelectedDurableTaskId] = useState('')
   const [fileChangeSelection, setFileChangeSelection] = useState<FileChangeSelection | null>(null)
   const [sidePanelWidth, setSidePanelWidth] = useState<number | null>(null)
   const [sidePanelResizing, setSidePanelResizing] = useState(false)
@@ -228,7 +229,14 @@ function SessionsPage() {
   const durableTask = useApiData<DurableTask | null>(null, () => activeId
     ? api.get<DurableTask | null>(`/api/sessions/${encodeURIComponent(activeId)}/active-task`)
     : Promise.resolve(null), [activeId])
+  const durableTasks = useApiData<DurableTask[]>([], () => activeId
+    ? api.list<DurableTask>(`/api/sessions/${encodeURIComponent(activeId)}/tasks`, ['durable-tasks'])
+    : Promise.resolve([]), [activeId])
   const refreshDurableTask = durableTask.refresh
+  const refreshDurableTasks = durableTasks.refresh
+  const refreshDurableTaskState = useCallback(async () => {
+    await Promise.all([refreshDurableTask(), refreshDurableTasks()])
+  }, [refreshDurableTask, refreshDurableTasks])
   const context = useApiData<SessionContext | null>(null, () => activeId ? api.get<SessionContext>(`/api/sessions/${activeId}/context`) : Promise.resolve(null), [activeId])
   // 以下派生值把原始资源收敛为当前会话、当前运行、可见消息及可操作状态。
   const activeSession = sessions.data.find((item) => stringId(item.id) === activeId)
@@ -313,6 +321,9 @@ function SessionsPage() {
   // 子任务、队友和选中子任务运行共同驱动右侧 ChildAgentPanel。
   const visibleChildTasks = childTasks.data.ownerSessionId === activeId ? childTasks.data.items : noDelegatedTasks
   const visibleTeammates = activeId ? teammates.data : noTeammates
+  const visibleDurableTasks = durableTasks.data.filter((task) => task.session_id === activeId)
+  const resumableTask = durableTask.data?.session_id === activeId && ['paused', 'needs_recovery', 'blocked'].includes(durableTask.data.status) ? durableTask.data : null
+  const resumeFromComposer = !draftActive && !canInterrupt && !composerHasValue && !pendingAttachments.length && resumableTask !== null
   const childPanelOpen = childPanelState.open
   const setChildPanelOpen = useCallback((update: SetStateAction<boolean>) => {
     setChildPanelState((current) => {
@@ -760,6 +771,7 @@ function SessionsPage() {
     refreshChildTasks,
     refreshTeammates,
     refreshDurableTask,
+    refreshDurableTasks: refreshDurableTaskState,
   })
 
   useEffect(() => {
@@ -897,14 +909,14 @@ function SessionsPage() {
       void messages.refresh()
       void runs.refresh()
       void context.refresh()
-      void durableTask.refresh()
+      void refreshDurableTaskState()
       startRunStream(launched.id, targetSessionId, launched.started_at)
     } catch (error) {
       setLiveRun(emptyLiveRun())
       setActionError(describeError(error))
       if (!draftActive && activeId) {
         // 运输失败前请求可能已经提交；重新加载持久状态，避免已接收轮次只留下用户气泡。
-        void Promise.all([messages.refresh(), runs.refresh(), context.refresh(), durableTask.refresh()])
+        void Promise.all([messages.refresh(), runs.refresh(), context.refresh(), refreshDurableTaskState()])
       }
     } finally {
       sendingRef.current = false
@@ -915,11 +927,36 @@ function SessionsPage() {
   // 表单入口从非受控编辑器读取最新文本和附件快照，再交给 submitMessage。
   function sendMessage(event: FormEvent) {
     event.preventDefault()
+    if (resumeFromComposer && resumableTask) {
+      void resumeDurableTask(resumableTask.id)
+      return
+    }
     void submitMessage(
       composerInputRef.current?.getValue().trim() || '',
       pendingAttachmentsRef.current.map((item) => item.file),
       true,
     )
+  }
+
+  // 恢复是任务控制动作，不经过普通消息提交，也不消耗编辑器中的草稿。
+  async function resumeDurableTask(taskId: string) {
+    const sessionId = activeIdRef.current
+    if (!sessionId || sendingRef.current) return
+    sendingRef.current = true
+    setSending(true)
+    setActionError('')
+    try {
+      const run = await api.post<Run>(`/api/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/resume`)
+      if (activeIdRef.current !== sessionId) return
+      setInterruptedRunId('')
+      startRunStream(run.id, sessionId, run.started_at)
+      await Promise.all([refreshDurableTaskState(), runs.refresh()])
+    } catch (error) {
+      if (activeIdRef.current === sessionId) setActionError(describeError(error))
+    } finally {
+      sendingRef.current = false
+      setSending(false)
+    }
   }
 
   // 请求后端中断当前运行；实际草稿和终态随后由运输层事件同步。
@@ -962,7 +999,7 @@ function SessionsPage() {
         `/api/sessions/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/cancel`,
       )
       if (activeIdRef.current !== sessionId) return
-      await Promise.all([durableTask.refresh(), runs.refresh()])
+      await Promise.all([durableTask.refresh(), durableTasks.refresh(), runs.refresh()])
     } catch (error) {
       if (activeIdRef.current === sessionId) setActionError(describeError(error))
     } finally {
@@ -1307,13 +1344,6 @@ function SessionsPage() {
                   return <MessageBubble key={message.id} message={message} thoughtRunId={messageRunId || undefined} thoughtTimeline={completedThought} onOpenFileChange={openFileChange} />
                 }) : liveRun.status === 'idle' ? <EmptyState icon={MessageSquare} title="从一条清晰的任务开始" description="描述目标、约束和期望产物，Agent 会先理解上下文再行动。" /> : null}
                 {!draftActive && messages.error && !!visibleMessages.length && <p className="inline-error" role="alert">消息同步失败：{messages.error}</p>}
-                {!draftActive && durableTask.data && <DurableTaskCard
-                  task={durableTask.data}
-                  cancelling={cancellingTaskId === durableTask.data.id}
-                  resuming={sending}
-                  onResume={() => void submitMessage('继续刚刚的工作', [], false)}
-                  onCancel={() => void cancelDurableTask(durableTask.data!.id)}
-                />}
                 {!draftActive && stoppedRunNotices.map((run) => <div key={`run-notice:${run.id}`} className="stopped-run-notice" role="status"><AlertCircle size={16} /><div><strong>{run.status === 'failed' ? '本次运行失败，未生成最终回复' : '本次运行已停止，未生成最终回复'}</strong><p>{run.error_message || run.stop_reason || 'Agent 未能继续执行，请调整指令后重试。'}</p></div></div>)}
                 {liveRun.status !== 'idle' && !liveReplyPersisted
                   && (!completedThoughtsByRun[liveRun.runId] || (canEditInterrupted && liveRun.runId === interruptedRunId))
@@ -1430,17 +1460,17 @@ function SessionsPage() {
                     <button
                       type={canInterrupt ? 'button' : 'submit'}
                       className={`send-button ${canInterrupt ? 'is-stop' : ''}`}
-                      aria-label={canInterrupt ? '中断当前任务' : '发送'}
-                      title={canInterrupt ? '中断当前任务' : '发送'}
+                      aria-label={canInterrupt ? '中断当前任务' : resumeFromComposer ? '继续任务' : '发送'}
+                      title={canInterrupt ? '中断当前任务' : resumeFromComposer ? '继续任务' : '发送'}
                       aria-busy={Boolean(stoppingRunId)}
                       disabled={canInterrupt
                         ? Boolean(stoppingRunId)
-                        : sending || settingsSaving || capabilitySaving || settingsLocked || (!composerHasValue && !pendingAttachments.length)}
+                        : sending || settingsSaving || capabilitySaving || settingsLocked || (!resumeFromComposer && !composerHasValue && !pendingAttachments.length)}
                       onClick={canInterrupt ? () => void stopActiveRun() : undefined}
                     >
                       {canInterrupt
                         ? stoppingRunId ? <LoaderCircle className="spin" size={14} /> : <Square className="send-stop-icon" size={12} strokeWidth={3} fill="currentColor" />
-                        : <ArrowUp className="send-arrow-icon" size={16} strokeWidth={2.4} />}
+                        : resumeFromComposer ? <span aria-hidden="true">▶</span> : <ArrowUp className="send-arrow-icon" size={16} strokeWidth={2.4} />}
                     </button>
                   </div>
                 </div>
@@ -1471,6 +1501,9 @@ function SessionsPage() {
           {fileChangeSelection ? <FileChangePanel selection={fileChangeSelection} onClose={() => setFileChangeSelection(null)} /> : <ChildAgentPanel
             open={childPanelOpen}
             tasks={visibleChildTasks}
+            durableTasks={visibleDurableTasks}
+            selectedDurableTaskId={selectedDurableTaskId}
+            durableSourceOpen={durableSourceOpen}
             teammates={visibleTeammates}
             loading={childTasks.loading}
             error={childTasks.error}
@@ -1481,6 +1514,12 @@ function SessionsPage() {
             eventsError={childTaskEvents.error}
             onClose={() => setChildPanelOpen(false)}
             onSelect={setSelectedChildTaskId}
+            onToggleDurableSource={() => setDurableSourceOpen((open) => !open)}
+            onSelectDurableTask={(taskId) => { setSelectedDurableTaskId(taskId); setDurableSourceOpen(true) }}
+            onResumeDurableTask={(taskId) => { void resumeDurableTask(taskId) }}
+            onCancelDurableTask={(taskId) => { void cancelDurableTask(taskId) }}
+            cancellingDurableTaskId={cancellingTaskId}
+            resumingDurableTask={sending}
             onRetry={() => { void childTasks.reload(); void teammates.reload(); void childTaskEvents.reload() }}
           />}
       </div>
