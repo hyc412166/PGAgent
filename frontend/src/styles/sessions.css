@@ -22,7 +22,9 @@
 }
 
 .chat-shell:not(.child-panel-open) { grid-template-columns: 226px minmax(0, 1fr) 0; }
-.chat-shell.child-panel-open { grid-template-columns: 226px minmax(0, 1fr) var(--session-side-panel-width); }
+.chat-shell.child-panel-open { grid-template-columns: 226px minmax(0, 1fr) 0; }
+.chat-shell.file-panel-open,
+.chat-shell.child-conversation-open { grid-template-columns: 226px minmax(0, 1fr) var(--session-side-panel-width); }
 
 .chat-shell.is-resizing { transition: none; }
 
@@ -30,8 +32,8 @@
   position: absolute;
   z-index: 6;
   top: 0;
-  right: var(--session-side-panel-width);
-  width: 10px;
+  right: calc(var(--session-side-panel-width) - 2px);
+  width: 4px;
   height: 100%;
   cursor: col-resize;
   touch-action: none;
@@ -40,7 +42,7 @@
 
 .side-panel-resizer::before {
   position: absolute;
-  inset: 0 auto 0 4px;
+  inset: 0 auto 0 1px;
   width: 2px;
   content: '';
   border-radius: 999px;
@@ -855,10 +857,11 @@
 .tool-activity-group-item-line { width: 100%; min-width: 0; min-height: 25px; display: flex; align-items: center; gap: 7px; padding: 0 2px; color: var(--muted); }
 .tool-activity-group-item-line.is-clickable { border: 0; background: transparent; font: inherit; text-align: left; cursor: pointer; }
 .tool-activity-group-item-line.is-clickable:hover { color: var(--ink); background: transparent; box-shadow: none; }
-.tool-activity-group-item-line > .tool-activity-icon { flex: 0 0 20px; transform: translateY(1px); }
+.tool-activity-group-item-line > .tool-activity-icon { flex: 0 0 20px; }
 .tool-activity-group-item-line > span:not(.tool-activity-icon) { min-width: 0; flex: 1; display: flex; align-items: center; gap: 7px; overflow: hidden; }
 .tool-activity-group-item-line strong { flex: 0 0 auto; color: var(--muted); font-size: .6875rem; font-weight: 400; line-height: 20px; white-space: nowrap; }
-.tool-activity-group-item-line code { min-width: 0; overflow: hidden; color: var(--muted-2); font: .6875rem/20px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+/* 工具行摘要沿用标题字体与行高，避免中英文回退字体的字面中心不同；展开内容仍保留等宽字体。 */
+.tool-activity-group-item-line code { min-width: 0; overflow: hidden; color: var(--muted-2); font-family: inherit; font-size: .6875rem; font-weight: 400; line-height: 20px; text-overflow: ellipsis; white-space: nowrap; }
 .tool-activity-group-item.is-running .tool-activity-group-item-line strong,
 .tool-activity-group-item.is-running .tool-activity-group-item-toggle strong {
   color: #087ca8;
@@ -885,10 +888,10 @@
 }
 .tool-activity-group-item-toggle:not(:disabled):hover { color: var(--ink); background: transparent; box-shadow: none; }
 .tool-activity-group-item-toggle:disabled { cursor: default; opacity: 1; }
-.tool-activity-group-item-toggle > .tool-activity-icon { flex: 0 0 20px; transform: translateY(1px); }
+.tool-activity-group-item-toggle > .tool-activity-icon { flex: 0 0 20px; }
 .tool-activity-group-item-toggle > span:not(.tool-activity-icon) { min-width: 0; flex: 1; display: flex; align-items: center; gap: 7px; overflow: hidden; }
 .tool-activity-group-item-toggle strong { flex: 0 0 auto; color: var(--muted); font-size: .6875rem; font-weight: 400; line-height: 20px; white-space: nowrap; }
-.tool-activity-group-item-toggle code { min-width: 0; overflow: hidden; color: var(--muted-2); font: .6875rem/20px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.tool-activity-group-item-toggle code { min-width: 0; overflow: hidden; color: var(--muted-2); font-family: inherit; font-size: .6875rem; font-weight: 400; line-height: 20px; text-overflow: ellipsis; white-space: nowrap; }
 .tool-activity-group-item.failed .tool-activity-group-item-toggle strong { color: var(--red); }
 .tool-activity-group-item-toggle:not(:disabled):hover > .tool-activity-icon,
 .tool-activity-group-item-toggle:not(:disabled):hover strong,
@@ -916,7 +919,11 @@
 .thought-activity.kind-tool .thought-activity-static { justify-content: flex-start; }
 .thought-activity.kind-tool .thought-activity-static .thought-activity-summary { margin-left: 0; }
 .thought-activity.kind-tool { align-items: start; }
-.thought-activity.kind-tool .thought-activity-icon { align-self: start; transform: translateY(1px); }
+/* 子 Agent 的独立图标与 20px 文本行居中，避免沿用工具详情容器的顶部对齐。 */
+.thought-activity.kind-tool > svg { align-self: center; justify-self: center; }
+/* 图标对齐首行而不是整个详情区：静态行高 20px，可展开按钮高 25px。 */
+.thought-activity > .thought-activity-icon { align-self: start; }
+.thought-activity:has(> .thought-activity-copy > .thought-activity-toggle) > .thought-activity-icon { margin-top: 2.5px; }
 .thought-activity-title { display: block; min-width: max-content; color: var(--ink); font-size: .75rem; font-weight: 400; line-height: 20px; white-space: nowrap; }
 .thought-activity.kind-tool .thought-activity-title { color: var(--muted); }
 .thought-activity.kind-tool .thought-activity-static:hover .thought-activity-title,
@@ -1282,9 +1289,18 @@
 .context-compacting .context-ring-value { stroke: var(--scarf); }
 
 .child-agent-panel {
-  width: 100%;
+  position: absolute;
+  z-index: 8;
+  top: 12px;
+  right: 12px;
+  width: min(var(--session-side-panel-width), calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 16px;
   border-left-color: var(--line);
-  background: rgb(232 248 253 / 78%);
+  background: var(--surface);
+  box-shadow: 0 16px 34px rgb(7 25 35 / 16%);
   opacity: 0;
   transform: translateX(18px);
   pointer-events: none;
@@ -1292,6 +1308,51 @@
 }
 
 .child-agent-panel.is-open { opacity: 1; transform: translateX(0); pointer-events: auto; }
+.chat-shell.child-panel-open .side-panel-resizer { display: none; }
+
+/* 子会话复用主会话消息样式，滚动仅发生在侧栏正文中。 */
+.chat-shell.child-conversation-open > .child-agent-panel {
+  position: relative;
+  inset: auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  max-height: none;
+  border: 0;
+  border-left: 1px solid var(--line);
+  border-radius: 0;
+  box-shadow: none;
+}
+.child-agent-panel:has(.child-conversation) { display: flex; flex-direction: column; overflow: hidden; }
+.child-agent-panel:has(.child-conversation) > .child-panel-header { flex-shrink: 0; }
+.child-conversation.messages { flex: 1; min-height: 0; padding: 16px 12px; min-width: 0; overflow-x: hidden; overflow-y: auto; }
+.child-conversation .message { display: block; min-width: 0; width: auto; }
+.child-conversation .message-body { min-width: 0; max-width: 100%; }
+.child-conversation .message.user { margin-left: 20px; }
+.child-conversation .message.assistant { margin-right: 8px; }
+.child-conversation .message-meta { flex-wrap: wrap; }
+
+.child-agent-conversation { min-height: 0; padding: 12px; overflow-y: auto; }
+.child-agent-conversation-title { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.child-agent-conversation-title > div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.child-agent-conversation-title strong { overflow: hidden; color: var(--ink); font-size: .62rem; text-overflow: ellipsis; white-space: nowrap; }
+.child-agent-conversation-title small { color: var(--muted-2); font-size: .5rem; }
+.child-agent-message { margin-top: 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: var(--surface); }
+.child-agent-message-user { margin-left: 18px; background: var(--surface-soft); }
+.child-agent-message-assistant { margin-right: 18px; }
+.child-agent-message strong { display: block; color: var(--muted); font-size: .52rem; }
+.child-agent-message p { margin: 6px 0 0; font-size: .56rem; line-height: 1.55; white-space: pre-wrap; }
+.child-agent-message pre { max-height: 180px; margin: 6px 0 0; overflow: auto; font: .52rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+.child-agent-process { margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.child-agent-process > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: .54rem; }
+.child-agent-process > header span { color: var(--muted-2); font-size: .48rem; }
+.child-agent-process ol { display: flex; flex-direction: column; gap: 7px; margin: 8px 0 0; padding: 0; list-style: none; }
+.child-agent-process li { display: grid; grid-template-columns: 8px minmax(0, 1fr); gap: 7px; align-items: start; }
+.child-agent-process-dot { width: 7px; height: 7px; margin-top: 3px; border-radius: 50%; background: var(--ocean-500); box-shadow: 0 0 0 3px var(--blue-soft); }
+.child-agent-process li div { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.child-agent-process li strong { color: var(--ink); font-size: .53rem; line-height: 1.35; }
+.child-agent-process li small { color: var(--muted-2); font: .46rem ui-monospace, SFMono-Regular, Consolas, monospace; }
+.child-agent-process > p { margin: 8px 0 0; color: var(--muted-2); font-size: .52rem; }
 
 /* 文件变更面板复用协作侧栏的空间节奏，但采用更高密度的代码阅读表面。 */
 .file-change-panel {
@@ -1358,6 +1419,8 @@
 .child-task-list > button.selected { border-color: var(--line); background: var(--surface); }
 .child-task-list > button.selected { box-shadow: inset 3px 0 0 var(--scarf); }
 .child-task-avatar { color: var(--ocean-700); background: var(--blue-soft); }
+.child-delegation-link { padding: 0; border: 0; background: transparent; font-family: inherit; cursor: pointer; }
+.child-delegation-link:hover { text-decoration: underline; }
 .durable-step-meta { display: block; margin-top: 2px; color: var(--muted-2); font-size: .5rem; }
 .teammate-roster { padding: 10px 12px; border-bottom: 1px solid var(--line); }
 .teammate-roster > strong { display: block; margin-bottom: 7px; color: var(--muted); font-size: .55rem; }
@@ -1369,21 +1432,10 @@
 .teammate-roster .teammate-failed svg { color: var(--scarf-dark); }
 
 /* 分支与来源入口把代码摘要、外部资料和持久任务收纳到同一层级。 */
-.persistent-task-source { margin: 10px 12px; }
-.persistent-source-trigger { width: 100%; display: grid; grid-template-columns: 28px minmax(0, 1fr) 17px; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: var(--surface); text-align: left; }
-.persistent-source-trigger:hover,
-.persistent-source-trigger.is-open { border-color: var(--ocean-500); background: var(--surface-soft); }
-.persistent-source-trigger-icon { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; color: var(--ocean-700); background: var(--blue-soft); }
-.persistent-source-trigger strong,
-.persistent-source-trigger small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.persistent-source-trigger strong { font-size: .62rem; }
-.persistent-source-trigger small { margin-top: 2px; color: var(--muted-2); font-size: .51rem; }
-.persistent-source-chevron { color: var(--muted-2); transition: transform .18s ease; }
-.persistent-source-trigger.is-open .persistent-source-chevron { transform: rotate(90deg); }
-.persistent-source-popover { margin-top: 6px; overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); box-shadow: 0 10px 25px rgb(7 25 35 / 12%); }
-.persistent-source-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 11px; border-bottom: 1px solid var(--line); background: var(--glass-strong); }
-.persistent-source-header strong { display: block; margin-top: 2px; overflow: hidden; font-size: .67rem; text-overflow: ellipsis; white-space: nowrap; }
-.persistent-source-branch { padding: 8px 11px; border-bottom: 1px solid var(--line); }
+.persistent-task-source { margin: 0; }
+.persistent-source-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 13px 14px 11px; border-bottom: 1px solid var(--line); background: var(--glass-strong); }
+.persistent-source-project { min-width: 0; display: flex; flex-direction: column; gap: 7px; }
+.persistent-source-project > strong { overflow: hidden; color: var(--ink); font-size: .75rem; text-overflow: ellipsis; white-space: nowrap; }
 .persistent-source-branch-row { display: flex; align-items: center; gap: 7px; color: var(--muted); font: .58rem/1 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .persistent-source-branch-row svg { color: var(--ocean-700); }
 .persistent-source-branch-row .change-added { margin-left: auto; color: #3c9f5f; font-weight: 700; }

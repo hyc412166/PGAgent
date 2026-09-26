@@ -1,6 +1,7 @@
 // 本文件实现 presentation 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
 import {
   Brain,
+  ArrowLeft,
   Bot,
   CheckCheck,
   ChevronDown,
@@ -13,29 +14,29 @@ import {
   Search,
   ShieldCheck,
   SquareTerminal,
-  Users,
   Wrench,
   X,
   XCircle,
   CheckCircle2,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useContext, useEffect, useState } from 'react'
 import { memo } from 'react'
 import type { ReactNode } from 'react'
 import { formatLiveThinkingDuration, formatThoughtDuration, parseFileChangeSet, type ThoughtActivityIcon, type ThoughtActivityItem, type ThoughtTimelineState } from '../../thoughtTimeline'
 import { apiUrl, describeError } from '../../api'
 import { formatAttachmentSize, messageAttachments } from '../../attachments'
 import type { Approval, DelegatedTask, DurableTask, FileChangeRecord, FileChangeSelection, FileChangeSet, Message, Run, RunEvent, Teammate } from '../../types'
-import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../../components/ui'
-import { statusText } from '../../components/status'
+import { ErrorState, LoadingState, StatusBadge } from '../../components/ui'
 import { PenguinMark } from '../../components/penguin'
-import { isHiddenRunEvent, presentRunEvent } from '../../runEventPresentation'
 import { MarkdownContent } from './MarkdownContent'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
 import { formatApprovalArguments } from './approvalPresentation'
 import { createToolResultDetailLoader, presentToolResult, toolResultRequest, type CompleteToolResult } from '../../toolResultDetails'
 import type { RunPlanStep } from './sessionState'
-import { PersistentTaskSource } from './components/PersistentTaskSource'
+import { PersistentTaskSource, type PersistentSourceItem } from './components/PersistentTaskSource'
+import { ChildConversation } from './components/ChildConversation'
+import { ChildNavigation } from './childNavigation'
+import { childNames } from './childIdentity'
 
 // LiveRunView 是运输状态到实时回复组件之间的最小只读接口。
 export type LiveRunView = {
@@ -78,31 +79,16 @@ function formatUiDate(value?: string) {
   }).format(date)
 }
 
-// 从宽松结果对象中安全读取数值字段。
-function numberFromRecord(record: Record<string, unknown> | undefined, key: string) {
-  const value = record?.[key]
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
-}
-
-// 将子任务内部状态转换为面板标签。
-function childTaskStatusLabel(status?: string) {
-  return statusText[(status || '').toLowerCase()] ?? status ?? '处理中'
-}
-
-// 按优先级提取子任务最终输出、错误或当前阶段说明。
-function childTaskOutput(_task?: DelegatedTask) {
-  // 子任务原始结果可能包含文件正文、命令输出或 provider 错误；仅使用 RunEvent 的安全摘要。
-  return ''
-}
 
 // ChildAgentPanel 展示协作树、选中子任务详情及其运行事件，memo 避免流式文本更新带来无关重绘。
 export const ChildAgentPanel = memo(function ChildAgentPanel({
   open,
   tasks,
+  workspaceName = 'PGAgent',
+  branchName,
+  sources = [],
   durableTasks = [],
   selectedDurableTaskId,
-  durableSourceOpen = false,
-  onToggleDurableSource = () => undefined,
   onSelectDurableTask = () => undefined,
   onResumeDurableTask = () => undefined,
   onCancelDurableTask = () => undefined,
@@ -112,16 +98,15 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
   loading,
   error,
   selectedTask,
-  run,
-  events,
-  eventsLoading,
-  eventsError,
   onClose,
   onSelect,
   onRetry,
 }: {
   open: boolean
   tasks: DelegatedTask[]
+  workspaceName?: string
+  branchName?: string
+  sources?: PersistentSourceItem[]
   durableTasks?: DurableTask[]
   selectedDurableTaskId?: string
   durableSourceOpen?: boolean
@@ -143,57 +128,45 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
   resumingDurableTask?: boolean
   onRetry: () => void
 }) {
-  const output = childTaskOutput(selectedTask)
-  const toolEvents = events.filter((event) => !isHiddenRunEvent(event) && ['tool_started', 'tool_call'].includes(event.type || event.event_type || ''))
-  return <aside className={`child-agent-panel ${open ? 'is-open' : 'is-closed'}`} aria-label="子 Agent 工作详情" aria-hidden={!open} inert={!open}>
-    <header className="child-panel-header"><div><span className="eyebrow">协作执行</span><strong>子 Agent</strong></div><button type="button" className="icon-button" onClick={onClose} aria-label="收起子 Agent 侧栏"><X size={16} /></button></header>
-    {!!teammates.length && <section className="teammate-roster" aria-label="持久化队友"><strong>协作队友</strong><div>{teammates.map((teammate) => <span key={teammate.id} className={`teammate teammate-${teammate.status}`} title={teammate.branch_name || teammate.worktree_path || '共享工作区'}><Bot size={12} /><b>{teammate.name}</b><small>{teammate.status}{teammate.workspace_mode === 'worktree' ? ' · worktree' : ''}</small></span>)}</div></section>}
-    {error ? <ErrorState message={error} onRetry={onRetry} /> : loading && !tasks.length ? <LoadingState label="正在读取子 Agent…" /> : !tasks.length ? <>
-      <EmptyState icon={Users} title="尚未调用子 Agent" description="主 Agent 发起委派后，真实的子 Agent 任务会显示在这里。" />
-      {!!durableTasks.length && <PersistentTaskSource
-        tasks={durableTasks}
-        open={durableSourceOpen}
-        selectedTaskId={selectedDurableTaskId}
-        onToggle={onToggleDurableSource}
-        onSelectTask={onSelectDurableTask}
-        onResume={onResumeDurableTask}
-        onCancel={onCancelDurableTask}
-        cancellingTaskId={cancellingDurableTaskId}
-        resuming={resumingDurableTask}
-      />}
-    </> : <>
+  // 子 Agent 详情在同一个侧栏内替换列表；返回只恢复列表，不关闭外层侧栏。
+  const [detailTaskId, setDetailTaskId] = useState<string | null>(null)
+  const navigation = useContext(ChildNavigation)
+  const names = navigation?.names || childNames(tasks)
+  const detailTask = tasks.find((task) => task.id === (navigation ? navigation.detailId : detailTaskId))
+  const openTask = (taskId: string) => {
+    onSelect(taskId)
+    setDetailTaskId(taskId)
+    navigation?.open(taskId)
+  }
+  const closeTask = () => { setDetailTaskId(null); navigation?.back() }
+  return <aside className={`child-agent-panel ${open ? 'is-open' : 'is-closed'}`} aria-label="会话上下文与子 Agent" aria-hidden={!open} inert={!open}>
+    {detailTask && <header className="child-panel-header"><><button type="button" className="icon-button" onClick={closeTask} aria-label="返回子 Agent 列表"><ArrowLeft size={16} /></button><div><span className="eyebrow">协作执行</span><strong>{names[detailTask.id]}</strong></div></><button type="button" className="icon-button" onClick={onClose} aria-label="收起子 Agent 侧栏"><X size={16} /></button></header>}
+    {detailTask ? <ChildConversation key={detailTask.id} task={detailTask} /> : <>
+    <PersistentTaskSource
+      tasks={durableTasks}
+      workspaceName={workspaceName}
+      branchName={branchName}
+      sources={sources}
+      selectedTaskId={selectedDurableTaskId}
+      onClose={onClose}
+      onSelectTask={onSelectDurableTask}
+      onResume={onResumeDurableTask}
+      onCancel={onCancelDurableTask}
+      cancellingTaskId={cancellingDurableTaskId}
+      resuming={resumingDurableTask}
+    />
+    {!!tasks.length && !!teammates.length && <section className="teammate-roster" aria-label="持久化队友"><strong>协作队友</strong><div>{teammates.map((teammate) => <span key={teammate.id} className={`teammate teammate-${teammate.status}`} title={teammate.branch_name || teammate.worktree_path || '共享工作区'}><Bot size={12} /><b>{teammate.name}</b><small>{teammate.status}{teammate.workspace_mode === 'worktree' ? ' · worktree' : ''}</small></span>)}</div></section>}
+    {error ? <ErrorState message={error} onRetry={onRetry} /> : loading && !tasks.length ? <LoadingState label="正在读取子 Agent…" /> : !tasks.length ? null : <>
       <div className="child-task-list" role="list" aria-label="本次调用的子 Agent">
         {tasks.map((task) => {
           const selected = task.id === selectedTask?.id
-          const agent = task.result?.agent
-          const agentName = agent && typeof agent === 'object' && typeof (agent as Record<string, unknown>).name === 'string'
-            ? String((agent as Record<string, unknown>).name)
-            : task.child_agent_name || '子 Agent'
-          return <button key={task.id} type="button" className={selected ? 'selected' : ''} onClick={() => onSelect(task.id)}>
+          const agentName = names[task.id]
+          return <button key={task.id} type="button" className={selected ? 'selected' : ''} onClick={() => openTask(task.id)}>
             <span className="child-task-avatar"><Bot size={14} /></span><span><strong>{agentName}</strong><small>{task.title}</small></span><StatusBadge status={task.status} />
           </button>
         })}
       </div>
-      <PersistentTaskSource
-        tasks={durableTasks}
-        branchName={teammates.find((teammate) => teammate.id === selectedTask?.teammate_id)?.branch_name}
-        open={durableSourceOpen}
-        selectedTaskId={selectedDurableTaskId}
-        onToggle={onToggleDurableSource}
-        onSelectTask={onSelectDurableTask}
-        onResume={onResumeDurableTask}
-        onCancel={onCancelDurableTask}
-        cancellingTaskId={cancellingDurableTaskId}
-        resuming={resumingDurableTask}
-      />
-      {selectedTask && <section className="child-task-detail">
-        <header><div><strong>{selectedTask.title}</strong><small>{childTaskStatusLabel(selectedTask.status)}</small></div><StatusBadge status={selectedTask.status} /></header>
-        <dl className="child-task-stats"><div><dt>步骤</dt><dd>{numberFromRecord(selectedTask.result, 'steps') ?? run?.step_count ?? run?.current_step ?? 0}</dd></div><div><dt>工具</dt><dd>{numberFromRecord(selectedTask.result, 'tool_calls') ?? run?.tool_calls ?? 0}</dd></div></dl>
-        {selectedTask.description && <section className="child-detail-block"><strong>任务</strong><p>{selectedTask.description}</p></section>}
-        {output && <section className="child-detail-block"><strong>{selectedTask.status === 'completed' ? '结果' : '状态说明'}</strong><pre>{output}</pre></section>}
-        <section className="child-detail-block child-events"><strong>工作过程</strong>{eventsError ? <p className="inline-error">{eventsError}</p> : eventsLoading ? <p>正在读取运行事件…</p> : toolEvents.length ? <ol>{toolEvents.map((event, index) => <li key={event.id || index}><span>{presentRunEvent(event).title}</span><small>{formatUiDate(event.created_at)}</small></li>)}</ol> : <p>暂未记录工具调用。</p>}</section>
-      </section>}
-    </>}
+    </>}</>}
   </aside>
 })
 
@@ -421,16 +394,29 @@ function toolGroupLabel(items: ThoughtActivityItem[]) {
   const running = items.some((item) => item.status === 'running')
   const failed = items.some((item) => item.status === 'failed')
   if (shellOnly) return running ? '正在运行命令' : failed ? '运行命令时出错' : '运行了命令'
-  return running ? '正在调用多个工具' : failed ? '调用多个工具时出错' : '调用了多个工具'
+  return running ? '正在执行多个工具' : failed ? '执行多个工具时出错' : '执行了多个工具'
 }
 
 function groupedToolStatus(item: ThoughtActivityItem) {
   if (item.icon === 'edit' || item.title.startsWith('正在编辑') || item.title.startsWith('已编辑') || item.title === '文件编辑失败') {
     return item.title
   }
-  if (item.status === 'running') return item.icon === 'shell' ? '正在运行' : '正在调用'
-  if (item.status === 'failed') return item.icon === 'shell' ? '运行失败' : '调用失败'
-  return item.icon === 'shell' ? '已运行' : '已调用'
+  const updatePlan = item.icon === 'task' && /update\s*plan|更新任务计划/i.test(item.title)
+  const verb = item.icon === 'shell' ? '运行' : item.icon === 'read' ? '读取' : item.icon === 'search' ? '搜索' : item.icon === 'write' ? '写入' : updatePlan ? '更新计划' : item.icon === 'task' ? '执行' : '执行'
+  if (item.status === 'running') return `正在${verb}`
+  if (item.status === 'failed') return `${verb}失败`
+  return `已${verb}`
+}
+
+// 状态标题已经表达动作时，摘要只保留对象或进度，避免动作前缀重复出现。
+function toolActivityDetail(item: ThoughtActivityItem): string {
+  const detail = item.detail.trim()
+  if (!detail) return ''
+  if (item.icon === 'read') return detail.replace(/^读取\s*[:：]\s*/i, '')
+  if (item.icon === 'task' && /update\s*plan|更新任务计划/i.test(item.title)) {
+    return detail.replace(/^更新任务计划\s*(?:[:：·]|\.)\s*/i, '')
+  }
+  return detail
 }
 
 type OrderedContentEntry =
@@ -498,7 +484,7 @@ type ToolResultDetailState =
 
 export function ToolResultDetailPanel({ state, fallbackTitle, onRetry }: { state: ToolResultDetailState; fallbackTitle: string; onRetry: () => void }) {
   if (state.status === 'loading') {
-    return <div className="tool-result-detail" aria-busy="true"><span>正在读取完整结果…</span></div>
+    return <div className="tool-result-detail" aria-busy="true"><span>正在读取…</span></div>
   }
   if (state.status === 'error') {
     return <div className="tool-result-detail" aria-busy="false"><div className="tool-result-error" role="alert"><span>{state.message}</span><button type="button" onClick={onRetry}>重试</button></div></div>
@@ -520,6 +506,7 @@ function CollapsibleRegion({ expanded, mounted = expanded, children, id, classNa
 
 // ThoughtActivityList 统一渲染实时与历史活动；完整结果缓存只跟随当前列表实例的生命周期。
 export function ThoughtActivityList({ items, runId, live = false, activeItemId, onOpenFileChange }: { items: ThoughtActivityItem[]; runId?: string; live?: boolean; activeItemId?: string; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
+  const navigation = useContext(ChildNavigation)
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({})
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({})
   const [mountedItems, setMountedItems] = useState<Record<string, boolean>>({})
@@ -574,17 +561,18 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
               const detailRequest = toolResultRequest(runId, live, item.kind, item.id)
               const expandable = !item.changeSet && (Boolean(item.detail.trim()) || Boolean(detailRequest))
               const itemRunning = live && item.status === 'running'
+              const activityDetail = toolActivityDetail(item)
               return <div className={`tool-activity-group-item ${item.status} ${itemRunning ? 'is-running' : ''}`} key={item.id}>
                 {item.changeSet?.files?.[0] && runId && onOpenFileChange ? <button type="button" className="tool-activity-group-item-line is-clickable" onClick={() => openInlineChange(item)}>
                   <ToolActivityGlyph icon={item.icon} size={13} />
-                  <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>
+                  <span><strong>{groupedToolStatus(item)}</strong>{activityDetail && <code>{activityDetail}</code>}</span>
                 </button> : expandable ? <button type="button" className="tool-activity-group-item-toggle" aria-expanded={itemExpanded} onClick={() => toggleItem(item)}>
                   <ToolActivityGlyph icon={item.icon} size={13} />
-                  <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>
+                  <span><strong>{groupedToolStatus(item)}</strong>{activityDetail && <code>{activityDetail}</code>}</span>
                   <ChevronRight className="tool-activity-item-chevron" size={13} aria-hidden="true" />
                 </button> : <div className="tool-activity-group-item-line">
                   <ToolActivityGlyph icon={item.icon} size={13} />
-                  <span><strong>{groupedToolStatus(item)}</strong>{item.detail && <code>{item.detail}</code>}</span>
+                  <span><strong>{groupedToolStatus(item)}</strong>{activityDetail && <code>{activityDetail}</code>}</span>
                 </div>}
                 {expandable && <CollapsibleRegion expanded={itemExpanded} mounted={Boolean(mountedItems[item.id]) || itemExpanded} className="tool-activity-item-collapse">
                   {detailRequest
@@ -598,24 +586,30 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
         </section>
       }
       const item = entry.item
+      if (item.kind === 'task' && navigation) {
+        const task = navigation.tasks.find(task => task.id === item.delegationId || Boolean(item.childRunId && task.child_run_id === item.childRunId))
+        return <div key={item.id} className="thought-activity kind-tool"><Bot size={14} /><div className="thought-activity-copy"><div className="thought-activity-static">{task ? <button type="button" className="thought-activity-title child-delegation-link" onClick={() => navigation.open(task.id)}>{navigation.names[task.id]}</button> : <span className="thought-activity-title">子 Agent</span>}<span className="thought-activity-summary">{item.delegationState || item.title}</span></div></div></div>
+      }
       if (item.kind === 'assistant') return <div key={item.id} className="ordered-assistant-content"><MarkdownContent content={item.detail} streaming={Boolean(live && item.status === 'running')} /></div>
       if (item.kind === 'file-change') return <FileChangeActivity key={item.id} runId={runId} title={item.title} status={item.status} changeSet={item.changeSet} onOpenFileChange={onOpenFileChange} />
       if (item.kind === 'thought') return <p key={item.id} className={`thought-activity-thought ${item.status}`}>{item.detail}</p>
       const detailRequest = toolResultRequest(runId, live, item.kind, item.id)
+      const activityTitle = item.kind === 'tool' ? groupedToolStatus(item) : item.title
+      const activityDetail = item.kind === 'tool' ? toolActivityDetail(item) : item.detail
       const hasLongUrl = /https?:\/\/\S{72,}/i.test(item.detail)
       const expandable = item.kind === 'tool' && !item.changeSet && (Boolean(detailRequest) || (Boolean(item.detail.trim()) && (item.title !== '联网搜索' || hasLongUrl)))
       const expanded = Boolean(expandedItems[item.id])
       return <div key={item.id} className={`thought-activity kind-${item.kind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
         <ThoughtActivityIcon icon={item.icon} />
         <div className="thought-activity-copy">
-          {item.changeSet?.files?.[0] && runId && onOpenFileChange ? <button type="button" className="thought-activity-static is-clickable" onClick={() => openInlineChange(item)}><span className="thought-activity-title">{item.title}</span>{item.detail && item.title !== '准备上下文' && <span className="thought-activity-summary">{item.detail}</span>}</button> : expandable ? <>
-            <button type="button" className="thought-activity-toggle" aria-expanded={expanded} onClick={() => toggleItem(item)}><span><span className="thought-activity-title">{item.title}</span><span className="thought-activity-summary">{item.detail}</span></span><ChevronRight className="thought-activity-chevron" size={14} aria-hidden="true" /></button>
+          {item.changeSet?.files?.[0] && runId && onOpenFileChange ? <button type="button" className="thought-activity-static is-clickable" onClick={() => openInlineChange(item)}><span className="thought-activity-title">{activityTitle}</span>{activityDetail && item.title !== '准备上下文' && <span className="thought-activity-summary">{activityDetail}</span>}</button> : expandable ? <>
+            <button type="button" className="thought-activity-toggle" aria-expanded={expanded} onClick={() => toggleItem(item)}><span><span className="thought-activity-title">{activityTitle}</span><span className="thought-activity-summary">{activityDetail}</span></span><ChevronRight className="thought-activity-chevron" size={14} aria-hidden="true" /></button>
             <CollapsibleRegion expanded={expanded} mounted={Boolean(mountedItems[item.id]) || expanded} className="thought-activity-detail-collapse">
               {detailRequest
               ? <ToolResultDetailPanel state={detailStates[item.id] || { status: 'loading' }} fallbackTitle={item.title} onRetry={() => loadDetail(item)} />
               : <div className="thought-activity-detail">{item.detail}</div>}
             </CollapsibleRegion>
-          </> : <div className="thought-activity-static"><span className="thought-activity-title">{item.title}</span>{item.detail && item.title !== '准备上下文' && <span className="thought-activity-summary">{item.detail}</span>}</div>}
+          </> : <div className="thought-activity-static"><span className="thought-activity-title">{activityTitle}</span>{activityDetail && item.title !== '准备上下文' && <span className="thought-activity-summary">{activityDetail}</span>}</div>}
         </div>
       </div>
     })}

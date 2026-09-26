@@ -80,8 +80,8 @@ describe('子 Agent 运行事件展示', () => {
     expect(formatApprovalArguments('http', {})).toBe('无参数')
   })
 
-  // 测试场景：工具事件显示可读标题，未知事件也不会回显内部事件名或 payload。
-  it('复用安全事件描述而不是原始事件类型', () => {
+  // 列表页只保留入口，执行记录由点击后的独立子会话呈现。
+  it('列表不再展示旧摘要或原始事件载荷', () => {
     const markup = renderToStaticMarkup(createElement(ChildAgentPanel, {
       open: true,
       tasks: [{ id: 'task-1', title: '检查日志', status: 'running', child_run_id: 'run-1' }],
@@ -101,7 +101,8 @@ describe('子 Agent 运行事件展示', () => {
       onRetry: vi.fn(),
     }))
 
-    expect(markup).toContain('开始调用 Shell')
+    expect(markup).not.toContain('child-task-detail')
+    expect(markup).not.toContain('开始调用 Shell')
     expect(markup).not.toContain('tool_started')
     expect(markup).not.toContain('provider_internal_packet')
     expect(markup).not.toContain('secret-command')
@@ -197,6 +198,23 @@ describe('助手消息中的思考过程展示', () => {
     expect(markup).not.toContain('Get-Content first.ts')
     expect(markup).not.toContain('rg -n second')
     expect(markup).not.toContain('pnpm test')
+  })
+
+  it('工具状态使用对应动作而不是统一显示已调用', () => {
+    const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: {
+        runId: 'run-semantic-tool-status', phase: '执行中', draft: '', status: 'live', error: '', thinkingStatus: '处理中',
+        thought: { startedAt: 1_000, elapsedMs: 0, finished: false, conclusion: '', tools: [], items: [
+          { id: 'read-done', kind: 'tool', icon: 'read', title: 'Read', detail: '读取 converter.py', status: 'completed' },
+          { id: 'separator', kind: 'event', icon: 'think', title: '进度', detail: '继续处理', status: 'completed' },
+          { id: 'plan-running', kind: 'tool', icon: 'task', title: 'Update Plan', detail: '更新 3 项任务', status: 'running' },
+        ] },
+      },
+    }))
+
+    expect(markup).toContain('已读取')
+    expect(markup).toContain('正在更新计划')
+    expect(markup).not.toContain('已调用')
   })
 
   it('多个工具中仍有调用运行时保持可见动效状态', () => {
@@ -313,8 +331,9 @@ describe('助手消息中的思考过程展示', () => {
   it('工具活动图标不会继承起始对齐并在展开详情时保持标题行对齐', () => {
     expect(sessionsCss).toMatch(/\.tool-activity-icon\s*\{[^}]*align-self:\s*center;/s)
     expect(sessionsCss).toContain('.thought-activity.kind-tool { align-items: start; }')
-    expect(sessionsCss).toContain('.thought-activity.kind-tool .thought-activity-icon { align-self: start; transform: translateY(1px); }')
-    expect(sessionsCss).toContain('.tool-activity-group-item-line > .tool-activity-icon { flex: 0 0 20px; transform: translateY(1px); }')
+    expect(sessionsCss).toContain('.thought-activity > .thought-activity-icon { align-self: start; }')
+    expect(sessionsCss).toContain('.thought-activity:has(> .thought-activity-copy > .thought-activity-toggle) > .thought-activity-icon { margin-top: 2.5px; }')
+    expect(sessionsCss).toContain('.tool-activity-group-item-line > .tool-activity-icon { flex: 0 0 20px; }')
     expect(sessionsCss).toContain('.tool-activity-group-item-line > span:not(.tool-activity-icon) {')
   })
 

@@ -2078,6 +2078,7 @@ class RunCoordinator:
         payload = {
             "task_id": task.id,
             "delegation_id": task.id,
+            "display_name": (task.result or {}).get("display_name", ""),
             "child_run_id": run.id,
             "parent_run_id": link["parent_run_id"],
             "parent_session_id": run.session_id or link.get("parent_session_id"),

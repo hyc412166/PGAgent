@@ -2048,6 +2048,7 @@ def normalize_delegate_specs(
     model_id: object = "",
     thinking_level: object = "",
     workspace_mode: object = "shared",
+    display_name: object = "",
 ) -> tuple[list[dict[str, Any]], str | None, str | None]:
     """Normalize one task or a dependency-aware batch."""
 
@@ -2057,6 +2058,7 @@ def normalize_delegate_specs(
             or str(agent_id or "").strip()
             or str(model_id or "").strip()
             or str(thinking_level or "").strip()
+            or str(display_name or "").strip()
         ):
             return [], "invalid_task", "批量委派时 task、agent_id、model_id 和 thinking_level 必须写入 tasks 各项"
         if not isinstance(tasks, (list, tuple)) or not tasks:
@@ -2096,6 +2098,7 @@ def normalize_delegate_specs(
             if selected_thinking and selected_thinking not in {"low", "medium", "high", "xhigh"}:
                 return [], "invalid_delegate_thinking_level", "tasks 中的 thinking_level 必须是 low、medium、high 或 xhigh"
             normalized_item = {
+                "display_name": str(item.get("display_name") or "").strip(),
                 "id": external_id or f"generated-{index}",
                 "generated_id": not bool(external_id),
                 "task": request,
@@ -2136,6 +2139,7 @@ def normalize_delegate_specs(
             return [], "invalid_delegate_thinking_level", "thinking_level 必须是 low、medium、high 或 xhigh"
         # 变量说明：normalized 表示当前步骤使用的 normalized 值。
         normalized_item = {
+            "display_name": str(display_name or "").strip(),
             "id": external_id or "generated-1",
             "generated_id": not bool(external_id),
             "task": request,
@@ -2148,6 +2152,11 @@ def normalize_delegate_specs(
         if selected_thinking:
             normalized_item["thinking_level"] = selected_thinking
         normalized = [normalized_item]
+    for item in normalized:
+        if len(item["display_name"]) > 80 or "\n" in item["display_name"] or "\r" in item["display_name"]:
+            return [], "invalid_delegate_name", "display_name 必须是 80 字以内的单行任务名称"
+        if not item["display_name"]:
+            del item["display_name"]
     # 变量说明：graph_rows 表示当前流程使用的 graph_rows 集合。
     graph_rows = [
         {"id": item["id"], "depends_on": item["depends_on"]}
@@ -2196,6 +2205,7 @@ def delegate_task(
     task: str = "",
     *,
     agent_id: str = "",
+    display_name: str = "",
     tasks: object = None,
     step_id: str = "",
     depends_on: object = None,
@@ -2214,7 +2224,7 @@ def delegate_task(
 
     # 变量说明：requests 表示当前流程使用的 requests 集合；error_code 表示当前步骤使用的 error_code 值；error 表示当前捕获或准备上报的错误。
     specs, error_code, error = normalize_delegate_specs(
-        task, agent_id, tasks, step_id, depends_on, model_id, thinking_level, workspace_mode
+        task, agent_id, tasks, step_id, depends_on, model_id, thinking_level, workspace_mode, display_name
     )
     if error_code and error:
         return _invalid_delegate_result(error_code, error)
@@ -2241,6 +2251,7 @@ def delegate_task(
             str(spec["task"]),
             str(spec["agent_id"]),
             call_id=None,
+            display_name=spec.get("display_name"),
             model_id=spec.get("model_id"),
             thinking_level=spec.get("thinking_level"),
         )
@@ -2274,6 +2285,7 @@ def _call_task_delegate(
     agent_id: str,
     *,
     call_id: str | None,
+    display_name: str | None = None,
     plan_step_external_id: str | None = None,
     graph_call_id: str | None = None,
     model_id: str | None = None,
@@ -2299,6 +2311,8 @@ def _call_task_delegate(
         accepts_keywords = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
         # 变量说明：names 表示当前流程使用的 names 集合。
         names = signature.parameters
+        if display_name and not (accepts_keywords or "display_name" in names):
+            return ToolResult("task", False, "当前委派器不支持命名", error_code="delegate_name_unsupported")
         if model_id and not (accepts_keywords or "model_id" in names):
             return ToolResult(
                 "task", False, "当前子 Agent 委派器不支持模型分配", error_code="delegate_allocation_unsupported"
@@ -2318,6 +2332,8 @@ def _call_task_delegate(
         ):
             # 变量说明：keyword_arguments 表示当前流程使用的 keyword_arguments 集合。
             keyword_arguments: dict[str, str | None] = {}
+            if display_name:
+                keyword_arguments["display_name"] = display_name
             if accepts_keywords or "agent_id" in names:
                 keyword_arguments["agent_id"] = agent_id
             if accepts_keywords or "call_id" in names:
@@ -2394,6 +2410,7 @@ async def delegate_task_async(
     task: str = "",
     *,
     agent_id: str = "",
+    display_name: str = "",
     tasks: object = None,
     step_id: str = "",
     depends_on: object = None,
@@ -2412,7 +2429,7 @@ async def delegate_task_async(
 
     # 变量说明：specs 表示当前流程使用的 specs 集合；error_code 表示当前步骤使用的 error_code 值；error 表示当前捕获或准备上报的错误。
     specs, error_code, error = normalize_delegate_specs(
-        task, agent_id, tasks, step_id, depends_on, model_id, thinking_level, workspace_mode
+        task, agent_id, tasks, step_id, depends_on, model_id, thinking_level, workspace_mode, display_name
     )
     if error_code and error:
         return _invalid_delegate_result(error_code, error)
@@ -2447,6 +2464,7 @@ async def delegate_task_async(
                 str(spec["task"]),
                 str(spec["agent_id"]),
                 call_id=child_call_id,
+                display_name=spec.get("display_name"),
                 plan_step_external_id=str(spec["id"]),
                 graph_call_id=call_id,
                 model_id=spec.get("model_id"),

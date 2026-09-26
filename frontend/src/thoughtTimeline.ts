@@ -21,6 +21,10 @@ export type ThoughtActivityIcon = 'think' | 'read' | 'write' | 'edit' | 'search'
 
 // ThoughtActivityItem 是用户可见的单条推理活动摘要。
 export interface ThoughtActivityItem {
+  delegationId?: string
+  childRunId?: string
+  delegationState?: string
+  delegationTool?: boolean
   id: string
   kind: ThoughtActivityKind
   icon: ThoughtActivityIcon
@@ -316,7 +320,9 @@ function stableDelegationActivityId(event: RunStreamEvent, fallback: string): st
     payload?.delegation_id,
     payload?.child_run_id,
   )
-  return key ? `task:${key}` : fallback
+  // 启动是独立的历史记录；等待和终态只更新状态行，不能覆盖启动行。
+  const type = firstString(event.type, event.event_type, payload?.type, payload?.event_type)
+  return key ? `task:${key}:${type === 'delegated_child_started' ? 'started' : 'status'}` : fallback
 }
 
 function assistantItemIdentity(event: RunStreamEvent, fallbackIndex: number) {
@@ -610,12 +616,16 @@ function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): Tho
     const granted = type === 'approval_granted'
     return { id: firstString(event.event_id, event.id, event.approval_id) || `approval-${itemIndex}`, kind: 'approval', icon: 'approval', title: granted ? '审批通过' : '等待审批', detail: progress || (granted ? '继续执行已批准的操作' : '需要你的确认后继续'), status: granted ? 'completed' : 'running' }
   }
+  // continuation 是父运行恢复汇总，并不是又启动了一个子 Agent。
+  if (type === 'delegated_child_continuation_started') {
+    return { id: firstString(event.event_id, event.id) || `continuation-${itemIndex}`, kind: 'event', icon: 'task', title: '主 Agent 汇总子 Agent 结果', detail: '', status: 'completed' }
+  }
   if (type.startsWith('delegated_child_')) {
     const completed = type.endsWith('completed')
     const failed = type.endsWith('failed') || type.endsWith('stopped')
     const payload = record(event.payload)
     const taskTitle = firstString(event.task_title, payload?.task_title, event.task, payload?.task)
-    return { id: firstString(event.event_id, event.id, event.task_id, event.child_run_id) || `task-${itemIndex}`, kind: 'task', icon: 'task', title: completed ? '子 Agent 已返回' : failed ? '子 Agent 已停止' : '子 Agent 工作中', detail: taskTitle || progress || (completed ? '已收到子 Agent 的凝练结果' : failed ? '子 Agent 未完成任务' : '正在处理专长任务'), status: completed ? 'completed' : failed ? 'failed' : 'running' }
+    return { id: firstString(event.event_id, event.id, event.task_id, event.child_run_id) || `task-${itemIndex}`, delegationId: firstString(event.task_id, event.delegation_id, payload?.task_id, payload?.delegation_id), childRunId: firstString(event.child_run_id, payload?.child_run_id), delegationState: type.endsWith('awaiting_approval') ? '等待审批' : completed ? '已完成' : type.endsWith('failed') ? '执行失败' : failed ? '已停止' : type.endsWith('started') ? '开始工作' : '工作中', kind: 'task', icon: 'task', title: completed ? '子 Agent 已返回' : failed ? '子 Agent 已停止' : '子 Agent 工作中', detail: taskTitle || progress || (completed ? '已收到子 Agent 的凝练结果' : failed ? '子 Agent 未完成任务' : '正在处理专长任务'), status: completed ? 'completed' : failed ? 'failed' : 'running' }
   }
   if (safeProgressTypes.has(type) && progress) {
     return { id: firstString(event.event_id, event.id) || `activity-${itemIndex}`, kind: 'event', icon: 'think', title: '进度', detail: progress, status: 'running' }
@@ -696,6 +706,7 @@ export function updateThoughtTimeline(
         id,
         // 文件工具和 Shell/搜索一样进入普通活动流，完成时只更新这一行。
         kind: 'tool',
+        delegationTool: name.trim().toLowerCase() === 'task',
         icon: thoughtIconForTool(name),
         title: fileMutation ? `正在编辑${target ? ` ${target}` : '文件'}` : displayToolName(name),
         detail,
@@ -775,6 +786,11 @@ export function updateThoughtTimeline(
   if (activity?.kind === 'event' && type.startsWith('completion_verification_')) activity = null
   if (activity) {
     const items = [...(state.items || [])]
+    // 子运行已实际启动后，专用委派行替代对应的 task 工具展示；失败在启动前的 task 仍保留。
+    if (type === 'delegated_child_started') {
+      const tool = items.findLast(item => item.delegationTool && item.status === 'running')
+      if (tool) items.splice(items.indexOf(tool), 1)
+    }
     const compactionFinished = type === 'context_compaction_finished'
       || type === 'context_compacted'
       || type === 'context_compaction_failed'
