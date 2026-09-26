@@ -539,6 +539,7 @@ class _SubagentTaskDelegate:
         task: str,
         *,
         agent_id: str = "",
+        display_name: str | None = None,
         model_id: str | None = None,
         thinking_level: str | None = None,
         call_id: str | None = None,
@@ -786,6 +787,8 @@ class _SubagentTaskDelegate:
             # 变量说明：result 表示本步骤产生的结果。
             delegation.result = {
                 **dict(delegation.result or {}),
+                # 名称属于本次委派，不修改可复用 Agent 角色的名称。
+                "display_name": display_name or "",
                 "task_id": delegation.id,
                 "delegation_id": delegation.id,
                 "child_run_id": child_run.id,

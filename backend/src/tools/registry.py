@@ -255,6 +255,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {
                 "task": {"type": "string"},
                 "agent_id": {"type": "string"},
+                "display_name": {"type": "string", "maxLength": 80, "description": "为本次子 Agent 取一个简短、与任务相关的名字，例如：温度转换实现、单元测试审查。请在每次委派时填写。"},
                 "model_id": {"type": "string", "description": "本次委派使用的模型；省略时继承主 Agent 本轮模型。"},
                 "thinking_level": {"type": "string", "enum": ["low", "medium", "high", "xhigh"], "description": "本次委派的思考强度；省略时继承主 Agent 本轮设置。"},
                 "step_id": {"type": "string", "description": "可选的已有持久任务步骤标识。"},
@@ -267,6 +268,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "properties": {
                             "task": {"type": "string"},
                             "agent_id": {"type": "string"},
+                            "display_name": {"type": "string", "maxLength": 80, "description": "为该子 Agent 取一个与本项任务相关的简短名字。"},
                             "model_id": {"type": "string"},
                             "thinking_level": {"type": "string", "enum": ["low", "medium", "high", "xhigh"]},
                             "id": {"type": "string"},

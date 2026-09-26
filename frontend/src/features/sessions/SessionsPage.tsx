@@ -2,8 +2,8 @@
 import { AlertCircle, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
 import { type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type SetStateAction, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { api, describeError } from '../../api'
-import { attachmentForm, attachmentSignature, formatAttachmentSize, selectAttachmentFiles } from '../../attachments'
+import { api, apiUrl, describeError } from '../../api'
+import { attachmentForm, attachmentSignature, formatAttachmentSize, messageAttachments, selectAttachmentFiles } from '../../attachments'
 import type { PendingAttachment } from '../../attachments'
 import { permissionLabel, permissionOptions, toggleSelectedId } from '../../capabilitySelection'
 import { modelSelectionPayload, resolveEffectiveThinking, sessionThinkingOptions, shortModelLabel, thinkingLevelLabels } from '../../composerSettings'
@@ -26,6 +26,9 @@ import { FileChangePanel } from './components/FileChangePanel'
 import { ProjectTreeItem } from './components/ProjectTreeItem'
 import { projectDeleteConfirmation } from './projectDeletion'
 import { useRunTransport } from './hooks/useRunTransport'
+import { ChildNavigation } from './childNavigation'
+import { childNames } from './childIdentity'
+import type { PersistentSourceItem } from './components/PersistentTaskSource'
 import { activeRunStatuses, draftSettingsWithPermission, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, removePendingApproval, runThinkingStartedAt } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
 import { buildConversationTurnSummaries } from './turnTimeline'
@@ -145,6 +148,7 @@ function SessionsPage() {
   const [completedThoughtsByRun, setCompletedThoughtsByRun] = useState<Record<string, ThoughtTimelineState>>({})
   const [childPanelState, setChildPanelState] = useState<ChildPanelState>({ sessionId: '', open: false, autoOpened: false })
   const [selectedChildTaskId, setSelectedChildTaskId] = useState('')
+  const [childDetail, setChildDetail] = useState({ sessionId: '', taskId: '' })
   const [durableSourceOpen, setDurableSourceOpen] = useState(false)
   const [selectedDurableTaskId, setSelectedDurableTaskId] = useState('')
   const [fileChangeSelection, setFileChangeSelection] = useState<FileChangeSelection | null>(null)
@@ -322,6 +326,35 @@ function SessionsPage() {
   const visibleChildTasks = childTasks.data.ownerSessionId === activeId ? childTasks.data.items : noDelegatedTasks
   const visibleTeammates = activeId ? teammates.data : noTeammates
   const visibleDurableTasks = durableTasks.data.filter((task) => task.session_id === activeId)
+  const activeWorkspace = workspaces.data.find((workspace) => workspace.id === activeSession?.workspace_id)
+  const contextWorkspaceName = folderName(activeWorkspace?.root_path || activeWorkspace?.path || activeWorkspace?.name || 'PGAgent')
+  const contextBranchName = visibleTeammates.find((teammate) => teammate.id === activeChildTask?.teammate_id)?.branch_name
+    || visibleTeammates.find((teammate) => teammate.branch_name)?.branch_name
+    || 'main'
+  const contextSources = (() => {
+    const result: PersistentSourceItem[] = []
+    const seen = new Set<string>()
+    const add = (item: PersistentSourceItem) => {
+      if (seen.has(item.id)) return
+      seen.add(item.id)
+      result.push(item)
+    }
+    messages.data.items.filter((message) => !message.session_id || message.session_id === activeId).forEach((message) => {
+      messageAttachments(message.metadata?.attachments).forEach((attachment) => add({
+        id: `attachment:${attachment.id}`,
+        label: attachment.name,
+        kind: attachment.mime_type.startsWith('image/') ? 'image' : 'document',
+        href: message.session_id ? apiUrl(`/api/sessions/${message.session_id}/attachments/${attachment.id}/content`) : '#',
+      }))
+      message.citations?.forEach((citation, index) => add({
+        id: `citation:${citation.url}:${index}`,
+        label: citation.title || citation.url,
+        kind: 'web',
+        href: citation.url,
+      }))
+    })
+    return result
+  })()
   const resumableTask = durableTask.data?.session_id === activeId && ['paused', 'needs_recovery', 'blocked'].includes(durableTask.data.status) ? durableTask.data : null
   const resumeFromComposer = !draftActive && !canInterrupt && !composerHasValue && !pendingAttachments.length && resumableTask !== null
   const childPanelOpen = childPanelState.open
@@ -336,6 +369,10 @@ function SessionsPage() {
     setChildPanelOpen(false)
   }, [setChildPanelOpen])
   const sidePanelOpen = childPanelOpen || Boolean(fileChangeSelection)
+  // 概览只覆盖消息；选中真实子会话后才为可滚动的详情侧栏预留空间。
+  const childConversationOpen = childPanelOpen && childDetail.sessionId === activeId
+    && visibleChildTasks.some((task) => task.id === childDetail.taskId)
+  const dockedPanelOpen = childConversationOpen || Boolean(fileChangeSelection)
   const chatShellStyle = sidePanelWidth === null
     ? undefined
     : { '--session-side-panel-width': `${sidePanelWidth}px` } as CSSProperties
@@ -1266,7 +1303,8 @@ function SessionsPage() {
   const dependencyErrors = [agents.error, workspaces.error, connections.error].filter(Boolean)
   return (
     <div className="page page-chat">
-      <div ref={chatShellRef} className={`chat-shell ${sidePanelOpen ? 'child-panel-open' : ''}${sidePanelResizing ? ' is-resizing' : ''}`} style={chatShellStyle}>
+      <ChildNavigation.Provider value={{ tasks: visibleChildTasks, names: childNames(visibleChildTasks), detailId: childDetail.sessionId === activeId ? childDetail.taskId : '', open: (id) => { setSelectedChildTaskId(id); setChildDetail({ sessionId: activeId, taskId: id }); setFileChangeSelection(null); setChildPanelOpen(true) }, back: () => setChildDetail({ sessionId: activeId, taskId: '' }) }}>
+      <div ref={chatShellRef} className={`chat-shell ${fileChangeSelection ? 'file-panel-open' : childConversationOpen ? 'child-conversation-open' : childPanelOpen ? 'child-panel-open' : ''}${sidePanelResizing ? ' is-resizing' : ''}`} style={chatShellStyle}>
           <aside className="session-list project-session-sidebar" onScroll={() => setProjectHoverCard(null)}>
             <section className="draft-tree-section">
               <button type="button" className="new-draft-button" disabled={sending} onClick={() => beginDraft()}><Plus size={14} />新建对话</button>
@@ -1483,7 +1521,7 @@ function SessionsPage() {
               </div>
             </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={() => beginDraft()}>新建对话</button>} />}
           </section>
-          {sidePanelOpen && <div
+          {dockedPanelOpen && <div
             className={`side-panel-resizer${sidePanelResizing ? ' is-dragging' : ''}`}
             role="separator"
             tabIndex={0}
@@ -1501,6 +1539,9 @@ function SessionsPage() {
           {fileChangeSelection ? <FileChangePanel selection={fileChangeSelection} onClose={() => setFileChangeSelection(null)} /> : <ChildAgentPanel
             open={childPanelOpen}
             tasks={visibleChildTasks}
+            workspaceName={contextWorkspaceName}
+            branchName={contextBranchName}
+            sources={contextSources}
             durableTasks={visibleDurableTasks}
             selectedDurableTaskId={selectedDurableTaskId}
             durableSourceOpen={durableSourceOpen}
@@ -1515,7 +1556,7 @@ function SessionsPage() {
             onClose={() => setChildPanelOpen(false)}
             onSelect={setSelectedChildTaskId}
             onToggleDurableSource={() => setDurableSourceOpen((open) => !open)}
-            onSelectDurableTask={(taskId) => { setSelectedDurableTaskId(taskId); setDurableSourceOpen(true) }}
+            onSelectDurableTask={(taskId) => { setSelectedDurableTaskId((current) => current === taskId ? '' : taskId); setDurableSourceOpen(true) }}
             onResumeDurableTask={(taskId) => { void resumeDurableTask(taskId) }}
             onCancelDurableTask={(taskId) => { void cancelDurableTask(taskId) }}
             cancellingDurableTaskId={cancellingTaskId}
@@ -1523,6 +1564,7 @@ function SessionsPage() {
             onRetry={() => { void childTasks.reload(); void teammates.reload(); void childTaskEvents.reload() }}
           />}
       </div>
+      </ChildNavigation.Provider>
       {projectHoverCard && createPortal(
         <div className="project-hover-card" id="project-hover-card" role="tooltip" style={{ left: projectHoverCard.left, top: projectHoverCard.top }}>
           <div className="project-hover-card-row project-hover-card-title"><Folder size={14} /><strong>{projectHoverCard.name}</strong></div>
