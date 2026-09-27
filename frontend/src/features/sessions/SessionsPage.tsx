@@ -32,6 +32,7 @@ import type { PersistentSourceItem } from './components/PersistentTaskSource'
 import { activeRunStatuses, draftSettingsWithPermission, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, removePendingApproval, runThinkingStartedAt } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
 import { buildConversationTurnSummaries } from './turnTimeline'
+import { loadSessionScrollTop, saveSessionScrollTop } from './sessionScrollPosition'
 import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, PermissionSettings, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 type ChildPanelState = { sessionId: string; open: boolean; autoOpened: boolean }
@@ -171,6 +172,7 @@ function SessionsPage() {
   const activeIdRef = useRef('')
   const stickToBottomRef = useRef(true)
   const historyScrollSessionRef = useRef('')
+  const historyPositionRestoredRef = useRef('')
   const terminalSyncVersionRef = useRef(0)
   const pendingDraftRunRef = useRef<{ sessionId: string; runId: string; startedAt?: string } | null>(null)
   const draftIdempotencyKeyRef = useRef('')
@@ -517,8 +519,14 @@ function SessionsPage() {
   useLayoutEffect(() => {
     thoughtHydrationRegistryRef.current.reset()
     historyScrollSessionRef.current = activeId
+    historyPositionRestoredRef.current = ''
     stickToBottomRef.current = true
   }, [activeId])
+
+  useEffect(() => () => {
+    const sessionId = activeIdRef.current
+    if (sessionId && messagesRef.current) saveSessionScrollTop(sessionId, messagesRef.current.scrollTop)
+  }, [])
 
   useEffect(() => {
     if (!activeId || runs.loading || runs.data.ownerSessionId !== activeId) return
@@ -623,6 +631,12 @@ function SessionsPage() {
   }
 
   // 将尚未创建的新会话恢复为初始草稿，并废弃此前异步操作版本。
+  function captureCurrentSessionScrollPosition() {
+    const sessionId = activeIdRef.current
+    const element = messagesRef.current
+    if (sessionId && element) saveSessionScrollTop(sessionId, element.scrollTop)
+  }
+
   function clearDraftState() {
     draftVersionRef.current += 1
     clearPendingAttachments()
@@ -636,6 +650,7 @@ function SessionsPage() {
   // 进入新会话模式；传入项目时直接把草稿归属到该项目，避免依赖当前会话推断目录。
   function beginDraft(workspace?: Workspace) {
     if (sendingRef.current) return
+    captureCurrentSessionScrollPosition()
     closeAllMenus()
     setPendingSession(null)
     clearPendingAttachments()
@@ -660,6 +675,7 @@ function SessionsPage() {
   // 切换至持久化会话；后续 useApiData 依赖 activeId 自动加载关联资源。
   function openExistingSession(sessionId: string) {
     if (draftActive && sendingRef.current) return
+    captureCurrentSessionScrollPosition()
     closeAllMenus()
     if (draftActive) {
       clearDraftState()
@@ -816,12 +832,14 @@ function SessionsPage() {
     if (pendingSessionSendRef.current?.sessionId !== activeId) pendingSessionSendRef.current = null
     terminalSyncVersionRef.current += 1
     seenStreamEventsRef.current = { runId: '', eventIds: new Set() }
+    // 会话切换后先隔离旧会话的流式草稿，等当前会话的消息和运行状态水合完成后再重建实时流。
+    setLiveRun(emptyLiveRun())
     stickToBottomRef.current = true
     return () => {
       closeRunTransport()
       terminalSyncVersionRef.current += 1
     }
-  }, [activeId, closeRunTransport])
+  }, [activeId, closeRunTransport, setLiveRun])
 
   useEffect(() => {
     const pending = pendingDraftRunRef.current
@@ -866,10 +884,20 @@ function SessionsPage() {
     const scrollToLatest = () => {
       const element = messagesRef.current
       if (!element) return
+      // 保存位置已经恢复后，后续消息/时间线渲染不能再次把会话滚回底部。
+      if (historyPositionRestoredRef.current === activeId) return
       // 水合完成后一次跳到底部，不在长历史中播放滚动动画，以保持会话切换即时响应。
       observedElement = element
       element.addEventListener('scrollend', finishHistoryAnchor)
-      element.scrollTo({ top: element.scrollHeight })
+      const savedTop = loadSessionScrollTop(activeId)
+      if (savedTop !== null && historyPositionRestoredRef.current !== activeId) {
+        historyPositionRestoredRef.current = activeId
+        element.scrollTo({ top: Math.min(savedTop, Math.max(0, element.scrollHeight - element.clientHeight)) })
+        historyScrollSessionRef.current = ''
+        stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
+      } else {
+        element.scrollTo({ top: element.scrollHeight })
+      }
       settleFrame = window.requestAnimationFrame(finishHistoryAnchor)
     }
     // React 提交完整历史后再等待两个浏览器布局周期，确保最终滚动高度稳定。
@@ -1359,6 +1387,7 @@ function SessionsPage() {
                 aria-live="polite"
                 onScroll={(event) => {
                   const element = event.currentTarget
+                  if (activeId) saveSessionScrollTop(activeId, element.scrollTop)
                   const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight
                   if (activeId && historyScrollSessionRef.current === activeId) {
                     const historyReady = historyHydration.sessionId === activeId
