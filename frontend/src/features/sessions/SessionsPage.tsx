@@ -1,5 +1,5 @@
 // 本文件实现 SessionsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
-import { AlertCircle, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
+import { AlertCircle, ArrowDown, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
 import { type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type SetStateAction, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, apiUrl, describeError } from '../../api'
@@ -32,7 +32,7 @@ import type { PersistentSourceItem } from './components/PersistentTaskSource'
 import { activeRunStatuses, draftSettingsWithPermission, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, removePendingApproval, runThinkingStartedAt } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
 import { buildConversationTurnSummaries } from './turnTimeline'
-import { loadSessionScrollPosition, saveSessionScrollPosition } from './sessionScrollPosition'
+import { loadSessionScrollPosition, saveSessionScrollPosition, type SessionScrollPosition } from './sessionScrollPosition'
 import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, PermissionSettings, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 type ChildPanelState = { sessionId: string; open: boolean; autoOpened: boolean }
@@ -171,8 +171,12 @@ function SessionsPage() {
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([])
   const activeIdRef = useRef('')
   const stickToBottomRef = useRef(true)
+  const [awayFromBottom, setAwayFromBottom] = useState(false)
+  const [followLatestRequest, setFollowLatestRequest] = useState(0)
   const historyScrollSessionRef = useRef('')
   const historyPositionRestoredRef = useRef('')
+  const scrollCaptureSessionRef = useRef('')
+  const pendingScrollPositionRef = useRef<SessionScrollPosition | null>(null)
   const scrollCaptureFrameRef = useRef<number | null>(null)
   const terminalSyncVersionRef = useRef(0)
   const pendingDraftRunRef = useRef<{ sessionId: string; runId: string; startedAt?: string } | null>(null)
@@ -519,9 +523,17 @@ function SessionsPage() {
 
   useLayoutEffect(() => {
     thoughtHydrationRegistryRef.current.reset()
+    // 进入时保留恢复目标；清空旧 DOM 和加载历史产生的滚动不能成为新的浏览记录。
+    pendingScrollPositionRef.current = loadSessionScrollPosition(activeId)
+    scrollCaptureSessionRef.current = ''
+    if (scrollCaptureFrameRef.current !== null) {
+      window.cancelAnimationFrame(scrollCaptureFrameRef.current)
+      scrollCaptureFrameRef.current = null
+    }
     historyScrollSessionRef.current = activeId
     historyPositionRestoredRef.current = ''
     stickToBottomRef.current = true
+    setAwayFromBottom(false)
   }, [activeId])
 
   useEffect(() => () => {
@@ -632,7 +644,21 @@ function SessionsPage() {
     setPendingAttachments(next)
   }
 
-  // 将尚未创建的新会话恢复为初始草稿，并废弃此前异步操作版本。
+  function followLatestOutput() {
+    const element = messagesRef.current
+    if (!element) return
+    // 主动跟随取代历史阅读锚点；旧的恢复回调不能再把视口拉回先前位置。
+    pendingScrollPositionRef.current = null
+    historyScrollSessionRef.current = ''
+    historyPositionRestoredRef.current = ''
+    scrollCaptureSessionRef.current = activeId
+    stickToBottomRef.current = true
+    element.scrollTo({ top: element.scrollHeight, behavior: 'auto' })
+    setAwayFromBottom(false)
+    setFollowLatestRequest((request) => request + 1)
+    if (activeId) captureSessionScrollPosition(activeId, element)
+  }
+
   function captureCurrentSessionScrollPosition() {
     const sessionId = activeIdRef.current
     const element = messagesRef.current
@@ -640,6 +666,7 @@ function SessionsPage() {
   }
 
   function captureSessionScrollPosition(sessionId: string, element: HTMLDivElement) {
+    if (scrollCaptureSessionRef.current !== sessionId || element.dataset.sessionId !== sessionId) return
     const containerTop = element.getBoundingClientRect().top
     const anchor = [...element.querySelectorAll<HTMLElement>('[id^="conversation-message-"]')]
       .map((item) => ({ item, rect: item.getBoundingClientRect() }))
@@ -653,6 +680,7 @@ function SessionsPage() {
   }
 
   function scheduleSessionScrollCapture(sessionId: string, element: HTMLDivElement) {
+    if (scrollCaptureSessionRef.current !== sessionId) return
     if (scrollCaptureFrameRef.current !== null) return
     scrollCaptureFrameRef.current = window.requestAnimationFrame(() => {
       scrollCaptureFrameRef.current = null
@@ -698,6 +726,7 @@ function SessionsPage() {
   // 切换至持久化会话；后续 useApiData 依赖 activeId 自动加载关联资源。
   function openExistingSession(sessionId: string) {
     if (draftActive && sendingRef.current) return
+    if (!draftActive && sessionId === activeId) return
     captureCurrentSessionScrollPosition()
     closeAllMenus()
     if (draftActive) {
@@ -903,18 +932,21 @@ function SessionsPage() {
         : Number.POSITIVE_INFINITY
       if (anchoringHistory && historyReady && distanceFromBottom <= 1 && historyScrollSessionRef.current === activeId) {
         historyScrollSessionRef.current = ''
+        scrollCaptureSessionRef.current = activeId
         stickToBottomRef.current = true
       }
     }
     const scrollToLatest = () => {
       const element = messagesRef.current
       if (!element) return
+      // 两帧布局等待期间用户仍可上翻，执行时再次遵从当前阅读意图。
+      if (!anchoringHistory && !stickToBottomRef.current) return
       // 保存位置已经恢复后，后续消息/时间线渲染不能再次把会话滚回底部。
       if (historyPositionRestoredRef.current === activeId) return
       // 水合完成后一次跳到底部，不在长历史中播放滚动动画，以保持会话切换即时响应。
       observedElement = element
       element.addEventListener('scrollend', finishHistoryAnchor)
-      const savedPosition = loadSessionScrollPosition(activeId)
+      const savedPosition = pendingScrollPositionRef.current
       const restoreFromAnchor = () => {
         const target = savedPosition?.messageId ? document.getElementById(savedPosition.messageId) : null
         if (!target || !element.contains(target)) return false
@@ -927,11 +959,20 @@ function SessionsPage() {
       const finishPositionRestore = () => {
         historyPositionRestoredRef.current = activeId
         historyScrollSessionRef.current = ''
+        scrollCaptureSessionRef.current = activeId
         stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
+        setAwayFromBottom(!stickToBottomRef.current)
+        if (stickToBottomRef.current) {
+          // 恢复点就在底部时继续跟随，避免新内容增长后既不滚动也没有返回入口。
+          pendingScrollPositionRef.current = null
+          historyPositionRestoredRef.current = ''
+          setFollowLatestRequest((request) => request + 1)
+          return
+        }
         const target = savedPosition?.messageId ? document.getElementById(savedPosition.messageId) : null
         if (target && typeof ResizeObserver !== 'undefined') {
           resizeObserver = new ResizeObserver(() => {
-            if (!cancelled) restoreFromAnchor()
+            if (!cancelled && historyPositionRestoredRef.current === activeId && pendingScrollPositionRef.current === savedPosition) restoreFromAnchor()
           })
           resizeObserver.observe(element)
           resizeObserver.observe(target)
@@ -962,6 +1003,15 @@ function SessionsPage() {
         return
       }
       element.scrollTo({ top: element.scrollHeight })
+      setAwayFromBottom(false)
+      // 思考、工具卡片和正文都可能在不新增消息时变高，跟随实际布局变化。
+      resizeObserver = new ResizeObserver(() => {
+        if (!cancelled && stickToBottomRef.current && historyPositionRestoredRef.current !== activeId) {
+          element.scrollTo({ top: element.scrollHeight })
+        }
+      })
+      resizeObserver.observe(element)
+      for (const child of element.children) resizeObserver.observe(child)
       settleFrame = window.requestAnimationFrame(finishHistoryAnchor)
     }
     // React 提交完整历史后再等待两个浏览器布局周期，确保最终滚动高度稳定。
@@ -976,7 +1026,7 @@ function SessionsPage() {
       resizeObserver?.disconnect()
       observedElement?.removeEventListener('scrollend', finishHistoryAnchor)
     }
-  }, [activeId, childPanelOpen, completedThoughtLayoutVersion, historyHydration.complete, historyHydration.sessionId, historyOpenVersion, messages.data.ownerSessionId, messages.loading, liveRun.draft, liveRun.phase, runs.data.ownerSessionId, runs.loading, visibleApprovals.length, visibleMessages.length])
+  }, [activeId, childPanelOpen, completedThoughtLayoutVersion, followLatestRequest, historyHydration.complete, historyHydration.sessionId, historyOpenVersion, messages.data.ownerSessionId, messages.loading, liveRun.assistantItems, liveRun.draft, liveRun.phase, liveRun.status, liveRun.thought, runs.data.ownerSessionId, runs.loading, visibleApprovals.length, visibleMessages.length])
 
   // 统一处理首轮建会话和已有会话续写，复用幂等键防止网络重试造成重复运行。
   async function submitMessage(content: string, files: File[], consumeComposer: boolean) {
@@ -1452,6 +1502,7 @@ function SessionsPage() {
                 // 用户主动定位时取消尚未完成的首次历史滚动，避免后台锚定覆盖点击结果。
                 historyScrollSessionRef.current = ''
                 historyPositionRestoredRef.current = activeId
+                scrollCaptureSessionRef.current = activeId
                 stickToBottomRef.current = false
                 // 长会话的目标节点可能尚未进入 DOM，先按消息序号跳到估算区域，再由导航组件精确重试。
                 const element = messagesRef.current
@@ -1464,6 +1515,7 @@ function SessionsPage() {
             {activeSession || draftActive ? <>
               <div
                 className="messages"
+                data-session-id={activeId}
                 ref={messagesRef}
                 aria-live="polite"
                 onScroll={(event) => {
@@ -1477,13 +1529,18 @@ function SessionsPage() {
                       && runs.data.ownerSessionId === activeId
                       && !messages.loading
                       && !runs.loading
-                    if (historyReady && distanceFromBottom === 0) {
+                    if (historyReady && !pendingScrollPositionRef.current && distanceFromBottom === 0) {
                       historyScrollSessionRef.current = ''
+                      scrollCaptureSessionRef.current = activeId
                       stickToBottomRef.current = true
                     }
                     return
                   }
                   stickToBottomRef.current = distanceFromBottom < 80
+                  setAwayFromBottom(!stickToBottomRef.current)
+                  if (stickToBottomRef.current && historyPositionRestoredRef.current === activeId) {
+                    followLatestOutput()
+                  }
                 }}
               >
                 {draftActive ? liveRun.status === 'idle' && <EmptyState icon={MessageSquare} title="开始一次新任务" description="直接描述目标；需要处理本地文件时，可以在输入框中选择一个项目文件夹。" /> : messages.error && !visibleMessages.length ? <ErrorState message={messages.error} onRetry={messages.reload} /> : messages.loading && !visibleMessages.length ? <LoadingState /> : visibleMessages.length ? visibleMessages.map((message) => {
@@ -1506,6 +1563,7 @@ function SessionsPage() {
                 {!draftActive && approvals.loading && activeRunId && !visibleApprovals.length && liveRun.status === 'awaiting_approval' && <LoadingState label="正在读取审批状态" />}
               </div>
               <div className={`composer-stage composer-stage-${activeComposerSurface}`} aria-live="polite">
+              {awayFromBottom && (sending || canInterrupt) && <button type="button" className="follow-latest-button" aria-label="回到底部并跟随输出" title="回到底部并跟随输出" onClick={followLatestOutput}><ArrowDown size={16} aria-hidden="true" /></button>}
               <form className={`composer composer-surface composer-surface-composer${activeComposerSurface === 'composer' ? ' is-active' : ''}`} aria-hidden={activeComposerSurface !== 'composer'} inert={activeComposerSurface !== 'composer' || undefined} onSubmit={sendMessage}>
                 {actionError && <p className="form-error" role="alert">{actionError}</p>}
                 {draftActive && <div className="draft-project-controls">

@@ -284,6 +284,31 @@
   margin: 0 auto 14px;
 }
 
+.follow-latest-button {
+  position: absolute;
+  z-index: 3;
+  bottom: calc(100% + 12px);
+  left: 50%;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  color: var(--ocean-800);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  transform: translateX(-50%);
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+/* 保持圆圈小巧，同时让鼠标和触屏有足够的点击范围。 */
+.follow-latest-button::after { content: ''; position: absolute; inset: -6px; border-radius: 50%; }
+.follow-latest-button:hover { color: var(--ocean-900); background: var(--blue-soft); }
+.follow-latest-button:focus-visible { outline: 2px solid var(--ocean-700); outline-offset: 3px; }
+
 .composer-surface {
   grid-area: 1 / 1;
   width: 100%;
