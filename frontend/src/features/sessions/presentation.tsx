@@ -34,6 +34,7 @@ import { formatApprovalArguments } from './approvalPresentation'
 import { createToolResultDetailLoader, presentToolResult, toolResultRequest, type CompleteToolResult } from '../../toolResultDetails'
 import type { RunPlanStep } from './sessionState'
 import { PersistentTaskSource, type PersistentSourceItem } from './components/PersistentTaskSource'
+import { PendingImagePreview, type PreviewImageItem } from './components/PendingImagePreview'
 import { ChildConversation } from './components/ChildConversation'
 import { ChildNavigation } from './childNavigation'
 import { childNames } from './childIdentity'
@@ -173,10 +174,16 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
 // MessageBubble 按“身份与时间、附件、正文”的阅读顺序渲染持久消息及其操作。
 export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId, thoughtTimeline, onOpenFileChange }: { message: Message; thoughtRunId?: string; thoughtTimeline?: ThoughtTimelineState; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const [copied, setCopied] = useState(false)
+  const [previewImageId, setPreviewImageId] = useState('')
   const attachments = messageAttachments(message.metadata?.attachments)
   const imageAttachments = message.session_id
     ? attachments.filter((attachment) => attachment.mime_type.startsWith('image/'))
     : []
+  const previewImages: PreviewImageItem[] = imageAttachments.map((attachment) => ({
+    id: attachment.id,
+    name: attachment.name,
+    src: apiUrl(`/api/sessions/${message.session_id}/attachments/${attachment.id}/content`),
+  }))
   const fileAttachments = attachments.filter((attachment) => (
     !attachment.mime_type.startsWith('image/') || !message.session_id
   ))
@@ -215,11 +222,12 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
         {!!imageAttachments.length && <div className="message-image-gallery" aria-label="消息图片">
           {imageAttachments.map((attachment) => {
             const href = apiUrl(`/api/sessions/${message.session_id}/attachments/${attachment.id}/content`)
-            return <a key={attachment.id} className="message-image-link" href={href} target="_blank" rel="noreferrer" title={`打开 ${attachment.name}`}>
+            return <button key={attachment.id} type="button" className="message-image-link" onClick={() => setPreviewImageId(attachment.id)} title={`预览 ${attachment.name}`} aria-label={`预览 ${attachment.name}`}>
               <img src={href} alt={attachment.name} loading="lazy" />
-            </a>
+            </button>
           })}
         </div>}
+        {previewImages.some((image) => image.id === previewImageId) && <PendingImagePreview images={previewImages} selectedId={previewImageId} onSelect={setPreviewImageId} onClose={() => setPreviewImageId('')} />}
         {!!fileAttachments.length && <div className="message-attachments" aria-label="消息附件">
           {fileAttachments.map((attachment) => {
             const href = message.session_id

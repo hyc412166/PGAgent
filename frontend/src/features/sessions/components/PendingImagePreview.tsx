@@ -1,12 +1,12 @@
 import { ChevronLeft, ChevronRight, Maximize, Minus, Plus, X } from 'lucide-react'
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
-import type { PendingAttachment } from '../../../attachments'
+export type PreviewImageItem = { id: string; name: string; src: string }
 
 const MIN_ZOOM = 0.25
 const MAX_ZOOM = 5
 
 // 切图时通过 key 重建视口，使缩放和拖动位置只属于当前图片。
-function ImageViewport({ image }: { image: PendingAttachment }) {
+function ImageViewport({ image }: { image: PreviewImageItem }) {
   const viewportRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<{ id: number; x: number; y: number; left: number; top: number } | null>(null)
   const previousSizeRef = useRef({ width: 0, height: 0 })
@@ -67,14 +67,14 @@ function ImageViewport({ image }: { image: PendingAttachment }) {
       onLostPointerCapture={() => { dragRef.current = null }}
     >
       <div className="pending-image-stage" style={{ width: stageWidth, height: stageHeight }}>
-        <img className="pending-image-full" src={image.previewUrl} alt={image.file.name} draggable={false} style={{ width, height }} onLoad={(event) => setImageSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />
+        <img className="pending-image-full" src={image.src} alt={image.name} draggable={false} style={{ width, height }} onLoad={(event) => setImageSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />
       </div>
     </div>
   </>
 }
 
 // 图片列表直接来自待发送附件，移除/发送/切换会话后不保留已失效的预览 URL。
-export function PendingImagePreview({ images, selectedId, onSelect, onClose }: { images: PendingAttachment[]; selectedId: string; onSelect: (id: string) => void; onClose: () => void }) {
+export function PendingImagePreview({ images, selectedId, onSelect, onClose }: { images: PreviewImageItem[]; selectedId: string; onSelect: (id: string) => void; onClose: () => void }) {
   const dialogRef = useRef<HTMLDialogElement>(null)
   const titleId = useId()
   const index = images.findIndex((image) => image.id === selectedId)
@@ -99,7 +99,7 @@ export function PendingImagePreview({ images, selectedId, onSelect, onClose }: {
     }}
   >
     <header>
-      <strong id={titleId} title={image.file.name}>{image.file.name}</strong>
+      <strong id={titleId} title={image.name}>{image.name}</strong>
       <button type="button" className="pending-image-control" aria-label="关闭图片预览" onClick={() => dialogRef.current?.close()}><X size={20} aria-hidden="true" /></button>
     </header>
     <ImageViewport key={image.id} image={image} />

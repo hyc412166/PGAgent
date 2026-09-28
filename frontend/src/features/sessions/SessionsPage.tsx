@@ -20,7 +20,7 @@ import { ApprovalCard, ChildAgentPanel, LiveAssistantMessage, MessageBubble } fr
 import { useApiData } from '../../shared/hooks/useApiData'
 import { stringId } from '../../shared/lib/display'
 import { ComposerTextArea } from './components/ComposerTextArea'
-import { PendingImagePreview } from './components/PendingImagePreview'
+import { PendingImagePreview, type PreviewImageItem } from './components/PendingImagePreview'
 import type { ComposerTextAreaHandle } from './components/ComposerTextArea'
 import { ConversationTurnTimeline } from './components/ConversationTurnTimeline'
 import { FileChangePanel } from './components/FileChangePanel'
@@ -355,6 +355,9 @@ function SessionsPage() {
         label: attachment.name,
         kind: attachment.mime_type.startsWith('image/') ? 'image' : 'document',
         href: message.session_id ? apiUrl(`/api/sessions/${message.session_id}/attachments/${attachment.id}/content`) : '#',
+        previewUrl: attachment.mime_type.startsWith('image/') && message.session_id
+          ? apiUrl(`/api/sessions/${message.session_id}/attachments/${attachment.id}/content`)
+          : undefined,
       }))
       message.citations?.forEach((citation, index) => add({
         id: `citation:${citation.url}:${index}`,
@@ -1737,7 +1740,7 @@ function SessionsPage() {
           />}
       </div>
       </ChildNavigation.Provider>
-      {pendingImages.some((image) => image.id === previewAttachmentId) && <PendingImagePreview images={pendingImages} selectedId={previewAttachmentId} onSelect={setPreviewAttachmentId} onClose={() => setPreviewAttachmentId('')} />}
+      {pendingImages.some((image) => image.id === previewAttachmentId) && <PendingImagePreview images={pendingImages.map((image): PreviewImageItem => ({ id: image.id, name: image.file.name, src: image.previewUrl }))} selectedId={previewAttachmentId} onSelect={setPreviewAttachmentId} onClose={() => setPreviewAttachmentId('')} />}
       {projectHoverCard && createPortal(
         <div className="project-hover-card" id="project-hover-card" role="tooltip" style={{ left: projectHoverCard.left, top: projectHoverCard.top }}>
           <div className="project-hover-card-row project-hover-card-title"><Folder size={14} /><strong>{projectHoverCard.name}</strong></div>
