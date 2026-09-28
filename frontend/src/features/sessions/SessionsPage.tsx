@@ -32,7 +32,7 @@ import type { PersistentSourceItem } from './components/PersistentTaskSource'
 import { activeRunStatuses, draftSettingsWithPermission, emptyDraftContext, emptyDraftSettings, emptyLiveRun, noDelegatedTasks, noTeammates, removePendingApproval, runThinkingStartedAt } from './sessionState'
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
 import { buildConversationTurnSummaries } from './turnTimeline'
-import { loadSessionScrollTop, saveSessionScrollTop } from './sessionScrollPosition'
+import { loadSessionScrollPosition, saveSessionScrollPosition } from './sessionScrollPosition'
 import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, PermissionSettings, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 type ChildPanelState = { sessionId: string; open: boolean; autoOpened: boolean }
@@ -173,6 +173,7 @@ function SessionsPage() {
   const stickToBottomRef = useRef(true)
   const historyScrollSessionRef = useRef('')
   const historyPositionRestoredRef = useRef('')
+  const scrollCaptureFrameRef = useRef<number | null>(null)
   const terminalSyncVersionRef = useRef(0)
   const pendingDraftRunRef = useRef<{ sessionId: string; runId: string; startedAt?: string } | null>(null)
   const draftIdempotencyKeyRef = useRef('')
@@ -524,8 +525,9 @@ function SessionsPage() {
   }, [activeId])
 
   useEffect(() => () => {
+    if (scrollCaptureFrameRef.current !== null) window.cancelAnimationFrame(scrollCaptureFrameRef.current)
     const sessionId = activeIdRef.current
-    if (sessionId && messagesRef.current) saveSessionScrollTop(sessionId, messagesRef.current.scrollTop)
+    if (sessionId && messagesRef.current) captureSessionScrollPosition(sessionId, messagesRef.current)
   }, [])
 
   useEffect(() => {
@@ -634,7 +636,28 @@ function SessionsPage() {
   function captureCurrentSessionScrollPosition() {
     const sessionId = activeIdRef.current
     const element = messagesRef.current
-    if (sessionId && element) saveSessionScrollTop(sessionId, element.scrollTop)
+    if (sessionId && element) captureSessionScrollPosition(sessionId, element)
+  }
+
+  function captureSessionScrollPosition(sessionId: string, element: HTMLDivElement) {
+    const containerTop = element.getBoundingClientRect().top
+    const anchor = [...element.querySelectorAll<HTMLElement>('[id^="conversation-message-"]')]
+      .map((item) => ({ item, rect: item.getBoundingClientRect() }))
+      .find(({ rect }) => rect.bottom > containerTop + 1)
+    const offset = anchor ? anchor.rect.top - containerTop : 0
+    saveSessionScrollPosition(sessionId, {
+      messageId: anchor?.item.id,
+      offset,
+      scrollTop: element.scrollTop,
+    })
+  }
+
+  function scheduleSessionScrollCapture(sessionId: string, element: HTMLDivElement) {
+    if (scrollCaptureFrameRef.current !== null) return
+    scrollCaptureFrameRef.current = window.requestAnimationFrame(() => {
+      scrollCaptureFrameRef.current = null
+      if (activeIdRef.current === sessionId) captureSessionScrollPosition(sessionId, element)
+    })
   }
 
   function clearDraftState() {
@@ -859,6 +882,7 @@ function SessionsPage() {
 
   // 新打开的历史在消息和持久化思考/工具时间线均水合前保持锚定；程序布局滚动不能取消首次锚点。
   useEffect(() => {
+    let cancelled = false
     const anchoringHistory = Boolean(activeId) && historyScrollSessionRef.current === activeId
     const historyReady = historyHydration.sessionId === activeId
       && historyHydration.complete
@@ -870,6 +894,7 @@ function SessionsPage() {
     let prepareFrame = 0
     let frame = 0
     let settleFrame = 0
+    let resizeObserver: ResizeObserver | null = null
     let observedElement: HTMLDivElement | null = null
     const finishHistoryAnchor = () => {
       const element = messagesRef.current
@@ -889,15 +914,54 @@ function SessionsPage() {
       // 水合完成后一次跳到底部，不在长历史中播放滚动动画，以保持会话切换即时响应。
       observedElement = element
       element.addEventListener('scrollend', finishHistoryAnchor)
-      const savedTop = loadSessionScrollTop(activeId)
-      if (savedTop !== null && historyPositionRestoredRef.current !== activeId) {
+      const savedPosition = loadSessionScrollPosition(activeId)
+      const restoreFromAnchor = () => {
+        const target = savedPosition?.messageId ? document.getElementById(savedPosition.messageId) : null
+        if (!target || !element.contains(target)) return false
+        const containerTop = element.getBoundingClientRect().top
+        const targetTop = target.getBoundingClientRect().top
+        const desiredTop = element.scrollTop + targetTop - containerTop - savedPosition!.offset
+        element.scrollTo({ top: Math.min(Math.max(0, desiredTop), Math.max(0, element.scrollHeight - element.clientHeight)) })
+        return true
+      }
+      const finishPositionRestore = () => {
         historyPositionRestoredRef.current = activeId
-        element.scrollTo({ top: Math.min(savedTop, Math.max(0, element.scrollHeight - element.clientHeight)) })
         historyScrollSessionRef.current = ''
         stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
-      } else {
-        element.scrollTo({ top: element.scrollHeight })
+        const target = savedPosition?.messageId ? document.getElementById(savedPosition.messageId) : null
+        if (target && typeof ResizeObserver !== 'undefined') {
+          resizeObserver = new ResizeObserver(() => {
+            if (!cancelled) restoreFromAnchor()
+          })
+          resizeObserver.observe(element)
+          resizeObserver.observe(target)
+        }
       }
+      if (savedPosition && historyPositionRestoredRef.current !== activeId) {
+        if (savedPosition.messageId && !restoreFromAnchor()) {
+          // 目标节点可能仍在长历史渲染队列中，后续 RAF 会继续等待。
+          let attempts = 0
+          const retryRestore = () => {
+            if (cancelled || historyPositionRestoredRef.current === activeId) return
+            if (attempts++ >= 60) {
+              element.scrollTo({ top: Math.min(savedPosition.scrollTop, Math.max(0, element.scrollHeight - element.clientHeight)) })
+              finishPositionRestore()
+              return
+            }
+            if (restoreFromAnchor()) {
+              finishPositionRestore()
+              return
+            }
+            window.requestAnimationFrame(retryRestore)
+          }
+          retryRestore()
+          return
+        }
+        if (!savedPosition.messageId) element.scrollTo({ top: Math.min(savedPosition.scrollTop, Math.max(0, element.scrollHeight - element.clientHeight)) })
+        finishPositionRestore()
+        return
+      }
+      element.scrollTo({ top: element.scrollHeight })
       settleFrame = window.requestAnimationFrame(finishHistoryAnchor)
     }
     // React 提交完整历史后再等待两个浏览器布局周期，确保最终滚动高度稳定。
@@ -905,9 +969,11 @@ function SessionsPage() {
       frame = window.requestAnimationFrame(scrollToLatest)
     })
     return () => {
+      cancelled = true
       window.cancelAnimationFrame(prepareFrame)
       window.cancelAnimationFrame(frame)
       if (settleFrame) window.cancelAnimationFrame(settleFrame)
+      resizeObserver?.disconnect()
       observedElement?.removeEventListener('scrollend', finishHistoryAnchor)
     }
   }, [activeId, childPanelOpen, completedThoughtLayoutVersion, historyHydration.complete, historyHydration.sessionId, historyOpenVersion, messages.data.ownerSessionId, messages.loading, liveRun.draft, liveRun.phase, runs.data.ownerSessionId, runs.loading, visibleApprovals.length, visibleMessages.length])
@@ -1387,7 +1453,7 @@ function SessionsPage() {
                 aria-live="polite"
                 onScroll={(event) => {
                   const element = event.currentTarget
-                  if (activeId) saveSessionScrollTop(activeId, element.scrollTop)
+                  if (activeId) scheduleSessionScrollCapture(activeId, element)
                   const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight
                   if (activeId && historyScrollSessionRef.current === activeId) {
                     const historyReady = historyHydration.sessionId === activeId
