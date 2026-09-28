@@ -667,6 +667,9 @@
 .message-image-link {
   width: min(190px, 100%);
   display: block;
+  padding: 0;
+  cursor: zoom-in;
+  text-align: left;
   overflow: hidden;
   border: 1px solid rgb(168 211 228 / 78%);
   border-radius: 14px;
@@ -1535,6 +1538,7 @@
 .persistent-source-row { display: flex; align-items: center; gap: 7px; min-height: 28px; color: var(--ink); font-size: .58rem; text-decoration: none; }
 .persistent-source-row:hover { color: var(--ocean-800); }
 .persistent-source-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.persistent-source-thumbnail { width: 28px; height: 28px; flex: 0 0 auto; display: block; object-fit: cover; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-soft); }
 .persistent-source-row > svg:last-child { margin-left: auto; color: var(--muted-2); }
 .persistent-task-list-title { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; color: var(--muted-2); font-size: .54rem; }
 .persistent-task-row { width: 100%; display: grid; grid-template-columns: 21px minmax(0, 1fr) auto; align-items: center; gap: 7px; padding: 6px 5px; border: 1px solid transparent; border-radius: 7px; color: var(--ink); background: transparent; text-align: left; }

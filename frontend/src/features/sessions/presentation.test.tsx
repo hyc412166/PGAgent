@@ -69,6 +69,37 @@ describe('持久任务来源入口', () => {
     expect(source).toContain('pgagent/task-1')
     expect(source).toContain('整理项目结构')
   })
+
+  it('图片来源显示缩略图而不是图片图标', () => {
+    const source = renderToStaticMarkup(createElement(PersistentTaskSource, {
+      tasks: [],
+      sources: [{ id: 'image-1', label: 'image.png', kind: 'image', href: '/image.png', previewUrl: '/image.png' }],
+      onSelectTask: vi.fn(),
+      onResume: vi.fn(),
+      onCancel: vi.fn(),
+    }))
+    expect(source).toContain('class="persistent-source-thumbnail"')
+    expect(source).toContain('src="/image.png"')
+    expect(source).not.toContain('lucide-image')
+  })
+})
+
+describe('消息图片预览', () => {
+  it('已发送图片使用页面内预览按钮，不再新开链接', () => {
+    const markup = renderToStaticMarkup(createElement(MessageBubble, {
+      message: {
+        id: 'message-image-preview',
+        role: 'user',
+        session_id: 'session-1',
+        content: '',
+        created_at: '2026-09-28T00:00:00.000Z',
+        metadata: { attachments: [{ id: 'image-1', name: 'image.png', mime_type: 'image/png', size_bytes: 12, kind: 'user_attachment' }] },
+      },
+    }))
+    expect(markup).toContain('aria-label="预览 image.png"')
+    expect(markup).toContain('message-image-link')
+    expect(markup).not.toContain('target="_blank"')
+  })
 })
 
 describe('子 Agent 运行事件展示', () => {

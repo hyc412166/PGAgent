@@ -11,6 +11,7 @@ export type PersistentSourceItem = {
   label: string
   kind: 'image' | 'document' | 'web'
   href: string
+  previewUrl?: string
 }
 
 export function PersistentTaskSource({
@@ -55,7 +56,7 @@ export function PersistentTaskSource({
     {!!sources.length && <section className="persistent-source-list" aria-label="来源">
       <strong>来源</strong>
       {sources.map((source) => <a key={source.id} href={source.href} target="_blank" rel="noreferrer" className="persistent-source-row">
-        {sourceIcon(source.kind)}<span>{source.label}</span><Link2 size={12} />
+        {source.previewUrl ? <img className="persistent-source-thumbnail" src={source.previewUrl} alt="" loading="lazy" /> : sourceIcon(source.kind)}<span>{source.label}</span><Link2 size={12} />
       </a>)}
     </section>}
     {!!orderedTasks.length && <section className="persistent-task-list" aria-label="持久任务">
