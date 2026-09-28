@@ -1,5 +1,6 @@
 // 本组件提供会话轮次的低干扰导航：格子用于定位，悬浮卡用于快速回忆上下文。
-import { useRef, useState, type FocusEvent, type MouseEvent } from 'react'
+import { useEffect, useRef, useState, type FocusEvent, type MouseEvent } from 'react'
+import { scrollToTurnTarget } from '../turnScroll'
 import type { ConversationTurnSummary } from '../turnTimeline'
 import { summarizeTurnContent } from '../turnTimeline'
 
@@ -13,6 +14,11 @@ const PREVIEW_HEIGHT = 96
 export function ConversationTurnTimeline({ turns, onNavigate }: ConversationTurnTimelineProps) {
   const railRef = useRef<HTMLElement>(null)
   const navigationTokenRef = useRef(0)
+  const cancelScrollRef = useRef<(() => void) | null>(null)
+  useEffect(() => () => {
+    navigationTokenRef.current += 1
+    cancelScrollRef.current?.()
+  }, [])
   const [preview, setPreview] = useState<{ id: string; top: number } | null>(null)
   if (turns.length < 2) return null
 
@@ -27,16 +33,16 @@ export function ConversationTurnTimeline({ turns, onNavigate }: ConversationTurn
 
   const hidePreview = () => setPreview(null)
   const scrollToTurn = (turn: ConversationTurnSummary) => {
+    cancelScrollRef.current?.()
     onNavigate?.(turn)
     const token = ++navigationTokenRef.current
-    // 长历史定位必须立即完成；平滑滚动会与异步历史布局竞争，导致目标只移动到中间位置。
-    const behavior = 'auto' as const
     let attempts = 0
     const findAndScroll = () => {
       if (navigationTokenRef.current !== token) return
       const target = document.getElementById(`conversation-message-${turn.anchorMessageId}`)
       if (target) {
-        target.scrollIntoView({ behavior, block: 'center' })
+        const container = target.closest<HTMLElement>('.messages')
+        if (container) cancelScrollRef.current = scrollToTurnTarget(container, target, window.matchMedia('(prefers-reduced-motion: reduce)').matches)
         return
       }
       if (attempts++ < 45) window.requestAnimationFrame(findAndScroll)
