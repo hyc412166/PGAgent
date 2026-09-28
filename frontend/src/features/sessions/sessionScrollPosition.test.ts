@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach } from 'vitest'
-import { loadSessionScrollTop, saveSessionScrollTop } from './sessionScrollPosition'
+import { loadSessionScrollPosition, saveSessionScrollPosition, saveSessionScrollTop } from './sessionScrollPosition'
 
 describe('session scroll position', () => {
   const storage = new Map<string, string>()
@@ -17,15 +17,15 @@ describe('session scroll position', () => {
 
   it('保存并按会话读取滚动位置', () => {
     saveSessionScrollTop('session-1', 420)
-    expect(loadSessionScrollTop('session-1')).toBe(420)
-    expect(loadSessionScrollTop('session-2')).toBeNull()
+    expect(loadSessionScrollPosition('session-1')).toEqual({ offset: 0, scrollTop: 420 })
+    saveSessionScrollPosition('session-2', { messageId: 'conversation-message-2', offset: 36, scrollTop: 820 })
+    expect(loadSessionScrollPosition('session-2')).toEqual({ messageId: 'conversation-message-2', offset: 36, scrollTop: 820 })
   })
 
   it('忽略无效位置和损坏的存储内容', () => {
     saveSessionScrollTop('session-1', -1)
-    expect(loadSessionScrollTop('session-1')).toBeNull()
+    expect(loadSessionScrollPosition('session-1')).toBeNull()
     storage.set('pgagent-session-scroll-positions', '{bad json')
-    expect(loadSessionScrollTop('session-1')).toBeNull()
+    expect(loadSessionScrollPosition('session-1')).toBeNull()
   })
 })
-

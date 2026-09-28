@@ -11,6 +11,7 @@ const PREVIEW_HEIGHT = 96
 
 export function ConversationTurnTimeline({ turns }: ConversationTurnTimelineProps) {
   const railRef = useRef<HTMLElement>(null)
+  const navigationTokenRef = useRef(0)
   const [preview, setPreview] = useState<{ id: string; top: number } | null>(null)
   if (turns.length < 2) return null
 
@@ -25,9 +26,19 @@ export function ConversationTurnTimeline({ turns }: ConversationTurnTimelineProp
 
   const hidePreview = () => setPreview(null)
   const scrollToTurn = (turn: ConversationTurnSummary) => {
-    const target = document.getElementById(`conversation-message-${turn.anchorMessageId}`)
+    const token = ++navigationTokenRef.current
     const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
-    target?.scrollIntoView({ behavior, block: 'center' })
+    let attempts = 0
+    const findAndScroll = () => {
+      if (navigationTokenRef.current !== token) return
+      const target = document.getElementById(`conversation-message-${turn.anchorMessageId}`)
+      if (target) {
+        target.scrollIntoView({ behavior, block: 'center' })
+        return
+      }
+      if (attempts++ < 45) window.requestAnimationFrame(findAndScroll)
+    }
+    findAndScroll()
   }
 
   const selectedTurn = preview ? turns.find((turn) => turn.id === preview.id) : undefined
