@@ -5,7 +5,7 @@ import { summarizeTurnContent } from '../turnTimeline'
 
 type ConversationTurnTimelineProps = {
   turns: ConversationTurnSummary[]
-  onNavigate?: () => void
+  onNavigate?: (turn: ConversationTurnSummary) => void
 }
 
 const PREVIEW_HEIGHT = 96
@@ -27,9 +27,10 @@ export function ConversationTurnTimeline({ turns, onNavigate }: ConversationTurn
 
   const hidePreview = () => setPreview(null)
   const scrollToTurn = (turn: ConversationTurnSummary) => {
-    onNavigate?.()
+    onNavigate?.(turn)
     const token = ++navigationTokenRef.current
-    const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
+    // 长历史定位必须立即完成；平滑滚动会与异步历史布局竞争，导致目标只移动到中间位置。
+    const behavior = 'auto' as const
     let attempts = 0
     const findAndScroll = () => {
       if (navigationTokenRef.current !== token) return
