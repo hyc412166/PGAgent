@@ -20,6 +20,7 @@ import { ApprovalCard, ChildAgentPanel, LiveAssistantMessage, MessageBubble } fr
 import { useApiData } from '../../shared/hooks/useApiData'
 import { stringId } from '../../shared/lib/display'
 import { ComposerTextArea } from './components/ComposerTextArea'
+import { PendingImagePreview } from './components/PendingImagePreview'
 import type { ComposerTextAreaHandle } from './components/ComposerTextArea'
 import { ConversationTurnTimeline } from './components/ConversationTurnTimeline'
 import { FileChangePanel } from './components/FileChangePanel'
@@ -106,6 +107,8 @@ function SessionsPage() {
   // activeId 选择当前会话；编辑器、发送、中断和删除状态共同描述当前用户操作。
   const [composerHasValue, setComposerHasValue] = useState(false)
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([])
+  const [previewAttachmentId, setPreviewAttachmentId] = useState('')
+  const pendingImages = pendingAttachments.filter((item) => item.previewUrl)
   const [sending, setSending] = useState(false)
   const [stoppingRunId, setStoppingRunId] = useState('')
   const [cancellingTaskId, setCancellingTaskId] = useState('')
@@ -604,6 +607,7 @@ function SessionsPage() {
 
   // 清除待上传附件及对应 input 值，保证再次选择同名文件仍会触发 change。
   function clearPendingAttachments() {
+    setPreviewAttachmentId('')
     pendingAttachmentsRef.current.forEach((item) => {
       if (item.previewUrl) URL.revokeObjectURL(item.previewUrl)
     })
@@ -613,7 +617,7 @@ function SessionsPage() {
   }
 
   // 校验新选择文件并与现有队列合并，同时为列表生成稳定本地 ID。
-  function queueAttachments(files: FileList | null) {
+  function queueAttachments(files: FileList | File[] | null) {
     const selected = Array.from(files || [])
     if (!selected.length) return
     const current = pendingAttachmentsRef.current
@@ -1572,13 +1576,13 @@ function SessionsPage() {
                 </div>}
                 {!!pendingAttachments.length && <div className="attachment-tray" role="list" aria-label="待发送附件">
                   {pendingAttachments.map((item) => <div className="attachment-chip" role="listitem" key={item.id}>
-                    <span className="attachment-chip-preview">{item.previewUrl ? <img src={item.previewUrl} alt="" /> : <FileText size={16} />}</span>
+                    <span className="attachment-chip-preview">{item.previewUrl ? <button type="button" className="attachment-image-trigger" aria-label={`放大预览 ${item.file.name}`} title={`放大预览 ${item.file.name}`} onClick={() => setPreviewAttachmentId(item.id)}><img src={item.previewUrl} alt="" /></button> : <FileText size={16} />}</span>
                     <span className="attachment-chip-copy"><strong title={item.file.name}>{item.file.name}</strong><small>仅本会话 · {formatAttachmentSize(item.file.size)}</small></span>
                     <button type="button" aria-label={`移除附件 ${item.file.name}`} title="移除附件" disabled={sending} onClick={() => removePendingAttachment(item.id)}><X size={12} /></button>
                   </div>)}
                 </div>}
                 <input ref={attachmentInputRef} className="attachment-file-input" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => queueAttachments(event.currentTarget.files)} />
-                <ComposerTextArea ref={composerInputRef} disabled={draftActive && sending} resetKey={`${activeId}:${draftActive}`} placeholder={draftActive ? '描述你想完成的任务……' : '告诉 PGAgent 你想完成什么……'} onHasValueChange={setComposerHasValue} />
+                <ComposerTextArea ref={composerInputRef} disabled={draftActive && sending} resetKey={`${activeId}:${draftActive}`} placeholder={draftActive ? '描述你想完成的任务……' : '告诉 PGAgent 你想完成什么……'} onHasValueChange={setComposerHasValue} onPasteImages={settingsLocked || sending ? undefined : queueAttachments} />
                 <div className="composer-toolbar">
                   <div className="composer-left-actions">
                     <button type="button" className="composer-tool-button composer-plus-button attachment-trigger" aria-label="添加本机附件" title="添加本机附件（仅当前会话可见）" disabled={settingsLocked || sending} onClick={() => attachmentInputRef.current?.click()}>
@@ -1733,6 +1737,7 @@ function SessionsPage() {
           />}
       </div>
       </ChildNavigation.Provider>
+      {pendingImages.some((image) => image.id === previewAttachmentId) && <PendingImagePreview images={pendingImages} selectedId={previewAttachmentId} onSelect={setPreviewAttachmentId} onClose={() => setPreviewAttachmentId('')} />}
       {projectHoverCard && createPortal(
         <div className="project-hover-card" id="project-hover-card" role="tooltip" style={{ left: projectHoverCard.left, top: projectHoverCard.top }}>
           <div className="project-hover-card-row project-hover-card-title"><Folder size={14} /><strong>{projectHoverCard.name}</strong></div>
