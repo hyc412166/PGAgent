@@ -320,6 +320,13 @@
 .message,
 .completed-thought,
 .approval-card,
+.messages.is-locating-turn .message,
+.messages.is-locating-turn .completed-thought,
+.messages.is-locating-turn .approval-card,
+.messages.is-locating-turn .durable-task-card {
+  content-visibility: visible;
+}
+
 .durable-task-card {
   margin-bottom: 18px;
   content-visibility: auto;
