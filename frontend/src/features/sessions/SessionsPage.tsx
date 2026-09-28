@@ -1445,7 +1445,15 @@ function SessionsPage() {
           </aside>
           <section className={`conversation ${sidePanelOpen ? 'with-child-panel' : ''}`}>
             {(activeSession || draftActive) && <button type="button" className="child-panel-toggle conversation-side-toggle" aria-label={fileChangeSelection ? '关闭文件变更面板' : childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} title={fileChangeSelection ? '关闭文件变更面板' : childPanelOpen ? '收起子 Agent 面板' : '打开子 Agent 面板'} aria-expanded={sidePanelOpen} onClick={() => fileChangeSelection ? setFileChangeSelection(null) : setChildPanelOpen((open) => !open)}>{fileChangeSelection ? <X size={14} /> : childPanelOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}</button>}
-            <ConversationTurnTimeline turns={conversationTurns} />
+            <ConversationTurnTimeline
+              turns={conversationTurns}
+              onNavigate={() => {
+                // 用户主动定位时取消尚未完成的首次历史滚动，避免后台锚定覆盖点击结果。
+                historyScrollSessionRef.current = ''
+                historyPositionRestoredRef.current = activeId
+                stickToBottomRef.current = false
+              }}
+            />
             {activeSession || draftActive ? <>
               <div
                 className="messages"

@@ -5,11 +5,12 @@ import { summarizeTurnContent } from '../turnTimeline'
 
 type ConversationTurnTimelineProps = {
   turns: ConversationTurnSummary[]
+  onNavigate?: () => void
 }
 
 const PREVIEW_HEIGHT = 96
 
-export function ConversationTurnTimeline({ turns }: ConversationTurnTimelineProps) {
+export function ConversationTurnTimeline({ turns, onNavigate }: ConversationTurnTimelineProps) {
   const railRef = useRef<HTMLElement>(null)
   const navigationTokenRef = useRef(0)
   const [preview, setPreview] = useState<{ id: string; top: number } | null>(null)
@@ -26,6 +27,7 @@ export function ConversationTurnTimeline({ turns }: ConversationTurnTimelineProp
 
   const hidePreview = () => setPreview(null)
   const scrollToTurn = (turn: ConversationTurnSummary) => {
+    onNavigate?.()
     const token = ++navigationTokenRef.current
     const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
     let attempts = 0
