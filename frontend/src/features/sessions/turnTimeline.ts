@@ -5,6 +5,7 @@ export type ConversationTurnSummary = {
   id: string
   index: number
   anchorMessageId: string
+  anchorMessageIndex: number
   userContent: string
   assistantContent: string
   hasReply: boolean
@@ -76,6 +77,7 @@ export function buildConversationTurnSummaries(messages: Message[]): Conversatio
       id: draft.id,
       index: index + 1,
       anchorMessageId: draft.anchorMessageId,
+      anchorMessageIndex: draft.firstIndex,
       userContent: draft.userMessage?.content || '',
       assistantContent: draft.assistantMessage?.content || '',
       hasReply: Boolean(draft.assistantMessage),
