@@ -11,8 +11,8 @@ import shutil
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from src.agents.collaboration import cleanup_session_worktrees
 from src.memory.service import refresh_memory_markdown_projection
+from src.coding.git import GitOperationError, list_managed_worktrees, release_worktree_owner
 from src.persistence.database import (
     BackgroundJob,
     DelegatedTask,
@@ -21,7 +21,6 @@ from src.persistence.database import (
     Run,
     Session as ChatSession,
     UsageRecord,
-    Workspace,
 )
 from src.runs.service import STOPPABLE_STATUSES, coordinator
 
@@ -39,6 +38,7 @@ class SessionDeletionEffects:
     session_ids: tuple[str, ...]
     # 变量说明：artifact_directories 表示当前流程使用的 artifact_directories 集合。
     artifact_directories: tuple[Path, ...]
+    worktree_owners: tuple[tuple[str, str], ...] = ()
 
 
 # 函数职责：完成 stage_session_deletions 对应的业务处理。
@@ -53,18 +53,6 @@ def stage_session_deletions(
     for conversation in conversations:
         _ensure_deletable(db, conversation.id)
 
-    for conversation in conversations:
-        # 变量说明：workspace 表示当前步骤使用的 workspace 值。
-        workspace = db.get(Workspace, conversation.workspace_id)
-        if workspace is None:
-            continue
-        try:
-            cleanup_session_worktrees(db, conversation.id, workspace.root_path)
-        except RuntimeError as exc:
-            raise SessionDeletionConflict(
-                f"Cannot delete conversation worktrees: {exc}"
-            ) from exc
-
     from src.api import routes as resources_api
 
     # 变量说明：artifact_root 表示当前步骤使用的 artifact_root 值。
@@ -73,10 +61,22 @@ def stage_session_deletions(
     artifact_directories: list[Path] = []
     # 变量说明：session_ids 表示session 对象标识集合。
     session_ids: list[str] = []
+    worktree_owners: list[tuple[str, str]] = []
     for conversation in conversations:
         # 变量说明：session_id 表示所属会话标识。
         session_id = conversation.id
         session_ids.append(session_id)
+        # 删除会话只解除其 checkout 归属，保留未提交文件；提交失败时不触碰 sidecar。
+        if conversation.cwd:
+            cwd = Path(conversation.cwd).resolve()
+            pool = (resources_api.settings.data_dir / "worktrees").resolve()
+            if cwd.is_relative_to(pool) and cwd.is_dir():
+                try:
+                    for checkout in list_managed_worktrees(cwd):
+                        if checkout.owner_thread_id == session_id:
+                            worktree_owners.append((checkout.root, session_id))
+                except (GitOperationError, OSError, ValueError) as exc:
+                    raise SessionDeletionConflict(str(exc)) from exc
         # 变量说明：artifact_directory 表示当前步骤使用的 artifact_directory 值。
         artifact_directory = (artifact_root / session_id).resolve()
         if artifact_directory.parent == artifact_root:
@@ -105,7 +105,7 @@ def stage_session_deletions(
         db.execute(delete(Memory).where(Memory.scope == "session", Memory.scope_id == session_id))
         db.delete(conversation)
 
-    return SessionDeletionEffects(tuple(session_ids), tuple(artifact_directories))
+    return SessionDeletionEffects(tuple(session_ids), tuple(artifact_directories), tuple(worktree_owners))
 
 
 # 函数职责：完成 finalize_session_deletions 对应的业务处理。
@@ -116,6 +116,8 @@ def finalize_session_deletions(effects: SessionDeletionEffects) -> None:
 
     for session_id in effects.session_ids:
         coordinator.close_mcp_session(session_id)
+    for root, session_id in effects.worktree_owners:
+        release_worktree_owner(root, session_id)
     for artifact_directory in effects.artifact_directories:
         if artifact_directory.is_dir():
             shutil.rmtree(artifact_directory)

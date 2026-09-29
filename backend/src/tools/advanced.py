@@ -825,23 +825,6 @@ def shutdown_request(sandbox: WorkspaceSandbox, teammate: str) -> ToolResult:
     return send_message(sandbox, teammate, "Please shut down.", msg_type="shutdown_request")
 
 
-# 函数职责：完成 integrate_teammate 对应的业务处理。
-# 参数关系：_sandbox 表示当前步骤使用的 _sandbox 值；teammate 表示当前步骤使用的 teammate 值；commit_message 表示当前步骤使用的 commit_message 值；paths 表示当前流程使用的 paths 集合。
-# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def integrate_teammate(
-    _sandbox: WorkspaceSandbox,
-    teammate: str,
-    commit_message: str = "",
-    paths: Sequence[str] = (),
-) -> ToolResult:
-    return ToolResult(
-        "integrate_teammate",
-        False,
-        "worktree integration requires a durable run-scoped teammate",
-        error_code="durable_team_unavailable",
-    )
-
-
 # 函数职责：完成 plan_approval 对应的业务处理。
 # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；request_id 表示request 对象的唯一标识；approve 表示当前步骤使用的 approve 值；feedback 表示当前步骤使用的 feedback 值。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。

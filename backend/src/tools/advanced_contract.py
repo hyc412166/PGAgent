@@ -104,13 +104,12 @@ ADVANCED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "task_get": _schema("Get one durable shared task.", {"task_id": {"oneOf": [_STRING, _INTEGER]}}, ("task_id",)),
     "task_update": _schema("Update one durable shared task.", {"task_id": {"oneOf": [_STRING, _INTEGER]}, "status": _STRING, "message": _STRING, "add_blocked_by": _STRINGS, "remove_blocked_by": _STRINGS, "output": _STRING}, ("task_id",)),
     "task_list": _schema("List durable shared tasks.", {}),
-    "spawn_teammate": _schema("Create or reuse a durable teammate identity backed by a configured child Agent.", {"name": _STRING, "role": _STRING, "prompt": _STRING, "agent_id": _STRING, "workspace_mode": {"type": "string", "enum": ["shared", "worktree"]}}, ("name", "role", "prompt", "agent_id")),
+    "spawn_teammate": _schema("Create or reuse a durable teammate identity backed by a configured child Agent.", {"name": _STRING, "role": _STRING, "prompt": _STRING, "agent_id": _STRING}, ("name", "role", "prompt", "agent_id")),
     "list_teammates": _schema("List durable teammate records.", {}),
     "send_message": _schema("Send a durable teammate message.", {"to": _STRING, "content": _STRING, "sender": _STRING, "msg_type": _STRING}, ("to", "content")),
     "read_inbox": _schema("Read and drain a teammate inbox.", {"recipient": _STRING}),
     "broadcast": _schema("Send one message to all teammates.", {"content": _STRING}, ("content",)),
     "shutdown_request": _schema("Ask a teammate to shut down.", {"teammate": _STRING}, ("teammate",)),
-    "integrate_teammate": _schema("Commit only the explicitly selected paths from one isolated teammate worktree, then merge its branch into the parent branch.", {"teammate": _STRING, "commit_message": _STRING, "paths": _STRINGS}, ("teammate",)),
     "plan_approval": _schema("Approve or reject a teammate plan with feedback.", {"request_id": _STRING, "approve": _BOOL, "feedback": _STRING}, ("request_id", "approve")),
     "idle": _schema("Yield while waiting for teammate or background progress.", {"duration_ms": _INTEGER}),
     "claim_task": _schema("Atomically claim an unblocked shared task.", {"task_id": {"oneOf": [_STRING, _INTEGER]}, "owner": _STRING}, ("task_id",)),
@@ -133,5 +132,5 @@ CLAW_TOOL_NAMES: tuple[str, ...] = (
 LEARN_TOOL_NAMES: tuple[str, ...] = (
     "compress", "background_run", "check_background", "write_stdin", "task_create", "task_get", "task_update",
     "task_list", "spawn_teammate", "list_teammates", "send_message", "read_inbox", "broadcast",
-    "shutdown_request", "integrate_teammate", "plan_approval", "idle", "claim_task",
+    "shutdown_request", "plan_approval", "idle", "claim_task",
 )

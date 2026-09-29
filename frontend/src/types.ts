@@ -33,6 +33,24 @@ export interface Workspace {
   }
   created_at?: string
   updated_at?: string
+  git_info?: GitInfo | null
+  git_error?: string | null
+}
+
+export interface GitInfo {
+  commit_hash?: string | null
+  branch?: string | null
+  repository_url?: string | null
+}
+
+export interface ManagedWorktree {
+  root: string
+  cwd: string
+  source_root: string
+  source_cwd: string
+  head_sha: string
+  branch?: string | null
+  owner_thread_id?: string | null
 }
 
 // MemoryRecord 是持久记忆条目，包含来源、类型、状态和检索元数据。
@@ -114,6 +132,7 @@ export interface Session {
   status?: string
   created_at?: string
   updated_at?: string
+  cwd?: string | null
 }
 
 // ThinkingLevel 和 PermissionMode 是编辑器可提交的两组枚举配置。
@@ -452,8 +471,6 @@ export interface PlanStep {
   assigned_agent_id?: string
   assigned_run_id?: string
   claim_owner?: string
-  workspace_mode?: 'shared' | 'worktree' | string
-  worktree_path?: string
   attempt?: number
   error?: string
   last_run_id?: string
@@ -557,9 +574,6 @@ export interface Teammate {
   status: string
   current_plan_step_id?: string
   last_run_id?: string
-  workspace_mode: 'shared' | 'worktree' | string
-  worktree_path?: string
-  branch_name?: string
   created_at?: string
   updated_at?: string
 }

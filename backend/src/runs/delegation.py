@@ -104,7 +104,6 @@ _CHILD_FORBIDDEN_ORCHESTRATION_TOOLS = frozenset({
     "claim_task",
     "shutdown_request",
     "plan_approval",
-    "integrate_teammate",
 })
 # 变量说明：_DELEGATE_CHILD_SYSTEM_SUFFIX 表示当前步骤使用的 _DELEGATE_CHILD_SYSTEM_SUFFIX 值。
 _DELEGATE_CHILD_SYSTEM_SUFFIX = (
@@ -188,8 +187,6 @@ class _SubagentTaskDelegate:
                     worker_map[str(spec["id"])] = worker.id
                     # 变量说明：spec 的索引项 表示该语句创建或更新的目标数据。
                     spec["agent_id"] = worker.agent_id
-                    # 变量说明：spec 的索引项 表示该语句创建或更新的目标数据。
-                    spec["workspace_mode"] = worker.workspace_mode
                 resolved_specs.append(spec)
         # 变量说明：映射 的索引项 表示该语句创建或更新的目标数据。
         self._plan_step_ids[graph_key] = upsert_delegated_graph(
@@ -404,7 +401,7 @@ class _SubagentTaskDelegate:
         return max(0.0, limit - elapsed)
 
     # 函数职责：完成 freeze_child_binding 对应的业务处理。
-    # 参数关系：db 表示当前数据库会话；child 表示当前步骤使用的 child 值；workspace_root_override 表示当前步骤使用的 workspace_root_override 值。
+    # 参数关系：db 表示当前数据库会话；child 表示当前步骤使用的 child 值。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def _freeze_child_binding(
         self,
@@ -413,7 +410,6 @@ class _SubagentTaskDelegate:
         *,
         model_id: str | None = None,
         thinking_level: str | None = None,
-        workspace_root_override: str | None = None,
     ) -> tuple[ProviderConfig, dict[str, Any], list[dict[str, str]]]:
         """Snapshot all execution-relevant child settings before model I/O."""
 
@@ -458,7 +454,7 @@ class _SubagentTaskDelegate:
         skill_instructions = _read_selected_skill_instructions(db, child_skill_ids)
         # 变量说明：workspace_root 表示当前步骤使用的 workspace_root 值。
         workspace_root = str(
-            workspace_root_override or self.parent_binding.get("workspace_root") or ""
+            self.parent_binding.get("workspace_root") or ""
         ).strip()
         if not workspace_root:
             raise RuntimeError("主会话缺少冻结的工作区")
@@ -526,8 +522,7 @@ class _SubagentTaskDelegate:
             "allowed_tool_names": list(binding.get("allowed_tool_names") or []),
             "skill_ids": list(binding.get("skill_ids") or []),
             "mcp_server_names": list(binding.get("mcp_server_names") or []),
-            "workspace_mode": str(binding.get("workspace_mode") or "shared"),
-            "workspace_inherited": str(binding.get("workspace_mode") or "shared") == "shared",
+            "workspace_inherited": True,
             "recursive_task_enabled": False,
         }
 
@@ -647,13 +642,8 @@ class _SubagentTaskDelegate:
                     child,
                     model_id=model_id,
                     thinking_level=thinking_level,
-                    workspace_root_override=(
-                        teammate.worktree_path if teammate is not None and teammate.workspace_mode == "worktree" else None
-                    ),
                 )
                 if teammate is not None:
-                    # 变量说明：child_binding 的索引项 表示该语句创建或更新的目标数据。
-                    child_binding["workspace_mode"] = teammate.workspace_mode
                     # 变量说明：child_binding 的索引项 表示该语句创建或更新的目标数据。
                     child_binding["agent_system_prompt"] = (
                         str(child_binding["agent_system_prompt"])
@@ -710,10 +700,6 @@ class _SubagentTaskDelegate:
                 step.started_at = step.started_at or _utcnow()
                 # 变量说明：assigned_agent_id 表示assigned_agent 对象的唯一标识。
                 step.assigned_agent_id = child.id
-                # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
-                step.workspace_mode = teammate.workspace_mode if teammate is not None else "shared"
-                # 变量说明：worktree_path 表示worktree_path 对应的文件系统位置。
-                step.worktree_path = teammate.worktree_path if teammate is not None else None
                 # 变量说明：attempt 表示当前步骤使用的 attempt 值。
                 step.attempt = int(step.attempt or 0) + 1
                 # 变量说明：error 表示当前捕获或准备上报的错误。

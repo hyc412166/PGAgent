@@ -1,7 +1,8 @@
 // 本文件实现 ProjectTreeItem 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
-import { ChevronRight, Folder, LoaderCircle, MessageSquarePlus, Trash2 } from 'lucide-react'
+import { ChevronRight, Folder, GitBranch, LoaderCircle, MessageSquarePlus, Trash2 } from 'lucide-react'
 import type { FocusEvent, MouseEvent, ReactNode } from 'react'
 import type { Workspace } from '../../../types'
+import { gitStatusLabel } from '../gitStatus'
 
 // ProjectTreeItemProps 包含项目节点、其会话子项以及悬浮/项目操作回调。
 type ProjectTreeItemProps = {
@@ -15,6 +16,7 @@ type ProjectTreeItemProps = {
   onToggle: () => void
   onNewConversation: () => void
   onDelete: () => void
+  onManageGit: () => void
   onShowHoverCard: (event: MouseEvent<HTMLButtonElement> | FocusEvent<HTMLButtonElement>) => void
   onHideHoverCard: () => void
 }
@@ -31,6 +33,7 @@ export function ProjectTreeItem({
   onToggle,
   onNewConversation,
   onDelete,
+  onManageGit,
   onShowHoverCard,
   onHideHoverCard,
 }: ProjectTreeItemProps) {
@@ -48,7 +51,10 @@ export function ProjectTreeItem({
       >
         <ChevronRight className="project-chevron" size={13} />
         <Folder size={15} />
-        <span>{workspace.name}</span>
+        <span className="project-name-and-branch"><span>{workspace.name}</span><small title={workspace.git_error || undefined}>{gitStatusLabel(workspace.git_info, workspace.git_error)}</small></span>
+      </button>
+      <button type="button" className="project-git" aria-label={`管理项目 ${workspace.name} 的 Git 与 worktree`} title="Git / worktree" onClick={onManageGit}>
+        <GitBranch size={13} />
       </button>
       <button
         type="button"

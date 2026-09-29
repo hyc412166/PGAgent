@@ -319,7 +319,6 @@ async def test_delegate_without_step_id_requests_existing_plan_link(graph_db, tm
         "task": "Inspect the failure",
         "agent_id": "debugger",
         "depends_on": [],
-        "workspace_mode": "shared",
         "link_existing": True,
     }]
 

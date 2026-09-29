@@ -57,7 +57,7 @@ describe('持久任务来源入口', () => {
 
     const source = renderToStaticMarkup(createElement(PersistentTaskSource, {
       tasks: [task],
-      branchName: 'pgagent/task-1',
+      branchName: 'feature/task-1',
       open: true,
       selectedTaskId: task.id,
       onToggle: vi.fn(),
@@ -66,7 +66,7 @@ describe('持久任务来源入口', () => {
       onCancel: vi.fn(),
     }))
     expect(source).toContain('分支与来源')
-    expect(source).toContain('pgagent/task-1')
+    expect(source).toContain('feature/task-1')
     expect(source).toContain('整理项目结构')
   })
 

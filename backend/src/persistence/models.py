@@ -240,6 +240,8 @@ class Session(TimestampMixin, Base):
     workspace_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True
     )
+    # 当前会话真正执行所在的 checkout；普通会话默认等于 workspace.root_path。
+    cwd: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 变量说明：agent_id 表示智能体标识。
     agent_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
@@ -577,6 +579,8 @@ class Run(Base):
     workspace_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True
     )
+    # 运行绑定的真实目录，供历史变更读取使用，不随项目路径后续编辑而改变。
+    cwd: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 变量说明：agent_id 表示智能体标识。
     agent_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
@@ -693,10 +697,6 @@ class PlanStep(TimestampMixin, Base):
     assigned_run_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
     # 变量说明：claim_owner 表示当前步骤使用的 claim_owner 值。
     claim_owner: Mapped[str | None] = mapped_column(String(160), nullable=True)
-    # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
-    workspace_mode: Mapped[str] = mapped_column(String(24), default="shared", nullable=False)
-    # 变量说明：worktree_path 表示worktree_path 对应的文件系统位置。
-    worktree_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 变量说明：attempt 表示当前步骤使用的 attempt 值。
     attempt: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # 变量说明：error 表示当前捕获或准备上报的错误。
@@ -838,12 +838,6 @@ class TeammateWorker(TimestampMixin, Base):
     )
     # 变量说明：last_run_id 表示last_run 对象的唯一标识。
     last_run_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
-    # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
-    workspace_mode: Mapped[str] = mapped_column(String(24), default="shared", nullable=False)
-    # 变量说明：worktree_path 表示worktree_path 对应的文件系统位置。
-    worktree_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # 变量说明：branch_name 表示当前步骤使用的 branch_name 值。
-    branch_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 # 类职责：定义 CollaborationMessage 在本领域中的数据与行为。

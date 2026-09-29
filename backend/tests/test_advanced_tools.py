@@ -34,7 +34,7 @@ LEARN_TOOL_NAMES = {
     "compress", "background_run", "check_background", "task_create",
     "task_get", "task_update", "task_list", "spawn_teammate", "list_teammates",
     "send_message", "read_inbox", "broadcast", "shutdown_request", "plan_approval",
-    "integrate_teammate", "idle", "claim_task",
+    "idle", "claim_task",
 }
 
 

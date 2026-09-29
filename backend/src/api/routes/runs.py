@@ -77,7 +77,7 @@ from src.api.schemas import (
 from src.memory.service import recall_memories, refresh_memory_markdown_projection, store_memory
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
 from src.tasks.state import latest_resumable_task, task_payload
-from src.agents.collaboration import cleanup_session_worktrees
+
 # 变量说明：router 表示当前步骤使用的 router 值。
 router = APIRouter(prefix="/api", tags=["runs"])
 
@@ -306,6 +306,11 @@ def get_run_file_content(
     workspace = db.get(Workspace, run.workspace_id) if run.workspace_id else None
     if workspace is None or not workspace.root_path:
         raise HTTPException(status_code=404, detail="该运行没有可读取的工作区")
+    session = db.get(ChatSession, run.session_id) if run.session_id else None
+    # 老运行从已有 runtime_snapshot 恢复目录，新运行直接使用持久化 cwd。
+    snapshot = db.scalar(select(RunEvent).where(RunEvent.run_id == run.id, RunEvent.event_type == "runtime_snapshot").order_by(RunEvent.created_at.desc()).limit(1)) if not run.cwd else None
+    binding = (snapshot.payload or {}).get("runtime_binding", {}) if snapshot else {}
+    run_root = run.cwd or binding.get("workspace_root") or (session.cwd if session else None) or workspace.root_path
     relative = path.replace("\\", "/").strip()
     if any(ord(character) < 32 for character in relative):
         raise HTTPException(status_code=400, detail="文件路径包含非法控制字符")
@@ -313,7 +318,7 @@ def get_run_file_content(
     if candidate_input.is_absolute() or any(part in {"", ".", ".."} for part in candidate_input.parts if part != "."):
         raise HTTPException(status_code=400, detail="文件路径必须是工作区内的相对路径")
     try:
-        root = Path(workspace.root_path).expanduser().resolve()
+        root = Path(run_root).expanduser().resolve()
         target = (root / candidate_input).resolve(strict=False)
     except (OSError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="文件路径无效") from exc

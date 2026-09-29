@@ -38,6 +38,7 @@ from src.persistence.database import (
     get_db,
     next_chat_message_sequence,
 )
+from src.coding.git import GitOperationError, bind_worktree_owner, git_state, resolve_session_cwd, release_worktree_owner
 from src.api.schemas import (
     AgentCreate,
     AgentRead,
@@ -77,7 +78,7 @@ from src.permissions.preferences import get_permission_mode, set_permission_mode
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
 from src.tasks.state import cancel_durable_task, latest_resumable_task, prepare_durable_task_resume, task_payload
 from src.persistence.run_events import append_run_event
-from src.agents.collaboration import cleanup_session_worktrees
+
 from src.runs.service import coordinator
 from src.sessions.deletion import (
     SessionDeletionConflict,
@@ -142,6 +143,8 @@ def list_sessions(
 @router.post("/sessions", response_model=SessionRead, status_code=status.HTTP_201_CREATED)
 def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> ChatSession:
     # 变量说明：data 表示当前处理的数据。
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(text("BEGIN IMMEDIATE"))
     data = payload.model_dump()
     requested_permission_mode = data.pop("permission_mode", None)
     data["permission_mode"] = requested_permission_mode or get_permission_mode(db)
@@ -164,6 +167,14 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> Cha
         raise HTTPException(status_code=409, detail="Selected workspace does not exist")
     if db.get(Agent, DEFAULT_AGENT_ID) is None:
         raise HTTPException(status_code=409, detail="PGAgent coordinator is unavailable")
+    selected_workspace = db.get(Workspace, data["workspace_id"])
+    assert selected_workspace is not None
+    try:
+        data["cwd"], checkout = resolve_session_cwd(selected_workspace.root_path, data.get("cwd"))
+        if checkout is not None and checkout.owner_thread_id:
+            raise GitOperationError(f"worktree already belongs to thread {checkout.owner_thread_id}")
+    except (GitOperationError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     _require_enabled_model_connection(db, data.get("model_connection_id"))
     # 变量说明：item 表示当前步骤使用的 item 值。
     item = ChatSession(**data)
@@ -172,9 +183,31 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> Cha
         set_permission_mode(db, requested_permission_mode)
     db.flush()
     replace_session_skills(db, item, skill_ids)
-    _commit(db)
+    # 跨 DB/文件系统绑定先完成唯一 owner 写入；提交失败时只补偿本次绑定。
+    owner_bound = False
+    try:
+        if checkout is not None:
+            bind_worktree_owner(checkout.root, item.id)
+            owner_bound = True
+        _commit(db)
+    except Exception as exc:
+        session_id = item.id
+        db.rollback()
+        if owner_bound:
+            release_worktree_owner(checkout.root, session_id)
+        if isinstance(exc, (GitOperationError, OSError, ValueError)):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise
     db.refresh(item)
     return item
+
+
+@router.get("/sessions/{session_id}/git")
+def get_session_git(session_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    session = _require(db, ChatSession, session_id, "Session")
+    workspace = db.get(Workspace, session.workspace_id) if session.workspace_id else None
+    cwd = session.cwd or (workspace.root_path if workspace is not None else "")
+    return git_state(cwd)
 
 
 # 函数职责：读取 session 对应的数据或流程。
@@ -495,6 +528,8 @@ async def update_session(
     item = _require(db, ChatSession, session_id, "Session")
     # 变量说明：updates 表示当前流程使用的 updates 集合。
     updates = payload.model_dump(exclude_unset=True)
+    if "cwd" in updates or ("workspace_id" in updates and updates["workspace_id"] != item.workspace_id):
+        raise HTTPException(status_code=409, detail="请在目标目录新建会话，或使用 worktree 绑定入口绑定空会话")
     # 变量说明：mcp_selection_changed 表示当前步骤使用的 mcp_selection_changed 值。
     mcp_selection_changed = (
         "mcp_server_names" in updates

@@ -26,6 +26,7 @@ describe('project deletion', () => {
         onToggle={() => undefined}
         onNewConversation={() => undefined}
         onDelete={() => undefined}
+        onManageGit={() => undefined}
         onShowHoverCard={() => undefined}
         onHideHoverCard={() => undefined}
       ><div>children</div></ProjectTreeItem>,
@@ -35,5 +36,21 @@ describe('project deletion', () => {
     expect(markup).toContain('aria-label="删除项目 Alpha"')
     expect(markup).toContain('title="从 PGAgent 删除项目"')
     expect(markup).not.toContain('children')
+  })
+})
+
+
+describe('项目 Git 状态', () => {
+  const actions = { onToggle() {}, onNewConversation() {}, onDelete() {}, onManageGit() {}, onShowHoverCard() {}, onHideHoverCard() {} }
+  it.each([
+    [{ branch: 'master', commit_hash: 'abcdef012345' }, null, 'master'],
+    [{ branch: null, commit_hash: 'abcdef012345' }, null, 'detached HEAD · abcdef01'],
+    [null, null, '非 Git 项目'],
+    [{ branch: 'master' }, 'git timed out', 'Git 读取失败'],
+  ])('显示真实分支、detached、普通目录和读取失败', (git_info, git_error, expected) => {
+    const html = renderToStaticMarkup(<ProjectTreeItem workspace={{ id: 'w', name: 'Alpha', git_info, git_error }} expanded={false} deleting={false} deleteDisabled={false} newConversationDisabled={false} hoverCardVisible={false} {...actions}>{null}</ProjectTreeItem>)
+    expect(html).toContain(expected)
+    expect(html).not.toContain('>main<')
+    expect(html).toContain('管理项目 Alpha 的 Git 与 worktree')
   })
 })

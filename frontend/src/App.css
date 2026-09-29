@@ -175,3 +175,26 @@
   .session-create { position: sticky; z-index: 1; top: 0; background: #fff; }.message.user .message-body { max-width: 90%; }.composer { margin: 0 8px 8px; }.composer-toolbar { align-items: flex-end; }.permission-trigger span { display: none; }.session-settings-trigger { max-width: 180px; }.session-settings-submenu { right: 0; bottom: calc(100% + 7px); width: min(246px, calc(100vw - 48px)); }.capability-level-three { left: 0; bottom: calc(100% + 7px); width: min(250px, calc(100vw - 48px)); }.skill-preview { grid-template-columns: 1fr; }.context-tooltip { width: min(250px, calc(100vw - 48px)); }.usage-mini-totals { position: static; margin-top: 14px; }.usage-mini-totals div { min-width: 0; }.usage-card-grid { grid-template-columns: 1fr; }.usage-models table { min-width: 590px; }.usage-date-filter { grid-template-columns: 1fr; align-items: start; }.usage-date-inputs { justify-content: flex-start; flex-wrap: wrap; }.usage-date-inputs label { align-items: flex-start; flex-direction: column; }.usage-date-inputs input { min-width: min(170px, 44vw); }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+.project-row-wrap { grid-template-columns: minmax(0, 1fr) 30px 30px 30px; }
+.project-git { width: 30px; height: 30px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 8px; color: var(--muted-2); background: transparent; opacity: 0; }
+.project-row-wrap:hover .project-git, .project-git:focus-visible { opacity: 1; }
+.project-git:hover { color: var(--orange-dark); background: var(--orange-soft); }
+.git-manager-backdrop { position: fixed; inset: 0; z-index: 180; display: grid; place-items: center; padding: 20px; background: rgb(25 31 35 / 22%); }
+.git-manager { width: min(620px, 100%); max-height: min(680px, 90vh); overflow: auto; padding: 17px; border: 1px solid var(--line-strong); border-radius: 14px; color: var(--ink); background: var(--surface); box-shadow: 0 18px 52px rgb(8 42 66 / 20%); }
+.git-manager > header { display: flex; align-items: flex-start; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.git-manager > header div { display: flex; flex-direction: column; gap: 4px; }.git-manager > header strong { font-size: .75rem; }.git-manager > header small { color: var(--muted-2); font-size: .55rem; }
+.git-manager-status { display: flex; align-items: center; gap: 7px; margin: 13px 0; color: var(--orange-dark); font-size: .62rem; }.git-manager-status svg { flex: 0 0 auto; }
+.git-manager-create { display: flex; gap: 7px; margin-bottom: 13px; }.git-manager-create input { min-width: 0; flex: 1; height: 31px; padding: 0 9px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: var(--surface-soft); font-size: .58rem; outline: none; }.git-manager-create input:focus { border-color: #e4a77f; box-shadow: 0 0 0 3px var(--orange-soft); }
+.git-manager-list { display: flex; flex-direction: column; gap: 6px; }.git-manager-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); }.git-manager-row > div:first-child { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.git-manager-row strong { font-size: .58rem; }.git-manager-row small { overflow: hidden; color: var(--muted-2); font-family: ui-monospace, Consolas, monospace; font-size: .48rem; text-overflow: ellipsis; white-space: nowrap; }.git-manager-row-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; }.git-manager-row-actions .button { min-height: 27px; padding: 0 8px; font-size: .5rem; }.git-manager-row-actions .icon-button { width: 27px; height: 27px; }.git-manager-muted { display: block; padding: 13px; color: var(--muted-2); font-size: .56rem; text-align: center; }.git-manager-error { margin: 9px 0 0; color: var(--red); font-size: .54rem; line-height: 1.4; }
+
+/* 分支状态属于项目标题；弹层采用原生 dialog 保持键盘焦点在当前操作内。 */
+.project-name-and-branch { display: flex; flex-direction: column; min-width: 0; gap: 2px; text-align: left; }
+.project-name-and-branch > span, .project-name-and-branch > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-name-and-branch > small { color: var(--muted-2); font-size: .56rem; font-weight: 400; }
+.git-manager::backdrop { background: rgb(25 31 35 / 22%); }
+.git-manager-status .button { margin-left: auto; }
+.git-manager-create { align-items: flex-end; }
+.git-manager-create > label { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 5px; font-size: .62rem; }
+.git-manager-create input { width: 100%; flex: auto; }
+.git-manager-base-option { display: flex; align-items: center; gap: 7px; margin-bottom: 12px; font-size: .62rem; }
+@media (max-width: 540px) { .git-manager-row { flex-direction: column; align-items: stretch; } .git-manager-row-actions { justify-content: flex-end; } }

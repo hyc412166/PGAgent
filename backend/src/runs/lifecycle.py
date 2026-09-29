@@ -162,7 +162,6 @@ _CHILD_FORBIDDEN_ORCHESTRATION_TOOLS = frozenset({
     "claim_task",
     "shutdown_request",
     "plan_approval",
-    "integrate_teammate",
 })
 # 变量说明：USER_INTERRUPT_REASONS 表示当前流程使用的 USER_INTERRUPT_REASONS 集合。
 USER_INTERRUPT_REASONS = frozenset({USER_INTERRUPT_REASON, "parent_user_interrupted"})
@@ -1776,7 +1775,7 @@ class RunCoordinator:
                     else _explicit_setting(agent.thinking_level, connection.thinking_level) or "medium"
                 )
                 # 变量说明：workspace_root 表示当前步骤使用的 workspace_root 值。
-                workspace_root = workspace.root_path
+                workspace_root = str(session.cwd or workspace.root_path) if session is not None else workspace.root_path
                 # 变量说明：agents_instructions 表示当前流程使用的 agents_instructions 集合；agents_instruction_sources 表示当前流程使用的 agents_instruction_sources 集合。
                 agents_instructions, agents_instruction_sources = load_instruction_chain(workspace_root)
                 if "read_artifact" not in allowed_tool_names:
@@ -1904,6 +1903,10 @@ class RunCoordinator:
                         + "\n</background-task-events>\n"
                     )
 
+            # 已绑定的 checkout 被外部删除后必须报错，不能由 sandbox.mkdir 重新创建空目录。
+            if session is not None and session.cwd and not Path(workspace_root).is_dir():
+                raise ModelConfigurationError(f"会话工作目录不存在：{workspace_root}")
+            run.cwd = workspace_root
             # 变量说明：context 表示当前步骤使用的 context 值。
             context = {
                 "system_prompt": effective_system_prompt,
