@@ -35,6 +35,24 @@ def test_update_plan_contract_requires_progressive_step_transitions(tmp_path) ->
     assert "非并行计划同一时刻只保留一个 in_progress" in DEFAULT_AGENT_SYSTEM_PROMPT
 
 
+# 这条契约覆盖可选命令/路径探测被 PowerShell 退出码误记为失败，以及新增文件漏写 + 前缀的真实场景。
+def test_shell_and_apply_patch_contracts_explain_expected_misses(tmp_path) -> None:
+    registry = create_default_registry(
+        str(tmp_path),
+        allowed_tool_names=["shell", "apply_patch"],
+    )
+    schemas = {
+        item["function"]["name"]: item["function"]["description"]
+        for item in registry.schemas
+    }
+
+    assert "部分候选不存在" in schemas["shell"]
+    assert "Test-Path" in schemas["shell"]
+    assert "包括空行" in schemas["apply_patch"]
+    assert "部分候选不存在" in DEFAULT_AGENT_SYSTEM_PROMPT
+    assert "包括空行" in DEFAULT_AGENT_SYSTEM_PROMPT
+
+
 # 测试场景：默认能力目录应让完全访问会话直接看到 Codex 风格 web_run，而不是退回工具搜索。
 def test_full_mode_default_catalog_exposes_web_run_without_approval(tmp_path) -> None:
     registry = create_default_registry(

@@ -63,7 +63,7 @@ def _tool(
 
 # 变量说明：BUILTIN_TOOL_CATALOG 表示当前步骤使用的 BUILTIN_TOOL_CATALOG 值。
 BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
-    _tool("shell", "运行命令", "在 Windows 项目目录中通过 PowerShell 执行命令；支持管道和 cmdlet。长命令会返回可继续读取的 session_id；后台失败时先读取输出再决定是否重试。", "execution", "adaptive"),
+    _tool("shell", "运行命令", "在 Windows 项目目录中通过 PowerShell 执行命令；支持管道和 cmdlet。部分候选不存在属于预期探测结果时，应逐个执行 Get-Command、只输出已找到项，并用 Test-Path 过滤不存在的路径，避免缺失项造成退出码 1。长命令会返回可继续读取的 session_id；后台失败时先读取输出再决定是否重试。", "execution", "adaptive"),
     _tool("write_stdin", "继续命令", "向持久后台命令写入输入或读取后续输出；使用 task_id，取值为 shell/background_run 返回的 session_id。后台命令失败时先检查已有输出，不要直接重复执行原命令。", "execution", "adaptive"),
     _tool("read", "读取文件", "分页读取项目目录中的 UTF-8 文本文件。", "filesystem"),
     _tool("read_artifact", "读取 Artifact", "分页读取当前会话拥有的大型工具输出或压缩对话。", "filesystem"),
@@ -72,7 +72,7 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
     _tool(
         "apply_patch",
         "应用补丁",
-        "应用严格的多文件文本补丁；路径必须是工作区相对路径，Add File 区段每一行都必须以 + 开头，Update File 必须使用 @@ hunk。",
+        "应用严格的多文件文本补丁；路径必须是工作区相对路径，Add File 区段包括空行在内的每一行都必须以 + 开头，Update File 必须使用 @@ hunk。",
         "developer",
         "adaptive",
     ),

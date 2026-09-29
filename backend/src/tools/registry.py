@@ -157,7 +157,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "apply_patch": {
-        "description": "Apply one strict, workspace-scoped multi-file text patch.",
+        "description": "应用严格的工作区多文件文本补丁。路径必须是工作区相对路径；Add File 区段包括空行在内的每一行都必须以 + 开头；Update File 必须包含 @@ hunk 和正确的上下文行。",
         "parameters": {
             "type": "object",
             "properties": {"patch": {"type": "string"}},
@@ -393,7 +393,7 @@ TOOL_SCHEMAS.update(ADVANCED_TOOL_SCHEMAS)
 # vocabulary to new model calls.
 # 变量说明：TOOL_SCHEMAS 的索引项 表示该语句创建或更新的目标数据。
 TOOL_SCHEMAS["shell"] = {
-    "description": "在 Windows 工作区中通过 PowerShell 执行命令；支持管道与 cmdlet。长命令会返回可继续读取的持久 session_id；收到 background_job_failed 时先读取输出/日志，再决定是否重试。",
+    "description": "在 Windows 工作区中通过 PowerShell 执行命令；支持管道与 cmdlet。部分候选不存在属于预期探测结果时，在 ForEach-Object 中逐个执行 Get-Command -ErrorAction SilentlyContinue、只输出已找到项，并用 Test-Path 过滤不存在的路径，避免整条命令因缺失项返回退出码 1。长命令会返回可继续读取的持久 session_id；收到 background_job_failed 时先读取输出/日志，再决定是否重试。",
     "parameters": {
         "type": "object",
         "properties": {
