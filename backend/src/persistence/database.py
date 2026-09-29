@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 from pathlib import Path
 from typing import Generator, cast
 
@@ -138,6 +139,7 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "workflow_profile_id": "VARCHAR(16) NOT NULL DEFAULT 'auto'",
     },
     "sessions": {
+        "cwd": "TEXT",
         "model_connection_id": "VARCHAR(36)",
         "model_id": "VARCHAR(255)",
         "thinking_level": "VARCHAR(16) NOT NULL DEFAULT 'medium'",
@@ -154,6 +156,7 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "provider_payload": "JSON NOT NULL DEFAULT '{}'",
     },
     "runs": {
+        "cwd": "TEXT",
         "turn_id": "VARCHAR(36)",
         "task_id": "VARCHAR(36)",
         "plan_step_id": "VARCHAR(36)",
@@ -193,8 +196,6 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "assigned_agent_id": "VARCHAR(36)",
         "assigned_run_id": "VARCHAR(36)",
         "claim_owner": "VARCHAR(160)",
-        "workspace_mode": "VARCHAR(24) NOT NULL DEFAULT 'shared'",
-        "worktree_path": "TEXT",
         "attempt": "INTEGER NOT NULL DEFAULT 0",
         "error": "TEXT",
     },
@@ -709,6 +710,52 @@ def _seed_defaults() -> None:
         db.commit()
 
 
+def _migrate_retired_workspace_mode_defaults() -> None:
+    """保留旧列历史值，修复移除 ORM 字段后旧表 NOT NULL 没有默认值的问题。"""
+    if engine.dialect.name != "sqlite":
+        return
+    connection = engine.raw_connection()
+    try:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("BEGIN IMMEDIATE")
+        for table in ("plan_steps", "teammate_workers"):
+            columns = connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+            retired = next((column for column in columns if column[1] == "workspace_mode"), None)
+            if retired is None or retired[4] is not None:
+                continue
+            create_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()[0]
+            indexes = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name=? AND type IN ('index', 'trigger') AND sql IS NOT NULL",
+                (table,),
+            ).fetchall()
+            temporary = table + "_workspace_migration"
+            create_sql = re.sub(r'(?i)(CREATE TABLE\s+)[^ (]+', rf'\1"{temporary}"', create_sql, count=1)
+            create_sql, count = re.subn(
+                r'(?i)(["`]?workspace_mode["`]?\s+[^,\n]+)',
+                r"\1 DEFAULT 'shared'", create_sql, count=1,
+            )
+            if count != 1:
+                raise RuntimeError(f"Cannot migrate retired workspace mode in {table}")
+            names = ", ".join('"' + column[1] + '"' for column in columns)
+            connection.execute(create_sql)
+            connection.execute(f'INSERT INTO "{temporary}" ({names}) SELECT {names} FROM "{table}"')
+            connection.execute(f'DROP TABLE "{table}"')
+            connection.execute(f'ALTER TABLE "{temporary}" RENAME TO "{table}"')
+            for (index_sql,) in indexes:
+                connection.execute(index_sql)
+        if connection.execute("PRAGMA foreign_key_check").fetchone():
+            raise RuntimeError("Foreign key violation while migrating retired workspace columns")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.close()
+
+
 # 函数职责：完成 init_db 对应的业务处理。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
 def init_db() -> None:
@@ -716,6 +763,7 @@ def init_db() -> None:
     _drop_retired_team_collaboration_tables()
     _migrate_retired_context_storage()
     _migrate_sqlite_columns()
+    _migrate_retired_workspace_mode_defaults()
     _drop_retired_session_context_columns()
     _migrate_sqlite_indexes()
     _migrate_agent_tool_surface()

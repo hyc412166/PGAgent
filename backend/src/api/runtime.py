@@ -475,6 +475,7 @@ async def _launch_draft_core(
         chat_session = Session(
             title=payload.title,
             workspace_id=workspace.id,
+            cwd=workspace.root_path,
             agent_id=DEFAULT_AGENT_ID,
             model_connection_id=payload.model_connection_id,
             model_id=payload.model_id,

@@ -1,5 +1,5 @@
 // 本文件实现 SessionsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
-import { AlertCircle, ArrowDown, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
+import { AlertCircle, ArrowDown, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, GitBranch, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
 import { type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type SetStateAction, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, apiUrl, describeError } from '../../api'
@@ -9,7 +9,7 @@ import { permissionLabel, permissionOptions, toggleSelectedId } from '../../capa
 import { modelSelectionPayload, resolveEffectiveThinking, sessionThinkingOptions, shortModelLabel, thinkingLevelLabels } from '../../composerSettings'
 import { buildDraftLaunchPayload, createDraftIdempotencyKey, createTurnIdempotencyKey } from '../../draftLaunch'
 import { availableConnectionModels, resolveEffectiveModelSettings } from '../../modelSettings'
-import { buildSessionNavigation, draftSessionTitle, folderName, isDefaultWorkspace, mergePendingSession, pendingSessionAfterRemoval, projectRootForSession } from '../../sessionNavigation'
+import { buildSessionNavigation, draftSessionTitle, folderName, mergePendingSession, pendingSessionAfterRemoval, projectRootForSession } from '../../sessionNavigation'
 import { composerSurface, isResumableWaitingRun, isTerminalRunStatus, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from '../../sessionStream'
 import { emptyThoughtTimeline, hasVisibleCompletedThought, pickThinkingStatus, timelineFromRunEvents } from '../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../thoughtTimeline'
@@ -26,6 +26,7 @@ import { ConversationTurnTimeline } from './components/ConversationTurnTimeline'
 import { FileChangePanel } from './components/FileChangePanel'
 import { ProjectTreeItem } from './components/ProjectTreeItem'
 import { projectDeleteConfirmation } from './projectDeletion'
+import { currentSessionGit, gitStatusLabel, type GitSnapshot, type SessionGitSnapshot } from './gitStatus'
 import { useRunTransport } from './hooks/useRunTransport'
 import { ChildNavigation } from './childNavigation'
 import { childNames } from './childIdentity'
@@ -34,10 +35,9 @@ import { activeRunStatuses, draftSettingsWithPermission, emptyDraftContext, empt
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
 import { buildConversationTurnSummaries } from './turnTimeline'
 import { loadSessionScrollPosition, saveSessionScrollPosition, type SessionScrollPosition } from './sessionScrollPosition'
-import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, McpServer, MemorySettings, Message, PermissionMode, PermissionSettings, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
+import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, ManagedWorktree, McpServer, MemorySettings, Message, PermissionMode, PermissionSettings, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 type ChildPanelState = { sessionId: string; open: boolean; autoOpened: boolean }
-type WorkspaceExpansion = { contextKey: string; ids: Set<string> }
 type SidePanelResizeBounds = { min: number; max: number }
 type SidePanelResizeInteraction = SidePanelResizeBounds & { pointerId: number; startX: number; startWidth: number }
 
@@ -71,16 +71,6 @@ function nextChildPanelStateForTasks(current: ChildPanelState, sessionId: string
     : { sessionId, open: current.open, autoOpened: false }
   if (!tasks.length) return { ...scoped, autoOpened: false }
   return scoped.autoOpened ? scoped : { ...scoped, open: true, autoOpened: true }
-}
-
-// 展开状态只属于创建它的会话或草稿；切换上下文时改用当前项目作为默认值。
-function resolveExpandedWorkspaceIds(
-  expansion: WorkspaceExpansion | null,
-  contextKey: string,
-  defaultWorkspaceId: string,
-): Set<string> {
-  if (expansion?.contextKey === contextKey) return expansion.ids
-  return defaultWorkspaceId ? new Set([defaultWorkspaceId]) : new Set()
 }
 
 // 菜单的打开请求必须仍属于当前会话/运行上下文，运行锁定后不再重新显现。
@@ -144,11 +134,18 @@ function SessionsPage() {
   const [draftRootPath, setDraftRootPath] = useState('')
   const [draftSettings, setDraftSettings] = useState<DraftSessionSettings>(emptyDraftSettings)
   // 项目树展开、文件夹选择、悬浮卡片，以及完成思考/子 Agent 面板属于展示层状态。
-  const [workspaceExpansion, setWorkspaceExpansion] = useState<WorkspaceExpansion | null>(null)
+  // 展开状态由用户点击项目控制，切换会话或进入草稿时保留。
+  const [expandedWorkspaceIds, setExpandedWorkspaceIds] = useState<Set<string>>(() => new Set())
   const [addingProject, setAddingProject] = useState(false)
   const [pickingDraftProject, setPickingDraftProject] = useState(false)
   const [projectError, setProjectError] = useState('')
   const [projectHoverCard, setProjectHoverCard] = useState<ProjectHoverCard | null>(null)
+  const [gitManagerWorkspaceId, setGitManagerWorkspaceId] = useState('')
+  const [worktreeBase, setWorktreeBase] = useState('')
+  const [useDefaultBranch, setUseDefaultBranch] = useState(false)
+  const gitDialogRef = useRef<HTMLDialogElement>(null)
+  const [gitActionBusy, setGitActionBusy] = useState(false)
+  const [gitActionError, setGitActionError] = useState('')
   const [completedThoughtsByRun, setCompletedThoughtsByRun] = useState<Record<string, ThoughtTimelineState>>({})
   const [childPanelState, setChildPanelState] = useState<ChildPanelState>({ sessionId: '', open: false, autoOpened: false })
   const [selectedChildTaskId, setSelectedChildTaskId] = useState('')
@@ -240,6 +237,59 @@ function SessionsPage() {
   const teammates = useApiData<Teammate[]>([], () => activeId
     ? api.list<Teammate>(`/api/sessions/${encodeURIComponent(activeId)}/teammates`, ['teammates'])
     : Promise.resolve([]), [activeId])
+  const activeSession = sessions.data.find((item) => stringId(item.id) === activeId)
+    ?? (pendingSession && stringId(pendingSession.id) === activeId ? pendingSession : undefined)
+  const sessionCwd = activeSession?.cwd || ''
+  const gitSnapshot = useApiData<{ workspaceId: string; snapshot: GitSnapshot } | null>(null, async () => {
+    const workspaceId = gitManagerWorkspaceId
+    if (!workspaceId) return null
+    try {
+      return { workspaceId, snapshot: await api.get<GitSnapshot>(`/api/workspaces/${encodeURIComponent(workspaceId)}/git`) }
+    } catch (error) {
+      return { workspaceId, snapshot: { cwd: '', git_info: null, git_error: describeError(error) } }
+    }
+  }, [gitManagerWorkspaceId])
+  const managedWorktrees = useApiData<{ workspaceId: string; items: ManagedWorktree[]; error: string }>(
+    { workspaceId: '', items: [], error: '' }, async () => {
+      const workspaceId = gitManagerWorkspaceId
+      if (!workspaceId) return { workspaceId, items: [], error: '' }
+      try {
+        return { workspaceId, items: await api.list<ManagedWorktree>(`/api/workspaces/${encodeURIComponent(workspaceId)}/worktrees`, ['worktrees']), error: '' }
+      } catch (error) {
+        return { workspaceId, items: [], error: describeError(error) }
+      }
+    }, [gitManagerWorkspaceId])
+  const sessionGit = useApiData<SessionGitSnapshot | null>(null, async () => {
+    if (!activeId) return null
+    try {
+      return { sessionId: activeId, requestedCwd: sessionCwd, snapshot: await api.get<GitSnapshot>(`/api/sessions/${encodeURIComponent(activeId)}/git`) }
+    } catch (error) {
+      return { sessionId: activeId, requestedCwd: sessionCwd, snapshot: { cwd: sessionCwd, git_info: null, git_error: describeError(error) } }
+    }
+  }, [activeId, sessionCwd])
+  const refreshSessionGit = sessionGit.reload
+  const refreshWorkspaceGit = workspaces.reload
+  const refreshManagerGit = gitSnapshot.reload
+  const refreshManagedWorktrees = managedWorktrees.reload
+  useEffect(() => {
+    const refresh = () => {
+      void refreshSessionGit()
+      void refreshWorkspaceGit()
+      if (gitManagerWorkspaceId) { void refreshManagerGit(); void refreshManagedWorktrees() }
+    }
+    window.addEventListener('focus', refresh)
+    return () => window.removeEventListener('focus', refresh)
+  }, [refreshSessionGit, refreshWorkspaceGit, refreshManagerGit, refreshManagedWorktrees, gitManagerWorkspaceId])
+  // 运行可能执行 checkout；终态后重新查询 cwd，不沿用会话建立时的分支。
+  useEffect(() => {
+    if (liveRun.status === 'terminal') { void refreshSessionGit(); void refreshWorkspaceGit(); void refreshManagerGit(); void refreshManagedWorktrees() }
+  }, [liveRun.status, liveRun.runId, refreshSessionGit, refreshWorkspaceGit, refreshManagerGit, refreshManagedWorktrees])
+  useLayoutEffect(() => {
+    if (!gitManagerWorkspaceId) return
+    const trigger = document.activeElement as HTMLElement | null
+    gitDialogRef.current?.showModal()
+    return () => { trigger?.focus() }
+  }, [gitManagerWorkspaceId])
   const durableTask = useApiData<DurableTask | null>(null, () => activeId
     ? api.get<DurableTask | null>(`/api/sessions/${encodeURIComponent(activeId)}/active-task`)
     : Promise.resolve(null), [activeId])
@@ -253,15 +303,7 @@ function SessionsPage() {
   }, [refreshDurableTask, refreshDurableTasks])
   const context = useApiData<SessionContext | null>(null, () => activeId ? api.get<SessionContext>(`/api/sessions/${activeId}/context`) : Promise.resolve(null), [activeId])
   // 以下派生值把原始资源收敛为当前会话、当前运行、可见消息及可操作状态。
-  const activeSession = sessions.data.find((item) => stringId(item.id) === activeId)
-    ?? (pendingSession && stringId(pendingSession.id) === activeId ? pendingSession : undefined)
   const activeAgent = agents.data.find((item) => item.id === activeSession?.agent_id)
-  const workspaceExpansionContextKey = draftActive ? 'draft' : `session:${activeId}`
-  const activeWorkspaceId = activeSession?.workspace_id || ''
-  const defaultExpandedWorkspaceId = !draftActive && workspaces.data.some((workspace) => workspace.id === activeWorkspaceId && !isDefaultWorkspace(workspace))
-    ? activeWorkspaceId
-    : ''
-  const expandedWorkspaceIds = resolveExpandedWorkspaceIds(workspaceExpansion, workspaceExpansionContextKey, defaultExpandedWorkspaceId)
   const sessionRuns = visibleSessionItems(runs.data.ownerSessionId, activeId, runs.data.items)
     .filter((item) => !item.session_id || item.session_id === activeId)
   // awaitingApprovalRunIds 驱动审批查询；只关注当前会话中仍等待决策的运行。
@@ -338,9 +380,8 @@ function SessionsPage() {
   const visibleDurableTasks = durableTasks.data.filter((task) => task.session_id === activeId)
   const activeWorkspace = workspaces.data.find((workspace) => workspace.id === activeSession?.workspace_id)
   const contextWorkspaceName = folderName(activeWorkspace?.root_path || activeWorkspace?.path || activeWorkspace?.name || 'PGAgent')
-  const contextBranchName = visibleTeammates.find((teammate) => teammate.id === activeChildTask?.teammate_id)?.branch_name
-    || visibleTeammates.find((teammate) => teammate.branch_name)?.branch_name
-    || 'main'
+  const contextGit = currentSessionGit(sessionGit.data, activeId, sessionCwd)
+  const contextBranchName = activeId ? gitStatusLabel(contextGit?.git_info, contextGit?.git_error, !contextGit || sessionGit.loading) : undefined
   const contextSources = (() => {
     const result: PersistentSourceItem[] = []
     const seen = new Set<string>()
@@ -598,16 +639,6 @@ function SessionsPage() {
     }
   }, [activeId, historyMessageRunIds, runs.data.items, runs.data.ownerSessionId, runs.loading])
 
-  function setExpandedWorkspaceIds(update: SetStateAction<Set<string>>) {
-    setWorkspaceExpansion((current) => {
-      const currentIds = resolveExpandedWorkspaceIds(current, workspaceExpansionContextKey, defaultExpandedWorkspaceId)
-      return {
-        contextKey: workspaceExpansionContextKey,
-        ids: typeof update === 'function' ? update(currentIds) : update,
-      }
-    })
-  }
-
   // 清除待上传附件及对应 input 值，保证再次选择同名文件仍会触发 change。
   function clearPendingAttachments() {
     setPreviewAttachmentId('')
@@ -713,7 +744,6 @@ function SessionsPage() {
     setPendingSession(null)
     clearPendingAttachments()
     const selectedProjectRoot = workspace ? (workspace.root_path || workspace.path || '') : projectRootForSession(workspaces.data, activeSession)
-    const selectedProjectId = workspace?.id || (selectedProjectRoot ? activeSession?.workspace_id : '')
     draftVersionRef.current += 1
     setActionError('')
     setCompletedThoughtsByRun({})
@@ -725,7 +755,6 @@ function SessionsPage() {
     setDraftSettings(draftSettingsWithPermission(permissionSettings.data?.permission_mode ?? 'smart'))
     setLiveRun(emptyLiveRun())
     draftIdempotencyKeyRef.current = createDraftIdempotencyKey()
-    setExpandedWorkspaceIds(selectedProjectId ? new Set([selectedProjectId]) : new Set())
     setActiveId('')
     setDraftActive(true)
   }
@@ -791,9 +820,8 @@ function SessionsPage() {
     try {
       const selection = await api.post<FolderSelection>('/api/system/select-folder', { title: 'Select Project Root' })
       if (!selection.path) return
-      const workspace = await api.post<Workspace>('/api/workspaces', { root_path: selection.path })
+      await api.post<Workspace>('/api/workspaces', { root_path: selection.path })
       await workspaces.refresh()
-      setExpandedWorkspaceIds((current) => new Set([...current, workspace.id]))
     } catch (error) {
       setProjectError(describeError(error))
     } finally { setAddingProject(false) }
@@ -835,6 +863,46 @@ function SessionsPage() {
     } finally {
       setDeletingWorkspaceId('')
     }
+  }
+
+  async function createManagedWorktree() {
+    const workspaceId = gitManagerWorkspaceId
+    if (!workspaceId || gitActionBusy) return
+    setGitActionBusy(true); setGitActionError('')
+    try {
+      await api.post<ManagedWorktree>(`/api/workspaces/${encodeURIComponent(workspaceId)}/worktrees`, { base: useDefaultBranch ? null : worktreeBase.trim() || null, use_default_branch: useDefaultBranch })
+      setWorktreeBase('')
+      await managedWorktrees.refresh()
+    } catch (error) { setGitActionError(describeError(error)) } finally { setGitActionBusy(false) }
+  }
+
+  async function openManagedWorktree(workspace: Workspace, worktree: ManagedWorktree) {
+    if (gitActionBusy) return
+    setGitActionBusy(true); setGitActionError('')
+    try {
+      if (worktree.owner_thread_id) {
+        const items = await sessions.refresh()
+        if (!items?.some((item) => item.id === worktree.owner_thread_id)) throw new Error('此 worktree 绑定的会话已不存在或无法读取，请刷新后重试。')
+        setGitManagerWorkspaceId('')
+        openExistingSession(worktree.owner_thread_id)
+        return
+      }
+      const session = await api.post<Session>('/api/sessions', { workspace_id: workspace.id, cwd: worktree.cwd })
+      await Promise.all([sessions.refresh(), managedWorktrees.refresh()])
+      setGitManagerWorkspaceId('')
+      openExistingSession(stringId(session.id))
+    } catch (error) { setGitActionError(describeError(error)) } finally { setGitActionBusy(false) }
+  }
+
+  async function deleteManagedWorktree(workspace: Workspace, worktree: ManagedWorktree) {
+    if (gitActionBusy || worktree.owner_thread_id === activeId) return
+    if (!window.confirm(`删除 worktree ${worktree.root}？此操作会移除该 checkout。`)) return
+    setGitActionBusy(true); setGitActionError('')
+    try {
+      const query = `?path=${encodeURIComponent(worktree.root)}&session_id=${encodeURIComponent(activeId)}`
+      await api.delete<void>(`/api/workspaces/${encodeURIComponent(workspace.id)}/worktrees${query}`)
+      await managedWorktrees.refresh()
+    } catch (error) { setGitActionError(describeError(error)) } finally { setGitActionBusy(false) }
   }
 
   // 为新会话选择或创建工作区，但暂不创建会话本身。
@@ -1479,6 +1547,7 @@ function SessionsPage() {
                   onToggle={() => toggleProject(workspace.id)}
                   onNewConversation={() => beginDraft(workspace)}
                   onDelete={() => void deleteProject(workspace, projectSessions)}
+                  onManageGit={() => { setGitManagerWorkspaceId(workspace.id); setGitActionError(''); setWorktreeBase(''); setUseDefaultBranch(false); setProjectHoverCard(null) }}
                   onShowHoverCard={(event) => showProjectHoverCard(event, workspace, projectSessions.length, path)}
                   onHideHoverCard={() => setProjectHoverCard((current) => current?.id === workspace.id ? null : current)}
                 >
@@ -1741,6 +1810,28 @@ function SessionsPage() {
       </div>
       </ChildNavigation.Provider>
       {pendingImages.some((image) => image.id === previewAttachmentId) && <PendingImagePreview images={pendingImages.map((image): PreviewImageItem => ({ id: image.id, name: image.file.name, src: image.previewUrl }))} selectedId={previewAttachmentId} onSelect={setPreviewAttachmentId} onClose={() => setPreviewAttachmentId('')} />}
+      {gitManagerWorkspaceId && (() => {
+        const workspace = workspaces.data.find((item) => item.id === gitManagerWorkspaceId)
+        if (!workspace) return null
+        const snapshot = gitSnapshot.data?.workspaceId === workspace.id ? gitSnapshot.data.snapshot : null
+        const list = managedWorktrees.data.workspaceId === workspace.id ? managedWorktrees.data : null
+        const loadingGit = gitSnapshot.loading || !snapshot
+        return <dialog ref={gitDialogRef} className="git-manager" aria-label="Git 与 worktree" onCancel={(event) => { if (gitActionBusy) event.preventDefault() }} onClose={() => setGitManagerWorkspaceId('')}>
+            <header><div><strong>Git / worktree</strong><small>{workspace.name}</small></div><button type="button" className="icon-button" aria-label="关闭 Git 与 worktree" disabled={gitActionBusy} onClick={() => gitDialogRef.current?.close()}><X size={15} /></button></header>
+            <div className="git-manager-status"><GitBranch size={14} /><span>{gitStatusLabel(snapshot?.git_info, snapshot?.git_error, loadingGit)}</span><button type="button" className="button button-secondary" disabled={gitActionBusy || loadingGit || managedWorktrees.loading} onClick={() => { void refreshManagerGit(); void refreshManagedWorktrees(); void refreshWorkspaceGit() }}>刷新</button></div>
+            {snapshot?.git_error && <p role="alert" className="git-manager-error">{snapshot.git_error}</p>}
+            <label className="git-manager-base-option"><input type="checkbox" checked={useDefaultBranch} disabled={gitActionBusy} onChange={(event) => setUseDefaultBranch(event.target.checked)} />从仓库默认分支创建</label>
+            <div className="git-manager-create"><label>起始 revision<input value={worktreeBase} disabled={gitActionBusy || useDefaultBranch} onChange={(event) => setWorktreeBase(event.target.value)} placeholder="HEAD" aria-label="worktree 起始 revision" /></label><button type="button" className="button button-primary" disabled={gitActionBusy || loadingGit || !!snapshot?.git_error || !snapshot?.git_info} onClick={() => void createManagedWorktree()}><Plus size={13} />新建 worktree</button></div>
+            <div className="git-manager-list" aria-label="worktree 列表" aria-busy={managedWorktrees.loading}>
+              {managedWorktrees.loading || !list ? <span className="git-manager-muted">正在读取 worktree…</span> : list.error ? <p role="alert" className="git-manager-error">{list.error}</p> : list.items.length ? list.items.map((worktree) => <div className="git-manager-row" key={worktree.root}>
+                <div><strong>{gitStatusLabel({ branch: worktree.branch, commit_hash: worktree.head_sha })}</strong><small title={worktree.cwd}>{worktree.cwd}</small></div>
+                <div className="git-manager-row-actions"><button type="button" className="button button-secondary" disabled={gitActionBusy} onClick={() => void openManagedWorktree(workspace, worktree)}>{worktree.owner_thread_id ? '打开会话' : '在此新建会话'}</button><button type="button" className="icon-button danger" aria-label={`删除 worktree ${worktree.root}`} title={worktree.owner_thread_id === activeId ? '当前会话正在使用' : '删除 worktree'} disabled={gitActionBusy || worktree.owner_thread_id === activeId} onClick={() => void deleteManagedWorktree(workspace, worktree)}><Trash2 size={14} /></button></div>
+              </div>) : <span className="git-manager-muted">暂无 worktree</span>}
+            </div>
+            {gitActionBusy && <p className="git-manager-muted" role="status">正在处理…</p>}
+            {gitActionError && <p role="alert" className="git-manager-error">{gitActionError}</p>}
+        </dialog>
+      })()}
       {projectHoverCard && createPortal(
         <div className="project-hover-card" id="project-hover-card" role="tooltip" style={{ left: projectHoverCard.left, top: projectHoverCard.top }}>
           <div className="project-hover-card-row project-hover-card-title"><Folder size={14} /><strong>{projectHoverCard.name}</strong></div>
@@ -1754,6 +1845,6 @@ function SessionsPage() {
 }
 
 
-const SessionsPageState = { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveExpandedWorkspaceIds, resolveMenuOpen, clampSidePanelWidth, sidePanelWidthAfterDrag }
+const SessionsPageState = { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveMenuOpen, clampSidePanelWidth, sidePanelWidthAfterDrag }
 
 export { SessionsPage, SessionsPageState }

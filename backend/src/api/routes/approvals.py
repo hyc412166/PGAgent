@@ -72,7 +72,7 @@ from src.api.schemas import (
 from src.memory.service import recall_memories, refresh_memory_markdown_projection, store_memory
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
 from src.tasks.state import latest_resumable_task, task_payload
-from src.agents.collaboration import cleanup_session_worktrees
+
 # 变量说明：router 表示当前步骤使用的 router 值。
 router = APIRouter(prefix="/api", tags=["approvals"])
 

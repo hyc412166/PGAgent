@@ -89,10 +89,44 @@ class WorkspaceRead(ORMModel):
     enabled: bool
     # 变量说明：validation_runtime 表示当前步骤使用的 validation_runtime 值。
     validation_runtime: ValidationRuntimeConfig
+    # Git 状态来自项目当前 checkout，而不是项目名称或子 Agent 元数据。
+    git_info: "GitInfoRead | None" = None
+    git_error: str | None = None
     # 变量说明：created_at 表示创建时间。
     created_at: datetime
     # 变量说明：updated_at 表示最近更新时间。
     updated_at: datetime
+
+
+class GitInfoRead(BaseModel):
+    """Codex 风格的项目 Git 元数据。"""
+
+    commit_hash: str | None = None
+    branch: str | None = None
+    repository_url: str | None = None
+
+
+class ManagedWorktreeRead(BaseModel):
+    """一个由项目 Git 仓库注册的 managed checkout。"""
+
+    root: str
+    cwd: str
+    source_root: str
+    source_cwd: str
+    head_sha: str
+    branch: str | None = None
+    owner_thread_id: str | None = None
+
+
+class ManagedWorktreeCreate(BaseModel):
+    base: str | None = Field(default=None, min_length=1, max_length=1024)
+    use_default_branch: bool = False
+
+
+class ManagedWorktreeBind(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    session_id: str = Field(min_length=1)
+
 
 
 # 变量说明：ThinkingLevel 表示当前步骤使用的 ThinkingLevel 值。
@@ -434,6 +468,7 @@ class SessionCreate(BaseModel):
     title: str = Field(default="New session", min_length=1, max_length=200)
     # 变量说明：workspace_id 表示工作区标识。
     workspace_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=4096)
     # 变量说明：agent_id 表示智能体标识。
     agent_id: str | None = None
     # 变量说明：model_connection_id 表示model_connection 对象的唯一标识。
@@ -459,6 +494,7 @@ class SessionUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     # 变量说明：workspace_id 表示工作区标识。
     workspace_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=4096)
     # 变量说明：agent_id 表示智能体标识。
     agent_id: str | None = None
     # 变量说明：model_connection_id 表示model_connection 对象的唯一标识。
@@ -488,6 +524,7 @@ class SessionRead(ORMModel):
     title: str
     # 变量说明：workspace_id 表示工作区标识。
     workspace_id: str | None
+    cwd: str | None
     # 变量说明：agent_id 表示智能体标识。
     agent_id: str | None
     # 变量说明：model_connection_id 表示model_connection 对象的唯一标识。
@@ -703,10 +740,6 @@ class PlanStepRead(ORMModel):
     assigned_run_id: str | None
     # 变量说明：claim_owner 表示当前步骤使用的 claim_owner 值。
     claim_owner: str | None
-    # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
-    workspace_mode: str
-    # 变量说明：worktree_path 表示worktree_path 对应的文件系统位置。
-    worktree_path: str | None
     # 变量说明：attempt 表示当前步骤使用的 attempt 值。
     attempt: int
     # 变量说明：error 表示当前捕获或准备上报的错误。
@@ -1433,12 +1466,6 @@ class TeammateRead(ORMModel):
     current_plan_step_id: str | None
     # 变量说明：last_run_id 表示last_run 对象的唯一标识。
     last_run_id: str | None
-    # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
-    workspace_mode: str
-    # 变量说明：worktree_path 表示worktree_path 对应的文件系统位置。
-    worktree_path: str | None
-    # 变量说明：branch_name 表示当前步骤使用的 branch_name 值。
-    branch_name: str | None
     # 变量说明：created_at 表示创建时间。
     created_at: datetime
     # 变量说明：updated_at 表示最近更新时间。

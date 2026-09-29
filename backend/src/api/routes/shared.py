@@ -74,7 +74,7 @@ from src.api.schemas import (
 from src.memory.service import recall_memories, refresh_memory_markdown_projection, store_memory
 from src.skills.registry import replace_agent_capabilities, replace_session_skills
 from src.tasks.state import latest_resumable_task, task_payload
-from src.agents.collaboration import cleanup_session_worktrees
+
 # 变量说明：T 表示当前步骤使用的 T 值。
 T = TypeVar("T")
 # 变量说明：_ACTIVE_SESSION_RUN_STATUSES 表示当前流程使用的 _ACTIVE_SESSION_RUN_STATUSES 集合。

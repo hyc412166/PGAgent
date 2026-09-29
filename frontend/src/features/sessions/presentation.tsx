@@ -156,7 +156,7 @@ export const ChildAgentPanel = memo(function ChildAgentPanel({
       cancellingTaskId={cancellingDurableTaskId}
       resuming={resumingDurableTask}
     />
-    {!!tasks.length && !!teammates.length && <section className="teammate-roster" aria-label="持久化队友"><strong>协作队友</strong><div>{teammates.map((teammate) => <span key={teammate.id} className={`teammate teammate-${teammate.status}`} title={teammate.branch_name || teammate.worktree_path || '共享工作区'}><Bot size={12} /><b>{teammate.name}</b><small>{teammate.status}{teammate.workspace_mode === 'worktree' ? ' · worktree' : ''}</small></span>)}</div></section>}
+    {!!tasks.length && !!teammates.length && <section className="teammate-roster" aria-label="持久化队友"><strong>协作队友</strong><div>{teammates.map((teammate) => <span key={teammate.id} className={`teammate teammate-${teammate.status}`} title="共享工作区"><Bot size={12} /><b>{teammate.name}</b><small>{teammate.status}</small></span>)}</div></section>}
     {error ? <ErrorState message={error} onRetry={onRetry} /> : loading && !tasks.length ? <LoadingState label="正在读取子 Agent…" /> : !tasks.length ? null : <>
       <div className="child-task-list" role="list" aria-label="本次调用的子 Agent">
         {tasks.map((task) => {

@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { SessionsPageState } from './SessionsPage'
 import type { DelegatedTask, Session } from '../../types'
 
-const { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveExpandedWorkspaceIds, resolveMenuOpen, clampSidePanelWidth, sidePanelWidthAfterDrag } = SessionsPageState
+const { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveMenuOpen, clampSidePanelWidth, sidePanelWidthAfterDrag } = SessionsPageState
 
 describe('SessionsPage 会话级状态', () => {
   it('会话列表首次到达时选择第一项，但草稿模式保持未选择', () => {
@@ -28,14 +28,6 @@ describe('SessionsPage 会话级状态', () => {
     expect(nextChildPanelStateForTasks(closed, 'session-a', nextTasks).open).toBe(false)
     expect(nextChildPanelStateForTasks(reset, 'session-a', firstTasks).open).toBe(true)
     expect(nextChildPanelStateForTasks(closed, 'session-b', firstTasks).open).toBe(true)
-  })
-
-  it('项目展开状态默认跟随当前会话，并保留当前上下文中的手动折叠', () => {
-    const collapsed = { contextKey: 'session:session-a', ids: new Set<string>() }
-
-    expect([...resolveExpandedWorkspaceIds(null, 'session:session-a', 'workspace-a')]).toEqual(['workspace-a'])
-    expect([...resolveExpandedWorkspaceIds(collapsed, 'session:session-a', 'workspace-a')]).toEqual([])
-    expect([...resolveExpandedWorkspaceIds(collapsed, 'session:session-b', 'workspace-b')]).toEqual(['workspace-b'])
   })
 
   it('菜单只在打开时的会话和运行上下文仍有效且未锁定时展示', () => {

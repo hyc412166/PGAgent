@@ -25,7 +25,7 @@ PGAgent 是单机、单用户、本地优先的 Agent 工作台。前端采用 R
 
 ## 持久化任务计划与恢复
 
-`ConversationTurn` 负责一轮消息的可靠交付，`DurableTask` 则负责跨多轮、跨进程保存用户目标。主控对包含两个以上可核验步骤的工作调用 `todowrite` 后，后端会同步创建一条 `durable_tasks`、`plan_steps` 和 `plan_step_dependencies`；每一步使用跨更新保持不变的显式 ID，并保存状态、执行器类型（主 Agent、子 Agent 或后台 Job）、目标 Agent/Run、工作区模式、尝试次数、结果与证据。SQLite `BEGIN IMMEDIATE` 保护“检查依赖并认领”这一原子边界，保证并发执行器不会重复认领同一步。`Run.task_id/plan_step_id` 记录本次运行归属，`run_kind/resumed_from_run_id` 记录初次执行或恢复链路。兼容的 `TaskCreate/task_create/TaskUpdate/task_update/claim_task` 也使用这套表，不再在真实运行中维护第二份 `tasks.json`。任务面板通过 `/api/sessions/{id}/active-task` 显示依赖、执行器和进度，完整历史可由 `/api/sessions/{id}/tasks` 获取。
+`ConversationTurn` 负责一轮消息的可靠交付，`DurableTask` 则负责跨多轮、跨进程保存用户目标。主控对包含两个以上可核验步骤的工作调用 `todowrite` 后，后端会同步创建一条 `durable_tasks`、`plan_steps` 和 `plan_step_dependencies`；每一步使用跨更新保持不变的显式 ID，并保存状态、执行器类型（主 Agent、子 Agent 或后台 Job）、目标 Agent/Run、尝试次数、结果与证据。SQLite `BEGIN IMMEDIATE` 保护“检查依赖并认领”这一原子边界，保证并发执行器不会重复认领同一步。历史数据库中的旧工作区字段仅为迁移兼容保留，不再参与任务、工具或运行决策。`Run.task_id/plan_step_id` 记录本次运行归属，`run_kind/resumed_from_run_id` 记录初次执行或恢复链路。兼容的 `TaskCreate/task_create/TaskUpdate/task_update/claim_task` 也使用这套表，不再在真实运行中维护第二份 `tasks.json`。任务面板通过 `/api/sessions/{id}/active-task` 显示依赖、执行器和进度，完整历史可由 `/api/sessions/{id}/tasks` 获取。
 
 用户主动停止时，任务转为 `paused`；进程重启会把遗留的活动 Run 收口为 `stopped/interrupted_restart`，任务和当时的活动步骤转为 `needs_recovery`。用户随后输入“继续刚刚的工作”等明确续接语句时，新 Run 会绑定该会话最近的未完成任务，并收到后端生成的恢复包。恢复包是结构化事实来源：模型不得重做已完成步骤，对 `needs_recovery` 步骤必须先检查文件、测试或其他工作区事实，再决定标记完成还是补做。每次成功的 `todowrite` 都会重新落盘进度，所以恢复不依赖模型从整段聊天历史中猜测做到哪里。
 
@@ -102,7 +102,11 @@ SQLite `delegated_tasks` 保存父会话、父 Run、子 Run、任务图步骤�
 
 需要跨多次分配保留角色、提示词、历史结果和收件箱时，主控使用 `spawn_teammate` 创建 `collaboration_teams/teammate_workers` 中的持久化队友身份。持久化的是身份和协作上下文，不是永久占用线程的 LLM 进程；每次分配仍创建一个新的子 Run，但会注入该队友的未读消息和最近任务结果。`send_message/read_inbox/broadcast` 使用 SQLite `collaboration_messages`，子 Agent 可向 `lead` 回信；终态和消息通知写入 `collaboration_events`。状态可通过 `/api/sessions/{id}/teammates`、`collaboration-messages` 和 `collaboration-events` 查询。
 
-队友默认共享父工作区。`workspace_mode=worktree` 会为该队友创建独立 Git branch/worktree，子 Run 的沙箱根切换到该 worktree，避免多个写入型 Agent 同时修改同一目录。创建流程先短事务写入 `provisioning`，再在事务外执行 Git，成功后用第二个短事务转为 `idle`，所以大型仓库或 Git hook 不会长期占用 SQLite 写锁。主控通过需要审批的 `integrate_teammate` 显式提交并合并队友分支；队友仍在工作时拒绝合并，冲突或超时时执行 `merge --abort` 并返回明确错误。
+子 Agent 继承父运行的实际工作目录，不拥有独立的分支、worktree 或自动合并流程。
+
+项目和会话 checkout 分开保存：`Workspace.root_path` 是项目目录，`Session.cwd` 是会话运行目录，`Run.cwd` 记录每次运行实际目录。Git 信息由 `coding/git.py` 查询真实 checkout，普通分支、detached HEAD、非 Git 目录和读取错误分别返回，不用 `main` 代替未知状态。界面切换会话、窗口重新获得焦点或运行结束后刷新状态。
+
+Managed worktree 的 Git 操作按 [openai/codex c0d26949](https://github.com/openai/codex/tree/c0d26949be4144c751894ae96e28d3db2208b764/codex-rs/worktree) 的公开实现移植：从 HEAD、指定 revision 或仓库默认分支解析 commit，创建 detached checkout，保留项目子目录的相对 cwd；Git common directory 与 backlink 用于确认注册归属。会话 owner 存放在 worktree Git 元数据目录的 `codex-thread.json`。项目的 Git/worktree 面板支持创建、打开 owner 会话、在未绑定 checkout 新建会话及显式删除。删除保留会话历史，拒绝当前使用目录、活动运行、未提交/未跟踪/ignored 文件；删除会话不会强制移除 checkout。旧子 Agent worktree 的历史列和值保留，但不再参与工具、API 或运行决策。
 
 长时间下载、安装和构建使用持久化 `background_jobs`。`background_run` 只负责入队并立即返回 Job ID，命令由独立后台线程执行，状态、PID、超时、日志路径和终态结果写入 SQLite；需要交互的运行中命令可由 `write_stdin` 发送输入或关闭 stdin。传入 `plan_step_id` 时 Job 会原子认领并在终态结算对应 DAG 步骤。Agent 可在入队后继续处理不依赖该结果的 ready step。若准备结束时仍有活动 Job，完成验收把 Run 持久化为 `stopped/waiting_background` 并登记 `waiting_run_id`，不再让 LLM 循环调用“完成了吗”。后台线程只在终态写一次事件并通知协调器；协调器确认该 Run 的全部等待 Job 均终态后自动恢复模型，启动 watchdog 也会重放遗漏的通知。终态事件先作为未确认消息注入模型，只有包含处理结果的 Run outcome 成功提交时才在同一事务中写入 `observed_at/consumed_at`；provider 失败或进程退出会保留事件供下次至少一次重投。`check_background` 保留为人工查询兼容工具，不是自动续跑的必要条件。正常关闭时运行中的 Job 会终止并回到队列，下次启动自动恢复；异常退出后无法证明原进程终态的 Job 会明确标记失败，不会盲目重复安装命令。会话可通过 `/api/sessions/{id}/background-jobs` 读取持久状态。
 

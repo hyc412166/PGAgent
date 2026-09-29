@@ -17,7 +17,6 @@ const pausedTask: DurableTask = {
     title: 'Connect Playwright',
     status: 'needs_recovery',
     executor_kind: 'main',
-    workspace_mode: 'shared',
   }],
 }
 

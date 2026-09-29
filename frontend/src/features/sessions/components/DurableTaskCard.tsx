@@ -43,7 +43,7 @@ export function DurableTaskCard({
     <ol className={`durable-plan-track${compact ? ' is-compact' : ''}`}>
       {visibleSteps.map((step) => <li key={step.id} className={`step-${step.status}`}>
         <span className="plan-step-node">{step.status === 'completed' ? <Check size={11} /> : step.position}</span>
-        <div><strong>{step.title}</strong><span className="durable-step-meta">{step.executor_kind === 'subagent' ? '子 Agent' : step.executor_kind === 'background' ? '后台' : '主 Agent'}{step.depends_on?.length ? ` · 依赖 ${step.depends_on.join(', ')}` : ' · 可立即执行'}{step.workspace_mode === 'worktree' ? ' · 独立 worktree' : ''}</span>{step.next_action && step.status !== 'completed' ? <small>{step.next_action}</small> : null}</div>
+        <div><strong>{step.title}</strong><span className="durable-step-meta">{step.executor_kind === 'subagent' ? '子 Agent' : step.executor_kind === 'background' ? '后台' : '主 Agent'}{step.depends_on?.length ? ` · 依赖 ${step.depends_on.join(', ')}` : ' · 可立即执行'}</span>{step.next_action && step.status !== 'completed' ? <small>{step.next_action}</small> : null}</div>
       </li>)}
     </ol>
     {task.resume_summary ? <p className="durable-task-summary">{task.resume_summary}</p> : null}

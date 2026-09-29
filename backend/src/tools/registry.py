@@ -273,7 +273,6 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                             "thinking_level": {"type": "string", "enum": ["low", "medium", "high", "xhigh"]},
                             "id": {"type": "string"},
                             "depends_on": {"type": "array", "items": {"type": "string"}},
-                            "workspace_mode": {"type": "string", "enum": ["shared", "worktree"]},
                         },
                         "required": ["task", "agent_id"],
                     },
@@ -302,7 +301,6 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                             "depends_on": {"type": "array", "items": {"type": "string"}},
                             "executor_kind": {"type": "string", "enum": ["main", "subagent", "background"]},
                             "agent_id": {"type": "string"},
-                            "workspace_mode": {"type": "string", "enum": ["shared", "worktree"]},
                         },
                         "required": ["id", "content", "status"],
                     },
@@ -985,9 +983,6 @@ class ToolRegistry:
             "shutdown_request": (
                 lambda _sandbox, **kwargs: self._team_store.shutdown(**kwargs)
             ) if self._team_store is not None else advanced.shutdown_request,
-            "integrate_teammate": (
-                lambda _sandbox, **kwargs: self._team_store.integrate(**kwargs)
-            ) if self._team_store is not None else advanced.integrate_teammate,
             "plan_approval": advanced.plan_approval,
             "idle": advanced.idle_tool,
             "claim_task": (

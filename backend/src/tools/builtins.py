@@ -1959,12 +1959,6 @@ def _normalize_todos(value: Any) -> list[dict[str, Any]]:
         if assigned_agent_id:
             # 变量说明：item 的索引项 表示该语句创建或更新的目标数据。
             item["agent_id"] = assigned_agent_id
-        # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
-        workspace_mode = str(raw.get("workspace_mode") or "shared").strip().lower()
-        if workspace_mode not in {"shared", "worktree"}:
-            raise ValueError(f"第 {index} 项 todo 的 workspace_mode 无效")
-        # 变量说明：item 的索引项 表示该语句创建或更新的目标数据。
-        item["workspace_mode"] = workspace_mode
         normalized.append(item)
     # 变量说明：known_ids 表示known 对象标识集合。
     known_ids = {item["id"] for item in normalized}
@@ -2047,7 +2041,6 @@ def normalize_delegate_specs(
     depends_on: object = None,
     model_id: object = "",
     thinking_level: object = "",
-    workspace_mode: object = "shared",
     display_name: object = "",
 ) -> tuple[list[dict[str, Any]], str | None, str | None]:
     """Normalize one task or a dependency-aware batch."""
@@ -2087,10 +2080,6 @@ def normalize_delegate_specs(
                 dependencies = []
             if not isinstance(dependencies, (list, tuple)):
                 return [], "invalid_task_dependencies", "tasks 中的 depends_on 必须是数组"
-            # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
-            workspace_mode = str(item.get("workspace_mode") or "shared").strip().lower()
-            if workspace_mode not in {"shared", "worktree"}:
-                return [], "invalid_workspace_mode", "workspace_mode 必须是 shared 或 worktree"
             selected_model = str(item.get("model_id") or "").strip()
             selected_thinking = str(item.get("thinking_level") or "").strip().lower()
             if len(selected_model) > 255:
@@ -2106,7 +2095,6 @@ def normalize_delegate_specs(
                 "depends_on": list(dict.fromkeys(
                     str(value).strip() for value in dependencies if str(value).strip()
                 )),
-                "workspace_mode": workspace_mode,
             }
             if selected_model:
                 normalized_item["model_id"] = selected_model
@@ -2130,9 +2118,6 @@ def normalize_delegate_specs(
         external_id = str(step_id or "").strip()
         selected_model = str(model_id or "").strip()
         selected_thinking = str(thinking_level or "").strip().lower()
-        selected_workspace = str(workspace_mode or "shared").strip().lower()
-        if selected_workspace not in {"shared", "worktree"}:
-            return [], "invalid_workspace_mode", "workspace_mode 必须是 shared 或 worktree"
         if len(selected_model) > 255:
             return [], "invalid_delegate_model", "model_id 不能超过 255 个字符"
         if selected_thinking and selected_thinking not in {"low", "medium", "high", "xhigh"}:
@@ -2145,7 +2130,6 @@ def normalize_delegate_specs(
             "task": request,
             "agent_id": target,
             "depends_on": [str(value).strip() for value in dependencies if str(value).strip()],
-                "workspace_mode": selected_workspace,
         }
         if selected_model:
             normalized_item["model_id"] = selected_model
@@ -2211,7 +2195,6 @@ def delegate_task(
     depends_on: object = None,
     model_id: str = "",
     thinking_level: str = "",
-    workspace_mode: str = "shared",
     delegate: Callable[..., ToolResult | Awaitable[ToolResult]] | None = None,
 ) -> ToolResult:
     """Synchronous compatibility path for a real, injected task delegate.
@@ -2224,7 +2207,7 @@ def delegate_task(
 
     # 变量说明：requests 表示当前流程使用的 requests 集合；error_code 表示当前步骤使用的 error_code 值；error 表示当前捕获或准备上报的错误。
     specs, error_code, error = normalize_delegate_specs(
-        task, agent_id, tasks, step_id, depends_on, model_id, thinking_level, workspace_mode, display_name
+        task, agent_id, tasks, step_id, depends_on, model_id, thinking_level, display_name
     )
     if error_code and error:
         return _invalid_delegate_result(error_code, error)
@@ -2416,7 +2399,6 @@ async def delegate_task_async(
     depends_on: object = None,
     model_id: str = "",
     thinking_level: str = "",
-    workspace_mode: str = "shared",
     delegate: Callable[..., ToolResult | Awaitable[ToolResult]] | None = None,
     call_id: str | None = None,
 ) -> ToolResult:
@@ -2429,7 +2411,7 @@ async def delegate_task_async(
 
     # 变量说明：specs 表示当前流程使用的 specs 集合；error_code 表示当前步骤使用的 error_code 值；error 表示当前捕获或准备上报的错误。
     specs, error_code, error = normalize_delegate_specs(
-        task, agent_id, tasks, step_id, depends_on, model_id, thinking_level, workspace_mode, display_name
+        task, agent_id, tasks, step_id, depends_on, model_id, thinking_level, display_name
     )
     if error_code and error:
         return _invalid_delegate_result(error_code, error)

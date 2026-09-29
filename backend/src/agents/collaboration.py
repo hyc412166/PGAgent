@@ -1,19 +1,16 @@
-"""Durable teammate identities, mailboxes, and optional Git worktrees."""
+"""Durable teammate identities and mailboxes."""
 # 文件职责：负责子代理协作与委派中的 collaboration 子模块。
 # 逻辑关系：上层通过 agents/collaboration.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 
 from __future__ import annotations
 
 import json
-import subprocess
 import threading
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select, text
 
 from src.persistence import database as database_module
-from src.config import settings
 from src.persistence.database import (
     Agent,
     CollaborationEvent,
@@ -43,9 +40,6 @@ def _worker_payload(worker: TeammateWorker) -> dict[str, Any]:
         "status": worker.status,
         "current_plan_step_id": worker.current_plan_step_id,
         "last_run_id": worker.last_run_id,
-        "workspace_mode": worker.workspace_mode,
-        "worktree_path": worker.worktree_path,
-        "branch_name": worker.branch_name,
         "created_at": worker.created_at.isoformat() if worker.created_at else None,
         "updated_at": worker.updated_at.isoformat() if worker.updated_at else None,
     }
@@ -68,149 +62,12 @@ def _message_payload(message: CollaborationMessage) -> dict[str, Any]:
     }
 
 
-# 函数职责：创建 worktree 对应的数据或流程。
-# 参数关系：workspace_root 表示当前步骤使用的 workspace_root 值；worker_id 表示worker 对象的唯一标识；worktree_root 表示当前步骤使用的 worktree_root 值。
-# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def _create_worktree(
-    workspace_root: str,
-    worker_id: str,
-    worktree_root: Path | None = None,
-) -> tuple[str, str]:
-    # 变量说明：root 表示处理范围的根目录。
-    root = Path(workspace_root).resolve()
-    # 变量说明：repository 表示当前步骤使用的 repository 值。
-    repository = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15,
-        check=False,
-    )
-    if repository.returncode != 0:
-        raise ValueError("workspace_mode=worktree requires a Git repository")
-    # 变量说明：repository_root 表示当前步骤使用的 repository_root 值。
-    repository_root = Path(repository.stdout.strip()).resolve()
-    # 变量说明：target 表示当前步骤使用的 target 值。
-    target = ((worktree_root or settings.data_dir / "worktrees") / worker_id).resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # 变量说明：branch 表示当前步骤使用的 branch 值。
-    branch = f"pgagent/{worker_id[:12]}"
-    # 变量说明：created 表示当前步骤使用的 created 值。
-    created = subprocess.run(
-        ["git", "-C", str(repository_root), "worktree", "add", "-b", branch, str(target), "HEAD"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=60,
-        check=False,
-    )
-    if created.returncode != 0:
-        raise RuntimeError(created.stderr.strip() or "git worktree add failed")
-    return str(target), branch
-
-
-# 函数职责：完成 cleanup_session_worktrees 对应的业务处理。
-# 参数关系：db 表示当前数据库会话；session_id 表示所属会话标识；workspace_root 表示当前步骤使用的 workspace_root 值。
-# 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def cleanup_session_worktrees(db: Any, session_id: str, workspace_root: str) -> None:
-    """Remove Git worktrees and temporary branches owned by one session."""
-
-    # 变量说明：team_ids 表示team 对象标识集合。
-    team_ids = select(CollaborationTeam.id).where(CollaborationTeam.session_id == session_id)
-    # 变量说明：workers 表示当前流程使用的 workers 集合。
-    workers = list(db.scalars(select(TeammateWorker).where(
-        TeammateWorker.team_id.in_(team_ids),
-        TeammateWorker.workspace_mode == "worktree",
-        TeammateWorker.worktree_path.is_not(None),
-        TeammateWorker.branch_name.is_not(None),
-    )))
-    if not workers:
-        return
-    # 变量说明：repository 表示当前步骤使用的 repository 值。
-    repository = subprocess.run(
-        ["git", "-C", workspace_root, "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15,
-        check=False,
-    )
-    if repository.returncode != 0:
-        raise RuntimeError(repository.stderr.strip() or "session workspace is no longer a Git repository")
-    # 变量说明：repository_root 表示当前步骤使用的 repository_root 值。
-    repository_root = repository.stdout.strip()
-    # 变量说明：listed 表示当前步骤使用的 listed 值。
-    listed = subprocess.run(
-        ["git", "-C", repository_root, "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15,
-        check=False,
-    )
-    if listed.returncode != 0:
-        raise RuntimeError(listed.stderr.strip() or "git worktree list failed")
-    # 变量说明：registered 表示当前步骤使用的 registered 值。
-    registered = {
-        str(Path(line.removeprefix("worktree ")).resolve()).casefold()
-        for line in listed.stdout.splitlines()
-        if line.startswith("worktree ")
-    }
-    for worker in workers:
-        # 变量说明：worktree_path 表示worktree_path 对应的文件系统位置。
-        worktree_path = str(Path(str(worker.worktree_path)).resolve())
-        # 变量说明：branch_name 表示当前步骤使用的 branch_name 值。
-        branch_name = str(worker.branch_name or "")
-        if not branch_name.startswith("pgagent/"):
-            raise RuntimeError(f"refusing to delete non-PGAgent branch {branch_name}")
-        if worktree_path.casefold() in registered:
-            # 变量说明：removed 表示当前步骤使用的 removed 值。
-            removed = subprocess.run(
-                ["git", "-C", repository_root, "worktree", "remove", "--force", worktree_path],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=60,
-                check=False,
-            )
-            if removed.returncode != 0:
-                raise RuntimeError(removed.stderr.strip() or f"failed to remove worktree {worktree_path}")
-        # 变量说明：branch_exists 表示当前流程使用的 branch_exists 集合。
-        branch_exists = subprocess.run(
-            ["git", "-C", repository_root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
-            capture_output=True,
-            timeout=15,
-            check=False,
-        )
-        if branch_exists.returncode == 0:
-            # 变量说明：deleted 表示当前步骤使用的 deleted 值。
-            deleted = subprocess.run(
-                ["git", "-C", repository_root, "branch", "-D", "--", branch_name],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-                check=False,
-            )
-            if deleted.returncode != 0:
-                raise RuntimeError(deleted.stderr.strip() or f"failed to delete branch {branch_name}")
-        elif branch_exists.returncode != 1:
-            raise RuntimeError(f"failed to inspect branch {branch_name}")
-
-
 # 类职责：封装 TeamToolStore 的持久化访问。
 class TeamToolStore:
     """Run-scoped provider facade over one durable collaboration team."""
 
     # 函数职责：初始化实例依赖与初始状态。
-    # 参数关系：run_id 表示当前运行标识；session_id 表示所属会话标识；workspace_root 表示当前步骤使用的 workspace_root 值；worktree_root 表示当前步骤使用的 worktree_root 值；actor_worker_id 表示actor_worker 对象的唯一标识。
+    # 参数关系：run_id 表示当前运行标识；session_id 表示所属会话标识；workspace_root 表示当前步骤使用的 workspace_root 值；actor_worker_id 表示actor_worker 对象的唯一标识。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def __init__(
         self,
@@ -218,7 +75,6 @@ class TeamToolStore:
         run_id: str,
         session_id: str | None,
         workspace_root: str,
-        worktree_root: Path | None = None,
         actor_worker_id: str | None = None,
     ) -> None:
         # 变量说明：run_id 表示当前运行标识。
@@ -227,8 +83,6 @@ class TeamToolStore:
         self.session_id = session_id
         # 变量说明：workspace_root 表示当前步骤使用的 workspace_root 值。
         self.workspace_root = workspace_root
-        # 变量说明：worktree_root 表示当前步骤使用的 worktree_root 值。
-        self.worktree_root = worktree_root
         # 变量说明：actor_worker_id 表示actor_worker 对象的唯一标识。
         self.actor_worker_id = actor_worker_id
 
@@ -292,7 +146,7 @@ class TeamToolStore:
         ))
 
     # 函数职责：完成 spawn 对应的业务处理。
-    # 参数关系：name 表示当前对象名称；role 表示当前步骤使用的 role 值；prompt 表示当前步骤使用的 prompt 值；agent_id 表示智能体标识；workspace_mode 表示当前步骤使用的 workspace_mode 值。
+    # 参数关系：name 表示当前对象名称；role 表示当前步骤使用的 role 值；prompt 表示当前步骤使用的 prompt 值；agent_id 表示智能体标识。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
     def spawn(
         self,
@@ -301,16 +155,11 @@ class TeamToolStore:
         role: str,
         prompt: str,
         agent_id: str = "",
-        workspace_mode: str = "shared",
     ) -> ToolResult:
         if self.actor_worker_id:
             return ToolResult(
                 "spawn_teammate", False, "only the lead Agent can spawn teammates", error_code="lead_only"
             )
-        # 变量说明：normalized_mode 表示当前步骤使用的 normalized_mode 值。
-        normalized_mode = str(workspace_mode or "shared").strip().lower()
-        if normalized_mode not in {"shared", "worktree"}:
-            return ToolResult("spawn_teammate", False, "workspace_mode must be shared or worktree", error_code="invalid_workspace_mode")
         with _TEAM_PROVISION_LOCK:
             with database_module.SessionLocal() as db:
                 if db.get_bind().dialect.name == "sqlite":
@@ -338,7 +187,7 @@ class TeamToolStore:
                     TeammateWorker.team_id == team.id,
                     func.lower(TeammateWorker.name) == str(name or "").strip().casefold(),
                 ))
-                if existing is not None and existing.status != "provisioning":
+                if existing is not None:
                     # 变量说明：payload 表示跨层传递的数据载荷。
                     payload = _worker_payload(existing)
                     db.commit()
@@ -355,73 +204,15 @@ class TeamToolStore:
                     name=str(name or child.name).strip()[:120],
                     role=str(role or "teammate").strip()[:160],
                     prompt=str(prompt or "").strip()[:20_000],
-                    status="provisioning" if normalized_mode == "worktree" else "idle",
-                    workspace_mode=normalized_mode,
+                    status="idle",
                 )
                 if existing is None:
                     db.add(worker)
                     db.flush()
-                # 变量说明：worker_id 表示worker 对象的唯一标识。
-                worker_id = worker.id
-                # 变量说明：task_id 表示任务标识。
-                task_id = team.task_id
-                if normalized_mode == "shared":
-                    # 变量说明：payload 表示跨层传递的数据载荷。
-                    payload = _worker_payload(worker)
-                    db.add(CollaborationEvent(
-                        task_id=task_id,
-                        run_id=self.run_id,
-                        source_kind="teammate",
-                        source_id=worker.id,
-                        event_type="teammate_spawned",
-                        payload=payload,
-                    ))
-                    db.commit()
-                    return ToolResult(
-                        "spawn_teammate",
-                        True,
-                        json.dumps(payload, ensure_ascii=False),
-                        changed=True,
-                        metadata={"teammate_id": worker.id},
-                    )
-                db.commit()
-
-            try:
-                # 变量说明：worktree_path 表示worktree_path 对应的文件系统位置；branch_name 表示当前步骤使用的 branch_name 值。
-                worktree_path, branch_name = _create_worktree(
-                    self.workspace_root, worker_id, self.worktree_root
-                )
-            except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
-                with database_module.SessionLocal() as db:
-                    # 变量说明：worker 表示当前步骤使用的 worker 值。
-                    worker = db.get(TeammateWorker, worker_id)
-                    if worker is not None and worker.status == "provisioning":
-                        db.delete(worker)
-                    db.commit()
-                return ToolResult(
-                    "spawn_teammate", False, str(exc), error_code="worktree_create_failed"
-                )
-
-            with database_module.SessionLocal() as db:
-                if db.get_bind().dialect.name == "sqlite":
-                    db.execute(text("BEGIN IMMEDIATE"))
-                # 变量说明：worker 表示当前步骤使用的 worker 值。
-                worker = db.get(TeammateWorker, worker_id)
-                if worker is None:
-                    db.rollback()
-                    return ToolResult(
-                        "spawn_teammate", False, "teammate provisioning record disappeared", error_code="teammate_not_found"
-                    )
-                # 变量说明：worktree_path 表示worktree_path 对应的文件系统位置。
-                worker.worktree_path = worktree_path
-                # 变量说明：branch_name 表示当前步骤使用的 branch_name 值。
-                worker.branch_name = branch_name
-                # 变量说明：status 表示当前对象或运行的状态。
-                worker.status = "idle"
-                # 变量说明：payload 表示跨层传递的数据载荷。
+                # 子代理身份只管理协作状态；实际目录由父运行绑定继承。
                 payload = _worker_payload(worker)
                 db.add(CollaborationEvent(
-                    task_id=task_id,
+                    task_id=team.task_id,
                     run_id=self.run_id,
                     source_kind="teammate",
                     source_id=worker.id,
@@ -616,271 +407,6 @@ class TeamToolStore:
             return ToolResult(
                 "shutdown_request", True, json.dumps(_worker_payload(worker), ensure_ascii=False), changed=True
             )
-
-    # 函数职责：完成 integrate 对应的业务处理。
-    # 参数关系：teammate 表示当前步骤使用的 teammate 值；commit_message 表示当前步骤使用的 commit_message 值；paths 表示当前流程使用的 paths 集合。
-    # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-    def integrate(
-        self,
-        *,
-        teammate: str,
-        commit_message: str = "",
-        paths: list[str] | None = None,
-    ) -> ToolResult:
-        """Commit one idle worktree and merge its branch into the parent repository."""
-
-        if self.actor_worker_id:
-            return ToolResult(
-                "integrate_teammate", False, "only the lead Agent can integrate worktrees", error_code="lead_only"
-            )
-        with database_module.SessionLocal() as db:
-            # 变量说明：team 表示当前步骤使用的 team 值。
-            team = self._team(db)
-            # 变量说明：worker 表示当前步骤使用的 worker 值。
-            worker = self._resolve_worker(db, team.id, teammate)
-            if worker is None:
-                return ToolResult(
-                    "integrate_teammate", False, "teammate does not exist", error_code="teammate_not_found"
-                )
-            if worker.workspace_mode != "worktree" or not worker.worktree_path or not worker.branch_name:
-                return ToolResult(
-                    "integrate_teammate",
-                    False,
-                    "teammate does not own an isolated worktree",
-                    error_code="teammate_has_no_worktree",
-                )
-            if worker.status in {"working", "stopping"}:
-                return ToolResult(
-                    "integrate_teammate",
-                    False,
-                    "teammate is still writing to the worktree",
-                    error_code="teammate_busy",
-                )
-            # 变量说明：worker_id 表示worker 对象的唯一标识。
-            worker_id = worker.id
-            # 变量说明：worktree_path 表示worktree_path 对应的文件系统位置。
-            worktree_path = worker.worktree_path
-            # 变量说明：branch_name 表示当前步骤使用的 branch_name 值。
-            branch_name = worker.branch_name
-            # 变量说明：task_id 表示任务标识。
-            task_id = team.task_id
-
-        # 变量说明：repository 表示当前步骤使用的 repository 值。
-        repository = subprocess.run(
-            ["git", "-C", self.workspace_root, "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
-        if repository.returncode != 0:
-            return ToolResult(
-                "integrate_teammate", False, "parent workspace is not a Git repository", error_code="git_repository_missing"
-            )
-        # 变量说明：repository_root 表示当前步骤使用的 repository_root 值。
-        repository_root = repository.stdout.strip()
-        # 变量说明：selected_paths 表示当前流程使用的 selected_paths 集合。
-        selected_paths: list[str] = []
-        for raw_path in paths or []:
-            # 变量说明：normalized 表示当前步骤使用的 normalized 值。
-            normalized = str(raw_path or "").strip().replace("\\", "/")
-            # 变量说明：candidate 表示当前步骤使用的 candidate 值。
-            candidate = Path(normalized)
-            if (
-                not normalized
-                or normalized in {".", "./"}
-                or candidate.is_absolute()
-                or ".." in candidate.parts
-            ):
-                return ToolResult(
-                    "integrate_teammate",
-                    False,
-                    f"invalid integration path: {raw_path}",
-                    error_code="integration_path_invalid",
-                )
-            if normalized not in selected_paths:
-                selected_paths.append(normalized)
-        # 变量说明：worktree_status 表示当前流程使用的 worktree_status 集合。
-        worktree_status = subprocess.run(
-            ["git", "-C", worktree_path, "status", "--porcelain", "--untracked-files=all"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
-        if worktree_status.returncode != 0:
-            return ToolResult(
-                "integrate_teammate", False, worktree_status.stderr.strip(), error_code="worktree_status_failed"
-            )
-        if worktree_status.stdout.strip():
-            if not selected_paths:
-                # 变量说明：changed_paths 表示当前流程使用的 changed_paths 集合。
-                changed_paths = [
-                    line[3:] for line in worktree_status.stdout.splitlines() if len(line) > 3
-                ]
-                return ToolResult(
-                    "integrate_teammate",
-                    False,
-                    "worktree has uncommitted changes; pass explicit paths to integrate: "
-                    + ", ".join(changed_paths[:50]),
-                    error_code="integration_paths_required",
-                )
-            # 变量说明：unstaged 表示当前步骤使用的 unstaged 值。
-            unstaged = subprocess.run(
-                ["git", "-C", worktree_path, "reset", "--quiet", "HEAD", "--", "."],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-                check=False,
-            )
-            if unstaged.returncode != 0:
-                return ToolResult(
-                    "integrate_teammate",
-                    False,
-                    unstaged.stderr.strip(),
-                    error_code="worktree_index_reset_failed",
-                )
-            # 变量说明：added 表示当前步骤使用的 added 值。
-            added = subprocess.run(
-                ["git", "-C", worktree_path, "add", "--", *selected_paths],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-                check=False,
-            )
-            if added.returncode != 0:
-                return ToolResult(
-                    "integrate_teammate", False, added.stderr.strip(), error_code="worktree_stage_failed"
-                )
-            # 变量说明：staged 表示当前步骤使用的 staged 值。
-            staged = subprocess.run(
-                ["git", "-C", worktree_path, "diff", "--cached", "--quiet"],
-                capture_output=True,
-                timeout=15,
-                check=False,
-            )
-            if staged.returncode not in {0, 1}:
-                return ToolResult(
-                    "integrate_teammate", False, "failed to inspect staged worktree changes", error_code="worktree_stage_failed"
-                )
-            if staged.returncode == 1:
-                # 变量说明：committed 表示当前步骤使用的 committed 值。
-                committed = subprocess.run(
-                    [
-                        "git", "-C", worktree_path,
-                        "-c", "user.name=PGAgent",
-                        "-c", "user.email=pgagent@local",
-                        "commit", "-m", str(commit_message or f"PGAgent teammate {worker_id[:12]}")[:200],
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=60,
-                    check=False,
-                )
-                if committed.returncode != 0:
-                    return ToolResult(
-                        "integrate_teammate", False, committed.stderr.strip(), error_code="worktree_commit_failed"
-                    )
-
-        # 变量说明：pending_commits 表示当前流程使用的 pending_commits 集合。
-        pending_commits = subprocess.run(
-            ["git", "-C", repository_root, "rev-list", "--count", f"HEAD..{branch_name}"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
-        if pending_commits.returncode != 0:
-            return ToolResult(
-                "integrate_teammate", False, pending_commits.stderr.strip(), error_code="worktree_compare_failed"
-            )
-        if int(pending_commits.stdout.strip() or "0") == 0:
-            return ToolResult(
-                "integrate_teammate",
-                True,
-                json.dumps({"teammate_id": worker_id, "branch": branch_name, "status": "already_integrated"}),
-            )
-
-        try:
-            # 变量说明：merged 表示当前步骤使用的 merged 值。
-            merged = subprocess.run(
-                ["git", "-C", repository_root, "merge", "--no-ff", "--no-edit", branch_name],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            subprocess.run(
-                ["git", "-C", repository_root, "merge", "--abort"],
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-            return ToolResult(
-                "integrate_teammate",
-                False,
-                "git merge timed out and was aborted",
-                error_code="worktree_merge_timeout",
-            )
-        if merged.returncode != 0:
-            subprocess.run(
-                ["git", "-C", repository_root, "merge", "--abort"],
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-            return ToolResult(
-                "integrate_teammate",
-                False,
-                merged.stderr.strip() or merged.stdout.strip(),
-                error_code="worktree_merge_conflict",
-            )
-        # 变量说明：head 表示当前步骤使用的 head 值。
-        head = subprocess.run(
-            ["git", "-C", repository_root, "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        ).stdout.strip()
-        # 变量说明：payload 表示跨层传递的数据载荷。
-        payload = {
-            "teammate_id": worker_id,
-            "branch": branch_name,
-            "status": "integrated",
-            "merge_commit": head,
-        }
-        with database_module.SessionLocal() as db:
-            db.add(CollaborationEvent(
-                task_id=task_id,
-                run_id=self.run_id,
-                source_kind="teammate",
-                source_id=worker_id,
-                event_type="teammate_worktree_integrated",
-                payload=payload,
-            ))
-            db.commit()
-        return ToolResult(
-            "integrate_teammate", True, json.dumps(payload, ensure_ascii=False), changed=True
-        )
-
 
 # 函数职责：完成 teammate_context 对应的业务处理。
 # 参数关系：db 表示当前数据库会话；worker 表示当前步骤使用的 worker 值。

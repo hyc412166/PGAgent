@@ -185,7 +185,7 @@ def _delegate_catalog_prompt(db: Any, run: Run) -> str:
             for worker in workers:
                 lines.append(
                     f"- teammate={worker.id} | {worker.name} | role={worker.role} | "
-                    f"status={worker.status} | workspace={worker.workspace_mode}"
+                    f"status={worker.status}"
                 )
     return "\n".join(lines)
 

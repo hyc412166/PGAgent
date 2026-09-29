@@ -50,7 +50,7 @@ export function PersistentTaskSource({
   const sourceIcon = (kind: PersistentSourceItem['kind']) => kind === 'image' ? <Image size={13} /> : kind === 'document' ? <FileText size={13} /> : <Globe2 size={13} />
   return <section className="persistent-task-source" aria-label="分支与来源及持久任务">
     <header className="persistent-source-header">
-      <div className="persistent-source-project"><strong>{workspaceName}</strong><span className="persistent-source-branch-row"><GitBranch size={13} /><span>{branchName || 'main'}</span>{added !== undefined && <b className="change-added">+{added}</b>}{removed !== undefined && <b className="change-removed">-{removed}</b>}</span></div>
+      <div className="persistent-source-project"><strong>{workspaceName}</strong>{branchName ? <span className="persistent-source-branch-row"><GitBranch size={13} /><span>{branchName}</span>{added !== undefined && <b className="change-added">+{added}</b>}{removed !== undefined && <b className="change-removed">-{removed}</b>}</span> : null}</div>
       {onClose && <button type="button" className="icon-button" onClick={onClose} aria-label="关闭会话上下文"><X size={14} /></button>}
     </header>
     {!!sources.length && <section className="persistent-source-list" aria-label="来源">

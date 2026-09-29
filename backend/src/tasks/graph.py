@@ -262,8 +262,6 @@ def upsert_delegated_graph(
             step.executor_kind = "subagent"
             # 变量说明：assigned_agent_id 表示assigned_agent 对象的唯一标识。
             step.assigned_agent_id = str(spec.get("agent_id") or "") or None
-            # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
-            step.workspace_mode = str(spec.get("workspace_mode") or "shared")
             # 变量说明：remaining_work 表示当前步骤使用的 remaining_work 值。
             step.remaining_work = [] if step.status == "completed" else [step.title]
             selected[local_external_id] = step

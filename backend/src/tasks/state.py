@@ -241,10 +241,6 @@ def _normalize_todos(todos: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]
         assigned_agent_id = str(raw.get("agent_id") or raw.get("assigned_agent_id") or "").strip()
         if executor_kind == "subagent" and not assigned_agent_id:
             raise ValueError(f"todo {external_id} requires agent_id for subagent execution")
-        # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
-        workspace_mode = str(raw.get("workspace_mode") or "shared").strip().lower()
-        if workspace_mode not in {"shared", "worktree"}:
-            raise ValueError(f"todo {external_id} has invalid workspace_mode")
         normalized.append({
             "id": external_id,
             "content": content,
@@ -253,7 +249,6 @@ def _normalize_todos(todos: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]
             "depends_on": dependencies,
             "executor_kind": executor_kind,
             "agent_id": assigned_agent_id,
-            "workspace_mode": workspace_mode,
         })
     validate_dependency_graph(normalized)
     return normalized
@@ -353,8 +348,6 @@ def sync_todos_for_run(
             step.executor_kind = item["executor_kind"]
             # 变量说明：assigned_agent_id 表示assigned_agent 对象的唯一标识。
             step.assigned_agent_id = item["agent_id"] or None
-            # 变量说明：workspace_mode 表示当前步骤使用的 workspace_mode 值。
-            step.workspace_mode = item["workspace_mode"]
             # 变量说明：last_run_id 表示last_run 对象的唯一标识。
             step.last_run_id = run.id
             if step.status == "in_progress":
@@ -470,7 +463,6 @@ def todo_state_for_run(db: Any, run: Run) -> list[dict[str, Any]]:
             **({"depends_on": dependencies.get(step.external_id, [])} if dependencies.get(step.external_id) else {}),
             **({"executor_kind": step.executor_kind} if step.executor_kind != "main" else {}),
             **({"agent_id": step.assigned_agent_id} if step.assigned_agent_id else {}),
-            **({"workspace_mode": step.workspace_mode} if step.workspace_mode != "shared" else {}),
         }
         for step in steps_for_task(db, run.task_id)
         if step.status in {"pending", "in_progress", "completed", "cancelled", "needs_recovery", "failed"}
@@ -531,7 +523,6 @@ def recovery_prompt(db: Any, run: Run) -> str:
                 "assigned_agent_id": step.assigned_agent_id,
                 "assigned_run_id": step.assigned_run_id,
                 "claim_owner": step.claim_owner,
-                "workspace_mode": step.workspace_mode,
                 "attempt": step.attempt,
                 "error": step.error,
             }
@@ -651,8 +642,6 @@ def task_payload(db: Any, task: DurableTask) -> dict[str, Any]:
                 "assigned_agent_id": step.assigned_agent_id,
                 "assigned_run_id": step.assigned_run_id,
                 "claim_owner": step.claim_owner,
-                "workspace_mode": step.workspace_mode,
-                "worktree_path": step.worktree_path,
                 "attempt": step.attempt,
                 "error": step.error,
                 "last_run_id": step.last_run_id,
