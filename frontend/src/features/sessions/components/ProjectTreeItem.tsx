@@ -1,8 +1,7 @@
 // 本文件实现 ProjectTreeItem 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
-import { ChevronRight, Folder, GitBranch, LoaderCircle, MessageSquarePlus, Trash2 } from 'lucide-react'
+import { Folder, GitBranch, LoaderCircle, MessageSquarePlus, Trash2 } from 'lucide-react'
 import type { FocusEvent, MouseEvent, ReactNode } from 'react'
 import type { Workspace } from '../../../types'
-import { gitStatusLabel } from '../gitStatus'
 
 // ProjectTreeItemProps 包含项目节点、其会话子项以及悬浮/项目操作回调。
 type ProjectTreeItemProps = {
@@ -49,12 +48,11 @@ export function ProjectTreeItem({
         onBlur={onHideHoverCard}
         onClick={onToggle}
       >
-        <ChevronRight className="project-chevron" size={13} />
-        <Folder size={15} />
-        <span className="project-name-and-branch"><span>{workspace.name}</span><small title={workspace.git_error || undefined}>{gitStatusLabel(workspace.git_info, workspace.git_error)}</small></span>
+        <Folder className="project-folder" size={15} />
+        <span className="project-name">{workspace.name}</span>
       </button>
       <button type="button" className="project-git" aria-label={`管理项目 ${workspace.name} 的 Git 与 worktree`} title="Git / worktree" onClick={onManageGit}>
-        <GitBranch size={13} />
+        <GitBranch size={12} />
       </button>
       <button
         type="button"
@@ -64,7 +62,7 @@ export function ProjectTreeItem({
         disabled={newConversationDisabled}
         onClick={onNewConversation}
       >
-        <MessageSquarePlus size={13} />
+        <MessageSquarePlus size={12} />
       </button>
       <button
         type="button"
@@ -74,7 +72,7 @@ export function ProjectTreeItem({
         disabled={deleteDisabled}
         onClick={onDelete}
       >
-        {deleting ? <LoaderCircle className="spin" size={13} /> : <Trash2 size={13} />}
+        {deleting ? <LoaderCircle className="spin" size={12} /> : <Trash2 size={12} />}
       </button>
     </div>
     {expanded ? children : null}

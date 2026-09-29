@@ -40,17 +40,14 @@ describe('project deletion', () => {
 })
 
 
-describe('项目 Git 状态', () => {
+describe('项目标题', () => {
   const actions = { onToggle() {}, onNewConversation() {}, onDelete() {}, onManageGit() {}, onShowHoverCard() {}, onHideHoverCard() {} }
-  it.each([
-    [{ branch: 'master', commit_hash: 'abcdef012345' }, null, 'master'],
-    [{ branch: null, commit_hash: 'abcdef012345' }, null, 'detached HEAD · abcdef01'],
-    [null, null, '非 Git 项目'],
-    [{ branch: 'master' }, 'git timed out', 'Git 读取失败'],
-  ])('显示真实分支、detached、普通目录和读取失败', (git_info, git_error, expected) => {
-    const html = renderToStaticMarkup(<ProjectTreeItem workspace={{ id: 'w', name: 'Alpha', git_info, git_error }} expanded={false} deleting={false} deleteDisabled={false} newConversationDisabled={false} hoverCardVisible={false} {...actions}>{null}</ProjectTreeItem>)
-    expect(html).toContain(expected)
-    expect(html).not.toContain('>main<')
+  it('只显示项目名，不在历史会话栏重复展示 Git 状态和展开箭头', () => {
+    const html = renderToStaticMarkup(<ProjectTreeItem workspace={{ id: 'w', name: 'Alpha', git_info: { branch: 'master' } }} expanded={false} deleting={false} deleteDisabled={false} newConversationDisabled={false} hoverCardVisible={false} {...actions}>{null}</ProjectTreeItem>)
+    expect(html).toContain('<span class="project-name">Alpha</span>')
+    expect(html).toContain('aria-expanded="false"')
+    expect(html).not.toContain('master')
+    expect(html).not.toContain('project-chevron')
     expect(html).toContain('管理项目 Alpha 的 Git 与 worktree')
   })
 })
