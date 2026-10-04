@@ -17,7 +17,7 @@ export interface ThoughtToolItem {
  */
 // ActivityKind/Icon 分别表达活动语义和对应的视觉图标类别。
 export type ThoughtActivityKind = 'thought' | 'tool' | 'file-change' | 'context' | 'approval' | 'task' | 'event' | 'assistant'
-export type ThoughtActivityIcon = 'think' | 'read' | 'write' | 'edit' | 'search' | 'shell' | 'task' | 'approval' | 'context' | 'generic'
+export type ThoughtActivityIcon = 'think' | 'read' | 'image' | 'write' | 'edit' | 'search' | 'shell' | 'task' | 'approval' | 'context' | 'generic'
 
 // ThoughtActivityItem 是用户可见的单条推理活动摘要。
 export interface ThoughtActivityItem {
@@ -47,6 +47,8 @@ export interface ThoughtTimelineState {
   // 当前模型轮次单独计时，只驱动等待提示；整次执行耗时仍由 startedAt/elapsedMs 维护。
   activeStepStartedAt?: number | null
   activeStepHasVisibleContent?: boolean
+  // 文字已停止增量输出时，完成事件可能还未到达；用实际文字更新时间识别这段等待。
+  lastVisibleOutputAt?: number
   conclusion?: string
 }
 
@@ -115,6 +117,7 @@ const toolStartTypes = new Set(['tool_started', 'tool_call'])
 const toolFinishTypes = new Set(['tool_finished', 'tool_result'])
 const fileMutationTools = new Set(['apply_patch', 'edit', 'edit_file', 'write', 'write_file', 'delete'])
 const assistantEventTypes = new Set(['assistant_message_started', 'assistant_message_delta', 'assistant_message_completed', 'assistant_delta'])
+const imageReadEventTypes = new Set(['image_read_started', 'image_read_completed', 'image_read_failed'])
 const terminalTypes = new Set(['turn_completed', 'turn_failed', 'turn_stopped', 'run_completed', 'completed', 'run_interrupted', 'run_stopped', 'stopped', 'model_failed', 'integration_failed', 'failed'])
 const terminalStatuses = new Set(['completed', 'stopped', 'failed', 'cancelled'])
 
@@ -385,6 +388,7 @@ function updateAssistantTimelineItem(
   const existingPhase = index >= 0 ? items[index].phase : undefined
   const phase = eventPhase === 'unknown' && existingPhase ? existingPhase : eventPhase
   const wasCompleted = index >= 0 && items[index].status === 'completed'
+  const previousContent = index >= 0 ? items[index].detail : ''
   const commentaryCompleted = type === 'assistant_message_completed' && phase === 'commentary'
   const status = type === 'assistant_message_completed' ? 'completed' as const : 'running' as const
   if (index < 0) {
@@ -413,6 +417,9 @@ function updateAssistantTimelineItem(
     startedAt: state.startedAt,
     items,
     activeItemId: undefined,
+    lastVisibleOutputAt: items[index >= 0 ? index : items.length - 1].detail !== previousContent
+      ? now
+      : state.lastVisibleOutputAt,
     activeStepStartedAt: commentaryCompleted && !wasCompleted
       ? now
       : state.activeStepStartedAt,
@@ -507,6 +514,18 @@ const contextActivityTypes = new Set(['context_prepared', 'context_resumed', 'co
 function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): ThoughtActivityItem | null {
   const type = firstString(event.type, event.event_type).toLowerCase()
   const progress = safeProgressText(event)
+  if (imageReadEventTypes.has(type)) {
+    const payload = record(event.payload)
+    const attachmentId = firstString(event.attachment_id, payload?.attachment_id)
+    const failed = type === 'image_read_failed'
+    const completed = type === 'image_read_completed'
+    return {
+      id: `image-read:${attachmentId}`, kind: 'event', icon: 'image',
+      title: failed ? '读取图片失败' : completed ? '已读取图片' : '正在读取图片',
+      detail: firstString(event.image_name, payload?.image_name) || '图片',
+      status: failed ? 'failed' : completed ? 'completed' : 'running',
+    }
+  }
   if (type === 'mcp_catalog_loading') {
     return {
       id: 'mcp-catalog',
@@ -640,7 +659,7 @@ export function updateThoughtTimeline(
   now = Date.now(),
 ): ThoughtTimelineState {
   const type = firstString(event.type, event.event_type).toLowerCase()
-  const start = state.startedAt ?? (type === 'model_step_started' || type === 'mcp_connecting' || toolStartTypes.has(type) || assistantEventTypes.has(type) ? now : null)
+  const start = state.startedAt ?? (type === 'model_step_started' || type === 'mcp_connecting' || toolStartTypes.has(type) || assistantEventTypes.has(type) || imageReadEventTypes.has(type) ? now : null)
   const payload = record(event.payload)
   if (assistantEventTypes.has(type)) {
     return updateAssistantTimelineItem({ ...state, startedAt: start }, event, type, now)
@@ -659,6 +678,7 @@ export function updateThoughtTimeline(
       items,
       activeItemId: id,
       activeStepHasVisibleContent: true,
+      lastVisibleOutputAt: now,
     }
   }
   if (type === 'thought_summary' && (event.complete === true || payload?.complete === true)) {
@@ -672,6 +692,7 @@ export function updateThoughtTimeline(
     const id = thoughtItemId(event, items.length)
     let index = items.findIndex((item) => item.id === id)
     if (index < 0) index = items.findLastIndex((item) => item.kind === 'thought' && item.status === 'running')
+    const previousContent = index >= 0 ? items[index].detail : ''
     if (index < 0) {
       items.push({ id, kind: 'thought', icon: 'think', title: '思考', detail: text, status: 'running' })
     } else {
@@ -688,6 +709,7 @@ export function updateThoughtTimeline(
       items,
       activeItemId: resolvedId,
       activeStepHasVisibleContent: true,
+      lastVisibleOutputAt: text !== previousContent ? now : state.lastVisibleOutputAt,
     }
   }
   if (toolStartTypes.has(type)) {
@@ -776,7 +798,17 @@ export function updateThoughtTimeline(
         status: failed ? 'failed' as const : 'completed' as const,
       }))]
     }
-    return { ...state, tools, items, activeItemId: state.activeItemId === matchedId ? undefined : state.activeItemId }
+    const toolsStillRunning = tools.some((tool) => tool.status === 'running')
+    return {
+      ...state,
+      tools,
+      items,
+      activeItemId: state.activeItemId === matchedId ? undefined : state.activeItemId,
+      // 最后一个工具结束即进入等待；不依赖下一次模型开始事件，且不把并行工具提前当成已结束。
+      activeStepStartedAt: toolsStillRunning ? state.activeStepStartedAt : now,
+      activeStepHasVisibleContent: toolsStillRunning,
+      lastVisibleOutputAt: undefined,
+    }
   }
 
   let activity = activityFromNonToolEvent(event, (state.items || []).length)
@@ -820,6 +852,7 @@ export function updateThoughtTimeline(
       items.push(currentActivity)
     }
     const resetWaiting = type === 'model_retry' || compactionFinished
+      || type === 'image_read_completed' || type === 'image_read_failed'
     const visibleActivity = currentActivity.kind !== 'context'
       && (Boolean(currentActivity.detail.trim()) || currentActivity.kind !== 'thought')
     return {
@@ -828,6 +861,7 @@ export function updateThoughtTimeline(
       items,
       activeItemId: currentActivity.status === 'running' ? currentActivity.id : (state.activeItemId === currentActivity.id ? undefined : state.activeItemId),
       activeStepStartedAt: type === 'model_step_started' || resetWaiting ? now : state.activeStepStartedAt,
+      lastVisibleOutputAt: type === 'model_step_started' || resetWaiting ? undefined : state.lastVisibleOutputAt,
       activeStepHasVisibleContent: resetWaiting
         ? false
         : type === 'model_step_started'

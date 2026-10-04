@@ -178,6 +178,7 @@ class RunRuntimeFactory:
             model_call=bind_attachment_store(
                 build_model_call(context["provider"]),
                 attachment_store,
+                image_event_sink=type(coordinator)._event_sink(run_id),
             ),
             tool_registry=registry,
             context_manager=ContextManager(max_tokens=settings.context_limit_tokens),

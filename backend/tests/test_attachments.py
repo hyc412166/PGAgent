@@ -24,6 +24,11 @@ from src.attachments.storage import (
 )
 from src.context.assembly import FilesystemArtifactStore
 from src.context.compaction import _prepare_session_history
+from src.model.gateway import bind_attachment_store
+from src.api.runtime import _public_stream_event
+from src.api.routes.shared import _public_run_event
+from src.persistence.database import RunEvent
+from src.runs.stream import run_stream_broker
 from src.persistence import database
 from src.persistence.database import (
     Artifact,
@@ -155,7 +160,56 @@ def test_image_attachment_history_keeps_reference_instead_of_base64(
         content = history[0]["content"]
         assert isinstance(content, list)
         assert content[1]["type"] == "pgagent_image_ref"
-        assert "base64" not in json.dumps(content)
+    assert "base64" not in json.dumps(content)
+
+
+def test_image_reads_reach_live_stream_and_public_history(
+    attachment_client: tuple[TestClient, Path, list[str]],
+) -> None:
+    client, data_dir, _launched = attachment_client
+    session_id = _session()
+    response = client.post(f"/api/sessions/{session_id}/turns", data={"payload": json.dumps({
+        "content": "看看这张图", "idempotency_key": "image-read-events",
+    })}, files=[("files", ("sample.png", b"\x89PNG\r\n\x1a\nimage-bytes", "image/png"))])
+    assert response.status_code == 202, response.text
+    run_id = response.json()["id"]
+    with database.SessionLocal() as db:
+        history = _prepare_session_history(db, db.get(Session, session_id))
+    captured: dict = {}
+
+    async def raw_model_call(**kwargs):
+        captured.update(kwargs)
+        return {"content": "ok"}
+
+    store = AttachmentToolStore(session_id, FilesystemArtifactStore(data_dir / "artifacts" / session_id))
+    call = bind_attachment_store(raw_model_call, store, image_event_sink=coordinator._event_sink(run_id))
+    asyncio.run(call(messages=history))
+    assert captured["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    with database.SessionLocal() as db:
+        rows = list(db.query(RunEvent).filter(RunEvent.run_id == run_id).order_by(RunEvent.sequence.asc()))
+    images = [_public_run_event(row) for row in rows if row.event_type.startswith("image_read_")]
+    assert [row.event_type for row in images] == ["image_read_started", "image_read_completed"]
+    assert images[0].payload["image_name"] == "sample.png"
+    assert "base64" not in json.dumps([row.payload for row in images])
+
+    async def replay_events() -> list[dict]:
+        replay, subscription = run_stream_broker.subscribe(run_id)
+        run_stream_broker.unsubscribe(subscription)
+        return [_public_stream_event(event) for event in replay if event["type"].startswith("image_read_")]
+
+    replay = asyncio.run(replay_events())
+    assert [event["type"] for event in replay] == ["image_read_started", "image_read_completed"]
+    assert replay[0]["attachment_id"] == images[0].payload["attachment_id"]
+
+    # 公开投影只提供图片身份与显示名称，不透传图片内容或存储位置。
+    unsafe = RunEvent(id="image-event", run_id=run_id, event_type="image_read_failed", payload={
+        "attachment_id": "image-1", "image_name": "sample.png", "error_code": "image_unavailable",
+        "data_url": "data:image/png;base64,private", "storage_path": "private/path", "content": "private-image",
+    }, created_at=images[0].created_at, sequence=1)
+    assert _public_run_event(unsafe).payload == {
+        "attachment_id": "image-1", "image_name": "sample.png", "error_code": "image_unavailable",
+    }
 
 
 # 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_attachment_only_draft_is_created_atomically 精确标识本用例的具体条件。

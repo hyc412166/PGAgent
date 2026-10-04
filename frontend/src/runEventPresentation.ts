@@ -38,6 +38,9 @@ const eventTitles: Record<string, string> = {
   delegated_child_stopped: '子 Agent 已停止',
   failed: '运行失败',
   integration_failed: '运行集成失败',
+  image_read_started: '正在读取图片',
+  image_read_completed: '已读取图片',
+  image_read_failed: '读取图片失败',
   mcp_catalog_loading: '正在准备 MCP 工具目录',
   mcp_connecting: '正在连接 MCP 服务',
   mcp_degraded: '部分 MCP 服务不可用',
@@ -131,6 +134,7 @@ function toneFor(type: string, payload: ApiRecord): RunEventTone {
 // 提炼事件最重要的一行详情，供运行时间线快速扫描。
 function eventDetail(type: string, payload: ApiRecord): string {
   const message = text(payload.message_excerpt)
+  if (type.startsWith('image_read_')) return truncate(text(payload.image_name) || '图片')
   if (type === 'context_prepared' || type === 'context_resumed') {
     return message ? `用户消息：${message}` : '已整理本轮模型需要的消息和系统上下文'
   }

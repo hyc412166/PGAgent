@@ -81,6 +81,25 @@ async def test_run_stream_sink_emits_one_canonical_assistant_delta() -> None:
         run_stream_broker.unsubscribe(subscription)
 
 
+@pytest.mark.asyncio
+async def test_run_stream_sink_emits_image_read_lifecycle() -> None:
+    from src.runs.lifecycle import RunCoordinator
+
+    run_id = "image-read-stream-test"
+    _replay, subscription = run_stream_broker.subscribe(run_id)
+    try:
+        sink = RunCoordinator._stream_sink(run_id)
+        sink({"type": "image_read_started", "attachment_id": "image-1", "image_name": "sample.png"})
+        sink({"type": "image_read_completed", "attachment_id": "image-1", "image_name": "sample.png"})
+        started = await asyncio.wait_for(subscription.queue.get(), timeout=1)
+        completed = await asyncio.wait_for(subscription.queue.get(), timeout=1)
+        assert started["type"] == "image_read_started"
+        assert completed["type"] == "image_read_completed"
+        assert completed["image_name"] == "sample.png"
+    finally:
+        run_stream_broker.unsubscribe(subscription)
+
+
 def test_turn_terminal_events_close_stream_but_model_response_does_not() -> None:
     from src.api.runtime import _stream_event_is_terminal
 

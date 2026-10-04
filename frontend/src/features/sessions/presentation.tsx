@@ -9,6 +9,7 @@ import {
   Copy,
   FileText,
   Globe2,
+  Image as ImageIcon,
   LoaderCircle,
   Pencil,
   Search,
@@ -333,6 +334,7 @@ function ThoughtActivityIcon({ icon }: { icon: ThoughtActivityIcon }) {
   if (icon === 'task') return <span className="thought-activity-icon is-task"><PenguinMark size={13} /></span>
   if (icon === 'search') return <span className="thought-activity-icon is-search"><Search size={13} /></span>
   if (icon === 'read') return <span className="thought-activity-icon is-read"><FileText size={13} /></span>
+  if (icon === 'image') return <span className="thought-activity-icon is-read"><ImageIcon size={13} aria-hidden="true" /></span>
   if (icon === 'write' || icon === 'edit') return <span className="thought-activity-icon is-write"><Pencil size={13} /></span>
   if (icon === 'shell') return <span className="thought-activity-icon is-shell"><SquareTerminal size={13} /></span>
   if (icon === 'approval') return <span className="thought-activity-icon is-approval"><ShieldCheck size={13} /></span>
@@ -607,7 +609,9 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
       const hasLongUrl = /https?:\/\/\S{72,}/i.test(item.detail)
       const expandable = item.kind === 'tool' && !item.changeSet && (Boolean(detailRequest) || (Boolean(item.detail.trim()) && (item.title !== '联网搜索' || hasLongUrl)))
       const expanded = Boolean(expandedItems[item.id])
-      return <div key={item.id} className={`thought-activity kind-${item.kind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
+      // 图片由模型输入自动加载，不是可展开结果的工具调用，但视觉上沿用同一套工具行状态。
+      const activityKind = item.icon === 'image' ? 'tool' : item.kind
+      return <div key={item.id} className={`thought-activity kind-${activityKind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
         <ThoughtActivityIcon icon={item.icon} />
         <div className="thought-activity-copy">
           {item.changeSet?.files?.[0] && runId && onOpenFileChange ? <button type="button" className="thought-activity-static is-clickable" onClick={() => openInlineChange(item)}><span className="thought-activity-title">{activityTitle}</span>{activityDetail && item.title !== '准备上下文' && <span className="thought-activity-summary">{activityDetail}</span>}</button> : expandable ? <>
@@ -683,12 +687,23 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChang
   const activeStepStartedAt = liveRun.thought.activeStepStartedAt ?? liveRun.thought.startedAt
   // 缺少轮次元数据时不能把旧工具详情当作当前轮输出，否则模型长时间无可见事件会静默。
   const activeStepHasVisibleContent = liveRun.thought.activeStepHasVisibleContent ?? false
+  const lastVisibleOutputAt = liveRun.thought.lastVisibleOutputAt
+  const outputPaused = lastVisibleOutputAt !== undefined && now - lastVisibleOutputAt >= 2_000
+  const hasRunningActivity = liveRun.thought.tools.some((tool) => tool.status === 'running')
+    || items.some((item) => item.status === 'running' && (
+      item.kind === 'tool' || item.kind === 'file-change' || item.kind === 'task' || item.kind === 'approval'
+      || (item.kind === 'event' && (item.icon === 'context' || item.icon === 'image'))
+    ))
   const waitingStatus = liveRun.thinkingStatus || '思考中…'
   const waitingForVisibleContent = !liveRun.thought.finished
+    && liveRun.status !== 'terminal'
     && liveRun.status !== 'awaiting_approval'
+    && !hasRunningActivity
     && activeStepStartedAt !== null
-    && !activeStepHasVisibleContent
-  const activeStepElapsedMs = activeStepStartedAt === null ? 0 : Math.max(0, now - activeStepStartedAt)
+    && (!activeStepHasVisibleContent || outputPaused)
+  // 已有文字后的停顿从最后一次文字更新计时；明确的模型/工具完成边界继续使用独立等待周期。
+  const waitingStartedAt = activeStepHasVisibleContent ? lastVisibleOutputAt ?? activeStepStartedAt : activeStepStartedAt
+  const activeStepElapsedMs = waitingStartedAt === null ? 0 : Math.max(0, now - waitingStartedAt)
   const showExecutionDetails = hasDetails || waitingForVisibleContent
   const toggleExpanded = () => {
     if (!expanded) setMounted(true)

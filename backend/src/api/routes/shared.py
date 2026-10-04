@@ -105,6 +105,9 @@ _PUBLIC_RUN_EVENT_TYPES = frozenset({
     "delegated_child_continuation_started",
     "failed",
     "integration_failed",
+    "image_read_started",
+    "image_read_completed",
+    "image_read_failed",
     "model_failed",
     "model_retry",
     "model_step_finished",
@@ -404,6 +407,16 @@ def _public_run_event_payload(event_type: str, payload: Any) -> dict[str, Any]:
             identifier = _public_event_identifier(source.get(key))
             if identifier is not None:
                 public[key] = identifier
+
+    if event_type in {"image_read_started", "image_read_completed", "image_read_failed"}:
+        # 图片行只公开附件身份和显示名称，不能把模型输入的 data URL 或私有存储路径带入事件接口。
+        for key in ("attachment_id", "image_name"):
+            text = _public_event_text(source.get(key), limit=160)
+            if text is not None:
+                public[key] = text
+        error_code = _public_event_identifier(source.get("error_code"))
+        if error_code is not None:
+            public["error_code"] = error_code
 
     if event_type in _TOOL_START_EVENT_TYPES | _TOOL_FINISH_EVENT_TYPES | {"user_question_requested"}:
         for key in ("tool_name", "tool_call_id", "response_id", "item_id", "call_id"):

@@ -92,6 +92,7 @@ export function runThinkingStartedAt(startedAt: string | undefined, now = Date.n
 export const runStreamEventNames = [
   'run_state', 'run_received', 'context_prepared', 'context_resumed', 'context_compacted',
   'context_compaction_started', 'context_compaction_finished', 'context_compaction_failed',
+  'image_read_started', 'image_read_completed', 'image_read_failed',
   'model_step_started', 'model_retry', 'progress', 'agent_progress', 'thought_summary',
   'mcp_catalog_loading', 'mcp_connecting', 'mcp_server_ready', 'mcp_ready', 'mcp_degraded',
   'thought_delta', 'activity_update', 'assistant_delta', 'tool_started', 'tool_call',

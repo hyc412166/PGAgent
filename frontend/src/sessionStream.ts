@@ -75,6 +75,9 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'context_compaction_finished':
     case 'context_compacted': return '上下文压缩完成，继续思考…'
     case 'context_compaction_failed': return '上下文压缩失败，继续处理…'
+    case 'image_read_started': return '正在读取图片…'
+    case 'image_read_completed': return '思考中…'
+    case 'image_read_failed': return '图片读取失败'
     case 'model_step_started':
     case 'model_retry': return '思考中…'
     case 'mcp_catalog_loading': return '正在准备 MCP 工具目录…'

@@ -4,6 +4,24 @@ import { displayToolName, emptyThoughtTimeline, formatLiveThinkingDuration, form
 
 // 测试分组：实时 Thought 时间线。
 describe('实时 Thought 时间线', () => {
+  it('图片读取按附件身份更新同一行，完成后恢复思考并支持历史回放', () => {
+    const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+    const reading = updateThoughtTimeline(started, { type: 'image_read_started', attachment_id: 'image-1', image_name: 'sample.png' }, 1_100)
+    expect(reading.items.at(-1)).toMatchObject({ id: 'image-read:image-1', icon: 'image', title: '正在读取图片', detail: 'sample.png', status: 'running' })
+    const completed = updateThoughtTimeline(reading, { type: 'image_read_completed', attachment_id: 'image-1', image_name: 'sample.png' }, 1_500)
+    expect(completed.items.filter(item => item.icon === 'image')).toHaveLength(1)
+    expect(completed.items.at(-1)).toMatchObject({ title: '已读取图片', status: 'completed' })
+    expect(completed).toMatchObject({ startedAt: 1_000, activeStepStartedAt: 1_500, activeStepHasVisibleContent: false })
+    expect(completed.tools).toHaveLength(0)
+    const failed = updateThoughtTimeline(reading, { type: 'image_read_failed', attachment_id: 'image-1', image_name: 'sample.png', error_code: 'image_unavailable' }, 1_600)
+    expect(failed.items.at(-1)).toMatchObject({ title: '读取图片失败', status: 'failed' })
+    const replayed = timelineFromRunEvents([
+      { sequence: 1, event_type: 'image_read_started', type: '', payload: { attachment_id: 'image-1', image_name: 'sample.png' }, created_at: '2026-10-03T12:00:00Z' },
+      { sequence: 2, event_type: 'image_read_completed', type: '', payload: { attachment_id: 'image-1', image_name: 'sample.png' }, created_at: '2026-10-03T12:00:01Z' },
+    ])
+    expect(replayed.items).toHaveLength(1)
+    expect(replayed.items[0]).toMatchObject({ title: '已读取图片', detail: 'sample.png', status: 'completed' })
+  })
   // 测试场景：展示规范工具名并兼容旧会话别名。
   it('展示规范工具名并兼容旧会话别名', () => {
     expect(displayToolName('shell')).toBe('Shell')
@@ -63,6 +81,31 @@ describe('实时 Thought 时间线', () => {
       output_index: 0, phase: 'commentary', content: '已经完成第一段检查。',
     }, 2_000)
     expect(replayed).toMatchObject({ activeStepStartedAt: 1_500, activeStepHasVisibleContent: false })
+  })
+
+  it('仅新可见文字推进输出时钟，重复完成和内部活动不推迟停顿提示', () => {
+    const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+    const identity = { response_id: 'response-1', item_id: 'commentary-1', phase: 'commentary' }
+    const visible = updateThoughtTimeline(started, { type: 'assistant_message_delta', ...identity, delta: '检查完成。' }, 1_200)
+    expect(visible).toMatchObject({ lastVisibleOutputAt: 1_200 })
+    const completed = updateThoughtTimeline(visible, { type: 'assistant_message_completed', ...identity, content: '检查完成。' }, 1_300)
+    const replayed = updateThoughtTimeline(completed, { type: 'assistant_message_completed', ...identity, content: '检查完成。' }, 1_500)
+    const internalActivity = updateThoughtTimeline(replayed, { type: 'model_response_completed' }, 1_700)
+    expect(internalActivity).toMatchObject({ lastVisibleOutputAt: 1_200, activeStepStartedAt: 1_300 })
+    const nextStep = updateThoughtTimeline(internalActivity, { type: 'model_step_started', step: 2 }, 2_000)
+    expect(nextStep.lastVisibleOutputAt).toBeUndefined()
+
+    const summary = updateThoughtTimeline(nextStep, { type: 'thought_summary', step: 2, summary: '继续检查。' }, 2_100)
+    expect(summary.lastVisibleOutputAt).toBe(2_100)
+    const sameSummary = updateThoughtTimeline(summary, { type: 'thought_summary', step: 2, summary: '继续检查。' }, 2_200)
+    expect(sameSummary.lastVisibleOutputAt).toBe(2_100)
+    const delta = updateThoughtTimeline(sameSummary, { type: 'thought_delta', step: 2, delta: '检查后续结果。' }, 2_300)
+    expect(delta.lastVisibleOutputAt).toBe(2_300)
+    const replay = timelineFromRunEvents([
+      { sequence: 1, type: 'model_step_started', step: 1, created_at: '2026-10-03T12:00:00Z' },
+      { sequence: 2, type: 'assistant_message_completed', ...identity, content: '检查完成。', created_at: '2026-10-03T12:00:03Z' },
+    ])
+    expect(replay.lastVisibleOutputAt).toBe(Date.parse('2026-10-03T12:00:03Z'))
   })
 
   it('模型重试后重新显示本轮等待提示', () => {

@@ -1,10 +1,19 @@
 // 本测试文件验证 sessionStream 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it } from 'vitest'
 import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, composerSurface, hasPersistedRunReply, isCurrentSessionRun, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, nextRunStreamPhase, parseRunStreamEvent, rememberRunStreamEvent, restoreAssistantItemsFromEvents, runStatusPhase, runStreamPhase, shouldMarkApprovalResuming, shouldRefreshConversationAfterApprovalDecision, shouldShowStoppedRunNotice, shouldStartHistoryScroll, visibleSessionItems } from './sessionStream'
-import { removePendingApproval } from './features/sessions/sessionState'
+import { removePendingApproval, runStreamEventNames } from './features/sessions/sessionState'
 
 // 测试分组：会话 SSE 事件。
 describe('会话 SSE 事件', () => {
+  it('订阅图片读取事件并将加载结束后的阶段交回思考', () => {
+    for (const type of ['image_read_started', 'image_read_completed', 'image_read_failed'] as const) {
+      expect(runStreamEventNames).toContain(type)
+      expect(isTerminalRunStreamEvent({ type })).toBe(false)
+    }
+    expect(runStreamPhase({ type: 'image_read_started' })).toBe('正在读取图片…')
+    expect(runStreamPhase({ type: 'image_read_completed' })).toBe('思考中…')
+    expect(runStreamPhase({ type: 'image_read_failed' })).toBe('图片读取失败')
+  })
   // 测试场景：所有没有持久化回复的终态都显示兜底提示。
   it('所有没有持久化回复的终态都显示兜底提示', () => {
     expect(shouldShowStoppedRunNotice({ id: 'r1', status: 'stopped', stop_reason: '已连续 4 步没有产生有效进展' }, new Set())).toBe(true)

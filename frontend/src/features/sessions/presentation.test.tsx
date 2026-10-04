@@ -11,6 +11,8 @@ import { createLiveMarkdownCoalescer } from './liveMarkdownCoalescer'
 import { formatApprovalArguments } from './approvalPresentation'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
 import type { DurableTask } from '../../types'
+import { emptyThoughtTimeline, updateThoughtTimeline } from '../../thoughtTimeline'
+import type { ThoughtTimelineState } from '../../thoughtTimeline'
 
 const sessionsCss = readFileSync(new URL('../../styles/sessions.css', import.meta.url), 'utf8')
 
@@ -142,6 +144,34 @@ describe('子 Agent 运行事件展示', () => {
 })
 
 describe('助手消息中的思考过程展示', () => {
+  it('图片读取复用工具行样式和运行动效，并显示完成或失败状态', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(2_000)
+    try {
+      let thought = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+      thought = updateThoughtTimeline(thought, { type: 'image_read_started', attachment_id: 'image-1', image_name: 'sample.png' }, 1_100)
+      const render = () => renderToStaticMarkup(createElement(LiveAssistantMessage, { liveRun: {
+        runId: 'run-image-read', phase: '正在读取图片…', draft: '', status: 'live', error: '', thinkingStatus: '思考中…', thought,
+      } }))
+      const reading = render()
+      expect(reading).toContain('正在读取图片')
+      expect(reading).toContain('sample.png')
+      expect(reading).toContain('lucide-image')
+      expect(reading).toContain('thought-activity kind-tool running is-active')
+      expect(reading).not.toContain('class="thought-waiting"')
+      expect(reading).not.toContain('tool-result-detail')
+      thought = updateThoughtTimeline(thought, { type: 'image_read_completed', attachment_id: 'image-1', image_name: 'sample.png' }, 1_500)
+      const completed = render()
+      expect(completed).toContain('已读取图片')
+      expect(completed).toContain('thought-activity kind-tool completed')
+      expect(completed).toContain('class="thought-waiting"')
+      thought = updateThoughtTimeline(thought, { type: 'image_read_failed', attachment_id: 'image-1', image_name: 'sample.png' }, 1_600)
+      expect(render()).toContain('读取图片失败')
+      expect(render()).toContain('thought-activity kind-tool failed')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
   it('合并高频流式正文更新，并在结束时立即刷新最终内容', () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-09-15T00:00:00.000Z'))
@@ -459,6 +489,65 @@ describe('助手消息中的思考过程展示', () => {
     expect(markup).toContain('class="thought-waiting"')
     expect(markup).toContain('思考中…')
     expect(markup.indexOf('class="thought-waiting"')).toBeGreaterThan(markup.indexOf('Get-ChildItem'))
+  })
+
+  it('中间文字停顿两秒后重新等待，续写和新模型轮次各自更新计时边界', () => {
+    vi.useFakeTimers()
+    const renderAt = (thought: ThoughtTimelineState, now: number) => {
+      vi.setSystemTime(now)
+      return renderToStaticMarkup(createElement(LiveAssistantMessage, {
+        liveRun: { runId: 'run-paused-commentary', phase: '思考中…', draft: '', status: 'live', error: '', thinkingStatus: '正在整理思路中…', thought },
+      }))
+    }
+    try {
+      let thought = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 11 }, 1_000)
+      const identity = { response_id: 'response-11', item_id: 'commentary-11', phase: 'commentary' }
+      thought = updateThoughtTimeline(thought, { type: 'assistant_message_delta', ...identity, delta: '检查发现一个排版替换问题。' }, 1_500)
+      expect(renderAt(thought, 3_499)).not.toContain('class="thought-waiting"')
+      const paused = renderAt(thought, 3_500)
+      expect(paused).toContain('class="thought-waiting"')
+      expect(paused).toContain('已等待 2 秒')
+      expect(paused.indexOf('class="thought-waiting"')).toBeGreaterThan(paused.indexOf('检查发现一个排版替换问题。'))
+
+      thought = updateThoughtTimeline(thought, { type: 'assistant_message_delta', ...identity, delta: '继续重新生成报告。' }, 3_700)
+      expect(renderAt(thought, 3_700)).not.toContain('class="thought-waiting"')
+      expect(renderAt(thought, 6_700)).toContain('已等待 3 秒')
+
+      thought = updateThoughtTimeline(thought, { type: 'model_step_started', step: 12 }, 7_000)
+      expect(renderAt(thought, 7_500)).toContain('已等待 0 秒')
+      expect(thought.startedAt).toBe(1_000)
+      expect(updateThoughtTimeline(thought, { type: 'run_completed' }, 8_000).elapsedMs).toBe(7_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('工具、压缩和审批期间抑制停顿提示，工具结束后立即重新等待', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    const render = (thought: ThoughtTimelineState, status: 'live' | 'awaiting_approval' | 'terminal' = 'live') => renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: { runId: 'run-busy-after-commentary', phase: '执行中', draft: '', status, error: '', thinkingStatus: '思考中…', thought },
+    }))
+    try {
+      const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+      const visible = updateThoughtTimeline(started, { type: 'assistant_message_delta', phase: 'commentary', item_id: 'commentary-1', delta: '先检查文件。' }, 1_500)
+      const firstTool = updateThoughtTimeline(visible, { type: 'tool_started', tool_name: 'shell', tool_call_id: 'shell-1' }, 2_000)
+      const secondTool = updateThoughtTimeline(firstTool, { type: 'tool_started', tool_name: 'shell', tool_call_id: 'shell-2' }, 2_100)
+      const firstFinished = updateThoughtTimeline(secondTool, { type: 'tool_finished', tool_call_id: 'shell-1' }, 3_000)
+      expect(render(firstFinished)).not.toContain('class="thought-waiting"')
+      const allFinished = updateThoughtTimeline(firstFinished, { type: 'tool_finished', tool_call_id: 'shell-2' }, 8_000)
+      expect(render(allFinished)).toContain('已等待 2 秒')
+
+      const compacting = updateThoughtTimeline(visible, { type: 'context_compaction_started' }, 2_000)
+      expect(render(compacting)).not.toContain('class="thought-waiting"')
+      const compacted = updateThoughtTimeline(compacting, { type: 'context_compaction_finished' }, 9_000)
+      expect(render(compacted)).toContain('已等待 1 秒')
+      expect(render(visible, 'awaiting_approval')).not.toContain('class="thought-waiting"')
+      expect(render(visible, 'terminal')).not.toContain('class="thought-waiting"')
+      expect(render(updateThoughtTimeline(visible, { type: 'run_completed' }, 9_000))).not.toContain('class="thought-waiting"')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('文件总结超过三个时默认收起并提供展开入口', () => {

@@ -178,6 +178,9 @@ _PUBLIC_TRANSIENT_STREAM_EVENT_TYPES = frozenset({
     "agent_progress",
     "thought_summary",
     "activity_update",
+    "image_read_started",
+    "image_read_completed",
+    "image_read_failed",
 })
 
 # 变量说明：_DELEGATE_OUTPUT_LIMIT 表示当前步骤使用的 _DELEGATE_OUTPUT_LIMIT 值。

@@ -27,6 +27,75 @@ def test_attachment_binding_preserves_assistant_item_capability() -> None:
     assert bound_call.emits_assistant_items is True
 
 
+@pytest.mark.asyncio
+async def test_image_read_events_wrap_actual_loads_and_do_not_repeat_history() -> None:
+    actions: list[str] = []
+    events: list[dict] = []
+    captured: list[list[dict]] = []
+
+    class AttachmentStore:
+        def data_url(self, attachment_id: str) -> str:
+            actions.append(f"load:{attachment_id}")
+            return "data:image/png;base64,cHJpdmF0ZQ=="
+
+    def event_sink(event: dict) -> None:
+        events.append(event)
+        actions.append(f"{event['type']}:{event['attachment_id']}")
+
+    async def raw_model_call(**kwargs):
+        captured.append(kwargs["messages"])
+        actions.append("model")
+        return {"content": "ok"}
+
+    messages = [{"role": "user", "content": [
+        {"type": "pgagent_image_ref", "attachment_id": "image-1", "name": "first.png"},
+        {"type": "pgagent_image_ref", "attachment_id": "image-2", "name": "second.png"},
+    ]}, {"role": "tool", "content": json.dumps({"metadata": {
+        "model_image_ref": {"id": "page-1", "name": "report-page.png"},
+    }})}]
+    call = bind_attachment_store(raw_model_call, AttachmentStore(), image_event_sink=event_sink)
+    await call(messages=messages)
+    assert actions == [
+        "image_read_started:image-1", "load:image-1", "image_read_completed:image-1",
+        "image_read_started:image-2", "load:image-2", "image_read_completed:image-2",
+        "image_read_started:page-1", "load:page-1", "image_read_completed:page-1", "model",
+    ]
+    assert [event["image_name"] for event in events[::2]] == ["first.png", "second.png", "report-page.png"]
+    assert "base64" not in json.dumps(events)
+    assert captured[0][0]["content"][0]["type"] == "image_url"
+    assert messages[0]["content"][0]["type"] == "pgagent_image_ref"
+    await call(messages=messages)
+    assert len(events) == 6
+    assert len(captured) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True])
+async def test_image_read_failure_is_reported_without_calling_model(raises: bool) -> None:
+    events: list[dict] = []
+    called = False
+
+    class AttachmentStore:
+        def data_url(self, _attachment_id: str) -> None:
+            if raises:
+                raise OSError("private/path/image.png")
+            return None
+
+    async def raw_model_call(**_kwargs):
+        nonlocal called
+        called = True
+
+    call = bind_attachment_store(raw_model_call, AttachmentStore(), image_event_sink=events.append)
+    with pytest.raises(OSError if raises else ModelConfigurationError):
+        await call(messages=[{"role": "user", "content": [
+            {"type": "pgagent_image_ref", "attachment_id": "missing", "name": "missing.png"},
+        ]}])
+    assert [event["type"] for event in events] == ["image_read_started", "image_read_failed"]
+    assert events[-1]["image_name"] == "missing.png"
+    assert "private/path" not in json.dumps(events)
+    assert not called
+
+
 # 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_gateway_keeps_namespaced_openrouter_models_on_openrouter 精确标识本用例的具体条件。
 def test_gateway_keeps_namespaced_openrouter_models_on_openrouter() -> None:
     assert _litellm_model("openrouter", "anthropic/claude-sonnet") == "openrouter/anthropic/claude-sonnet"

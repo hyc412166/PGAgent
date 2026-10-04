@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any, Mapping
 
 import litellm
@@ -17,6 +18,8 @@ from src.model.protocols.common import ModelConfigurationError, PartialModelStre
 def _hydrate_attachment_messages(
     messages: list[dict[str, Any]],
     attachment_store: Any | None,
+    *,
+    image_loader: Callable[[str, str], str | None] | None = None,
 ) -> list[dict[str, Any]]:
     # 变量说明：hydrated 表示当前步骤使用的 hydrated 值。
     hydrated: list[dict[str, Any]] = []
@@ -42,7 +45,11 @@ def _hydrate_attachment_messages(
                 # 变量说明：attachment_id 表示attachment 对象的唯一标识。
                 attachment_id = str(raw_part.get("attachment_id") or "")
                 # 变量说明：data_url 表示data 的访问地址。
-                data_url = attachment_store.data_url(attachment_id) if attachment_store is not None else None
+                data_url = (
+                    image_loader(attachment_id, str(raw_part.get("name") or "图片"))
+                    if image_loader is not None
+                    else attachment_store.data_url(attachment_id) if attachment_store is not None else None
+                )
                 if not data_url:
                     raise ModelConfigurationError("会话图片附件不可用，无法安全构造模型输入")
                 parts.append({"type": "image_url", "image_url": {"url": data_url}})
@@ -77,7 +84,11 @@ def _hydrate_attachment_messages(
                 # 变量说明：attachment_id 表示attachment 对象的唯一标识。
                 attachment_id = str(image_ref.get("id") or "")
                 # 变量说明：data_url 表示data 的访问地址。
-                data_url = attachment_store.data_url(attachment_id) if attachment_store is not None else None
+                data_url = (
+                    image_loader(attachment_id, str(image_ref.get("name") or "图片"))
+                    if image_loader is not None
+                    else attachment_store.data_url(attachment_id) if attachment_store is not None else None
+                )
                 if not data_url:
                     raise ModelConfigurationError("PDF 派生图片不可用，无法安全构造模型输入")
                 observation_parts.append({"type": "image_url", "image_url": {"url": data_url}})
@@ -89,11 +100,38 @@ def _hydrate_attachment_messages(
 # 函数职责：完成 bind_attachment_store 对应的业务处理。
 # 参数关系：model_call 表示当前步骤使用的 model_call 值；attachment_store 表示当前步骤使用的 attachment_store 值。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def bind_attachment_store(model_call: Any, attachment_store: Any | None) -> Any:
+def bind_attachment_store(
+    model_call: Any,
+    attachment_store: Any | None,
+    *,
+    image_event_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> Any:
     """Hydrate session-private image refs without changing provider factory APIs."""
 
     if attachment_store is None:
         return model_call
+
+    reported_images: set[str] = set()
+
+    def load_image(attachment_id: str, image_name: str) -> str | None:
+        # 在实际文件加载的两侧记录状态；历史图片仍按协议重发，但本次运行不重复新增读取记录。
+        first_read = attachment_id not in reported_images
+        identity = {"attachment_id": attachment_id, "image_name": image_name}
+        if first_read and image_event_sink is not None:
+            image_event_sink({"type": "image_read_started", **identity})
+        try:
+            data_url = attachment_store.data_url(attachment_id)
+        except Exception:
+            if image_event_sink is not None:
+                image_event_sink({"type": "image_read_failed", **identity, "error_code": "image_unavailable"})
+            raise
+        if data_url:
+            if first_read and image_event_sink is not None:
+                image_event_sink({"type": "image_read_completed", **identity})
+            reported_images.add(attachment_id)
+        elif image_event_sink is not None:
+            image_event_sink({"type": "image_read_failed", **identity, "error_code": "image_unavailable"})
+        return data_url
 
     # 函数职责：异步完成 call_with_attachments 对应的业务处理。
     # 参数关系：kwargs 表示当前流程使用的 kwargs 集合。
@@ -105,7 +143,7 @@ def bind_attachment_store(model_call: Any, attachment_store: Any | None) -> Any:
             # 变量说明：kwargs 表示当前流程使用的 kwargs 集合。
             kwargs = {
                 **kwargs,
-                "messages": _hydrate_attachment_messages(messages, attachment_store),
+                "messages": _hydrate_attachment_messages(messages, attachment_store, image_loader=load_image),
             }
         return await model_call(**kwargs)
 
