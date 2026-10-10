@@ -70,8 +70,46 @@ async def test_image_read_events_wrap_actual_loads_and_do_not_repeat_history() -
 
 
 @pytest.mark.asyncio
+async def test_new_run_hydrates_history_without_reporting_old_images() -> None:
+    events: list[dict] = []
+    captured: list[list[dict]] = []
+
+    class AttachmentStore:
+        def data_url(self, attachment_id: str) -> str:
+            return f"data:image/png;base64,{attachment_id}"
+
+    async def raw_model_call(**kwargs):
+        captured.append(kwargs["messages"])
+
+    history = [{"role": "user", "content": [
+        {"type": "pgagent_image_ref", "attachment_id": "old", "name": "old.png"},
+    ]}, {"role": "tool", "content": json.dumps({"metadata": {
+        "model_image_ref": {"id": "old-page", "name": "old-page.png"},
+    }})}, {"role": "user", "content": "纯文字新一轮"}]
+    call = bind_attachment_store(raw_model_call, AttachmentStore(), image_event_sink=events.append,
+                                 historical_image_ids={"old", "old-page"})
+    await call(messages=history)
+    assert events == []
+    assert captured[0][0]["content"][0]["type"] == "image_url"
+
+    new_input = {"role": "user", "content": [
+        {"type": "pgagent_image_ref", "attachment_id": "new", "name": "new.png"},
+    ]}
+    new_page = {"role": "tool", "content": json.dumps({"metadata": {
+        "model_image_ref": {"id": "new-page", "name": "new-page.png"},
+    }})}
+    await call(messages=[*history, new_input, new_page])
+    await call(messages=[*history, new_input, new_page])
+    assert [(event["type"], event["attachment_id"]) for event in events] == [
+        ("image_read_started", "new"), ("image_read_completed", "new"),
+        ("image_read_started", "new-page"), ("image_read_completed", "new-page"),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("raises", [False, True])
-async def test_image_read_failure_is_reported_without_calling_model(raises: bool) -> None:
+@pytest.mark.parametrize("historical", [False, True])
+async def test_image_read_failure_is_reported_without_calling_model(raises: bool, historical: bool) -> None:
     events: list[dict] = []
     called = False
 
@@ -85,13 +123,15 @@ async def test_image_read_failure_is_reported_without_calling_model(raises: bool
         nonlocal called
         called = True
 
-    call = bind_attachment_store(raw_model_call, AttachmentStore(), image_event_sink=events.append)
+    call = bind_attachment_store(raw_model_call, AttachmentStore(), image_event_sink=events.append,
+                                 historical_image_ids={"missing"} if historical else set())
     with pytest.raises(OSError if raises else ModelConfigurationError):
         await call(messages=[{"role": "user", "content": [
             {"type": "pgagent_image_ref", "attachment_id": "missing", "name": "missing.png"},
         ]}])
-    assert [event["type"] for event in events] == ["image_read_started", "image_read_failed"]
-    assert events[-1]["image_name"] == "missing.png"
+    assert [event["type"] for event in events] == ([] if historical else ["image_read_started", "image_read_failed"])
+    if not historical:
+        assert events[-1]["image_name"] == "missing.png"
     assert "private/path" not in json.dumps(events)
     assert not called
 

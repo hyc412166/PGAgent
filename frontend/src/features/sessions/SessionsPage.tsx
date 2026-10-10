@@ -1628,7 +1628,7 @@ function SessionsPage() {
                 {!draftActive && stoppedRunNotices.map((run) => <div key={`run-notice:${run.id}`} className="stopped-run-notice" role="status"><AlertCircle size={16} /><div><strong>{run.status === 'failed' ? '本次运行失败，未生成最终回复' : '本次运行已停止，未生成最终回复'}</strong><p>{run.error_message || run.stop_reason || 'Agent 未能继续执行，请调整指令后重试。'}</p></div></div>)}
                 {liveRun.status !== 'idle' && !liveReplyPersisted
                   && (!completedThoughtsByRun[liveRun.runId] || (canEditInterrupted && liveRun.runId === interruptedRunId))
-                  && <LiveAssistantMessage liveRun={liveRun} onOpenFileChange={openFileChange} />}
+                  && <LiveAssistantMessage liveRun={liveRun} sessionId={activeId} onOpenFileChange={openFileChange} />}
                 {canEditInterrupted && <div className="interrupted-run-actions">
                   <button type="button" className="interrupted-edit-button" onClick={editInterruptedPrompt}>
                     <Pencil size={12} />重新编辑本次输入

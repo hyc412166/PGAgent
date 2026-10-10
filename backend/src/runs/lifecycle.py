@@ -1551,6 +1551,14 @@ class RunCoordinator:
 
             # 变量说明：messages 表示发送给模型或客户端的消息序列。
             messages = _prepare_session_history(db, session) if session else []
+            # 图片提示以当前用户输入为边界，不能把历史消息中的附件当成本轮上传。
+            current_turn = db.get(ConversationTurn, run.turn_id) if run.turn_id else None
+            input_message = db.get(ChatMessage, current_turn.user_message_id) if current_turn and current_turn.user_message_id else None
+            input_attachments = (input_message.extra or {}).get("attachments", []) if input_message else []
+            input_image_ids = {
+                str(item["id"]) for item in input_attachments
+                if isinstance(item, dict) and item.get("id") and str(item.get("mime_type") or "").startswith("image/")
+            }
             # 变量说明：compaction_state 表示当前步骤使用的 compaction_state 值。
             compaction_state = _compaction_from_db(db, session) if session else {}
             if session:
@@ -1922,6 +1930,7 @@ class RunCoordinator:
                 "workspace_rules": render_workspace_rules(workspace_root, agents_instructions),
                 "memory_index": memory_index,
                 "recent_messages": messages,
+                "input_image_ids": input_image_ids,
                 "mode": "auto",
                 "workspace_root": workspace_root,
                 "provider": provider_config,

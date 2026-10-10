@@ -49,6 +49,8 @@ export interface ThoughtTimelineState {
   activeStepHasVisibleContent?: boolean
   // 文字已停止增量输出时，完成事件可能还未到达；用实际文字更新时间识别这段等待。
   lastVisibleOutputAt?: number
+  // 最终回复期间的停顿是输出/收尾，不是等待下一段中间思考；只有新执行阶段才重置。
+  activeStepHasFinalAnswer?: boolean
   conclusion?: string
 }
 
@@ -417,6 +419,7 @@ function updateAssistantTimelineItem(
     startedAt: state.startedAt,
     items,
     activeItemId: undefined,
+    activeStepHasFinalAnswer: state.activeStepHasFinalAnswer || phase === 'final_answer',
     lastVisibleOutputAt: items[index >= 0 ? index : items.length - 1].detail !== previousContent
       ? now
       : state.lastVisibleOutputAt,
@@ -664,6 +667,11 @@ export function updateThoughtTimeline(
   if (assistantEventTypes.has(type)) {
     return updateAssistantTimelineItem({ ...state, startedAt: start }, event, type, now)
   }
+  // 未标记 phase 的兼容协议只在完整 response 明确没有工具调用时确认输出收尾。
+  if (type === 'model_response_completed' && (event.has_tool_calls ?? payload?.has_tool_calls) === false
+    && state.items.some((item) => item.kind === 'assistant' && Boolean(item.detail.trim()))) {
+    return { ...state, activeStepHasFinalAnswer: true }
+  }
   if (type === 'thought_delta') {
     const text = cleanThoughtText(firstString(event.delta, payload?.delta))
     if (!text) return start === state.startedAt ? state : { ...state, startedAt: start }
@@ -806,6 +814,7 @@ export function updateThoughtTimeline(
       activeItemId: state.activeItemId === matchedId ? undefined : state.activeItemId,
       // 最后一个工具结束即进入等待；不依赖下一次模型开始事件，且不把并行工具提前当成已结束。
       activeStepStartedAt: toolsStillRunning ? state.activeStepStartedAt : now,
+      activeStepHasFinalAnswer: toolsStillRunning ? state.activeStepHasFinalAnswer : false,
       activeStepHasVisibleContent: toolsStillRunning,
       lastVisibleOutputAt: undefined,
     }
@@ -861,6 +870,7 @@ export function updateThoughtTimeline(
       items,
       activeItemId: currentActivity.status === 'running' ? currentActivity.id : (state.activeItemId === currentActivity.id ? undefined : state.activeItemId),
       activeStepStartedAt: type === 'model_step_started' || resetWaiting ? now : state.activeStepStartedAt,
+      activeStepHasFinalAnswer: type === 'model_step_started' || resetWaiting ? false : state.activeStepHasFinalAnswer,
       lastVisibleOutputAt: type === 'model_step_started' || resetWaiting ? undefined : state.lastVisibleOutputAt,
       activeStepHasVisibleContent: resetWaiting
         ? false

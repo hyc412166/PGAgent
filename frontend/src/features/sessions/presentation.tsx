@@ -219,7 +219,7 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
       <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <PenguinMark size={21} />}</div>
       <div className="message-body">
         <div className="message-meta"><strong>{speaker}</strong><time>{formatUiDate(message.created_at)}</time></div>
-        {thoughtRunId && thoughtTimeline && <CompletedThoughtTimeline runId={thoughtRunId} timeline={thoughtTimeline} onOpenFileChange={onOpenFileChange} />}
+        {thoughtRunId && thoughtTimeline && <CompletedThoughtTimeline runId={thoughtRunId} sessionId={message.session_id} timeline={thoughtTimeline} onOpenFileChange={onOpenFileChange} />}
         {!!imageAttachments.length && <div className="message-image-gallery" aria-label="消息图片">
           {imageAttachments.map((attachment) => {
             const href = apiUrl(`/api/sessions/${message.session_id}/attachments/${attachment.id}/content`)
@@ -460,6 +460,7 @@ function OrderedRunContent({
   items,
   activitiesVisible,
   runId,
+  sessionId,
   live,
   activeItemId,
   includeFinalAssistant,
@@ -468,6 +469,7 @@ function OrderedRunContent({
   items: ThoughtActivityItem[]
   activitiesVisible: boolean
   runId?: string
+  sessionId?: string
   live?: boolean
   activeItemId?: string
   includeFinalAssistant: boolean
@@ -481,7 +483,7 @@ function OrderedRunContent({
         return <div className="ordered-assistant-content" key={entry.item.id}><MarkdownContent content={entry.item.detail} streaming={Boolean(live && entry.item.status === 'running')} /></div>
       }
       return activitiesVisible
-        ? <ThoughtActivityList key={`activities-${entry.items[0]?.id || index}`} items={entry.items} runId={runId} live={live} activeItemId={activeItemId} onOpenFileChange={onOpenFileChange} />
+        ? <ThoughtActivityList key={`activities-${entry.items[0]?.id || index}`} items={entry.items} runId={runId} sessionId={sessionId} live={live} activeItemId={activeItemId} onOpenFileChange={onOpenFileChange} />
         : null
     })}
   </div>
@@ -515,8 +517,14 @@ function CollapsibleRegion({ expanded, mounted = expanded, children, id, classNa
 }
 
 // ThoughtActivityList 统一渲染实时与历史活动；完整结果缓存只跟随当前列表实例的生命周期。
-export function ThoughtActivityList({ items, runId, live = false, activeItemId, onOpenFileChange }: { items: ThoughtActivityItem[]; runId?: string; live?: boolean; activeItemId?: string; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
+export function ThoughtActivityList({ items, runId, sessionId, live = false, activeItemId, onOpenFileChange }: { items: ThoughtActivityItem[]; runId?: string; sessionId?: string; live?: boolean; activeItemId?: string; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const navigation = useContext(ChildNavigation)
+  const [previewImageId, setPreviewImageId] = useState('')
+  // 图片始终经所属会话的附件接口访问，与消息缩略图共用预览，不作为工具文本结果展开。
+  const previewImages: PreviewImageItem[] = sessionId ? items.filter((item) => item.icon === 'image' && item.id.startsWith('image-read:') && item.status === 'completed').map((item) => ({
+    id: item.id.slice('image-read:'.length), name: item.detail,
+    src: apiUrl(`/api/sessions/${sessionId}/attachments/${item.id.slice('image-read:'.length)}/content`),
+  })) : []
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({})
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({})
   const [mountedItems, setMountedItems] = useState<Record<string, boolean>>({})
@@ -614,7 +622,7 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
       return <div key={item.id} className={`thought-activity kind-${activityKind} ${item.status} ${live && item.status === 'running' && item.id === activeItemId ? 'is-active' : ''}`}>
         <ThoughtActivityIcon icon={item.icon} />
         <div className="thought-activity-copy">
-          {item.changeSet?.files?.[0] && runId && onOpenFileChange ? <button type="button" className="thought-activity-static is-clickable" onClick={() => openInlineChange(item)}><span className="thought-activity-title">{activityTitle}</span>{activityDetail && item.title !== '准备上下文' && <span className="thought-activity-summary">{activityDetail}</span>}</button> : expandable ? <>
+          {previewImages.some((image) => `image-read:${image.id}` === item.id) ? <button type="button" className="thought-activity-static is-clickable" aria-label={`预览 ${activityDetail}`} title={`预览 ${activityDetail}`} onClick={() => setPreviewImageId(item.id.slice('image-read:'.length))}><span className="thought-activity-title">{activityTitle}</span><span className="thought-activity-summary">{activityDetail}</span></button> : item.changeSet?.files?.[0] && runId && onOpenFileChange ? <button type="button" className="thought-activity-static is-clickable" onClick={() => openInlineChange(item)}><span className="thought-activity-title">{activityTitle}</span>{activityDetail && item.title !== '准备上下文' && <span className="thought-activity-summary">{activityDetail}</span>}</button> : expandable ? <>
             <button type="button" className="thought-activity-toggle" aria-expanded={expanded} onClick={() => toggleItem(item)}><span><span className="thought-activity-title">{activityTitle}</span><span className="thought-activity-summary">{activityDetail}</span></span><ChevronRight className="thought-activity-chevron" size={14} aria-hidden="true" /></button>
             <CollapsibleRegion expanded={expanded} mounted={Boolean(mountedItems[item.id]) || expanded} className="thought-activity-detail-collapse">
               {detailRequest
@@ -625,11 +633,12 @@ export function ThoughtActivityList({ items, runId, live = false, activeItemId, 
         </div>
       </div>
     })}
+    {previewImages.some((image) => image.id === previewImageId) && <PendingImagePreview images={previewImages} selectedId={previewImageId} onSelect={setPreviewImageId} onClose={() => setPreviewImageId('')} />}
   </div>
 }
 
 // CompletedThoughtTimeline 在助手历史消息上方展示可折叠的执行详情。
-export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({ runId, timeline, onOpenFileChange }: { runId: string; timeline: ThoughtTimelineState; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
+export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({ runId, sessionId, timeline, onOpenFileChange }: { runId: string; sessionId?: string; timeline: ThoughtTimelineState; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const [expanded, setExpanded] = useState(false)
   const [mounted, setMounted] = useState(false)
   const duration = formatThoughtDuration(timeline.elapsedMs)
@@ -645,12 +654,12 @@ export const CompletedThoughtTimeline = memo(function CompletedThoughtTimeline({
     {hasDetails ? <button type="button" className="completed-thought-toggle" aria-expanded={expanded} aria-controls={`thought-details-${runId}`} onClick={toggleExpanded}>
       <span className="completed-thought-duration">执行详情 · 用时 {duration}</span><span className="completed-thought-summary">{summary}</span><ChevronRight className="completed-thought-chevron" size={13} aria-hidden="true" />
     </button> : <span className="completed-thought-duration completed-thought-static">用时 {duration}</span>}
-    {hasDetails && <CollapsibleRegion id={`thought-details-${runId}`} expanded={expanded} mounted={mounted || expanded} className="completed-thought-collapse"><OrderedRunContent items={items} activitiesVisible runId={runId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} /></CollapsibleRegion>}
+    {hasDetails && <CollapsibleRegion id={`thought-details-${runId}`} expanded={expanded} mounted={mounted || expanded} className="completed-thought-collapse"><OrderedRunContent items={items} activitiesVisible runId={runId} sessionId={sessionId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} /></CollapsibleRegion>}
   </article>
 })
 
 // 每个运行阶段以独立实例持有计时和展开状态：新运行默认展开，进入终态时默认收起且仍允许用户再次展开。
-function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChange }: { liveRun: LiveRunView; initiallyExpanded: boolean; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
+function LiveAssistantMessageState({ liveRun, sessionId, initiallyExpanded, onOpenFileChange }: { liveRun: LiveRunView; sessionId?: string; initiallyExpanded: boolean; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const [now, setNow] = useState(() => Date.now())
   const [expanded, setExpanded] = useState(initiallyExpanded)
   const [mounted, setMounted] = useState(initiallyExpanded)
@@ -696,6 +705,7 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChang
     ))
   const waitingStatus = liveRun.thinkingStatus || '思考中…'
   const waitingForVisibleContent = !liveRun.thought.finished
+    && !liveRun.thought.activeStepHasFinalAnswer
     && liveRun.status !== 'terminal'
     && liveRun.status !== 'awaiting_approval'
     && !hasRunningActivity
@@ -717,7 +727,7 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChang
           ? <div className={`live-thought ${expanded ? 'expanded' : ''}`}>
             <button type="button" className="live-thought-toggle" aria-expanded={expanded} onClick={toggleExpanded}><ChevronRight className="live-thought-chevron" size={13} aria-hidden="true" /><span>{liveRun.thought.finished ? `执行详情 · 用时 ${formatThoughtDuration(liveRun.thought.elapsedMs)}` : '执行详情'}</span></button>
             <CollapsibleRegion expanded={expanded} mounted={mounted || expanded} className="live-thought-collapse">
-              <OrderedRunContent items={executionItems} activitiesVisible runId={liveRun.runId} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} />
+              <OrderedRunContent items={executionItems} activitiesVisible runId={liveRun.runId} sessionId={sessionId} live activeItemId={liveRun.thought.activeItemId} includeFinalAssistant={false} onOpenFileChange={onOpenFileChange} />
               {waitingForVisibleContent && <ThinkingWaitLine status={waitingStatus} elapsedMs={activeStepElapsedMs} />}
             </CollapsibleRegion>
           </div>
@@ -731,10 +741,10 @@ function LiveAssistantMessageState({ liveRun, initiallyExpanded, onOpenFileChang
 }
 
 // LiveAssistantMessage 合并阶段、实时耗时、活动时间线和逐字回复草稿。
-export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun, onOpenFileChange }: { liveRun: LiveRunView; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
+export const LiveAssistantMessage = memo(function LiveAssistantMessage({ liveRun, sessionId, onOpenFileChange }: { liveRun: LiveRunView; sessionId?: string; onOpenFileChange?: (selection: FileChangeSelection) => void }) {
   const terminal = liveRun.thought.finished || liveRun.status === 'terminal'
   const stateKey = `${liveRun.runId}:${liveRun.thought.startedAt ?? 'pending'}:${terminal ? 'terminal' : 'active'}`
-  return <LiveAssistantMessageState key={stateKey} liveRun={liveRun} initiallyExpanded={!terminal} onOpenFileChange={onOpenFileChange} />
+  return <LiveAssistantMessageState key={stateKey} liveRun={liveRun} sessionId={sessionId} initiallyExpanded={!terminal} onOpenFileChange={onOpenFileChange} />
 })
 
 // ApprovalCard 展示待执行动作及风险信息，并将批准/拒绝决策回传会话协调器。

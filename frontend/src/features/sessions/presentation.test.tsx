@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 
-import { ChildAgentPanel, CompletedThoughtTimeline, FileChangeActivity, LiveAssistantMessage, MessageBubble, RunPlanProgress } from './presentation'
+import { ChildAgentPanel, CompletedThoughtTimeline, FileChangeActivity, LiveAssistantMessage, MessageBubble, RunPlanProgress, ThoughtActivityList } from './presentation'
 import { DurableTaskCard } from './components/DurableTaskCard'
 import { PersistentTaskSource } from './components/PersistentTaskSource'
 import { createLiveMarkdownCoalescer } from './liveMarkdownCoalescer'
@@ -144,6 +144,38 @@ describe('子 Agent 运行事件展示', () => {
 })
 
 describe('助手消息中的思考过程展示', () => {
+  it('实时与历史图片行使用可访问的预览按钮，失败图片不伪装成可预览', () => {
+    const thought = updateThoughtTimeline(emptyThoughtTimeline, { type: 'image_read_completed', attachment_id: 'image-1', image_name: 'sample.png' }, 1_000)
+    for (const live of [true, false]) {
+      const markup = renderToStaticMarkup(createElement(ThoughtActivityList, { items: thought.items, sessionId: 'session-images', live }))
+      expect(markup).toContain('aria-label="预览 sample.png"')
+      expect(markup).toContain('thought-activity-static is-clickable')
+      expect(markup).not.toContain('target="_blank"')
+    }
+    const failed = updateThoughtTimeline(thought, { type: 'image_read_failed', attachment_id: 'image-1' }, 1_100)
+    expect(renderToStaticMarkup(createElement(ThoughtActivityList, { items: failed.items, sessionId: 'session-images' }))).not.toContain('aria-label="预览')
+  })
+  it('最终回复开始后不再显示停顿思考提示，真正进入新步骤后恢复', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    const render = (thought: ThoughtTimelineState) => renderToStaticMarkup(createElement(LiveAssistantMessage, {
+      liveRun: { runId: 'run-final-pause', phase: '正在回复…', draft: '', status: 'live', error: '', thinkingStatus: '思考中…', thought },
+    }))
+    try {
+      let thought = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+      thought = updateThoughtTimeline(thought, { type: 'assistant_message_started', item_id: 'final', phase: 'final_answer' }, 1_100)
+      expect(render(thought)).not.toContain('class="thought-waiting"')
+      thought = updateThoughtTimeline(thought, { type: 'assistant_message_delta', item_id: 'final', phase: 'final_answer', delta: '最终结果。' }, 1_200)
+      expect(render(thought)).not.toContain('class="thought-waiting"')
+      thought = updateThoughtTimeline(thought, { type: 'assistant_message_completed', item_id: 'final', phase: 'final_answer', content: '最终结果。' }, 1_300)
+      expect(render(thought)).not.toContain('class="thought-waiting"')
+      expect(thought.finished).toBe(false)
+      const next = updateThoughtTimeline(thought, { type: 'model_step_started', step: 2 }, 9_000)
+      expect(render(next)).toContain('已等待 1 秒')
+      expect(next.startedAt).toBe(1_000)
+    } finally { vi.useRealTimers() }
+  })
+
   it('图片读取复用工具行样式和运行动效，并显示完成或失败状态', () => {
     vi.useFakeTimers()
     vi.setSystemTime(2_000)

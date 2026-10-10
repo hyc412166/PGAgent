@@ -58,7 +58,7 @@ export function ChildConversation({ task }: { task: DelegatedTask }) {
     {data.initialLoading && <LoadingState label="正在读取子 Agent 会话…" />}
     {data.error && <ErrorState message={data.error} onRetry={reload} />}
     <article className="message assistant"><div className="message-body"><div className="message-meta"><strong>{name}</strong><StatusBadge status={data.data.run?.status || task.status} /></div>
-      {!!data.data.events.length && <CompletedThoughtTimeline runId={runId} timeline={timelineFromRunEvents(data.data.events.filter(event => !(event.event_type || event.type || '').startsWith('assistant_message_')).map(event => ({ ...event, type: event.event_type || event.type || '' })))} />}
+      {!!data.data.events.length && <CompletedThoughtTimeline runId={runId} sessionId={task.parent_session_id} timeline={timelineFromRunEvents(data.data.events.filter(event => !(event.event_type || event.type || '').startsWith('assistant_message_')).map(event => ({ ...event, type: event.event_type || event.type || '' })))} />}
       {replies.map(reply => <MarkdownContent key={reply.id} content={reply.content} />)}
       {!data.loading && !data.error && !replies.length && <p className="inline-notice">{terminal ? '此运行没有已记录的回复正文。' : '子 Agent 正在执行任务…'}</p>}
     </div></article>

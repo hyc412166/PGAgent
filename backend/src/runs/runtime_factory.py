@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -173,12 +174,32 @@ class RunRuntimeFactory:
             expose_legacy_tools=bool(context.get("expose_legacy_tools")),
         )
         coordinator.register_tool_canceller(run_id, registry.cancel_active)
+        # 初始化时已有的附件/派生页面属于历史；新上传图片与后续工具新生成的图片仍报告真实加载。
+        historical_image_ids: set[str] = set()
+        for message in context["recent_messages"]:
+            content = message.get("content")
+            if isinstance(content, list):
+                historical_image_ids.update(
+                    str(part["attachment_id"]) for part in content
+                    if isinstance(part, dict) and part.get("type") == "pgagent_image_ref" and part.get("attachment_id")
+                )
+            if message.get("role") == "tool" and isinstance(content, str):
+                try:
+                    tool_payload = json.loads(content)
+                except ValueError:
+                    continue
+                metadata = tool_payload.get("metadata") if isinstance(tool_payload, dict) else None
+                image_ref = metadata.get("model_image_ref") if isinstance(metadata, dict) else None
+                if isinstance(image_ref, dict) and image_ref.get("id"):
+                    historical_image_ids.add(str(image_ref["id"]))
+        historical_image_ids.difference_update(context.get("input_image_ids") or ())
         # 变量说明：runtime 表示当前步骤使用的 runtime 值。
         runtime = runtime_type(
             model_call=bind_attachment_store(
                 build_model_call(context["provider"]),
                 attachment_store,
                 image_event_sink=type(coordinator)._event_sink(run_id),
+                historical_image_ids=historical_image_ids,
             ),
             tool_registry=registry,
             context_manager=ContextManager(max_tokens=settings.context_limit_tokens),

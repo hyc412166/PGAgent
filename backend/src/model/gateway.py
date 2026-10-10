@@ -105,13 +105,16 @@ def bind_attachment_store(
     attachment_store: Any | None,
     *,
     image_event_sink: Callable[[dict[str, Any]], None] | None = None,
+    historical_image_ids: set[str] | None = None,
 ) -> Any:
     """Hydrate session-private image refs without changing provider factory APIs."""
 
     if attachment_store is None:
         return model_call
 
-    reported_images: set[str] = set()
+    # 历史图片仍需随上下文提交给模型，但重新组装请求不代表本轮新增了读取动作。
+    historical_images = set(historical_image_ids or ())
+    reported_images = set(historical_images)
 
     def load_image(attachment_id: str, image_name: str) -> str | None:
         # 在实际文件加载的两侧记录状态；历史图片仍按协议重发，但本次运行不重复新增读取记录。
@@ -122,14 +125,14 @@ def bind_attachment_store(
         try:
             data_url = attachment_store.data_url(attachment_id)
         except Exception:
-            if image_event_sink is not None:
+            if attachment_id not in historical_images and image_event_sink is not None:
                 image_event_sink({"type": "image_read_failed", **identity, "error_code": "image_unavailable"})
             raise
         if data_url:
             if first_read and image_event_sink is not None:
                 image_event_sink({"type": "image_read_completed", **identity})
             reported_images.add(attachment_id)
-        elif image_event_sink is not None:
+        elif attachment_id not in historical_images and image_event_sink is not None:
             image_event_sink({"type": "image_read_failed", **identity, "error_code": "image_unavailable"})
         return data_url
 

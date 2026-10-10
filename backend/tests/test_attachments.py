@@ -34,6 +34,8 @@ from src.persistence.database import (
     Artifact,
     Base,
     ChatMessage,
+    ModelConnection,
+    Run,
     DEFAULT_AGENT_ID,
     DEFAULT_WORKSPACE_ID,
     Session,
@@ -161,6 +163,47 @@ def test_image_attachment_history_keeps_reference_instead_of_base64(
         assert isinstance(content, list)
         assert content[1]["type"] == "pgagent_image_ref"
     assert "base64" not in json.dumps(content)
+
+
+def test_runtime_only_reports_images_uploaded_in_current_turn(
+    attachment_client: tuple[TestClient, Path, list[str]], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.runs import runtime_factory
+
+    client, _data_dir, _launched = attachment_client
+    session_id = _session()
+    with database.SessionLocal() as db:
+        connection = ModelConnection(name="Image test", provider="openai_compatible", base_url="https://example.invalid/v1",
+                                     secret_ref="test:image", default_model="test-model", status="connected")
+        db.add(connection)
+        db.flush()
+        db.get(Session, session_id).model_connection_id = connection.id
+        db.commit()
+    captured: list[list[dict]] = []
+
+    async def model_call(**kwargs):
+        captured.append(kwargs["messages"])
+        return {"content": "ok"}
+
+    monkeypatch.setattr(runtime_factory, "build_model_call", lambda _config: model_call)
+    for index, image_name in enumerate(["first.png", None, "second.png"]):
+        payload = {"content": "查看图片" if image_name else "纯文字继续", "idempotency_key": f"image-turn-{index}"}
+        response = (client.post(f"/api/sessions/{session_id}/turns", data={"payload": json.dumps(payload)},
+                               files=[("files", (image_name, b"\x89PNG\r\n\x1a\nimage-bytes", "image/png"))])
+                    if image_name else client.post(f"/api/sessions/{session_id}/run", json=payload))
+        assert response.status_code == 202, response.text
+        run_id = response.json()["id"]
+        runtime, context = coordinator._resolve_runtime(run_id)
+        asyncio.run(runtime.model_call(messages=context["recent_messages"]))
+        asyncio.run(runtime.model_call(messages=context["recent_messages"]))
+        with database.SessionLocal() as db:
+            events = list(db.query(RunEvent).filter(RunEvent.run_id == run_id, RunEvent.event_type.like("image_read_%")))
+            assert [event.event_type for event in events] == (["image_read_started", "image_read_completed"] if image_name else [])
+            assert all(event.payload["image_name"] == image_name for event in events)
+            db.get(Run, run_id).status = "completed"
+            db.commit()
+    # 纯文字续接仍保留先前图片上下文，但不得把协议重发呈现为新读取。
+    assert captured[2][0]["content"][1]["type"] == "image_url"
 
 
 def test_image_reads_reach_live_stream_and_public_history(

@@ -4,6 +4,16 @@ import { displayToolName, emptyThoughtTimeline, formatLiveThinkingDuration, form
 
 // 测试分组：实时 Thought 时间线。
 describe('实时 Thought 时间线', () => {
+  it('兼容未标记 phase 的输出，在无工具 response 完成后抑制等待且不提前终结运行', () => {
+    let timeline = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+    timeline = updateThoughtTimeline(timeline, { type: 'assistant_message_completed', item_id: 'unknown', content: '完成。' }, 1_100)
+    expect(updateThoughtTimeline(timeline, { type: 'model_response_completed', has_tool_calls: true }, 1_200).activeStepHasFinalAnswer).not.toBe(true)
+    const completed = updateThoughtTimeline(timeline, { type: 'model_response_completed', has_tool_calls: false }, 1_200)
+    expect(completed.activeStepHasFinalAnswer).toBe(true)
+    expect(completed.finished).toBe(false)
+    expect(updateThoughtTimeline(completed, { type: 'model_step_started', step: 2 }, 1_300).activeStepHasFinalAnswer).toBe(false)
+    expect(updateThoughtTimeline(completed, { type: 'model_retry' }, 1_300).activeStepHasFinalAnswer).toBe(false)
+  })
   it('图片读取按附件身份更新同一行，完成后恢复思考并支持历史回放', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
     const reading = updateThoughtTimeline(started, { type: 'image_read_started', attachment_id: 'image-1', image_name: 'sample.png' }, 1_100)
