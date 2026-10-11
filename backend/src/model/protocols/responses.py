@@ -77,7 +77,7 @@ def input_items(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # 函数职责：完成 response_tools 对应的业务处理。
 # 参数关系：tools 表示本轮可调用的工具集合。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
-def response_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def response_tools(tools: list[dict[str, Any]], *, hosted_web_search: bool = False) -> list[dict[str, Any]]:
     """Project the shared tool catalog into native Responses tool definitions."""
     # 变量说明：result 表示本步骤产生的结果。
     result: list[dict[str, Any]] = []
@@ -87,9 +87,8 @@ def response_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if kind == "function" and isinstance(tool.get("function"), Mapping):
             # 变量说明：function 表示当前步骤使用的 function 值。
             function = dict(tool["function"])
-            if function.get("name") == "web_search":
-                # The registry stays protocol-neutral: Chat Completions uses
-                # the local fallback, while Responses receives its hosted tool.
+            if function.get("name") == "web_search" and hosted_web_search:
+                # 协议兼容不代表搜索服务可用，只转换运行时已确认的原生能力。
                 result.append({"type": "web_search"})
                 continue
             # 变量说明：function 的索引项 表示该语句创建或更新的目标数据。
@@ -262,16 +261,26 @@ def _normalize_item(item: Mapping[str, Any], response_id: str | None, output_ind
     }
     if kind == "message":
         text = []
+        citations = []
+        offset = 0
         for part in item.get("content") or []:
             part = _as_mapping(part)
             if part.get("type") == "output_text":
                 text.append(str(part.get("text") or ""))
+                for annotation in part.get("annotations") or []:
+                    if annotation.get("type") == "url_citation":
+                        citation = dict(annotation)
+                        citation["end_index"] = int(annotation["end_index"]) + offset
+                        citation["start_index"] = int(annotation["start_index"]) + offset
+                        citations.append(citation)
             elif part.get("type") == "refusal":
                 text.append(str(part.get("refusal") or ""))
+            offset = sum(len(value) for value in text)
         return AssistantMessageItem(
             **common, content="".join(text),
             phase=item.get("phase", OutputPhase.UNKNOWN),
             end_turn=item.get("end_turn", EndTurn.UNKNOWN),
+            citations=citations,
         )
     if kind == "reasoning":
         return ReasoningItem(

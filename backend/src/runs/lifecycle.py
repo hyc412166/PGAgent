@@ -1689,6 +1689,11 @@ class RunCoordinator:
                     thinking_level=str(frozen_binding.get("thinking_level") or "auto"),
                     custom_headers=dict(connection.custom_headers or {}),
                     api_protocol=str(frozen_binding.get("api_protocol") or "chat_completions"),
+                    # 空能力也是本轮已确定的配置；旧快照不借用后来重新检测的能力。
+                    capabilities=dict(
+                        frozen_binding["model_capabilities"]
+                        if "model_capabilities" in frozen_binding else {}
+                    ),
                 )
                 if isinstance(frozen_binding.get("tool_ids"), list):
                     # 变量说明：agent_tool_ids 表示agent_tool 对象标识集合。
@@ -1813,6 +1818,7 @@ class RunCoordinator:
                     thinking_level=thinking_level,
                     custom_headers=dict(connection.custom_headers or {}),
                     api_protocol=connection.api_protocol,
+                    capabilities=dict(connection.capabilities or {}),
                 )
                 # 变量说明：frozen_binding 表示当前步骤使用的 frozen_binding 值。
                 frozen_binding = {
@@ -1822,6 +1828,7 @@ class RunCoordinator:
                     "model_connection_id": connection.id,
                     "provider": connection.provider,
                     "api_protocol": connection.api_protocol,
+                    "model_capabilities": dict(connection.capabilities or {}),
                     "base_url": connection.base_url,
                     "secret_ref": connection.secret_ref,
                     "model_id": model_id,

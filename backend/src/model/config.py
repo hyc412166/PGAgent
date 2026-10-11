@@ -3,7 +3,7 @@
 # 逻辑关系：上层通过 model/config.py 使用本模块；本模块把处理结果交给同领域服务、持久化层或 API 响应层。
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 # 类职责：定义 ProviderConfig 在本领域中的数据与行为。
 @dataclass(slots=True)
@@ -24,5 +24,9 @@ class ProviderConfig:
     custom_headers: dict[str, str] = field(default_factory=dict)
     # 变量说明：api_protocol 表示当前步骤使用的 api_protocol 值。
     api_protocol: Literal["chat_completions", "responses"] = "chat_completions"
+    # 由后端连接检测维护，用户表单不接受能力或搜索执行方式。
+    capabilities: dict[str, Any] = field(default_factory=dict)
+    # 运行组装后确定的执行方，也供请求适配使用，避免恢复时重新猜测能力。
+    web_search_backend: Literal["local", "provider"] = "local"
     # 变量说明：max_output_tokens 表示当前流程使用的 max_output_tokens 集合。
     max_output_tokens: int = 8_000

@@ -471,6 +471,7 @@ class _SubagentTaskDelegate:
             thinking_level=selected_thinking_level,
             custom_headers=dict(connection.custom_headers or {}),
             api_protocol=connection.api_protocol,
+            capabilities=dict(connection.capabilities or {}),
         )
         # 变量说明：binding 表示当前步骤使用的 binding 值。
         binding = {
@@ -488,6 +489,7 @@ class _SubagentTaskDelegate:
             "model_connection_id": connection.id,
             "provider": connection.provider,
             "api_protocol": connection.api_protocol,
+            "model_capabilities": dict(connection.capabilities or {}),
             "base_url": connection.base_url,
             "secret_ref": connection.secret_ref,
             "model_id": selected_model_id,

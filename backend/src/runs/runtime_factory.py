@@ -16,6 +16,7 @@ from src.config import settings
 from src.context import ContextManager, FilesystemArtifactStore
 from src.memory.service import MemoryToolStore
 from src.model.gateway import bind_attachment_store
+from src.model.web_search import supports_hosted_web_search
 from src.tasks.background import BackgroundJobToolStore
 from src.tasks.graph import TaskGraphToolStore
 from src.tasks.state import sync_todos_for_run, task_checkpoint_for_run
@@ -174,6 +175,17 @@ class RunRuntimeFactory:
             expose_legacy_tools=bool(context.get("expose_legacy_tools")),
         )
         coordinator.register_tool_canceller(run_id, registry.cancel_active)
+        # 已开始的运行沿用原执行方；升级前没有能力字段的快照保留本地入口，
+        # 使等待审批的 web_run 调用仍能继续。新运行才按 provider 能力选择。
+        hosted_search = (
+            binding["web_search_backend"] == "provider"
+            if "web_search_backend" in binding
+            else "model_capabilities" in binding and supports_hosted_web_search(context["provider"])
+        )
+        registry.configure_web_search(hosted=hosted_search)
+        context["provider"].web_search_backend = registry.runtime_state()["web_search_backend"]
+        context["runtime_binding"]["web_search_backend"] = context["provider"].web_search_backend
+        context["agent_instructions"] = str(context.get("agent_instructions") or "") + "\n" + registry.web_search_instructions
         # 初始化时已有的附件/派生页面属于历史；新上传图片与后续工具新生成的图片仍报告真实加载。
         historical_image_ids: set[str] = set()
         for message in context["recent_messages"]:

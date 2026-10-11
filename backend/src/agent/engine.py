@@ -352,9 +352,13 @@ def provider_web_search_calls(provider_payload: Mapping[str, Any] | None) -> lis
             continue
         # 变量说明：action 表示当前步骤使用的 action 值。
         action = item.get("action") if isinstance(item.get("action"), Mapping) else {}
+        # 服务端搜索可能返回批量 queries；阅读与页内查找则以 URL 展示实际动作。
+        detail = action.get("query") or "; ".join(str(query) for query in action.get("queries") or [])
+        if not detail:
+            detail = action.get("url") or ""
         calls.append({
             "id": str(item.get("id") or f"web-search-{index + 1}"),
-            "query": str(action.get("query") or ""),
+            "query": str(detail),
             "source_count": len(action.get("sources") or []),
             "ok": item.get("status") not in {"failed", "incomplete"},
         })
@@ -638,7 +642,7 @@ class ModelTurn:
             if not isinstance(normalized_response, NormalizedModelResponse):
                 raise TypeError("_pgagent_normalized_response 必须是 NormalizedModelResponse")
             assistant_content = "".join(
-                item.content
+                item.display_content
                 for item in normalized_response.items
                 if isinstance(item, AssistantMessageItem)
             )
@@ -1860,7 +1864,7 @@ class AgentRuntime:
                         if not isinstance(item, AssistantMessageItem):
                             raise TypeError("on_assistant_item_completed 必须接收 AssistantMessageItem")
                         item_payload: dict[str, Any] = {
-                            "content": item.content[:100_000],
+                            "content": item.display_content[:100_000],
                             "output_index": item.output_index,
                             "phase": str(item.phase),
                             "step": guard.steps,
@@ -2071,7 +2075,7 @@ class AgentRuntime:
                             continue
                         response_output_chars += len(response_item.content)
                         item_payload: dict[str, Any] = {
-                            "content": response_item.content[:100_000],
+                            "content": response_item.display_content[:100_000],
                             "output_index": response_item.output_index,
                             "phase": str(response_item.phase),
                             "has_tool_calls": bool(turn.tool_calls),

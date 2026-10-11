@@ -67,7 +67,9 @@ def create_model_call(config: ProviderConfig, *, credentials):
                     if client is None:
                         return await chat_completions.create(config, api_key, current_messages, tools, mode, prompt_cache_key)
                     # 变量说明：response_tool_defs 表示当前流程使用的 response_tool_defs 集合。
-                    response_tool_defs = responses.response_tools(tools)
+                    response_tool_defs = responses.response_tools(
+                        tools, hosted_web_search=config.web_search_backend == "provider",
+                    )
                     # 变量说明：include 表示当前步骤使用的 include 值。
                     include = ["reasoning.encrypted_content"]
                     if any(tool.get("type") in {"web_search", "web_search_preview"} for tool in response_tool_defs):

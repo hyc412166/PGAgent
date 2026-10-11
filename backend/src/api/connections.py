@@ -27,12 +27,32 @@ from src.model.credentials import (
     save_api_key,
     secret_ref_for_connection,
 )
+from src.model.web_search import probe_hosted_web_search
 
 
 # 变量说明：router 表示当前步骤使用的 router 值。
 router = APIRouter(prefix="/api/connections", tags=["model connections"])
 # 变量说明：REQUEST_TIMEOUT_SECONDS 表示当前流程使用的 REQUEST_TIMEOUT_SECONDS 集合。
 REQUEST_TIMEOUT_SECONDS = 12.0
+
+
+def _record_web_search_capability(connection: ModelConnection, api_key: str) -> dict[str, Any] | None:
+    """复用连接检测按模型记录能力；未完成的检测保留原因，不伪装为支持。"""
+    if connection.api_protocol != "responses" or not connection.default_model:
+        return None
+    base_url = connection.base_url.strip().rstrip("/")
+    previous = (connection.capabilities or {}).get("hosted_web_search", {})
+    models = dict(previous.get("models", {})) if previous.get("base_url") == base_url else {}
+    result = probe_hosted_web_search(base_url, api_key, connection.default_model, connection.custom_headers)
+    if result["supported"] is None and connection.default_model in models:
+        # 超时、限流等不确定结果不能抹掉已验证能力；最近检测错误仍完整可见。
+        models[connection.default_model] = {**models[connection.default_model], "last_check": result}
+    else:
+        models[connection.default_model] = result
+    connection.capabilities = {**(connection.capabilities or {}), "hosted_web_search": {
+        "base_url": base_url, "models": models,
+    }}
+    return result
 
 
 def _connection_model_catalog(connection: ModelConnection) -> list[str]:
@@ -358,6 +378,7 @@ def create_connection(payload: ModelConnectionCreate, db: Session = Depends(get_
         enabled=payload.enabled,
     )
     _reconcile_model_selection(db, connection)
+    _record_web_search_capability(connection, payload.api_key)
     db.add(connection)
     try:
         db.commit()
@@ -470,6 +491,10 @@ def update_connection(
             })
         # 变量说明：capabilities 表示当前流程使用的 capabilities 集合。
         connection.capabilities = {**connection.capabilities, connection.api_protocol: True}
+        # 地址、凭据或请求头变化后，旧的模型能力证据不再适用于新连接。
+        if should_discover:
+            connection.capabilities = {key: value for key, value in connection.capabilities.items() if key != "hosted_web_search"}
+        _record_web_search_capability(connection, api_key)
     if {"disabled_models", "manual_models", "default_model"}.intersection(payload.model_fields_set) or should_discover:
         _reconcile_model_selection(db, connection)
     if payload.api_key is not None:
@@ -556,6 +581,9 @@ def test_connection(connection_id: str, db: Session = Depends(get_db)) -> Connec
     if result.success:
         # 变量说明：capabilities 表示当前流程使用的 capabilities 集合。
         connection.capabilities = {**connection.capabilities, connection.api_protocol: True}
+        search_result = _record_web_search_capability(connection, api_key)
+        if search_result is not None:
+            result.message += f"；{search_result['message']}"
     db.commit()
     return result
 

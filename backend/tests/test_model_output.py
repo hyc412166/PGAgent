@@ -69,6 +69,7 @@ def test_normalized_response_keeps_four_item_kinds_ordered_and_serializable() ->
                 "item_id": "msg-1",
                 "output_index": 0,
                 "content": "准备执行。",
+                "citations": [],
                 "phase": "commentary",
                 "end_turn": False,
             },

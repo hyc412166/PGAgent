@@ -1805,6 +1805,77 @@ def test_runtime_uses_session_thinking_and_ignores_child_agent_settings(
         RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
 
 
+@pytest.mark.parametrize("initial_supported", [False, True])
+def test_resume_preserves_search_capability_when_live_connection_is_retested(
+    seeded_run: tuple[str, str], initial_supported: bool,
+) -> None:
+    """空能力快照和已验证能力都属于原运行，重检连接仅影响后续新运行。"""
+    run_id, session_id = seeded_run
+    with database.SessionLocal() as db:
+        connection = ModelConnection(
+            name="Search resume", provider="openai_compatible", api_protocol="responses",
+            base_url="https://search.test/v1", secret_ref="search-resume-secret",
+            default_model="test-model", status="connected",
+            capabilities=({"hosted_web_search": {"base_url": "https://search.test/v1", "models": {
+                "test-model": {"supported": True},
+            }}} if initial_supported else {}),
+        )
+        db.add(connection)
+        db.flush()
+        session = db.get(Session, session_id)
+        session.model_connection_id = connection.id
+        session.model_id = "test-model"
+        connection_id = connection.id
+        db.commit()
+    runtime, context = RunCoordinator._resolve_runtime(run_id)
+    expected_capabilities = dict(context["provider"].capabilities)
+    expected_backend = "provider" if initial_supported else "local"
+    assert runtime.tool_registry.runtime_state()["web_search_backend"] == expected_backend
+    with database.SessionLocal() as db:
+        connection = db.get(ModelConnection, connection_id)
+        connection.capabilities = {"hosted_web_search": {"base_url": connection.base_url, "models": {
+            "test-model": {"supported": not initial_supported},
+        }}}
+        db.commit()
+    resumed, resumed_context = RunCoordinator._resolve_runtime(run_id, runtime_binding=context["runtime_binding"])
+    assert resumed_context["provider"].capabilities == expected_capabilities
+    assert resumed.tool_registry.runtime_state()["web_search_backend"] == expected_backend
+
+
+@pytest.mark.asyncio
+async def test_legacy_openai_snapshot_can_finish_pending_local_search(
+    seeded_run: tuple[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.tools import builtins
+    from src.tools.types import ToolResult
+
+    run_id, session_id = seeded_run
+    monkeypatch.setattr(builtins, "web_run", lambda sandbox, **kwargs: ToolResult("web_run", True, "实际旧搜索结果"))
+    with database.SessionLocal() as db:
+        connection = ModelConnection(
+            name="Legacy OpenAI search", provider="openai_compatible", api_protocol="responses",
+            base_url="https://api.openai.com/v1", secret_ref="legacy-search-secret",
+            default_model="gpt-5.5", status="connected",
+        )
+        db.add(connection)
+        db.flush()
+        session = db.get(Session, session_id)
+        session.model_connection_id = connection.id
+        session.model_id = "gpt-5.5"
+        db.commit()
+    _, context = RunCoordinator._resolve_runtime(run_id)
+    legacy_binding = dict(context["runtime_binding"])
+    legacy_binding.pop("model_capabilities")
+    legacy_binding.pop("web_search_backend")
+    legacy_binding["allowed_tool_names"] = ["web_run", "tool_search"]
+    resumed, resumed_context = RunCoordinator._resolve_runtime(run_id, runtime_binding=legacy_binding)
+    assert resumed_context["provider"].web_search_backend == "local"
+    result = await resumed.tool_registry.execute_async(
+        "web_run", {"search_query": [{"q": "OpenAI website"}]}, approved=True,
+    )
+    assert result.ok and result.content == "实际旧搜索结果"
+
+
 # 测试场景：普通新 Run 不得继续调用已经被连接明确禁用的模型。
 def test_runtime_rejects_connection_when_all_models_are_disabled(
     seeded_run: tuple[str, str],

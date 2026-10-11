@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import httpx
 import pytest
@@ -18,6 +19,8 @@ from src.model import credentials as secrets
 from src.api import connections
 from src.api.connections import router as connections_router
 from src.persistence.database import Base, configure_database, init_db
+from src.model.config import ProviderConfig
+from src.model.web_search import supports_hosted_web_search
 
 
 # 测试替身类：FakeHttpClient 模拟外部依赖的响应与调用记录，使连接或协议测试无需访问真实服务。
@@ -47,7 +50,7 @@ class FakeHttpClient:
         assert headers["Authorization"].startswith("Bearer ")
         if url.endswith("/responses"):
             assert json["store"] is False
-            assert json["max_output_tokens"] == 16
+            assert json["max_output_tokens"] == (512 if json.get("tools") else 16)
         return self.protocol_response
 
     # 测试替身类：_Stream 保存该局部场景的可控状态。
@@ -143,6 +146,48 @@ def test_create_discovers_models_and_keeps_key_out_of_database_and_response(
     test_response = client.post(f"/api/connections/{body['id']}/test")
     assert test_response.status_code == 200
     assert test_response.json()["category"] == "ok"
+
+
+def test_connection_probe_persists_positive_search_evidence_and_transient_errors(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_client = httpx.Client
+    search_events = [{"type": "response.completed", "response": {"status": "completed", "output": [
+        {"type": "web_search_call", "id": "ws-positive", "status": "completed"},
+    ]}}]
+
+    def handle(request):
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "custom-model"}]})
+        payload = json.loads(request.content)
+        if not payload.get("tools"):
+            return httpx.Response(200, json={"id": "ping"})
+        return httpx.Response(200, text="\n\n".join("data: " + json.dumps(event) for event in search_events))
+
+    monkeypatch.setattr(connections.httpx, "Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(handle), **kwargs))
+    created = client.post("/api/connections", json={
+        "name": "Verified search relay", "base_url": "https://search-relay.test/v1/", "api_key": "secret",
+    })
+    assert created.status_code == 201, created.text
+    body = created.json()
+    evidence = body["capabilities"]["hosted_web_search"]
+    assert evidence["base_url"] == "https://search-relay.test/v1"
+    assert evidence["models"]["custom-model"]["supported"] is True
+    with database.SessionLocal() as db:
+        row = db.get(database.ModelConnection, body["id"])
+        assert row.capabilities["hosted_web_search"] == evidence
+        assert supports_hosted_web_search(ProviderConfig(
+            provider=row.provider, base_url=row.base_url, secret_ref=row.secret_ref,
+            model_id=row.default_model, api_protocol=row.api_protocol, capabilities=row.capabilities,
+        ))
+    search_events[:] = [{"type": "response.failed", "response": {"error": "quota"}}]
+    checked = client.post(f"/api/connections/{body['id']}/test")
+    assert checked.status_code == 200 and "搜索检测未完成" in checked.json()["message"]
+    read = client.get(f"/api/connections/{body['id']}").json()
+    evidence = read["capabilities"]["hosted_web_search"]["models"]["custom-model"]
+    assert evidence["supported"] is True
+    assert evidence["last_check"]["category"] == "provider_error"
 
 
 # 测试场景：验证接口或资源生命周期操作会返回正确结果并同步持久化状态；函数名 test_manual_models_allow_missing_models_endpoint 精确标识本用例的具体条件。

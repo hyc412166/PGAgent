@@ -318,7 +318,7 @@ def test_responses_preserves_native_web_search_tool_definition() -> None:
         },
     }]
 
-    assert response_tools(tools) == [tools[0], {
+    assert response_tools(tools, hosted_web_search=True) == [tools[0], {
         "type": "function",
         "name": "read",
         "description": "读取文件",
@@ -386,6 +386,26 @@ async def test_responses_keeps_hosted_web_search_call_out_of_local_dispatch(
         "content": response["content"],
         "_pgagent_provider": response["_pgagent_provider"],
     }]) == [web_search_call, message]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["local", "provider"])
+async def test_responses_request_uses_resolved_search_backend(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+    async def stream() -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "response.completed", "response": {
+            "status": "completed", "output": [], "usage": {},
+        }}
+    fake = install_fake_client(monkeypatch, [stream])
+    config = responses_config()
+    config.web_search_backend = backend
+    await build_model_call(config)(messages=[{"role": "user", "content": "搜索官网"}], tools=[{
+        "type": "function", "function": {"name": "web_search", "description": "搜索", "parameters": {
+            "type": "object", "properties": {"query": {"type": "string"}},
+        }},
+    }], mode="auto")
+    tool = fake.requests[0]["tools"][0]
+    assert tool["type"] == ("web_search" if backend == "provider" else "function")
+    assert ("web_search_call.action.sources" in fake.requests[0]["include"]) == (backend == "provider")
 
 
 @pytest.mark.asyncio

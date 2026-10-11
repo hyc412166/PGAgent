@@ -117,7 +117,14 @@ class AssistantMessageItem(OutputItem):
     content: str = ""
     phase: OutputPhase | str = OutputPhase.UNKNOWN
     end_turn: EndTurnInput = EndTurn.UNKNOWN
+    citations: list[dict[str, Any]] = field(default_factory=list)
     item_type: ClassVar[str] = "assistant_message"
+
+    @property
+    def display_content(self) -> str:
+        from src.model.citations import render_url_citations
+
+        return render_url_citations(self.content, self.citations)
 
     def __post_init__(self) -> None:
         OutputItem.__post_init__(self)

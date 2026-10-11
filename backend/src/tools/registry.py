@@ -694,6 +694,7 @@ class ToolRegistry:
 
         # 变量说明：sandbox 表示当前步骤使用的 sandbox 值。
         self.sandbox = sandbox
+        self._provider_hosted_web_search = False
         # 变量说明：permission_mode 表示当前步骤使用的 permission_mode 值。
         self.permission_mode = normalize_permission_mode(permission_mode)
         # 变量说明：_tools 表示当前流程使用的 _tools 集合。
@@ -1433,6 +1434,39 @@ class ToolRegistry:
                 runtime.presentation = ToolPresentation.hidden()
             self._activated_deferred_tools.discard(name)
 
+    def configure_web_search(self, *, hosted: bool) -> None:
+        """只替换已授权的搜索能力，保留 web_run 中独立的数据与截图命令。"""
+        search_names = {"web_run", "web_search", "websearch", "WebSearch"}
+        self._provider_hosted_web_search = hosted and bool(search_names.intersection(self.enabled_tool_names))
+        if not self._provider_hosted_web_search:
+            return
+        if "web_search" not in self.enabled_tool_names:
+            self._register_default("web_search")
+        for name in ("websearch", "WebSearch", "web_open", "webfetch", "WebFetch"):
+            self.hide_model_tool(name)
+        self.resolve_wire_name("web_search").presentation = ToolPresentation.direct()
+        web_run = self.resolve_wire_name("web_run")
+        if web_run is not None:
+            schema = dict(web_run.schema)
+            parameters = dict(schema["parameters"])
+            parameters["properties"] = {
+                key: value for key, value in parameters["properties"].items()
+                if key not in {"search_query", "open", "click", "find"}
+            }
+            parameters["additionalProperties"] = False
+            schema["parameters"] = parameters
+            schema["description"] = "查询天气、财经、体育、时间或生成公开网页截图。搜索、打开网页和页内查找使用本轮原生 web_search。"
+            web_run.schema = schema
+            self._schemas["web_run"] = schema
+
+    @property
+    def web_search_instructions(self) -> str:
+        if self._provider_hosted_web_search:
+            return "需要最新外部资料时使用本轮原生 web_search；搜索、网页阅读和页内查找由模型服务执行。web_run 仅用于已暴露的天气、财经、体育、时间与截图命令。搜索失败应说明错误，不通过本地搜索重试。保留实际来源引用。"
+        if {"web_run", "web_search", "websearch", "WebSearch"}.intersection(self.enabled_tool_names):
+            return "需要最新外部资料时使用本轮本地搜索工具，优先 web_run（如已暴露）；search_query 使用纯 ASCII 英文关键词，网页阅读使用已提供的 open/web_open。保留实际来源引用。"
+        return "本轮没有搜索权限，不调用搜索工具或声称已联网核实。"
+
     # 函数职责：完成 activate_deferred_tools 对应的业务处理。
     # 参数关系：names 表示当前流程使用的 names 集合。
     # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
@@ -1617,6 +1651,7 @@ class ToolRegistry:
         """Return only JSON-safe state that must survive approval/resume."""
 
         return {
+            "web_search_backend": "provider" if self._provider_hosted_web_search else "local",
             "allowed_tool_names": list(self.enabled_tool_names),
             "permission_mode": self.permission_mode,
             "skill_instructions": [dict(item) for item in self._skill_instructions.values()],
@@ -1656,6 +1691,12 @@ class ToolRegistry:
         name: str,
         invocation: ToolInvocation,
     ) -> ToolResult:
+        # 模型可能沿用历史中的旧函数名或参数；不能让它绕过本轮搜索执行方。
+        if self._provider_hosted_web_search and (
+            name in {"web_search", "websearch", "WebSearch", "web_open", "webfetch", "WebFetch"}
+            or (name == "web_run" and {"search_query", "open", "click", "find"}.intersection(invocation.arguments))
+        ):
+            return ToolResult(name, False, "本轮网页检索由服务端 web_search 执行，本地检索入口不可用", error_code="tool_not_offered")
         return await self._execute_async_legacy(
             name,
             invocation.arguments,
