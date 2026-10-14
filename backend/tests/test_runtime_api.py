@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -312,7 +313,7 @@ def test_run_stream_sends_current_state_replay_and_terminal_with_stable_ids(
     assert run_stream_broker.subscriber_count(run_id) == 0
 
 
-def test_run_stream_projects_durable_events_without_private_payloads(
+def test_run_stream_replay_preserves_timestamps_without_private_payloads(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:
     test_client, _launched = client
@@ -328,7 +329,7 @@ def test_run_stream_projects_durable_events_without_private_payloads(
         db.commit()
         run_id = run.id
 
-    run_stream_broker.publish(run_id, {
+    started = run_stream_broker.publish(run_id, {
         "type": "tool_started",
         "tool_name": "read_file",
         "tool_call_id": "call-secret-test",
@@ -338,18 +339,31 @@ def test_run_stream_projects_durable_events_without_private_payloads(
             "api_key": "private-api-key",
         },
     })
-    run_stream_broker.publish(run_id, {
+    delta = run_stream_broker.publish(run_id, {
+        "type": "thought_delta",
+        "delta": "正在检查",
+        "step": 1,
+        "private_context": "private-model-context",
+    })
+    terminal = run_stream_broker.publish(run_id, {
         "type": "run_completed",
         "output": "private-assistant-output",
     })
 
-    response = test_client.get(f"/api/runs/{run_id}/stream")
+    # 切回会话会重新建立连接；两次重放都应保留发布时刻，不能改成连接时刻。
+    for _ in range(2):
+        response = test_client.get(f"/api/runs/{run_id}/stream")
 
-    assert response.status_code == 200
-    assert '"path":"safe.txt"' in response.text
-    assert "private-file-body" not in response.text
-    assert "private-api-key" not in response.text
-    assert "private-assistant-output" not in response.text
+        assert response.status_code == 200
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+        replayed = {event["event_id"]: event for event in events if "event_id" in event}
+        for original in (started, delta, terminal):
+            assert replayed[original["event_id"]].get("created_at") == original["created_at"]
+        assert '"path":"safe.txt"' in response.text
+        assert "private-file-body" not in response.text
+        assert "private-api-key" not in response.text
+        assert "private-assistant-output" not in response.text
+        assert "private-model-context" not in response.text
 
 
 # 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_stop_run_is_idempotent_and_keeps_partial_stream_evidence 精确标识本用例的具体条件。

@@ -102,6 +102,9 @@ def _public_stream_event(event: dict) -> dict:
     public: dict = {"type": event_type}
     if event.get("event_id") is not None:
         public["event_id"] = event["event_id"]
+    # 重连重放必须保留发布时刻，前端才能延续当前等待计时；其余私有字段仍由下方投影过滤。
+    if "created_at" in event:
+        public["created_at"] = event["created_at"]
     if event_type == "run_state":
         for key in (
             "run_id", "status", "current_step", "tool_calls", "stop_reason",
