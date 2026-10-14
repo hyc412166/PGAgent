@@ -655,12 +655,21 @@ function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): Tho
   return null
 }
 
+// 重连会重放旧事件；实时流和历史恢复必须使用同一个原始时间，而不是重新接收的时刻。
+function thoughtEventTime(event: RunStreamEvent): number {
+  const value = firstString(event.created_at, event.timestamp)
+  if (!value) return Number.NaN
+  // 持久化的 UTC 时间可能没有时区标记，不能让浏览器按本地时区解释。
+  return Date.parse(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : `${value}Z`)
+}
+
 // 纯函数式吸收一个 SSE 事件，推进思考文本、工具状态、活动列表和终态时间。
 export function updateThoughtTimeline(
   state: ThoughtTimelineState,
   event: RunStreamEvent,
-  now = Date.now(),
+  now = thoughtEventTime(event),
 ): ThoughtTimelineState {
+  if (!Number.isFinite(now)) now = Date.now()
   const type = firstString(event.type, event.event_type).toLowerCase()
   const start = state.startedAt ?? (type === 'model_step_started' || type === 'mcp_connecting' || toolStartTypes.has(type) || assistantEventTypes.has(type) || imageReadEventTypes.has(type) ? now : null)
   const payload = record(event.payload)
@@ -911,8 +920,8 @@ export function timelineFromRunEvents(events: RunStreamEvent[]): ThoughtTimeline
     const leftSequence = typeof left.sequence === 'number' ? left.sequence : Number.MAX_SAFE_INTEGER
     const rightSequence = typeof right.sequence === 'number' ? right.sequence : Number.MAX_SAFE_INTEGER
     if (leftSequence !== rightSequence) return leftSequence - rightSequence
-    const leftCreatedAt = Date.parse(firstString(left.created_at, left.timestamp))
-    const rightCreatedAt = Date.parse(firstString(right.created_at, right.timestamp))
+    const leftCreatedAt = thoughtEventTime(left)
+    const rightCreatedAt = thoughtEventTime(right)
     if (Number.isFinite(leftCreatedAt) && Number.isFinite(rightCreatedAt) && leftCreatedAt !== rightCreatedAt) return leftCreatedAt - rightCreatedAt
     return 0
   })
@@ -921,8 +930,7 @@ export function timelineFromRunEvents(events: RunStreamEvent[]): ThoughtTimeline
     const type = firstString(event.type, event.event_type, payload.type, payload.event_type)
     if (!type) continue
     const flattened = { ...payload, ...event, type } as RunStreamEvent
-    const createdAt = firstString(event.created_at, event.timestamp)
-    const parsedTime = createdAt ? Date.parse(createdAt) : Number.NaN
+    const parsedTime = thoughtEventTime(event)
     const fallbackElapsed = typeof payload.elapsed_ms === 'number' ? payload.elapsed_ms : typeof event.elapsed_ms === 'number' ? event.elapsed_ms : 0
     const eventTime = Number.isFinite(parsedTime)
       ? parsedTime

@@ -1,9 +1,65 @@
 // 本测试文件验证 thoughtTimeline 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { parseRunStreamEvent } from './sessionStream'
 import { displayToolName, emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, safeToolTarget, summarizeThoughtConclusion, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from './thoughtTimeline'
 
 // 测试分组：实时 Thought 时间线。
 describe('实时 Thought 时间线', () => {
+  it('切回会话重放事件按原始时间恢复本轮等待，下一轮仍重新计时且总耗时不变', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime('2026-10-14T12:01:00Z')
+    try {
+      let timeline = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1, created_at: '2026-10-14T12:00:00Z' })
+      timeline = updateThoughtTimeline(timeline, { type: 'tool_started', tool_call_id: 'shell-1', tool_name: 'shell', created_at: '2026-10-14T12:00:05Z' })
+      timeline = updateThoughtTimeline(timeline, { type: 'tool_finished', tool_call_id: 'shell-1', created_at: '2026-10-14T12:00:10Z' })
+      expect(timeline.activeStepStartedAt).toBe(Date.parse('2026-10-14T12:00:10Z'))
+      expect(formatLiveThinkingDuration(Date.now() - timeline.activeStepStartedAt!)).toBe('50 秒')
+      timeline = updateThoughtTimeline(timeline, { type: 'model_step_started', step: 2, created_at: '2026-10-14T12:01:00Z' })
+      expect(timeline.activeStepStartedAt).toBe(Date.parse('2026-10-14T12:01:00Z'))
+      expect(timeline.startedAt).toBe(Date.parse('2026-10-14T12:00:00Z'))
+      expect(updateThoughtTimeline(timeline, { type: 'run_completed', created_at: '2026-10-14T12:01:02Z' }).elapsedMs).toBe(62_000)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('中间摘要停顿和完成后的等待在不同重连时刻保持原始边界', () => {
+    vi.useFakeTimers()
+    try {
+      const events = [
+        { type: 'model_step_started', created_at: '2026-10-14T12:00:00+00:00' },
+        { type: 'assistant_message_delta', item_id: 'summary-1', phase: 'commentary', delta: '继续检查', created_at: '2026-10-14T12:00:10+00:00' },
+        { type: 'assistant_message_completed', item_id: 'summary-1', phase: 'commentary', content: '继续检查', created_at: '2026-10-14T12:00:12+00:00' },
+      ]
+      for (const receivedAt of ['2026-10-14T12:01:00Z', '2026-10-14T12:02:00Z']) {
+        vi.setSystemTime(receivedAt)
+        let timeline = emptyThoughtTimeline
+        for (const event of events) {
+          timeline = updateThoughtTimeline(timeline, parseRunStreamEvent(JSON.stringify(event))!)
+          if (event.type === 'assistant_message_delta') {
+            expect(timeline.lastVisibleOutputAt).toBe(Date.parse(event.created_at))
+          }
+        }
+        expect(timeline.activeStepStartedAt).toBe(Date.parse(events[2].created_at))
+        expect(timeline.activeStepHasVisibleContent).toBe(false)
+        expect(timeline).toEqual(timelineFromRunEvents(events))
+      }
+    } finally { vi.useRealTimers() }
+  })
+
+  it('无时区的历史 UTC 时间与 SSE 时间一致，缺失无效时间仍使用接收时间', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime('2026-10-14T12:01:00Z')
+    try {
+      const event = { type: 'model_step_started', step: 1, created_at: '2026-10-14 12:00:00.000000' }
+      const live = updateThoughtTimeline(emptyThoughtTimeline, event)
+      const history = timelineFromRunEvents([event])
+      expect(live.activeStepStartedAt).toBe(Date.parse('2026-10-14T12:00:00Z'))
+      expect(history.activeStepStartedAt).toBe(live.activeStepStartedAt)
+      for (const created_at of [undefined, 'invalid']) {
+        expect(updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', created_at }).activeStepStartedAt).toBe(Date.now())
+      }
+      expect(updateThoughtTimeline(emptyThoughtTimeline, event, 123).activeStepStartedAt).toBe(123)
+    } finally { vi.useRealTimers() }
+  })
   it('兼容未标记 phase 的输出，在无工具 response 完成后抑制等待且不提前终结运行', () => {
     let timeline = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
     timeline = updateThoughtTimeline(timeline, { type: 'assistant_message_completed', item_id: 'unknown', content: '完成。' }, 1_100)
