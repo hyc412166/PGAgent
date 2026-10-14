@@ -14,6 +14,16 @@ export type AgentTemplate = {
 /** 精选配置仅作为起点，保存前每个字段仍可编辑。 */
 export const agentTemplates: AgentTemplate[] = [
   {
+    id: 'general-agent',
+    name: '通用子 Agent',
+    role: 'General assistant',
+    description: '处理日常资料、问答和轻量文件任务，不主动检查 Git 状态。',
+    systemPrompt: '你是一名通用执行子 Agent。直接完成分配的任务，先读取必要资料并保持结论简洁可验证；除非任务明确要求，否则不要检查 Git、仓库状态或未提交变更。',
+    workflowProfileId: 'general',
+    toolIds: ['read', 'rg', 'glob', 'read_artifact', 'question', 'tool_search', 'web_run', 'web_search'],
+    accent: 'green',
+  },
+  {
     id: 'coding-agent',
     name: '代码协作者',
     role: 'Coding',

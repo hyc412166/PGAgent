@@ -140,6 +140,89 @@ def test_read_artifact_tool_result_keeps_full_json_instead_of_event_summary(
     assert "完整 Artifact 正文" in response.json()["content"]
 
 
+def test_child_run_tool_result_reads_its_runtime_snapshot_when_no_chat_row_exists(
+    client: TestClient,
+) -> None:
+    """子 Agent 不写主会话 ChatMessage 时，详情接口仍能读取完整工具结果。"""
+
+    session = client.post("/api/sessions", json={}).json()
+    parent_run = client.post("/api/runs", json={"session_id": session["id"]}).json()
+    child_run = client.post("/api/runs", json={"session_id": session["id"]}).json()
+    sibling_run = client.post("/api/runs", json={"session_id": session["id"]}).json()
+    persisted = json.dumps({
+        "tool_name": "read",
+        "ok": True,
+        "content": "子 Agent 读取到的完整正文" * 8,
+        "metadata": {"private": "must-not-leak"},
+    }, ensure_ascii=False)
+    with database.SessionLocal() as db:
+        db.add(database.DelegatedTask(
+            parent_run_id=parent_run["id"],
+            parent_session_id=session["id"],
+            child_run_id=child_run["id"],
+            title="子任务",
+            description="读取文件",
+            status="completed",
+            idempotency_key="child-tool-result-test",
+            result={"child_run_id": child_run["id"]},
+        ))
+        db.add(database.RunEvent(
+            run_id=child_run["id"],
+            event_type="runtime_snapshot",
+            sequence=1,
+            payload={
+                "runtime_binding": {"delegation_version": 1},
+                "messages": [{
+                    "role": "tool",
+                    "name": "read",
+                    "tool_call_id": "child-read-call",
+                    "content": persisted,
+                }],
+            },
+        ))
+        db.add(database.RunEvent(
+            run_id=sibling_run["id"],
+            event_type="runtime_snapshot",
+            sequence=1,
+            payload={
+                "messages": [{
+                    "role": "tool",
+                    "name": "read",
+                    "tool_call_id": "child-read-call",
+                    "content": json.dumps({
+                        "tool_name": "read",
+                        "ok": True,
+                        "content": "不属于当前子运行的结果",
+                    }, ensure_ascii=False),
+                }],
+            },
+        ))
+        db.commit()
+
+    response = client.get(
+        f"/api/runs/{child_run['id']}/tool-results/child-read-call",
+        params={"offset": 0, "limit": 40},
+    )
+
+    assert response.status_code == 200, response.text
+    page = response.json()
+    assert page["tool_call_id"] == "child-read-call"
+    assert page["tool_name"] == "read"
+    assert page["ok"] is True
+    safe_content = json.dumps({
+        "tool_name": "read",
+        "ok": True,
+        "content": "子 Agent 读取到的完整正文" * 8,
+    }, ensure_ascii=False)
+    assert page["content"] == safe_content[:40]
+    assert page["offset"] == 0
+    assert page["next_offset"] == 40
+    assert page["total_chars"] == len(safe_content)
+    assert page["eof"] is False
+    assert "must-not-leak" not in response.text
+    assert "不属于当前子运行的结果" not in response.text
+
+
 @pytest.mark.parametrize("tool_name", ["shell", "bash", "run_command"])
 def test_shell_tool_result_removes_background_job_internal_fields(
     client: TestClient,

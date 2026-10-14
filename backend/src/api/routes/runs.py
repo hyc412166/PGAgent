@@ -215,6 +215,40 @@ def _project_tool_result(payload: Mapping[str, Any], *, fallback_tool_name: str)
             projected["metadata"] = safe_metadata
     return projected
 
+
+# 函数职责：从指定 Run 的最新运行快照中查找工具消息。
+# 参数关系：run_id 与 tool_call_id 唯一限定查询范围；db 提供持久化读取。
+# 返回关系：返回工具名称和原始 JSON 正文，供统一的脱敏与分页流程继续处理。
+def _snapshot_tool_result(
+    db: Session,
+    *,
+    run_id: str,
+    tool_call_id: str,
+) -> tuple[str, str] | None:
+    """Read a delegated tool result when no ChatMessage was written."""
+
+    snapshots = db.scalars(
+        select(RunEvent)
+        .where(RunEvent.run_id == run_id, RunEvent.event_type == "runtime_snapshot")
+        .order_by(RunEvent.sequence.desc(), RunEvent.created_at.desc(), RunEvent.id.desc())
+    )
+    for snapshot in snapshots:
+        payload = snapshot.payload if isinstance(snapshot.payload, Mapping) else {}
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            continue
+        for message in reversed(messages):
+            if not isinstance(message, Mapping):
+                continue
+            if message.get("role") != "tool" or str(message.get("tool_call_id") or "") != tool_call_id:
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+            tool_name = str(message.get("tool_name") or message.get("name") or "unknown")
+            return tool_name, content
+    return None
+
 # 函数职责：列出 runs 对应的数据或流程。
 # 参数关系：session_id 表示所属会话标识；run_status 表示当前流程使用的 run_status 集合；limit 表示当前步骤使用的 limit 值；offset 表示当前步骤使用的 offset 值；before_started_at 表示before_started_at 对应的时间信息；before_id 表示before 对象的唯一标识；db 表示当前数据库会话。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
@@ -367,44 +401,51 @@ def get_tool_result(
     db: Session = Depends(get_db),
 ) -> ToolResultPageRead:
     run = _require(db, Run, run_id, "Run")
-    if not run.session_id:
-        raise HTTPException(status_code=404, detail="Tool result not found")
 
     # 同一会话的不同运行可能复用 provider 生成的 call id；runtime_run_id 是持久化链路中的运行归属。
-    candidates = db.scalars(
-        select(ChatMessage)
-        .where(
-            ChatMessage.session_id == run.session_id,
-            ChatMessage.role == "tool",
-            ChatMessage.tool_call_id == tool_call_id,
+    message = None
+    if run.session_id:
+        candidates = db.scalars(
+            select(ChatMessage)
+            .where(
+                ChatMessage.session_id == run.session_id,
+                ChatMessage.role == "tool",
+                ChatMessage.tool_call_id == tool_call_id,
+            )
+            .order_by(ChatMessage.sequence.desc(), ChatMessage.created_at.desc(), ChatMessage.id.desc())
         )
-        .order_by(ChatMessage.sequence.desc(), ChatMessage.created_at.desc(), ChatMessage.id.desc())
+        message = next(
+            (
+                candidate
+                for candidate in candidates
+                if isinstance(candidate.extra, dict)
+                and candidate.extra.get("runtime_run_id") == run.id
+            ),
+            None,
+        )
+
+    snapshot_result = None if message is not None else _snapshot_tool_result(
+        db,
+        run_id=run.id,
+        tool_call_id=tool_call_id,
     )
-    message = next(
-        (
-            candidate
-            for candidate in candidates
-            if isinstance(candidate.extra, dict)
-            and candidate.extra.get("runtime_run_id") == run.id
-        ),
-        None,
-    )
-    if message is None:
+    if message is None and snapshot_result is None:
         raise HTTPException(status_code=404, detail="Tool result not found")
 
-    persisted = message.content
+    fallback_tool_name = message.tool_name if message is not None else snapshot_result[0]
+    persisted = message.content if message is not None else snapshot_result[1]
     decoded = _json_object(persisted)
     if decoded is None:
         safe_content = persisted
         projected: Mapping[str, Any] = {}
     else:
-        projected = _project_tool_result(decoded, fallback_tool_name=message.tool_name or "unknown")
+        projected = _project_tool_result(decoded, fallback_tool_name=fallback_tool_name or "unknown")
         safe_content = json.dumps(projected, ensure_ascii=False)
     total_chars = len(safe_content)
     end = min(total_chars, offset + limit)
     return ToolResultPageRead(
         tool_call_id=tool_call_id,
-        tool_name=message.tool_name or str(projected.get("tool_name") or "unknown"),
+        tool_name=fallback_tool_name or str(projected.get("tool_name") or "unknown"),
         ok=projected.get("ok") is True,
         content=safe_content[offset:end],
         offset=offset,
