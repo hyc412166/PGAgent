@@ -158,6 +158,16 @@ describe('会话 SSE 事件', () => {
     expect(runStreamPhase({ type: 'run_stopped', reason: 'delegated_child_waiting_event' })).toBe('等待子 Agent 返回…')
   })
 
+  it('从 code 读取可恢复停止事件的机器原因，而不是把描述文案当作原因', () => {
+    const event = {
+      type: 'run_stopped',
+      code: 'delegated_child_waiting_event',
+      reason: 'A delegated child run is waiting for a background terminal event.',
+    }
+    expect(isTerminalRunStreamEvent(event)).toBe(false)
+    expect(runStreamPhase(event)).toBe('等待子 Agent 返回…')
+  })
+
   // 测试场景：忽略无法识别的损坏事件。
   it('忽略无法识别的损坏事件', () => {
     expect(parseRunStreamEvent('not-json')).toBeNull()

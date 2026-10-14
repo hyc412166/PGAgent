@@ -1,4 +1,5 @@
 // 本文件负责 thoughtTimeline 相关的前端数据转换、状态判断或应用入口逻辑，供页面层调用。
+import { isResumableWaitingRun } from './sessionStream'
 import type { RunStreamEvent } from './sessionStream'
 import type { FileChangeRecord, FileChangeSet } from './types'
 
@@ -26,6 +27,8 @@ export interface ThoughtActivityItem {
   delegationState?: string
   delegationTool?: boolean
   id: string
+  // 压缩开始事件可能已离开 SSE 回放窗口，完成事件身份用于与完整历史对齐。
+  completionEventId?: string
   kind: ThoughtActivityKind
   icon: ThoughtActivityIcon
   title: string
@@ -316,6 +319,13 @@ function mcpToolCount(event: RunStreamEvent): number {
 }
 
 function stableDelegationActivityId(event: RunStreamEvent, fallback: string): string {
+  const key = delegationActivityKey(event)
+  // 启动是独立的历史记录；等待和终态只更新状态行，不能覆盖启动行。
+  const type = firstString(event.type, event.event_type, record(event.payload)?.type, record(event.payload)?.event_type)
+  return key ? `task:${key}:${type === 'delegated_child_started' ? 'started' : 'status'}` : fallback
+}
+
+function delegationActivityKey(event: RunStreamEvent): string {
   const payload = record(event.payload)
   const key = firstString(
     event.task_id,
@@ -325,9 +335,7 @@ function stableDelegationActivityId(event: RunStreamEvent, fallback: string): st
     payload?.delegation_id,
     payload?.child_run_id,
   )
-  // 启动是独立的历史记录；等待和终态只更新状态行，不能覆盖启动行。
-  const type = firstString(event.type, event.event_type, payload?.type, payload?.event_type)
-  return key ? `task:${key}:${type === 'delegated_child_started' ? 'started' : 'status'}` : fallback
+  return key
 }
 
 function assistantItemIdentity(event: RunStreamEvent, fallbackIndex: number) {
@@ -515,6 +523,8 @@ const contextActivityTypes = new Set(['context_prepared', 'context_resumed', 'co
 
 // 将上下文、审批、委派和进度等非工具事件转换为活动条目。
 function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): ThoughtActivityItem | null {
+  // 实时 SSE 的投递编号与历史 UUID 不同；有持久身份时优先使用它。
+  if (typeof event.id === 'string') event = { ...event, event_id: event.id }
   const type = firstString(event.type, event.event_type).toLowerCase()
   const progress = safeProgressText(event)
   if (imageReadEventTypes.has(type)) {
@@ -621,6 +631,7 @@ function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): Tho
     if (type === 'context_compaction_finished' || type === 'context_compacted') {
       return {
         id: firstString(event.compaction_id, event.event_id, event.id) || `context-compaction-${itemIndex}`,
+        completionEventId: firstString(event.event_id, event.id) || undefined,
         kind: 'event', icon: 'context', title: '上下文压缩完成',
         detail: progress || '任务状态已保留，继续执行', status: 'completed',
       }
@@ -628,6 +639,7 @@ function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): Tho
     if (type === 'context_compaction_failed') {
       return {
         id: firstString(event.compaction_id, event.event_id, event.id) || `context-compaction-${itemIndex}`,
+        completionEventId: firstString(event.event_id, event.id) || undefined,
         kind: 'event', icon: 'context', title: '上下文压缩失败',
         detail: progress || '压缩未完成，将继续处理', status: 'failed',
       }
@@ -849,6 +861,14 @@ export function updateThoughtTimeline(
       if (activeCompaction) activity = { ...activity, id: activeCompaction.id }
     }
     const currentActivity = activity
+    // 子运行结束后把对应的启动行收敛为同一结果，保留启动和完成两条历史记录。
+    const childTerminal = currentActivity.kind === 'task'
+      && ['delegated_child_completed', 'delegated_child_failed', 'delegated_child_stopped'].includes(type)
+    if (childTerminal) {
+      const startedId = `task:${delegationActivityKey(event)}:started`
+      const startedIndex = items.findIndex((item) => item.id === startedId)
+      if (startedIndex >= 0) items[startedIndex] = { ...items[startedIndex], status: currentActivity.status }
+    }
     const existingIndex = items.findIndex((item) => item.id === currentActivity.id)
     if (existingIndex >= 0) {
       const existing = items[existingIndex]
@@ -887,6 +907,17 @@ export function updateThoughtTimeline(
         ? Boolean(currentActivity.detail.trim())
         : state.activeStepHasVisibleContent || visibleActivity,
     }
+  }
+
+  const resumableWaiting = isResumableWaitingRun({
+    status: type === 'run_state' ? String(event.status || '') : terminalTypes.has(type) ? 'stopped' : '',
+    code: firstString(event.code),
+    stop_reason: firstString(event.stop_reason),
+    reason: firstString(event.reason),
+  })
+  if (resumableWaiting) {
+    // 等待后台事件或子 Agent 返回只是可恢复暂停，后续事件仍属于同一条时间线。
+    return { ...state, finished: false }
   }
 
   if (terminalTypes.has(type) || (type === 'run_state' && (event.terminal === true || terminalStatuses.has(String(event.status || ''))))) {
@@ -939,6 +970,37 @@ export function timelineFromRunEvents(events: RunStreamEvent[]): ThoughtTimeline
     if (timeline.finished && fallbackElapsed > timeline.elapsedMs) timeline = { ...timeline, elapsedMs: fallbackElapsed }
   }
   return timeline
+}
+
+// 会话切回时历史分页可能晚于 SSE 到达；把历史中缺失的活动补到实时时间线前面，
+// 保留实时条目的状态和当前轮计时，避免第二次压缩覆盖第一次记录。
+export function mergeThoughtTimelineHistory(
+  live: ThoughtTimelineState,
+  history: ThoughtTimelineState,
+): ThoughtTimelineState {
+  const liveItems = new Map(live.items.map((item) => [item.id, item]))
+  const liveCompletions = new Map(live.items.filter(item => item.completionEventId).map(item => [item.completionEventId, item]))
+  const liveTools = new Map(live.tools.map((tool) => [tool.id, tool]))
+  const mergedLiveIds = new Set<string>()
+  const items = history.items.map(item => {
+    const current = liveItems.get(item.id) ?? (item.completionEventId ? liveCompletions.get(item.completionEventId) : undefined)
+    if (!current) return item
+    mergedLiveIds.add(current.id)
+    // HTTP 可能比 SSE 更早拿到结束事件，同一活动不能从终态退回运行态。
+    return current.status === 'running' && item.status !== 'running' ? item : { ...current, id: item.id }
+  })
+  const historyToolIds = new Set(history.tools.map((tool) => tool.id))
+  return {
+    ...live,
+    startedAt: history.startedAt === null ? live.startedAt : live.startedAt === null ? history.startedAt : Math.min(live.startedAt, history.startedAt),
+    elapsedMs: Math.max(live.elapsedMs, history.elapsedMs),
+    items: [...items, ...live.items.filter(item => !mergedLiveIds.has(item.id))],
+    tools: [...history.tools.map(tool => {
+      const current = liveTools.get(tool.id)
+      return !current || (current.status === 'running' && tool.status !== 'running') ? tool : current
+    }), ...live.tools.filter(tool => !historyToolIds.has(tool.id))],
+    conclusion: live.conclusion || history.conclusion,
+  }
 }
 
 // 判断终态时间线是否含值得在历史消息上方展示的内容。

@@ -90,7 +90,8 @@ def _stream_event_is_terminal(event: dict) -> bool:
     if event_type in {"run_stopped", "stopped"}:
         return is_terminal_delivery(
             "stopped",
-            str(event.get("stop_reason") or event.get("reason") or "") or None,
+            # code 是机器可判定原因；reason 通常只是面向人的描述，不能用于终态判断。
+            str(event.get("code") or event.get("stop_reason") or event.get("reason") or "") or None,
         )
     return True
 

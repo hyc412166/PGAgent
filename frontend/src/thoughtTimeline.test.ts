@@ -70,6 +70,60 @@ describe('实时 Thought 时间线', () => {
     expect(updateThoughtTimeline(completed, { type: 'model_step_started', step: 2 }, 1_300).activeStepHasFinalAnswer).toBe(false)
     expect(updateThoughtTimeline(completed, { type: 'model_retry' }, 1_300).activeStepHasFinalAnswer).toBe(false)
   })
+
+  it('可恢复等待不会永久结束时间线，恢复后的模型步骤重新显示进行中状态', () => {
+    let timeline = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
+    timeline = updateThoughtTimeline(timeline, {
+      type: 'run_stopped',
+      code: 'delegated_child_waiting_event',
+      reason: 'A delegated child run is waiting for a background terminal event.',
+    }, 2_000)
+    expect(timeline.finished).toBe(false)
+
+    timeline = updateThoughtTimeline(timeline, { type: 'model_step_started', step: 2 }, 3_000)
+    expect(timeline.finished).toBe(false)
+    expect(timeline.activeStepStartedAt).toBe(3_000)
+
+    const replayed = timelineFromRunEvents([
+      { sequence: 1, type: 'model_step_started', step: 1, created_at: '2026-10-14T12:00:00Z' },
+      { sequence: 2, type: 'run_stopped', code: 'delegated_child_waiting_event', reason: 'A delegated child run is waiting for a background terminal event.', created_at: '2026-10-14T12:00:01Z' },
+      { sequence: 3, type: 'model_step_started', step: 2, created_at: '2026-10-14T12:00:02Z' },
+    ])
+    expect(replayed.finished).toBe(false)
+  })
+
+  it('子 Agent 返回时收敛对应的启动行，同时保留完成历史并不影响其它子任务', () => {
+    let timeline = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'delegated_child_started', task_id: 'task-a', child_run_id: 'child-a', task_title: '读取论文',
+    }, 1_000)
+    timeline = updateThoughtTimeline(timeline, {
+      type: 'delegated_child_started', task_id: 'task-b', child_run_id: 'child-b', task_title: '核对引用',
+    }, 1_100)
+    timeline = updateThoughtTimeline(timeline, {
+      type: 'delegated_child_completed', task_id: 'task-a', child_run_id: 'child-a', task_title: '读取论文',
+    }, 2_000)
+
+    expect(timeline.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'task:task-a:started', status: 'completed', delegationState: '开始工作' }),
+      expect.objectContaining({ id: 'task:task-a:status', status: 'completed', title: '子 Agent 已返回' }),
+      expect.objectContaining({ id: 'task:task-b:started', status: 'running', delegationState: '开始工作' }),
+    ]))
+  })
+
+  it.each([
+    ['delegated_child_failed', 'failed'],
+    ['delegated_child_stopped', 'failed'],
+  ] as const)('子 Agent %s 也会收敛启动行', (type, status) => {
+    let timeline = updateThoughtTimeline(emptyThoughtTimeline, {
+      type: 'delegated_child_started', task_id: 'task-terminal', child_run_id: 'child-terminal',
+    }, 1_000)
+    timeline = updateThoughtTimeline(timeline, {
+      type, task_id: 'task-terminal', child_run_id: 'child-terminal', reason: 'child ended',
+    }, 2_000)
+
+    expect(timeline.items.find((item) => item.id === 'task:task-terminal:started')).toMatchObject({ status })
+    expect(timeline.items.find((item) => item.id === 'task:task-terminal:status')).toMatchObject({ status })
+  })
   it('图片读取按附件身份更新同一行，完成后恢复思考并支持历史回放', () => {
     const started = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 1 }, 1_000)
     const reading = updateThoughtTimeline(started, { type: 'image_read_started', attachment_id: 'image-1', image_name: 'sample.png' }, 1_100)

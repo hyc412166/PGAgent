@@ -25,12 +25,16 @@ const resumableWaitingReasons = new Set([
 ])
 
 // WaitingRunCandidate 只抽取判断后台等待所需字段，使该判断可复用于 Run 和 SSE 事件。
-type WaitingRunCandidate = { status?: string; stop_reason?: string; reason?: string }
+type WaitingRunCandidate = { status?: string; code?: string; stop_reason?: string; reason?: string }
+
+function waitingRunReason(run: WaitingRunCandidate | undefined): string {
+  return String(run?.code || run?.stop_reason || run?.reason || '')
+}
 
 // 判断 stopped 是否只是持久化等待点；此类运行不能在 UI 中当作真正终止。
 export function isResumableWaitingRun(run: WaitingRunCandidate | undefined): boolean {
   if (!run || run.status !== 'stopped') return false
-  return resumableWaitingReasons.has(String(run.stop_reason || run.reason || ''))
+  return resumableWaitingReasons.has(waitingRunReason(run))
 }
 
 // 将等待原因映射为状态栏阶段文案。
@@ -67,8 +71,10 @@ export function runStreamPhase(event: RunStreamEvent): string {
   switch (event.type) {
     case 'run_state': return isResumableWaitingRun({
       status: event.status,
-      reason: String(event.code || event.reason || event.stop_reason || ''),
-    }) ? waitingRunPhase(String(event.reason || event.stop_reason || '')) : runStatusPhase(event.status)
+      code: String(event.code || ''),
+      stop_reason: String(event.stop_reason || ''),
+      reason: String(event.reason || ''),
+    }) ? waitingRunPhase(waitingRunReason(event)) : runStatusPhase(event.status)
     case 'context_prepared':
     case 'context_resumed': return '正在准备上下文…'
     case 'context_compaction_started': return '正在压缩上下文…'
@@ -117,7 +123,7 @@ export function runStreamPhase(event: RunStreamEvent): string {
     case 'run_interrupted':
     case 'run_stopped':
     case 'stopped': {
-      const reason = String(event.reason || event.stop_reason || '')
+      const reason = waitingRunReason(event)
       return isResumableWaitingRun({ status: 'stopped', reason }) ? waitingRunPhase(reason) : '已停止'
     }
     case 'model_failed':
@@ -143,7 +149,9 @@ export function isTerminalRunStreamEvent(event: RunStreamEvent): boolean {
   const inferredStatus = event.status || (event.type === 'run_stopped' || event.type === 'turn_stopped' || event.type === 'stopped' ? 'stopped' : '')
   if (isResumableWaitingRun({
     status: inferredStatus,
-    reason: String(event.code || event.stop_reason || event.reason || ''),
+    code: String(event.code || ''),
+    stop_reason: String(event.stop_reason || ''),
+    reason: String(event.reason || ''),
   })) return false
   return event.terminal === true || terminalTypes.has(event.type) || (event.type === 'run_state' && isTerminalRunStatus(event.status))
 }
@@ -279,7 +287,8 @@ export function restoreAssistantItemsFromEvents(events: RunStreamEvent[]): Assis
 
 // 用事件 ID 去重重连后重复送达的 SSE；无 ID 的兼容事件默认接受。
 export function rememberRunStreamEvent(seenEventIds: Set<string>, event: RunStreamEvent, lastEventId = ''): boolean {
-  const eventId = String(event.event_id || lastEventId || '')
+  // 历史分页与 SSE 共用持久 ID；文本增量未落盘时仍按流投递编号去重。
+  const eventId = String(event.id || event.event_id || lastEventId || '')
   if (!eventId) return true
   if (seenEventIds.has(eventId)) return false
   seenEventIds.add(eventId)

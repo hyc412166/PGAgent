@@ -69,6 +69,13 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient,
 def test_waiting_stop_events_do_not_close_the_run_stream() -> None:
     assert not _stream_event_is_terminal({"type": "run_stopped", "reason": "waiting_background"})
     assert not _stream_event_is_terminal({"type": "run_stopped", "reason": "delegated_child_waiting_event"})
+    # 真实 SSE 事件用 code 携带机器可判定原因，reason 只是描述性文案。
+    for code in ("waiting_background", "delegated_child_waiting_event", "delegated_child_awaiting_approval"):
+        assert not _stream_event_is_terminal({
+            "type": "run_stopped",
+            "code": code,
+            "reason": "A resumable run is waiting for a background event.",
+        })
     assert _stream_event_is_terminal({"type": "run_stopped", "reason": "user_interrupted"})
     assert _stream_event_is_terminal({"type": "run_completed"})
 
@@ -310,6 +317,40 @@ def test_run_stream_sends_current_state_replay_and_terminal_with_stable_ids(
     assert "context_prepared" not in response.text
     assert "event: run_completed" in response.text
     assert f"id: {terminal['event_id']}" in response.text
+    assert run_stream_broker.subscriber_count(run_id) == 0
+
+
+def test_run_stream_replays_resumable_stop_and_continuation_until_real_terminal(
+    client: tuple[TestClient, dict[str, list]],
+) -> None:
+    test_client, _launched = client
+    workspace_id, agent_id, session_id = _seed()
+    with database.SessionLocal() as db:
+        run = Run(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            status="stopped",
+            stop_reason="delegated_child_waiting_event",
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    run_stream_broker.publish(run_id, {
+        "type": "run_stopped",
+        "code": "delegated_child_waiting_event",
+        "reason": "A delegated child run is waiting for a background terminal event.",
+    })
+    run_stream_broker.publish(run_id, {"type": "context_resumed"})
+    run_stream_broker.publish(run_id, {"type": "run_completed"})
+
+    response = test_client.get(f"/api/runs/{run_id}/stream")
+
+    assert response.status_code == 200
+    assert '"code":"delegated_child_waiting_event"' in response.text
+    assert "event: context_resumed" in response.text
+    assert "event: run_completed" in response.text
     assert run_stream_broker.subscriber_count(run_id) == 0
 
 
