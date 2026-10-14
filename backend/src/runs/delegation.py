@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import threading
 import time
 from collections import Counter
@@ -111,6 +112,54 @@ _DELEGATE_CHILD_SYSTEM_SUFFIX = (
     "只完成下方任务并返回可验证的结构化结论；不要再次委派任务，"
     "不要假称调用未启用的工具，也不要把问题直接抛给用户。"
 )
+# 变量说明：_GIT_REVIEW_TOOL_NAMES 表示只有明确的代码版本审查任务才能启用的工具集合。
+_GIT_REVIEW_TOOL_NAMES = frozenset({"git_status", "git_diff"})
+# 变量说明：_GIT_SCOPE_MARKERS 表示任务文本中明确要求版本控制或代码变更审查的关键词。
+_GIT_SCOPE_MARKERS = (
+    "git",
+    "repository",
+    "repo",
+    "diff",
+    "commit",
+    "branch",
+    "worktree",
+    "version control",
+    "uncommitted",
+    "仓库",
+    "分支",
+    "工作树",
+    "版本控制",
+    "版本状态",
+    "未提交",
+    "提交记录",
+    "提交历史",
+    "代码提交",
+    "代码审查",
+    "代码变更审查",
+    "变更审查",
+    "代码补丁",
+    "patch",
+)
+
+
+# 函数职责：判断委派任务是否明确要求检查 Git/仓库状态。
+# 参数关系：task 表示主 Agent 分配给子 Agent 的原始任务文本。
+# 返回关系：只有任务包含明确的版本控制或代码变更审查语义时才返回 True。
+def _task_requests_git_scope(task: str) -> bool:
+    """Keep repository inspection opt-in for delegated work."""
+
+    normalized = " ".join(str(task or "").casefold().split())
+    for marker in _GIT_SCOPE_MARKERS:
+        if marker.isascii():
+            # ASCII markers use word boundaries so ordinary words such as
+            # ``digit`` or ``dispatch`` do not accidentally enable Git tools.
+            if re.search(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])", normalized):
+                return True
+        elif marker in normalized:
+            return True
+    return False
+
+
 # 类职责：定义 _SubagentTaskDelegate 在本领域中的数据与行为。
 class _SubagentTaskDelegate:
     """One parent runtime's bounded bridge to a user-created child Agent.
@@ -408,6 +457,7 @@ class _SubagentTaskDelegate:
         db: Any,
         child: Agent,
         *,
+        task: str = "",
         model_id: str | None = None,
         thinking_level: str | None = None,
     ) -> tuple[ProviderConfig, dict[str, Any], list[dict[str, str]]]:
@@ -435,12 +485,16 @@ class _SubagentTaskDelegate:
         # standalone/future restricted parent runtimes as well.
         # 变量说明：parent_allowed 表示当前步骤使用的 parent_allowed 值。
         parent_allowed = set(self.parent_allowed_tool_names)
+        # Git 状态和 diff 是高语义、仓库范围的检查；委派任务必须明确提出
+        # 版本控制或代码变更审查，文档/论文等普通资料任务不能继承它们。
+        git_scope_requested = _task_requests_git_scope(task)
         # 变量说明：child_tools 表示当前流程使用的 child_tools 集合。
         child_tools = [
             tool_name
             for tool_name in _allowed_runtime_tool_names(list(getattr(child, "tool_ids", []) or []))
             if tool_name in parent_allowed
             and tool_name not in _CHILD_FORBIDDEN_ORCHESTRATION_TOOLS
+            and (git_scope_requested or tool_name not in _GIT_REVIEW_TOOL_NAMES)
             and tool_name != "MemoryWrite"
         ]
         if "read_artifact" in parent_allowed and "read_artifact" not in child_tools:
@@ -458,6 +512,21 @@ class _SubagentTaskDelegate:
         ).strip()
         if not workspace_root:
             raise RuntimeError("主会话缺少冻结的工作区")
+
+        workflow_profile_id = str(
+            getattr(child, "workflow_profile_id", "auto") or "auto"
+        )
+        agent_system_prompt = (str(child.system_prompt or "") + _DELEGATE_CHILD_SYSTEM_SUFFIX).strip()
+        if not git_scope_requested:
+            # review profile 的固定提示会把资料任务误导到 diff 检查；资料任务
+            # 使用通用 profile，并在子 Agent 最终系统提示中明确关闭 Git 检查。
+            if workflow_profile_id == "review":
+                workflow_profile_id = "general"
+            agent_system_prompt = (
+                agent_system_prompt
+                + "\n\n当前委派任务未要求 Git、仓库或代码变更审查。不要运行 Git 命令，"
+                "不要调用 git_status 或 git_diff，只使用与任务直接相关的工具。"
+            ).strip()
 
         # 变量说明：agents_instructions 表示当前流程使用的 agents_instructions 集合；agents_instruction_sources 表示当前流程使用的 agents_instruction_sources 集合。
         agents_instructions, agents_instruction_sources = load_instruction_chain(workspace_root)
@@ -478,10 +547,8 @@ class _SubagentTaskDelegate:
             "delegation_version": 1,
             "parent_run_id": self.parent_run_id,
             "agent_id": child.id,
-            "agent_system_prompt": (str(child.system_prompt or "") + _DELEGATE_CHILD_SYSTEM_SUFFIX).strip(),
-            "workflow_profile_id": str(
-                getattr(child, "workflow_profile_id", "auto") or "auto"
-            ),
+            "agent_system_prompt": agent_system_prompt,
+            "workflow_profile_id": workflow_profile_id,
             "child_agent_id": child.id,
             "workspace_root": workspace_root,
             "agents_instructions": agents_instructions,
@@ -642,6 +709,7 @@ class _SubagentTaskDelegate:
                 provider_config, child_binding, child_skill_instructions = self._freeze_child_binding(
                     db,
                     child,
+                    task=task,
                     model_id=model_id,
                     thinking_level=thinking_level,
                 )

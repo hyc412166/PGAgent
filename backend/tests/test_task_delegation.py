@@ -216,6 +216,52 @@ def test_child_defaults_to_parent_runtime_model_and_ignores_legacy_profile_bindi
     assert binding["model_id"] == "parent-model"
 
 
+def test_delegated_task_scope_controls_git_review_capabilities(
+    delegated_run: dict[str, str],
+) -> None:
+    """A paper task must not inherit review-agent Git inspection behavior."""
+
+    _, context = RunCoordinator._resolve_runtime(delegated_run["run_id"])
+    delegate = run_service._SubagentTaskDelegate(
+        parent_run_id=delegated_run["run_id"],
+        parent_agent_id=database.DEFAULT_AGENT_ID,
+        parent_binding=context["runtime_binding"],
+        parent_allowed_tool_names=["read", "read_artifact", "git_status", "git_diff"],
+        permission_mode="full",
+    )
+
+    with database.SessionLocal() as db:
+        child = db.get(Agent, delegated_run["child_id"])
+        assert child is not None
+        child.workflow_profile_id = "review"
+        child.system_prompt = "审查未提交 diff 并报告代码问题。"
+        child.tool_bindings.extend([
+            AgentTool(tool_id="git_status"),
+            AgentTool(tool_id="git_diff"),
+        ])
+        db.commit()
+        _, paper_binding, _ = delegate._freeze_child_binding(
+            db,
+            child,
+            task="阅读课程论文并总结核心论点，不修改文件。",
+        )
+        _, code_binding, _ = delegate._freeze_child_binding(
+            db,
+            child,
+            task="审查当前仓库未提交的代码 diff 并报告问题。",
+        )
+
+    assert paper_binding["workflow_profile_id"] == "general"
+    assert "git_status" not in paper_binding["allowed_tool_names"]
+    assert "git_diff" not in paper_binding["allowed_tool_names"]
+    assert "不要运行 Git 命令" in paper_binding["agent_system_prompt"]
+
+    assert code_binding["workflow_profile_id"] == "review"
+    assert "git_status" in code_binding["allowed_tool_names"]
+    assert "git_diff" in code_binding["allowed_tool_names"]
+    assert "不要运行 Git 命令" not in code_binding["agent_system_prompt"]
+
+
 # 测试场景：验证并发或批量执行时的顺序、隔离性和最终状态一致性；函数名 test_concurrent_task_calls_keep_separate_dag_bindings 精确标识本用例的具体条件。
 def test_concurrent_task_calls_keep_separate_dag_bindings(delegated_run: dict[str, str]) -> None:
     delegate = run_service._SubagentTaskDelegate(
@@ -271,7 +317,7 @@ async def test_task_executes_child_with_frozen_limited_binding_and_returns_struc
                 "delegate-1",
                 "task",
                 {
-                    "task": "检查当前项目并给出证据",
+                    "task": "审查当前仓库未提交的代码 diff 并给出证据",
                     "agent_id": delegated_run["child_id"],
                     "model_id": "child-model",
                     "thinking_level": "high",
