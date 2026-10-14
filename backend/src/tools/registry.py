@@ -157,11 +157,22 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "apply_patch": {
-        "description": "应用严格的工作区多文件文本补丁。路径必须是工作区相对路径；Add File 区段包括空行在内的每一行都必须以 + 开头；Update File 必须包含 @@ hunk 和正确的上下文行。",
+        "description": "新增文件优先传 add_files（每项 path 与原始 content），无需手写 + 前缀，不覆盖已有文件；修改或删除文件传 patch。两种输入只能选一种。路径必须是工作区相对路径；文本补丁 Add File 区段包括空行在内的每一行都必须以 + 开头；Update File 必须包含 @@ hunk 和正确的上下文行。",
         "parameters": {
             "type": "object",
-            "properties": {"patch": {"type": "string"}},
-            "required": ["patch"],
+            "properties": {
+                "patch": {"type": "string"},
+                "add_files": {
+                    "type": "array", "minItems": 1,
+                    "description": "新增文件列表，content 无需补丁前缀；与文本补丁一致，统一 LF，非空文件以换行结束。",
+                    "items": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                        "required": ["path", "content"],
+                    },
+                },
+            },
+            "oneOf": [{"required": ["patch"]}, {"required": ["add_files"]}],
         },
     },
     "validate": {
@@ -397,7 +408,7 @@ TOOL_SCHEMAS["shell"] = {
     "parameters": {
         "type": "object",
         "properties": {
-            "command": {"type": "string"},
+            "command": {"type": "string", "minLength": 1, "pattern": "\\S", "description": "必须提供实际的非空 PowerShell 命令；无需执行时不要调用 shell。"},
             "cwd": {"type": "string"},
             "timeout_seconds": {"type": "number"},
             "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 300000},

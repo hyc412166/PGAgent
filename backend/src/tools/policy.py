@@ -438,8 +438,12 @@ def _patch_decision(
     workspace_root: str | Path | None,
 ) -> ToolRiskDecision:
     # 变量说明：patch 表示当前步骤使用的 patch 值。
-    patch = arguments.get("patch")
-    if not isinstance(patch, str):
+    from src.coding.patch import PatchError, normalize_patch_input
+
+    try:
+        patch = normalize_patch_input(arguments.get("patch"), arguments.get("add_files"))
+    except PatchError:
+        # 无效输入由执行入口明确报错，不把输入错误变成一次授权请求。
         return _allow()
     if _content_contains_secret(patch):
         return _approval("补丁内容看起来包含访问密钥或私钥，智能审批需要你确认。")

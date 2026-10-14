@@ -27,6 +27,16 @@ class InvocationValidationHook:
                 "invalid_tool_arguments",
             )
 
+        # 空命令无法表达任何执行意图，必须在审批和进程创建之前交还模型修正。
+        if invocation.wire_name == "shell":
+            command = arguments.get("command")
+            if not isinstance(command, str) or not command.strip():
+                return Reject(
+                    "shell.command 必须是非空命令字符串；请提供实际 PowerShell 命令。"
+                    "若无需执行命令，请直接继续回答，不要发送空 shell 调用。",
+                    "invalid_arguments",
+                )
+
         if invocation.wire_name in {"task", "Agent"}:
             # 变量说明：task 表示当前步骤使用的 task 值。
             task = arguments.get("task")

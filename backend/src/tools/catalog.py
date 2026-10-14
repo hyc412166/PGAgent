@@ -72,7 +72,7 @@ BUILTIN_TOOL_CATALOG: tuple[BuiltinTool, ...] = (
     _tool(
         "apply_patch",
         "应用补丁",
-        "应用严格的多文件文本补丁；路径必须是工作区相对路径，Add File 区段包括空行在内的每一行都必须以 + 开头，Update File 必须使用 @@ hunk。",
+        "新增文件优先使用 add_files 的 path/content，无需手写 + 且禁止覆盖；修改或删除使用 patch，两种输入只选一种。路径必须是工作区相对路径，文本补丁 Add File 区段包括空行在内的每一行都必须以 + 开头，Update File 必须使用 @@ hunk。",
         "developer",
         "adaptive",
     ),

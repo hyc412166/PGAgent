@@ -122,16 +122,19 @@ def parse_patch(value: str) -> list[FilePatch]:
 
         # 变量说明：body 表示当前步骤使用的 body 值。
         body: list[str] = []
+        body_start = index
         while index < len(lines) - 1 and not any(lines[index].startswith(prefix) for prefix in _FILE_HEADERS):
             body.append(lines[index])
             index += 1
 
         if operation == "add":
-            if any(not line.startswith("+") for line in body):
+            invalid_line = next((i for i, line in enumerate(body) if not line.startswith("+")), None)
+            if invalid_line is not None:
                 absolute_path_hint = " 路径必须使用工作区相对路径。" if _looks_absolute(path) else ""
                 raise PatchError(
                     f"新增文件补丁格式错误：Add File 区段的每一行都必须以 '+' 开头。"
-                    f"{absolute_path_hint} 当前路径：{path}"
+                    f"{absolute_path_hint} 当前路径：{path}；补丁第 {body_start + invalid_line + 1} 行："
+                    f"{body[invalid_line][:160]!r}。新增文件可改用 add_files 的 path/content 输入，无需手写 '+'。"
                 )
             file_patches.append(FilePatch(operation, path, added_lines=tuple(line[1:] for line in body)))
             continue
@@ -358,14 +361,48 @@ def _restore_change(change: PreparedChange) -> None:
 # 函数职责：应用 patch 对应的数据或流程。
 # 参数关系：sandbox 表示当前步骤使用的 sandbox 值；patch 表示当前步骤使用的 patch 值；approved 表示当前步骤使用的 approved 值。
 # 返回关系：结果返回给调用层，并由调用层继续持久化、发送事件或推进运行状态。
+def normalize_patch_input(patch: str | None = None, add_files: list[dict[str, str]] | None = None) -> str:
+    """结构化新增只生成 Add 区段，审批与执行共用同一转换，避免正文被解释为操作。"""
+    if (patch is None) == (add_files is None):
+        raise PatchError("patch 与 add_files 必须且只能提供其中一种", "invalid_arguments")
+    if patch is not None:
+        if not isinstance(patch, str):
+            raise PatchError("patch 必须是字符串", "invalid_arguments")
+        return patch
+    if not isinstance(add_files, list) or not add_files:
+        raise PatchError("add_files 必须是非空文件列表", "invalid_arguments")
+    lines = ["*** Begin Patch"]
+    for item in add_files:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not isinstance(item.get("content"), str):
+            raise PatchError("add_files 每项必须包含字符串 path 和 content", "invalid_arguments")
+        path = item["path"]
+        if not path.strip() or "\n" in path or "\r" in path:
+            raise PatchError("add_files.path 必须是非空单行工作区相对路径", "invalid_arguments")
+        lines.append(f"*** Add File: {path}")
+        # 与原文本补丁保持一致：统一 LF，非空文件以换行结束；正文中的补丁标记也只是文本。
+        content = item["content"].replace("\r\n", "\n").replace("\r", "\n")
+        if content:
+            content_lines = content.split("\n")
+            if content_lines[-1] == "":
+                content_lines.pop()
+            lines.extend("+" + line for line in content_lines)
+    lines.append("*** End Patch")
+    return "\n".join(lines)
+
+
 def apply_patch(
     sandbox: WorkspaceSandbox,
-    patch: str,
+    patch: str | None = None,
     *,
+    add_files: list[dict[str, str]] | None = None,
     approved: bool = False,
 ) -> ToolResult:
     # 变量说明：arguments 表示当前流程使用的 arguments 集合。
-    arguments = {"patch": patch}
+    arguments = {"patch": patch} if add_files is None else {"add_files": add_files}
+    try:
+        patch = normalize_patch_input(patch, add_files)
+    except PatchError as exc:
+        return ToolResult("apply_patch", False, str(exc), error_code=exc.code)
     if not approved:
         # 变量说明：reason 表示当前步骤使用的 reason 值。
         reason = "应用代码补丁需要批准"
