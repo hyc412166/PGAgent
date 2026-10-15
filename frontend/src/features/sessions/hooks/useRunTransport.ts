@@ -1,10 +1,10 @@
 // 本文件实现 useRunTransport 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
-import { useCallback } from 'react'
+import { useCallback, useRef } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { api, apiUrl } from '../../../api'
 import { appendAssistantDelta, applyAssistantStreamEvent, assistantItemsText, hasPersistedRunReply, isResumableWaitingRun, isTerminalRunStatus, isTerminalRunStreamEvent, nextRunStreamPhase, parseRunStreamEvent, rememberRunStreamEvent, restoreAssistantItemsFromEvents, runStreamPhase } from '../../../sessionStream'
 import type { RunStreamEvent } from '../../../sessionStream'
-import { emptyThoughtTimeline, hasVisibleCompletedThought, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from '../../../thoughtTimeline'
+import { emptyThoughtTimeline, hasVisibleCompletedThought, mergeThoughtTimelineHistory, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from '../../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../../thoughtTimeline'
 import type { Approval, Run, RunEvent } from '../../../types'
 import { emptyLiveRun, latestRunPlanFromEvents, runPlanFromEvent, runStreamEventNames, runThinkingStartedAt } from '../sessionState'
@@ -43,6 +43,7 @@ type RunTransportOptions = {
 
 // 管理单次运行的 SSE 生命周期，并在流不可用时回退为轮询；会话页只负责触发和展示。
 export function useRunTransport(options: RunTransportOptions) {
+  const contextRefreshTimer = useRef<number | null>(null)
   const {
     activeIdRef, eventSourceRef, fallbackTimerRef, streamReconnectTimerRef, streamErrorCountRef,
     streamRunIdRef, seenStreamEventsRef, terminalSyncVersionRef, liveRunRef, setRunsState,
@@ -53,6 +54,8 @@ export function useRunTransport(options: RunTransportOptions) {
 
   // 关闭全部运输资源并清空重连计数，供切换会话、终态和组件卸载共同调用。
   const closeRunTransport = useCallback(() => {
+    if (contextRefreshTimer.current !== null) window.clearTimeout(contextRefreshTimer.current)
+    contextRefreshTimer.current = null
     eventSourceRef.current?.close()
     eventSourceRef.current = null
     if (fallbackTimerRef.current !== null) {
@@ -216,6 +219,7 @@ export function useRunTransport(options: RunTransportOptions) {
           error: '',
         }))
         void refreshRuns()
+        void refreshContext()
         if (status === 'awaiting_approval') void refreshApprovalsForSession(sessionId)
         if (isTerminalRunStatus(status) && !resumableWaiting) {
           await syncTerminalRun(runId, { type: 'run_state', status, terminal: true, error: status === 'failed' ? (run.error_message || run.stop_reason) : undefined, reason: run.stop_reason }, sessionId)
@@ -228,7 +232,7 @@ export function useRunTransport(options: RunTransportOptions) {
     void poll()
     fallbackTimerRef.current = window.setInterval(() => void poll(), 4000)
   }, [
-    activeIdRef, eventSourceRef, fallbackTimerRef, refreshApprovalsForSession, refreshRuns,
+    activeIdRef, eventSourceRef, fallbackTimerRef, refreshApprovalsForSession, refreshRuns, refreshContext,
     setLiveRun, streamReconnectTimerRef, streamRunIdRef, syncTerminalRun,
   ])
 
@@ -236,6 +240,8 @@ export function useRunTransport(options: RunTransportOptions) {
   const startRunStream = useCallback((runId: string, sessionId = activeIdRef.current, persistedStartedAt?: string) => {
     if (!runId || activeIdRef.current !== sessionId) return
     if (streamRunIdRef.current === runId && eventSourceRef.current) return
+    // 自动续发可能先于上一轮的异步刷新完成；旧收尾不能清空新运行的流状态。
+    terminalSyncVersionRef.current += 1
     eventSourceRef.current?.close()
     eventSourceRef.current = null
     if (fallbackTimerRef.current !== null) {
@@ -296,11 +302,15 @@ export function useRunTransport(options: RunTransportOptions) {
         const hasLiveStepBoundary = typeof previous.thought.activeStepStartedAt === 'number'
         const hasRestoredThought = restoredThought.startedAt !== null || restoredThought.items.length > 0
         const shouldRestoreThought = !hasLiveStepBoundary && hasRestoredThought && (!restoredThought.finished || previous.status === 'terminal')
-        const nextThought = shouldRestoreThought ? restoredThought : previous.thought
+        const nextThought = shouldRestoreThought
+          ? restoredThought
+          : hasRestoredThought
+            ? mergeThoughtTimelineHistory(previous.thought, restoredThought)
+            : previous.thought
         const nextPhase = shouldRestoreThought && latestEventType ? runStreamPhase({ type: latestEventType, ...((latestEvent?.payload || {}) as Record<string, unknown>) }) : previous.phase
         const shouldRestoreAssistant = !previous.assistantItems.length && restored.length > 0
         const shouldRestorePlan = restoredPlan !== null && previous.plan.length === 0
-        if (!shouldRestoreThought && !shouldRestoreAssistant && !shouldRestorePlan) return previous
+        if (!shouldRestoreThought && !hasRestoredThought && !shouldRestoreAssistant && !shouldRestorePlan) return previous
         return {
           ...previous,
           phase: nextPhase || previous.phase,
@@ -323,6 +333,15 @@ export function useRunTransport(options: RunTransportOptions) {
     }
     eventSourceRef.current = source
 
+    // 历史重放连续到达时合并查询，始终读最新值，不将旧事件的数值直接写回 UI。
+    const scheduleContextRefresh = () => {
+      if (contextRefreshTimer.current !== null) return
+      contextRefreshTimer.current = window.setTimeout(() => {
+        contextRefreshTimer.current = null
+        if (eventSourceRef.current === source && activeIdRef.current === sessionId) void refreshContext()
+      }, 100)
+    }
+
     source.onopen = () => {
       if (eventSourceRef.current !== source || activeIdRef.current !== sessionId) return
       streamErrorCountRef.current = 0
@@ -331,6 +350,8 @@ export function useRunTransport(options: RunTransportOptions) {
         streamReconnectTimerRef.current = null
       }
       setLiveRun((previous) => ({ ...previous, status: previous.status === 'awaiting_approval' ? 'awaiting_approval' : 'live', error: '' }))
+      // 重连或切回会话时读取运行中的最新快照，避免只显示历史消息的旧用量。
+      scheduleContextRefresh()
     }
 
     const handleEvent = (message: MessageEvent<string>, fallbackType = '') => {
@@ -343,6 +364,7 @@ export function useRunTransport(options: RunTransportOptions) {
       const waitingApproval = parsed.type === 'approval_requested'
         || parsed.type === 'delegated_child_awaiting_approval'
         || (parsed.type === 'run_state' && parsed.status === 'awaiting_approval')
+      if (typeof parsed.active_context_tokens === 'number') scheduleContextRefresh()
       setLiveRun((previous) => {
         const assistantItems = applyAssistantStreamEvent(previous.assistantItems, parsed)
         const updatedPlan = runPlanFromEvent(parsed)
@@ -388,9 +410,9 @@ export function useRunTransport(options: RunTransportOptions) {
     }
   }, [
     activeIdRef, eventSourceRef, fallbackTimerRef, refreshApprovalsForSession, refreshChildTasks,
-    refreshRuns, refreshTeammates, seenStreamEventsRef, setChildPanelOpen,
+    refreshRuns, refreshContext, refreshTeammates, seenStreamEventsRef, setChildPanelOpen,
     setLiveRun, startRunFallback, streamErrorCountRef, streamReconnectTimerRef, streamRunIdRef,
-    syncTerminalRun,
+    syncTerminalRun, terminalSyncVersionRef,
   ])
 
 

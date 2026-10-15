@@ -1,8 +1,8 @@
 // 本文件实现 SessionsPage 功能域的页面或组件，并把接口数据、交互状态与公共展示组件连接起来。
-import { AlertCircle, ArrowDown, ArrowUp, BookOpen, Cable, Check, ChevronRight, FileText, Folder, FolderOpen, GitBranch, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
+import { AlertCircle, ArrowDown, ArrowUp, BookOpen, Cable, Check, ChevronRight, CornerDownRight, ListPlus, Pause, Play, FileText, Folder, FolderOpen, GitBranch, LoaderCircle, MessageSquare, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, ShieldAlert, ShieldCheck, Square, Trash2, X } from 'lucide-react'
 import { type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type SetStateAction, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { api, apiUrl, describeError } from '../../api'
+import { api, apiUrl, ApiError, describeError } from '../../api'
 import { attachmentForm, attachmentSignature, formatAttachmentSize, messageAttachments, selectAttachmentFiles } from '../../attachments'
 import type { PendingAttachment } from '../../attachments'
 import { permissionLabel, permissionOptions, toggleSelectedId } from '../../capabilitySelection'
@@ -19,6 +19,7 @@ import { ContextUsageRing, EmptyState, ErrorState, LoadingState } from '../../co
 import { ApprovalCard, ChildAgentPanel, LiveAssistantMessage, MessageBubble } from './presentation'
 import { useApiData } from '../../shared/hooks/useApiData'
 import { stringId } from '../../shared/lib/display'
+import { FollowUpControls } from './components/FollowUpControls'
 import { ComposerTextArea } from './components/ComposerTextArea'
 import { PendingImagePreview, type PreviewImageItem } from './components/PendingImagePreview'
 import type { ComposerTextAreaHandle } from './components/ComposerTextArea'
@@ -35,7 +36,7 @@ import { activeRunStatuses, draftSettingsWithPermission, emptyDraftContext, empt
 import type { DraftLaunchResponse, DraftSessionSettings, LiveRunState, OwnedSessionDelegations, OwnedSessionMessages, OwnedSessionRuns, ProjectHoverCard } from './sessionState'
 import { buildConversationTurnSummaries } from './turnTimeline'
 import { loadSessionScrollPosition, saveSessionScrollPosition, type SessionScrollPosition } from './sessionScrollPosition'
-import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, ManagedWorktree, McpServer, MemorySettings, Message, PermissionMode, PermissionSettings, Run, RunEvent, Session, SessionContext, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
+import type { AgentProfile, Approval, Connection, DelegatedTask, DurableTask, FileChangeSelection, FolderSelection, ManagedWorktree, McpServer, MemorySettings, Message, PermissionMode, PermissionSettings, Run, RunEvent, Session, SessionContext, SessionInput, SkillCatalogItem, Teammate, ThinkingLevel, Workspace } from '../../types'
 
 type ChildPanelState = { sessionId: string; open: boolean; autoOpened: boolean }
 type SidePanelResizeBounds = { min: number; max: number }
@@ -62,6 +63,15 @@ function resolveActiveSessionId(selectedSessionId: string, draftActive: boolean,
 
 function nextSelectedSessionId(current: string, sessions: Session[]): string {
   return current || stringId(sessions[0]?.id)
+}
+
+// 子 Agent 的审批运行可排在会话运行列表前面；输入必须绑定当前会话的主运行。
+function activeSessionInputRun(runs: Run[], tasks: DelegatedTask[], liveRun: LiveRunState): string {
+  const childRunIds = new Set(tasks.map((task) => stringId(task.child_run_id)).filter(Boolean))
+  if (liveRun.runId && ['connecting', 'live', 'fallback', 'awaiting_approval'].includes(liveRun.status)
+    && runs.some((run) => run.id === liveRun.runId && run.turn_id && !childRunIds.has(run.id))) return liveRun.runId
+  return runs.find((run) => run.turn_id && !childRunIds.has(run.id)
+    && (activeRunStatuses.has(run.status || '') || isResumableWaitingRun(run)))?.id || ''
 }
 
 // 子任务首次出现时自动打开；手动关闭持续到任务清空或切换会话。
@@ -100,6 +110,8 @@ function SessionsPage() {
   const [previewAttachmentId, setPreviewAttachmentId] = useState('')
   const pendingImages = pendingAttachments.filter((item) => item.previewUrl)
   const [sending, setSending] = useState(false)
+  const [inputMode, setInputMode] = useState<'follow_up' | 'steer'>('follow_up')
+  const [inputActionId, setInputActionId] = useState('')
   const [stoppingRunId, setStoppingRunId] = useState('')
   const [cancellingTaskId, setCancellingTaskId] = useState('')
   const [deletingSessionId, setDeletingSessionId] = useState('')
@@ -182,6 +194,7 @@ function SessionsPage() {
   const pendingDraftRunRef = useRef<{ sessionId: string; runId: string; startedAt?: string } | null>(null)
   const draftIdempotencyKeyRef = useRef('')
   const pendingSessionSendRef = useRef<{ sessionId: string; content: string; attachmentSignature: string; key: string } | null>(null)
+  const pendingInputSendRef = useRef<{ sessionId: string; content: string; attachmentSignature: string; mode: 'follow_up' | 'steer'; runId: string; key: string } | null>(null)
   const draftVersionRef = useRef(0)
   const sendingRef = useRef(false)
   const thoughtHydrationRegistryRef = useRef(new ThoughtHydrationRegistry())
@@ -218,6 +231,13 @@ function SessionsPage() {
     { ownerSessionId: '', items: [] },
     async () => activeId
       ? { ownerSessionId: activeId, items: await api.list<Run>(`/api/runs?session_id=${encodeURIComponent(activeId)}`, ['runs']) }
+      : { ownerSessionId: '', items: [] },
+    [activeId],
+  )
+  const inputs = useApiData<{ ownerSessionId: string; items: SessionInput[] }>(
+    { ownerSessionId: '', items: [] },
+    async () => activeId
+      ? { ownerSessionId: activeId, items: await api.list<SessionInput>(`/api/sessions/${encodeURIComponent(activeId)}/inputs`, ['inputs']) }
       : { ownerSessionId: '', items: [] },
     [activeId],
   )
@@ -306,6 +326,10 @@ function SessionsPage() {
   const activeAgent = agents.data.find((item) => item.id === activeSession?.agent_id)
   const sessionRuns = visibleSessionItems(runs.data.ownerSessionId, activeId, runs.data.items)
     .filter((item) => !item.session_id || item.session_id === activeId)
+  const sessionInputs = visibleSessionItems(inputs.data.ownerSessionId, activeId, inputs.data.items)
+  const queuedInputs = sessionInputs.filter((item) => item.status === 'queued' || item.status === 'pending' || item.status === 'failed')
+  const pendingInputCount = queuedInputs.filter((item) => item.status !== 'failed').length
+  const firstQueuedInputId = queuedInputs.find((item) => item.status === 'queued')?.id
   // awaitingApprovalRunIds 驱动审批查询；只关注当前会话中仍等待决策的运行。
   const awaitingApprovalRunIds = sessionRuns
     .filter((item) => item.status === 'awaiting_approval')
@@ -336,6 +360,13 @@ function SessionsPage() {
   )
   const interruptibleRunId = liveRunIsActive ? liveRun.runId : activeRunIsInterruptible ? activeRunId : ''
   const canInterrupt = Boolean(interruptibleRunId)
+  const primaryActionIsStop = canInterrupt && !composerHasValue && !pendingAttachments.length
+  // SSE 连接对应主运行；审批卡可能指向子运行，不能把子运行 ID 当作转向目标。
+  const inputTargetRunId = activeSessionInputRun(
+    sessionRuns,
+    childTasks.data.ownerSessionId === activeId ? childTasks.data.items : noDelegatedTasks,
+    liveRunIsActive ? liveRun : emptyLiveRun(),
+  )
   const canEditInterrupted = Boolean(
     interruptedRunId
       && liveRun.runId === interruptedRunId
@@ -410,7 +441,7 @@ function SessionsPage() {
     return result
   })()
   const resumableTask = durableTask.data?.session_id === activeId && ['paused', 'needs_recovery', 'blocked'].includes(durableTask.data.status) ? durableTask.data : null
-  const resumeFromComposer = !draftActive && !canInterrupt && !composerHasValue && !pendingAttachments.length && resumableTask !== null
+  const resumeFromComposer = !draftActive && !canInterrupt && !composerHasValue && !pendingAttachments.length && resumableTask !== null && !pendingInputCount
   const childPanelOpen = childPanelState.open
   const setChildPanelOpen = useCallback((update: SetStateAction<boolean>) => {
     setChildPanelState((current) => {
@@ -515,10 +546,11 @@ function SessionsPage() {
     awaitingApprovalRunIds.includes(stringId(approval.run_id))
       || (liveRun.status === 'awaiting_approval' && stringId(approval.run_id) === liveRun.runId)
   ))
-  const activeComposerSurface = composerSurface(visibleApprovals.length, draftActive)
+  const activeComposerSurface = inputTargetRunId ? 'composer' : composerSurface(visibleApprovals.length, draftActive)
   // 为运输 Hook 提供稳定命名的刷新/状态写入函数，使终态同步不依赖页面实现细节。
   const refreshMessages = messages.refresh
   const refreshRuns = runs.refresh
+  const refreshInputs = inputs.refresh
   const refreshChildTasks = childTasks.refresh
   const refreshTeammates = teammates.refresh
   const refreshContext = context.refresh
@@ -979,10 +1011,20 @@ function SessionsPage() {
   }, [activeId, refreshContext, refreshMessages, refreshRuns, startRunStream, visibleMessages])
 
   useEffect(() => {
-    if (!activeId || messages.loading || !activeRun?.id || !activeRunCanStream || liveRun.status === 'terminal') return
+    if (!activeId || messages.loading || !activeRun?.id || !activeRunCanStream) return
+    if (liveRun.status === 'terminal' && liveRun.runId === activeRun.id) return
     if (streamRunIdRef.current === activeRun.id) return
     startRunStream(activeRun.id, activeId, activeRun.started_at)
-  }, [activeId, activeRun?.id, activeRun?.started_at, activeRun?.status, activeRun?.stop_reason, activeRunCanStream, liveRun.status, messages.loading, startRunStream, visibleMessages])
+  }, [activeId, activeRun?.id, activeRun?.started_at, activeRun?.status, activeRun?.stop_reason, activeRunCanStream, liveRun.runId, liveRun.status, messages.loading, startRunStream, visibleMessages])
+
+  // 输入队列和新运行不一定产生当前 SSE 的事件；有活动运行或队列时定时读取权威状态。
+  useEffect(() => {
+    if (!activeId || (!inputTargetRunId && !pendingInputCount)) return
+    const timer = window.setInterval(() => {
+      void Promise.all([refreshInputs(), refreshRuns(), refreshMessages()])
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [activeId, inputTargetRunId, pendingInputCount, refreshInputs, refreshMessages, refreshRuns])
 
   // 新打开的历史在消息和持久化思考/工具时间线均水合前保持锚定；程序布局滚动不能取消首次锚点。
   useEffect(() => {
@@ -1105,7 +1147,18 @@ function SessionsPage() {
 
   // 统一处理首轮建会话和已有会话续写，复用幂等键防止网络重试造成重复运行。
   async function submitMessage(content: string, files: File[], consumeComposer: boolean) {
-    if (sendingRef.current || (!activeId && !draftActive) || (!content && !files.length) || settingsSaving || capabilitySaving || settingsLocked) return
+    if (sendingRef.current || (!activeId && !draftActive) || (!content && !files.length) || settingsSaving || capabilitySaving) return
+    const retry = pendingInputSendRef.current
+    // 响应丢失后即使原运行已经结束，仍通过原回执重试，不能误启动一条重复的普通消息。
+    if (!draftActive && retry?.sessionId === activeId && retry.content === content && retry.attachmentSignature === attachmentSignature(files)) {
+      await submitSessionInput(content, files, consumeComposer, activeId, retry.runId, retry.mode)
+      return
+    }
+    if (settingsLocked && !inputTargetRunId) return
+    if (!draftActive && inputTargetRunId) {
+      await submitSessionInput(content, files, consumeComposer, activeId, inputTargetRunId)
+      return
+    }
     sendingRef.current = true
     closeAllMenus()
     setSending(true); setActionError('')
@@ -1180,6 +1233,60 @@ function SessionsPage() {
     }
   }
 
+  // 活动运行的输入进入持久队列；请求失败保留编辑器内容和现有 SSE，便于原样重试。
+  async function submitSessionInput(content: string, files: File[], consumeComposer: boolean, sessionId: string, runId: string, mode = inputMode) {
+    sendingRef.current = true
+    setSending(true)
+    setActionError('')
+    const signature = attachmentSignature(files)
+    const previous = pendingInputSendRef.current
+    const key = previous?.sessionId === sessionId && previous.content === content
+      && previous.attachmentSignature === signature && previous.mode === mode && previous.runId === runId
+      ? previous.key : createTurnIdempotencyKey()
+    pendingInputSendRef.current = { sessionId, content, attachmentSignature: signature, mode, runId, key }
+    try {
+      const payload = { idempotency_key: key, content, mode, expected_run_id: runId }
+      const path = `/api/sessions/${encodeURIComponent(sessionId)}/inputs`
+      await (files.length
+        ? api.postForm<SessionInput>(path, attachmentForm(payload, files))
+        : api.post<SessionInput>(path, payload))
+      pendingInputSendRef.current = null
+      if (activeIdRef.current !== sessionId) return
+      if (consumeComposer) {
+        composerInputRef.current?.clear()
+        clearPendingAttachments()
+      }
+      void Promise.all([refreshInputs(), refreshMessages(), refreshRuns()])
+    } catch (error) {
+      if (activeIdRef.current === sessionId) setActionError(describeError(error))
+      // 明确拒绝表示尚未接收，允许用户改为另一种发送方式；运输失败则保留原回执重试。
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500) pendingInputSendRef.current = null
+      void Promise.all([refreshInputs(), refreshRuns()])
+    } finally {
+      sendingRef.current = false
+      setSending(false)
+    }
+  }
+
+  async function actOnInput(inputId: string, action: 'cancel' | 'steer' | 'start') {
+    const sessionId = activeIdRef.current
+    if (!sessionId || inputActionId) return
+    setInputActionId(inputId)
+    setActionError('')
+    const path = `/api/sessions/${encodeURIComponent(sessionId)}/inputs/${encodeURIComponent(inputId)}`
+    try {
+      if (action === 'cancel') await api.delete(path)
+      else if (action === 'steer') await api.post(`${path}/steer`, { expected_run_id: inputTargetRunId })
+      else await api.post(`${path}/start`)
+      if (activeIdRef.current !== sessionId) return
+      await Promise.all([refreshInputs(), refreshMessages(), refreshRuns()])
+    } catch (error) {
+      if (activeIdRef.current === sessionId) setActionError(describeError(error))
+    } finally {
+      setInputActionId('')
+    }
+  }
+
   // 表单入口从非受控编辑器读取最新文本和附件快照，再交给 submitMessage。
   function sendMessage(event: FormEvent) {
     event.preventDefault()
@@ -1217,7 +1324,7 @@ function SessionsPage() {
 
   // 请求后端中断当前运行；实际草稿和终态随后由运输层事件同步。
   async function stopActiveRun() {
-    const runId = interruptibleRunId || streamRunIdRef.current
+    const runId = inputTargetRunId || interruptibleRunId || streamRunIdRef.current
     if (!runId || stoppingRunId) return
     setStoppingRunId(runId)
     setInterruptedRunId(runId)
@@ -1636,10 +1743,25 @@ function SessionsPage() {
                   <span>已保留当前部分输出，重新发送前不会写入新的上下文。</span>
                 </div>}
                 {!draftActive && approvals.error && <ErrorState message={`审批状态读取失败：${approvals.error}`} onRetry={approvals.reload} />}
+                {!draftActive && inputs.error && <ErrorState message={`待发送消息读取失败：${inputs.error}`} onRetry={inputs.reload} />}
                 {!draftActive && approvals.loading && activeRunId && !visibleApprovals.length && liveRun.status === 'awaiting_approval' && <LoadingState label="正在读取审批状态" />}
               </div>
+              {(Boolean(inputTargetRunId && visibleApprovals.length) || (!draftActive && queuedInputs.length > 0)) && <div className="session-input-prelude">
+                {awayFromBottom && (sending || canInterrupt) && <button type="button" className="follow-latest-button" aria-label="回到底部并跟随输出" title="回到底部并跟随输出" onClick={followLatestOutput}><ArrowDown size={16} aria-hidden="true" /></button>}
+                {!!inputTargetRunId && !!visibleApprovals.length && <section className="session-input-approvals" aria-label="待审批操作"><div className="approval-composer-list">{visibleApprovals.map((approval) => <ApprovalCard key={approval.id} approval={approval} embedded deciding={decidingApproval === approval.id} onDecision={decideApproval} />)}</div></section>}
+                {!draftActive && queuedInputs.length > 0 && <div className="session-input-queue" aria-label="待处理输入">
+                  {!inputTargetRunId && firstQueuedInputId && <div className="session-queue-paused"><Pause size={14} aria-hidden="true" /><span>队列已暂停</span><button type="button" disabled={Boolean(inputActionId)} onClick={() => void actOnInput(firstQueuedInputId, 'start')}><Play size={12} />继续</button></div>}
+                  {queuedInputs.map((item) => <div className={`session-input-row${item.status === 'failed' ? ' is-failed' : ''}`} key={item.id}>
+                    <span className="session-input-status" title={item.status === 'failed' ? '发送失败' : item.status === 'pending' ? '等待送入当前任务' : '排队发送'}>{item.status === 'failed' ? <AlertCircle size={15} /> : item.status === 'pending' ? <LoaderCircle size={15} className="spin" /> : <ListPlus size={15} />}</span>
+                    <div className="session-input-copy"><span className="session-input-content" title={item.content || item.attachments.map((file) => file.name).join('、')}>{item.content || item.attachments.map((file) => file.name).join('、')}</span>{item.attachments.length > 0 && item.content && <span className="session-input-files"><Paperclip size={11} />{item.attachments.length} 个附件</span>}{item.error && <span className="session-input-error">{item.error}</span>}</div>
+                    {item.status === 'queued' && item.mode === 'follow_up' && inputTargetRunId && <button type="button" className="session-input-action" title="补充到当前任务，不中断正在执行的操作" disabled={Boolean(inputActionId)} onClick={() => void actOnInput(item.id, 'steer')}><CornerDownRight size={14} />Steer</button>}
+                    {item.status === 'failed' && (inputTargetRunId || !firstQueuedInputId) && <button type="button" className="session-input-action" disabled={Boolean(inputActionId)} onClick={() => void actOnInput(item.id, inputTargetRunId ? 'steer' : 'start')}>重试</button>}
+                    <button type="button" className="session-input-dismiss" disabled={Boolean(inputActionId)} aria-label="撤回待处理输入" title="撤回" onClick={() => void actOnInput(item.id, 'cancel')}><X size={14} /></button>
+                  </div>)}
+                </div>}
+              </div>}
               <div className={`composer-stage composer-stage-${activeComposerSurface}`} aria-live="polite">
-              {awayFromBottom && (sending || canInterrupt) && <button type="button" className="follow-latest-button" aria-label="回到底部并跟随输出" title="回到底部并跟随输出" onClick={followLatestOutput}><ArrowDown size={16} aria-hidden="true" /></button>}
+              {awayFromBottom && (sending || canInterrupt) && !queuedInputs.length && !(inputTargetRunId && visibleApprovals.length) && <button type="button" className="follow-latest-button" aria-label="回到底部并跟随输出" title="回到底部并跟随输出" onClick={followLatestOutput}><ArrowDown size={16} aria-hidden="true" /></button>}
               <form className={`composer composer-surface composer-surface-composer${activeComposerSurface === 'composer' ? ' is-active' : ''}`} aria-hidden={activeComposerSurface !== 'composer'} inert={activeComposerSurface !== 'composer' || undefined} onSubmit={sendMessage}>
                 {actionError && <p className="form-error" role="alert">{actionError}</p>}
                 {draftActive && <div className="draft-project-controls">
@@ -1654,10 +1776,10 @@ function SessionsPage() {
                   </div>)}
                 </div>}
                 <input ref={attachmentInputRef} className="attachment-file-input" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => queueAttachments(event.currentTarget.files)} />
-                <ComposerTextArea ref={composerInputRef} disabled={draftActive && sending} resetKey={`${activeId}:${draftActive}`} placeholder={draftActive ? '描述你想完成的任务……' : '告诉 PGAgent 你想完成什么……'} onHasValueChange={setComposerHasValue} onPasteImages={settingsLocked || sending ? undefined : queueAttachments} />
+                <ComposerTextArea ref={composerInputRef} disabled={draftActive && sending} resetKey={`${activeId}:${draftActive}`} placeholder={draftActive ? '描述你想完成的任务……' : '告诉 PGAgent 你想完成什么……'} onHasValueChange={setComposerHasValue} onPasteImages={sending ? undefined : queueAttachments} />
                 <div className="composer-toolbar">
                   <div className="composer-left-actions">
-                    <button type="button" className="composer-tool-button composer-plus-button attachment-trigger" aria-label="添加本机附件" title="添加本机附件（仅当前会话可见）" disabled={settingsLocked || sending} onClick={() => attachmentInputRef.current?.click()}>
+                    <button type="button" className="composer-tool-button composer-plus-button attachment-trigger" aria-label="添加本机附件" title="添加本机附件（仅当前会话可见）" disabled={sending} onClick={() => attachmentInputRef.current?.click()}>
                       <Paperclip size={14} />
                       {!!pendingAttachments.length && <b>{pendingAttachments.length}</b>}
                     </button>
@@ -1739,29 +1861,18 @@ function SessionsPage() {
                       </div>}
                     </div>
                     {draftActive ? <ContextUsageRing context={emptyDraftContext} /> : context.error ? <button type="button" className="context-state context-error" aria-label="上下文占用读取失败，点击重试" title={context.error} onClick={() => void context.reload()}><AlertCircle size={15} /></button> : context.loading || !context.data ? <span className="context-state" role="status" aria-label="正在读取上下文占用"><LoaderCircle className="spin" size={15} /></span> : <ContextUsageRing context={context.data} />}
-                    <button
-                      type={canInterrupt ? 'button' : 'submit'}
-                      className={`send-button ${canInterrupt ? 'is-stop' : ''}`}
-                      aria-label={canInterrupt ? '中断当前任务' : resumeFromComposer ? '继续任务' : '发送'}
-                      title={canInterrupt ? '中断当前任务' : resumeFromComposer ? '继续任务' : '发送'}
-                      aria-busy={Boolean(stoppingRunId)}
-                      disabled={canInterrupt
-                        ? Boolean(stoppingRunId)
-                        : sending || settingsSaving || capabilitySaving || settingsLocked || (!resumeFromComposer && !composerHasValue && !pendingAttachments.length)}
-                      onClick={canInterrupt ? () => void stopActiveRun() : undefined}
-                    >
-                      {canInterrupt
-                        ? stoppingRunId ? <LoaderCircle className="spin" size={14} /> : <Square className="send-stop-icon" size={12} strokeWidth={3} fill="currentColor" />
-                        : resumeFromComposer ? <span aria-hidden="true">▶</span> : <ArrowUp className="send-arrow-icon" size={16} strokeWidth={2.4} />}
+                    {!!inputTargetRunId && <FollowUpControls key={activeId} mode={inputMode} disabled={sending} onModeChange={setInputMode} onStop={canInterrupt && !stoppingRunId ? () => void stopActiveRun() : undefined} />}
+                    <button type={primaryActionIsStop ? 'button' : 'submit'} className={`send-button${primaryActionIsStop ? ' is-stop' : ''}`} aria-label={primaryActionIsStop ? '中断当前任务' : resumeFromComposer ? '继续任务' : inputTargetRunId ? inputMode === 'steer' ? '发送并转向' : '加入续发队列' : '发送'} title={primaryActionIsStop ? '停止当前任务' : resumeFromComposer ? '继续任务' : inputTargetRunId ? inputMode === 'steer' ? 'Steer · 补充当前任务' : '排队发送 · 当前任务完成后执行' : '发送'} disabled={primaryActionIsStop ? Boolean(stoppingRunId) : sending || settingsSaving || capabilitySaving || (settingsLocked && !inputTargetRunId) || (!resumeFromComposer && !composerHasValue && !pendingAttachments.length)} onClick={primaryActionIsStop ? () => void stopActiveRun() : undefined}>
+                      {primaryActionIsStop ? stoppingRunId ? <LoaderCircle className="spin" size={14} /> : <Square size={12} strokeWidth={3} fill="currentColor" /> : resumeFromComposer ? <Play size={14} /> : inputTargetRunId && inputMode === 'follow_up' ? <ListPlus size={18} /> : <ArrowUp className="send-arrow-icon" size={16} strokeWidth={2.4} />}
                     </button>
                   </div>
                 </div>
               </form>
-              <section className={`composer composer-surface composer-surface-approval${activeComposerSurface === 'approval' ? ' is-active' : ''}`} aria-hidden={activeComposerSurface !== 'approval'} inert={activeComposerSurface !== 'approval' || undefined} aria-label="待审批操作">
+              {!inputTargetRunId && <section className={`composer composer-surface composer-surface-approval${activeComposerSurface === 'approval' ? ' is-active' : ''}`} aria-hidden={activeComposerSurface !== 'approval'} inert={activeComposerSurface !== 'approval' || undefined} aria-label="待审批操作">
                 <div className="approval-composer-list">
                   {visibleApprovals.map((approval) => <ApprovalCard key={approval.id} approval={approval} embedded deciding={decidingApproval === approval.id} onDecision={decideApproval} />)}
                 </div>
-              </section>
+              </section>}
               </div>
             </> : <EmptyState icon={MessageSquare} title="开始新对话" description="创建一个临时草稿；首次发送后才会保存为任务或项目对话。" action={<button className="button button-primary" onClick={() => beginDraft()}>新建对话</button>} />}
           </section>
@@ -1845,6 +1956,6 @@ function SessionsPage() {
 }
 
 
-const SessionsPageState = { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveMenuOpen, clampSidePanelWidth, sidePanelWidthAfterDrag }
+const SessionsPageState = { nextSelectedSessionId, resolveActiveSessionId, activeSessionInputRun, nextChildPanelStateForTasks, resolveMenuOpen, clampSidePanelWidth, sidePanelWidthAfterDrag }
 
 export { SessionsPage, SessionsPageState }

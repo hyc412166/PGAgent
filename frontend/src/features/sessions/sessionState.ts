@@ -91,7 +91,7 @@ export function runThinkingStartedAt(startedAt: string | undefined, now = Date.n
 // EventSource 需要逐个注册的后端命名事件全集，与 useRunTransport 的事件处理入口对应。
 export const runStreamEventNames = [
   'run_state', 'run_received', 'context_prepared', 'context_resumed', 'context_compacted',
-  'context_compaction_started', 'context_compaction_finished', 'context_compaction_failed',
+  'context_compaction_started', 'context_compaction_finished', 'context_compaction_failed', 'context_usage_updated',
   'image_read_started', 'image_read_completed', 'image_read_failed',
   'model_step_started', 'model_retry', 'progress', 'agent_progress', 'thought_summary',
   'mcp_catalog_loading', 'mcp_connecting', 'mcp_server_ready', 'mcp_ready', 'mcp_degraded',

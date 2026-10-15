@@ -332,6 +332,19 @@ export interface Message {
   citations?: Array<{ url: string; title: string }>
 }
 
+// 会话输入在运行期间排队或转向；状态由服务端维护，页面只据此展示和提交控制动作。
+export interface SessionInput {
+  id: string
+  session_id: string
+  content: string
+  attachments: Array<{ id: string; name: string; mime_type: string; size_bytes: number; kind: string }>
+  status: 'queued' | 'pending' | 'delivered' | 'cancelled' | 'failed'
+  mode: 'steer' | 'follow_up'
+  run_id: string | null
+  error: string | null
+  created_at: string
+}
+
 // AssistantStreamItem 是单次运行中按 response/item 顺序累计的可见正文；它与工具、终态事件分离，避免正文被工具阶段重置。
 export interface AssistantStreamItem {
   id: string

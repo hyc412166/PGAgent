@@ -218,7 +218,7 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
     <article id={`conversation-message-${message.id}`} data-conversation-turn-id={conversationTurnId || undefined} className={`message ${message.role} ${isTool ? 'tool-message' : ''} ${attachments.length ? 'has-attachments' : ''}`}>
       <div className="message-avatar">{message.role === 'user' ? '你' : isTool ? <SquareTerminal size={16} /> : <PenguinMark size={21} />}</div>
       <div className="message-body">
-        <div className="message-meta"><strong>{speaker}</strong><time>{formatUiDate(message.created_at)}</time></div>
+        <div className="message-meta"><strong>{speaker}</strong>{message.role === 'user' && (message.metadata?.input_mode === 'steer' || message.metadata?.input_mode === 'follow_up') && <span className="message-input-mode">{message.metadata.input_mode === 'steer' ? '已转向' : '续发'}</span>}<time>{formatUiDate(message.created_at)}</time></div>
         {thoughtRunId && thoughtTimeline && <CompletedThoughtTimeline runId={thoughtRunId} sessionId={message.session_id} timeline={thoughtTimeline} onOpenFileChange={onOpenFileChange} />}
         {!!imageAttachments.length && <div className="message-image-gallery" aria-label="消息图片">
           {imageAttachments.map((attachment) => {

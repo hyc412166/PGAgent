@@ -42,4 +42,13 @@ describe('message image presentation', () => {
     expect(markup).toContain('href="https://example.com/news"')
     expect(markup).toContain('Example News')
   })
+
+  it('distinguishes delivered steer and follow-up messages from ordinary user turns', () => {
+    const render = (inputMode?: string) => renderToStaticMarkup(<MessageBubble message={{
+      id: 'input-message', role: 'user', content: '补充说明', metadata: inputMode ? { input_mode: inputMode } : {},
+    }} />)
+    expect(render('steer')).toContain('已转向')
+    expect(render('follow_up')).toContain('续发')
+    expect(render()).not.toContain('message-input-mode')
+  })
 })

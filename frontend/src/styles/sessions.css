@@ -482,6 +482,7 @@
 .message-meta { gap: 7px; margin-bottom: 5px; }
 .message-meta strong { color: var(--ink); font-size: 0.625rem; }
 .message-meta time { color: var(--muted-2); font-size: 0.5625rem; }
+.message-input-mode { padding: 2px 5px; border-radius: 6px; color: var(--ocean-700); background: var(--blue-soft); font-size: .5rem; }
 
 .message-content {
   color: var(--ink);
@@ -1557,3 +1558,34 @@
 
 /* 舞台容器负责外边距，两个表面保持完全相同的可用宽度。 */
 .composer-stage .composer-surface { width: 100%; margin: 0; }
+
+/* 队列与输入框共享宽度；消息行使用一个连续表面，避免独立卡片抢占正文。 */
+.session-input-prelude { position: relative; width: min(840px, calc(100% - 30px)); margin: 0 auto 6px; min-width: 0; }
+.session-input-queue { max-height: min(30dvh, 180px); overflow-y: auto; padding: 5px 8px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface-soft); scrollbar-width: thin; }
+.session-input-approvals { margin-bottom: 7px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); }
+.session-input-row, .session-queue-paused { display: flex; align-items: center; gap: 9px; min-height: 38px; padding: 0 5px; font-size: .65rem; }
+.session-input-row + .session-input-row { border-top: 1px solid var(--line); }
+.session-input-status { display: flex; flex: 0 0 auto; color: var(--muted-2); }
+.session-input-copy { flex: 1; min-width: 0; padding: 7px 0; }
+.session-input-content { display: block; overflow: hidden; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; line-height: 1.5; }
+.session-input-files { display: flex; align-items: center; gap: 3px; margin-top: 2px; color: var(--muted-2); font-size: .56rem; }
+.session-input-error { display: block; color: var(--danger, #b34b4b); font-size: .6rem; line-height: 1.5; }
+.session-input-row.is-failed .session-input-status { color: var(--danger, #b34b4b); }
+.session-input-action, .session-input-dismiss, .session-queue-paused button { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; gap: 4px; min-height: 36px; padding: 0 7px; border: 0; border-radius: 8px; color: var(--muted); background: transparent; font-size: .62rem; cursor: pointer; }
+.session-input-dismiss { width: 32px; padding: 0; }
+.session-input-row button:hover:not(:disabled), .session-queue-paused button:hover:not(:disabled) { color: var(--ink); background: var(--surface); }
+.session-input-row button:focus-visible, .session-queue-paused button:focus-visible, .follow-up-options summary:focus-visible, .follow-up-menu button:focus-visible { outline: 2px solid var(--ocean-700); outline-offset: 1px; }
+.session-input-row button:disabled, .session-queue-paused button:disabled { opacity: .45; cursor: default; }
+.session-queue-paused { color: var(--muted); border-bottom: 1px solid var(--line); }
+.session-queue-paused span { flex: 1; }
+.follow-up-options { position: relative; flex: 0 0 auto; }
+.follow-up-options summary { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--muted); cursor: pointer; list-style: none; }
+.follow-up-options summary::-webkit-details-marker { display: none; }
+.follow-up-options summary:hover, .follow-up-options[open] summary { background: var(--surface-soft); color: var(--ink); }
+.follow-up-menu { position: absolute; z-index: 20; right: 0; bottom: calc(100% + 9px); width: 212px; padding: 5px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow-sm); }
+.follow-up-menu-label { display: block; padding: 7px 9px 5px; color: var(--muted-2); font-size: .6rem; }
+.follow-up-menu button { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px; padding: 7px 9px; border: 0; border-radius: 7px; color: var(--ink); background: transparent; font-size: .65rem; text-align: left; cursor: pointer; }
+.follow-up-menu button span { flex: 1; }
+.follow-up-menu button:hover:not(:disabled) { background: var(--surface-soft); }
+.follow-up-menu button:disabled { opacity: .45; cursor: default; }
+.follow-up-menu .follow-up-menu-stop { border-top: 1px solid var(--line); border-radius: 0 0 7px 7px; margin-top: 4px; }

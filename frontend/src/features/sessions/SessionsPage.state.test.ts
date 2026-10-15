@@ -2,9 +2,10 @@
 import { describe, expect, it } from 'vitest'
 
 import { SessionsPageState } from './SessionsPage'
-import type { DelegatedTask, Session } from '../../types'
+import type { DelegatedTask, Run, Session } from '../../types'
+import { emptyLiveRun } from './sessionState'
 
-const { nextSelectedSessionId, resolveActiveSessionId, nextChildPanelStateForTasks, resolveMenuOpen, clampSidePanelWidth, sidePanelWidthAfterDrag } = SessionsPageState
+const { nextSelectedSessionId, resolveActiveSessionId, activeSessionInputRun, nextChildPanelStateForTasks, resolveMenuOpen, clampSidePanelWidth, sidePanelWidthAfterDrag } = SessionsPageState
 
 describe('SessionsPage 会话级状态', () => {
   it('会话列表首次到达时选择第一项，但草稿模式保持未选择', () => {
@@ -15,6 +16,17 @@ describe('SessionsPage 会话级状态', () => {
     expect(resolveActiveSessionId('session-b', false, sessions)).toBe('session-b')
     expect(nextSelectedSessionId('', sessions)).toBe('session-a')
     expect(nextSelectedSessionId('session-a', [...sessions].reverse())).toBe('session-a')
+  })
+
+  it('输入绑定主运行，即使子运行审批排在最前且主运行处于后台等待', () => {
+    const runs = [
+      { id: 'child', status: 'awaiting_approval' },
+      { id: 'root', turn_id: 'turn-a', status: 'stopped', stop_reason: 'delegated_child_awaiting_approval' },
+    ] as Run[]
+    const tasks = [{ id: 'task-a', child_run_id: 'child' }] as DelegatedTask[]
+    expect(activeSessionInputRun(runs, tasks, { ...emptyLiveRun(), runId: 'child', status: 'awaiting_approval' })).toBe('root')
+    expect(activeSessionInputRun(runs, tasks, emptyLiveRun())).toBe('root')
+    expect(activeSessionInputRun([{ id: 'child', status: 'running' }] as Run[], [], emptyLiveRun())).toBe('')
   })
 
   it('子任务首次出现时自动打开，手动关闭持续到任务清空或切换会话', () => {
