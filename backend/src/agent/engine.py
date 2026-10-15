@@ -27,6 +27,7 @@ from src.context.assembly import (
     ContextAssembler,
     ConversationCompactor,
     InMemoryArtifactStore,
+    ToolOutputBudgeter,
     compact_tool_results_for_model,
 )
 from .errors import (
@@ -51,6 +52,13 @@ if TYPE_CHECKING:
 
 # 变量说明：logger 表示日志记录器。
 logger = logging.getLogger(__name__)
+
+# 这些持久边界之后上下文可能已经变化；单独发布快照供输入框实时显示，
+# 不把完整 messages 或模型私有用量带到前端。
+_CONTEXT_USAGE_EVENT_SOURCES = frozenset({
+    "context_prepared", "context_resumed", "context_compaction_finished",
+    "tool_finished", "context_usage_updated",
+})
 
 _DIAGNOSTIC_EVENT_FIELDS = frozenset({
     "step", "elapsed_ms", "monotonic_ms", "duration_ms", "thought_duration_ms",
@@ -907,9 +915,11 @@ class AgentRuntime:
         completion_verifier: CompletionVerifier | None = None,
         background_wait_provider: Callable[[], Mapping[str, Any]] | None = None,
         task_state_provider: TaskStateProvider | None = None,
+        input_provider: Callable[[RunState, bool], list[dict[str, Any]]] | None = None,
     ) -> None:
         # 变量说明：model_call 表示当前步骤使用的 model_call 值。
         self.model_call = model_call
+        self.input_provider = input_provider
         # 变量说明：_model_manages_retries 表示_model_manages_retries 集合。
         self._model_manages_retries = bool(getattr(model_call, "manages_retries", False))
         # 只有协议网关明确声明会回调结构化 Assistant item 时，才用 item
@@ -1031,6 +1041,13 @@ class AgentRuntime:
     async def _publish(self, state: RunState, event_type: str, **payload: Any) -> list[dict[str, Any]]:
         from src.observability import log_event
 
+        if event_type in _CONTEXT_USAGE_EVENT_SOURCES:
+            # 与请求前工具预算使用同一投影；统计不落盘产物，也不修改运行消息。
+            visible = compact_tool_results_for_model(
+                list(state.get("messages", [])),
+                budgeter=ToolOutputBudgeter(InMemoryArtifactStore()),
+            ).messages
+            payload["active_context_tokens"] = sum(message_tokens(item) for item in visible)
         # 变量说明：event 表示当前运行事件。
         event = {"type": event_type, **payload}
         log_event(
@@ -1667,6 +1684,11 @@ class AgentRuntime:
                 stopped["events"] = await self._publish(stopped, "run_stopped", code=step_decision.code, reason=step_decision.reason)
                 return stopped
 
+            # steer 只在上一批工具完整结束后进入上下文，避免拆开工具调用/结果配对。
+            if self.input_provider is not None:
+                pending_input = self.input_provider(state, False)
+                if pending_input:
+                    state = {**state, "messages": [*state.get("messages", []), *pending_input]}
             # 变量说明：repaired_messages 表示repaired_messages 集合；protocol_repair 表示当前步骤使用的 protocol_repair 值。
             repaired_messages, protocol_repair = self.context_manager.repair_provider_messages(
                 state.get("messages", [])
@@ -1767,7 +1789,7 @@ class AgentRuntime:
                 # 函数职责：异步完成 model_attempt 对应的智能体处理。
                 # 返回关系：结果用于更新运行状态、形成模型输入或发送给上层调用方。
                 async def model_attempt() -> Any:
-                    nonlocal offered_tool_names
+                    nonlocal offered_tool_names, state
                     buffered_candidate_deltas.clear()
                     streamed_assistant_content: dict[tuple[str, str], str] = {}
                     # 变量说明：model_activity_seen 表示当前步骤使用的 model_activity_seen 值。
@@ -1881,6 +1903,16 @@ class AgentRuntime:
                         # provider reasoning summary 属于模型内部摘要，仅用于组装下一轮请求，不进入用户可见时间线。
                         await on_activity()
 
+                    # 事件发布、压缩和重试可能让出执行权；在请求快照前再次领取这期间的新输入。
+                    # 有新增输入且超预算时先压缩，再检查压缩期间到达的补充。
+                    while self.input_provider is not None:
+                        pending_input = self.input_provider(state, False)
+                        if not pending_input:
+                            break
+                        state = {**state, "messages": [*state.get("messages", []), *pending_input]}
+                        if sum(message_tokens(item) for item in state["messages"]) >= self.context_assembler.compaction_threshold:
+                            state = await compact_state(state, reason="threshold", phase="before_model")
+                    # 从最后一次领取到构造请求不再 await，接收边界与模型快照保持一致。
                     # 变量说明：step_context 表示当前步骤使用的 step_context 值。
                     step_context = AgentStepContext(
                         step_number=guard.steps,
@@ -1935,6 +1967,9 @@ class AgentRuntime:
                     if self._model_accepts_assistant_item_completed and self._model_emits_assistant_items:
                         kwargs["on_assistant_item_completed"] = on_assistant_item_completed
                     # 变量说明：is_async_call 表示是否满足 is_async_call 条件。
+                    state["events"] = await self._publish(
+                        {**state, "messages": kwargs["messages"]}, "context_usage_updated",
+                    )
                     is_async_call = inspect.iscoroutinefunction(self.model_call)
 
                     # 函数职责：异步完成 invoke 对应的智能体处理。
@@ -2378,6 +2413,7 @@ class AgentRuntime:
                 assistant_message["_pgagent_provider"] = dict(turn.provider_payload)
             # 变量说明：messages 表示模型消息序列。
             messages = [*state.get("messages", []), assistant_message]
+            state["events"] = await self._publish({**state, "messages": messages}, "context_usage_updated")
             if turn.tool_calls and visible_content.strip() and turn.normalized_response is None:
                 # This is the model's visible pre-tool progress text, not a
                 # provider reasoning field.  Keep it bounded and expose it as
@@ -2568,6 +2604,15 @@ class AgentRuntime:
                     "memory_citation": memory_citation,
                     "messages": [*clean_history, assistant_message],
                 }
+                if self.input_provider is not None:
+                    pending_input = self.input_provider(completed, True)
+                    if pending_input:
+                        # 已生成的答复作为历史保留；新的补充仍属于这一 Run，不发布终态。
+                        return {
+                            **completed, "status": "observing", "output": None,
+                            "messages": [*completed["messages"], *pending_input],
+                            "current_made_progress": True,
+                        }
                 # 变量说明：completed 的索引项 表示该语句创建或更新的目标数据。
                 completed["events"] = await self._publish(
                     completed,
@@ -3347,7 +3392,7 @@ class AgentRuntime:
         resume_verification_trace.append(dict(approved_tool_message))
         # 变量说明：events 表示events 集合。
         events = await self._publish(
-            {"events": events},
+            {"events": events, "messages": messages},
             "tool_finished",
             tool_name=tool_name,
             tool_call_id=call_id,
@@ -3493,7 +3538,7 @@ class AgentRuntime:
                     prior.output_ledger.mark_local_awaiting_approval(call.id)
                 # 变量说明：events 表示events 集合。
                 events = await self._publish(
-                    {"events": events},
+                    {"events": events, "messages": messages},
                     "tool_finished",
                     tool_name=call.name,
                     tool_call_id=call.id,
@@ -3575,7 +3620,7 @@ class AgentRuntime:
             # 变量说明：made_progress 表示made_progress 集合。
             made_progress = made_progress or remaining_result.changed or (remaining_result.ok and observation_is_new)
             # 变量说明：state 表示当前运行状态。
-            state = {"events": events}
+            state = {"events": events, "messages": messages}
             # 变量说明：events 表示events 集合。
             events = await self._publish(
                 state,
@@ -3928,20 +3973,6 @@ class AgentRuntime:
                 approved=True,
                 call_id=call_id,
             )
-            # 变量说明：events 表示events 集合。
-            events = await self._publish(
-                {"events": events},
-                "tool_finished",
-                tool_name=tool_name,
-                tool_call_id=call_id,
-                ok=result.ok,
-                changed=result.changed,
-                error_code=result.error_code,
-                resumed_after_delegated_child=True,
-                **_change_event_fields(result),
-                duration_ms=round((self.clock() - tool_started_at) * 1000),
-                elapsed_ms=elapsed_ms(),
-            )
             # The earlier assistant/tool pair was already provider-visible.
             # Never replace that cached result or append a duplicate result for
             # the same call id. A normal user-role observation carries the
@@ -3959,6 +3990,20 @@ class AgentRuntime:
             messages.append(terminal_update)
             delegated_transcript_delta.append(dict(terminal_update))
             delegated_verification_trace.append(dict(terminal_update))
+            # 子任务结果进入消息后再发布完成事件，窗口统计与恢复后的上下文一致。
+            events = await self._publish(
+                {"events": events, "messages": messages},
+                "tool_finished",
+                tool_name=tool_name,
+                tool_call_id=call_id,
+                ok=result.ok,
+                changed=result.changed,
+                error_code=result.error_code,
+                resumed_after_delegated_child=True,
+                **_change_event_fields(result),
+                duration_ms=round((self.clock() - tool_started_at) * 1000),
+                elapsed_ms=elapsed_ms(),
+            )
             if result.metadata.get("delegated_child_awaiting_approval"):
                 still_waiting.append({
                     "child_run_id": str(result.metadata.get("child_run_id") or ""),

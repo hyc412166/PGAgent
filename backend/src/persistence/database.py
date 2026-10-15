@@ -156,6 +156,7 @@ _SQLITE_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
         "provider_payload": "JSON NOT NULL DEFAULT '{}'",
     },
     "runs": {
+        "input_closed": "BOOLEAN NOT NULL DEFAULT 0",
         "cwd": "TEXT",
         "turn_id": "VARCHAR(36)",
         "task_id": "VARCHAR(36)",

@@ -24,6 +24,53 @@ from src.agent.engine import AgentRuntime, RuntimeConfig
 from src.tools.registry import create_default_registry
 
 
+def test_live_context_counts_follow_runtime_boundaries_without_exposing_messages(tmp_path) -> None:
+    captured = []
+    runtime = AgentRuntime(model_call=lambda **kwargs: {},
+                           tool_registry=create_default_registry(str(tmp_path)),
+                           event_sink=captured.append)
+
+    async def exercise():
+        for kind, content in [("context_prepared", "x" * 400),
+                              ("tool_finished", "x" * 4000),
+                              ("context_compaction_finished", "x" * 40)]:
+            await runtime._publish({"messages": [{"role": "user", "content": content}]}, kind)
+
+    asyncio.run(exercise())
+    # 字符估算之外还包含消息 JSON 和固定开销；不允许用累计消耗替代当前窗口。
+    counts = [event["active_context_tokens"] for event in captured]
+    assert 100 < counts[0] < 130
+    assert 1000 < counts[1] < 1030
+    assert 10 < counts[2] < 40
+    assert all("messages" not in event for event in captured)
+
+
+def test_live_context_updates_before_request_and_after_assistant_output(tmp_path) -> None:
+    captured = []
+
+    async def model_call(**kwargs):
+        assert captured[-1]["type"] == "context_usage_updated"
+        assert captured[-1]["active_context_tokens"] > 0
+        return {"choices": [{"message": {"content": "done " * 400}}]}
+
+    runtime = AgentRuntime(model_call=model_call,
+                           tool_registry=create_default_registry(str(tmp_path), allowed_tool_names=[]),
+                           event_sink=captured.append)
+    outcome = asyncio.run(runtime.run(system_prompt="assist", recent_messages=[{"role": "user", "content": "hello"}]))
+    assert outcome.status == "completed"
+    counts = [event["active_context_tokens"] for event in captured if event["type"] == "context_usage_updated"]
+    assert len(counts) == 2
+    assert counts[-1] > counts[0] + 400
+
+
+def test_live_context_counts_budgeted_tool_preview(tmp_path) -> None:
+    runtime = AgentRuntime(model_call=lambda **kwargs: {}, tool_registry=create_default_registry(str(tmp_path)))
+    events = asyncio.run(runtime._publish({"messages": [
+        {"role": "tool", "tool_call_id": "large", "name": "read_file", "content": "x" * 160_000},
+    ]}, "tool_finished"))
+    assert 0 < events[-1]["active_context_tokens"] < 3000
+
+
 # 测试场景：超大工具结果经过预算外置后，统计应按 provider 实际可见预览计数，而不是原始正文长度。
 def test_provider_visible_context_reuses_tool_output_budget() -> None:
     raw = [

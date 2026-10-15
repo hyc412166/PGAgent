@@ -12,6 +12,8 @@ from src.agent import AgentRuntime, RuntimeConfig
 from src.agents.collaboration import TeamToolStore
 from src.artifacts.storage import ArtifactToolStore
 from src.attachments.storage import AttachmentToolStore
+from src.attachments.contracts import ATTACHMENT_TOOL_NAMES
+from src.sessions.inputs import consume_steering
 from src.config import settings
 from src.context import ContextManager, FilesystemArtifactStore
 from src.memory.service import MemoryToolStore
@@ -134,7 +136,10 @@ class RunRuntimeFactory:
         # 变量说明：registry 表示当前步骤使用的 registry 值。
         registry = create_default_registry(
             context["workspace_root"],
-            allowed_tool_names=context["allowed_tool_names"],
+            # 运行中首次收到附件时也能读取；排队附件在 storage 层尚不可见。
+            allowed_tool_names=list(dict.fromkeys([
+                *context["allowed_tool_names"], *(ATTACHMENT_TOOL_NAMES if not delegated else ()),
+            ])),
             permission_mode=context["permission_mode"],
             skill_instructions=context["skill_instructions"],
             todo_state=context["todo_state"],
@@ -223,6 +228,7 @@ class RunRuntimeFactory:
                 else None
             ),
             background_wait_provider=background_store.completion_boundary,
+            input_provider=(lambda state, finishing: consume_steering(run_id, state, finishing)) if not delegated else None,
             config=RuntimeConfig(
                 max_steps=settings.max_steps,
                 max_tool_calls=settings.max_tool_calls,

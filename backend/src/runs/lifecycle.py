@@ -225,6 +225,7 @@ class RunCoordinator:
     def __init__(self) -> None:
         # 变量说明：_tasks 表示当前流程使用的 _tasks 集合。
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._input_tasks: dict[str, asyncio.Task[None]] = {}
         # 变量说明：_memory_tasks 表示当前流程使用的 _memory_tasks 集合。
         self._memory_tasks: dict[str, asyncio.Task[None]] = {}
         # 变量说明：_tool_cancellers 表示当前流程使用的 _tool_cancellers 集合。
@@ -417,6 +418,51 @@ class RunCoordinator:
     def _clear_task(self, completed: asyncio.Task[None], run_id: str) -> None:
         if self._tasks.get(run_id) is completed:
             self._tasks.pop(run_id, None)
+        if not self._shutting_down:
+            with database_module.SessionLocal() as db:
+                run = db.get(Run, run_id)
+                if run is not None and run.turn_id and run.session_id:
+                    self.schedule_session_inputs(run.session_id)
+
+    def schedule_session_inputs(self, session_id: str) -> None:
+        """调度在持久化终态之后触发；同一会话只保留一个领取协程。"""
+        if self._shutting_down or session_id in self._input_tasks:
+            return
+        task = asyncio.create_task(self._dispatch_session_inputs(session_id), name=f"pgagent-input-{session_id}")
+        self._input_tasks[session_id] = task
+        task.add_done_callback(lambda _done: self._input_tasks.pop(session_id, None))
+
+    async def _dispatch_session_inputs(self, session_id: str) -> None:
+        from src.sessions.inputs import dispatch_follow_up, lock_session
+        from src.persistence.models import SessionInput
+        try:
+            await dispatch_follow_up(self, session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Queued session input could not start: %s", session_id)
+            with database_module.SessionLocal() as db:
+                lock_session(db, session_id)
+                item = db.scalar(select(SessionInput).where(
+                    SessionInput.session_id == session_id, SessionInput.status == "queued",
+                ).order_by(SessionInput.created_at, SessionInput.id))
+                if item is not None:
+                    item.status = "failed"
+                    item.error = public_error_message(classify_exception(exc))
+                    db.commit()
+
+    def recover_session_inputs(self) -> None:
+        from src.persistence.models import SessionInput
+        from src.sessions.inputs import reconcile_inputs
+        with database_module.SessionLocal() as db:
+            sessions = list(db.scalars(select(SessionInput.session_id).where(
+                SessionInput.status.in_({"queued", "pending"}),
+            ).distinct()))
+            for session_id in sessions:
+                reconcile_inputs(db, session_id)
+            db.commit()
+        for session_id in sessions:
+            self.schedule_session_inputs(session_id)
 
     # 函数职责：完成 launch_queued_resume 对应的业务处理。
     # 参数关系：run_id 表示当前运行标识。
@@ -1135,7 +1181,7 @@ class RunCoordinator:
         # 变量说明：tasks 表示当前流程使用的 tasks 集合。
         tasks = [
             task
-            for task in [*self._tasks.values(), *self._memory_tasks.values()]
+            for task in [*self._tasks.values(), *self._memory_tasks.values(), *self._input_tasks.values()]
             if not task.done()
         ]
         for task in tasks:
@@ -1160,6 +1206,7 @@ class RunCoordinator:
                         ).values(status="active", consolidation_job_id=None))
                 db.commit()
         self._tasks.clear()
+        self._input_tasks.clear()
         self._memory_tasks.clear()
         await mcp_runtime_pool.shutdown()
 
@@ -1416,17 +1463,19 @@ class RunCoordinator:
                 if run is None:
                     db.rollback()
                     return
-                append_run_event(db, run_id=run_id, event_type=event_type, step=payload.get("step"), payload=payload)
+                persisted_event = append_run_event(db, run_id=run_id, event_type=event_type, step=payload.get("step"), payload=payload)
                 if event_type in status_by_event:
                     # 变量说明：status 表示当前对象或运行的状态。
                     run.status = status_by_event[event_type]
                 if run.turn_id:
                     sync_turn_progress(db, run)
                 db.commit()
+                # SSE 与历史分页共享持久身份，重连恢复才能合并同一活动而非重复追加。
+                stream_identity = {"id": persisted_event.id, "sequence": persisted_event.sequence}
             # Approval and terminal events are published only after the outcome
             # transaction makes their corresponding rows/messages visible.
             if event_type not in deferred_stream_events:
-                run_stream_broker.publish(run_id, {"type": event_type, **payload})
+                run_stream_broker.publish(run_id, {"type": event_type, **payload, **stream_identity})
 
         return sink
 

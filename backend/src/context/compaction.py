@@ -297,7 +297,14 @@ def _append_runtime_transcript(
         )
     )
     # 变量说明：existing 表示当前步骤使用的 existing 值。
-    existing = Counter(_chat_message_key(_message_payload(row)) for row in existing_rows)
+    # steer 会持久化并清空此前的增量；补充之后重复出现的相同正文是新的模型输出。
+    # 恢复重放仍只与最近一次 steer 之后的行比较，不能拿更早的正文抵消本次增量。
+    run = db.get(Run, run_id)
+    steer_sequence = max((row.sequence for row in existing_rows
+                          if run is not None and row.turn_id == run.turn_id
+                          and row.message_kind == "steer"), default=0)
+    existing = Counter(_chat_message_key(_message_payload(row)) for row in existing_rows
+                       if outcome.transcript_delta is None or row.sequence > steer_sequence)
     # 变量说明：next_sequence 表示当前步骤使用的 next_sequence 值。
     next_sequence = max((int(getattr(row, "sequence", 0) or 0) for row in existing_rows), default=0) + 1
     # 变量说明：final_reply_persisted 表示当前步骤使用的 final_reply_persisted 值。

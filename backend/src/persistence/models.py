@@ -563,6 +563,22 @@ def next_chat_message_sequence(db: OrmSession, session_id: str) -> int:
     return int(current or 0) + 1
 
 
+class SessionInput(Base):
+    """运行中提交的输入；排队内容只有投递时才进入会话历史。"""
+
+    __tablename__ = "session_inputs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(String(36), ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
+    client_message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    attachments: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    run_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 # 类职责：定义 Run 在本领域中的数据与行为。
 # 继承关系：复用基类提供的契约，并向调用方暴露本类声明的字段和方法。
 class Run(Base):
@@ -607,6 +623,8 @@ class Run(Base):
     )
     # 变量说明：status 表示当前对象或运行的状态。
     status: Mapped[str] = mapped_column(String(32), default="received", index=True, nullable=False)
+    # 最后一次检查待处理输入与结束之间关闭接收，避免已确认的 steer 落在结束之后。
+    input_closed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # 变量说明：mode 表示当前步骤使用的 mode 值。
     mode: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
     # 变量说明：current_step 表示当前步骤使用的 current_step 值。

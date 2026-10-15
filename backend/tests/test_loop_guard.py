@@ -482,6 +482,8 @@ async def test_parallel_child_approval_keeps_sibling_results_and_resumes_all(tmp
     assert still_waiting.status == "stopped"
     assert still_waiting.stop_reason == "delegated_child_awaiting_approval"
     assert still_waiting.output_ledger is waiting.output_ledger
+    resumed_tools = [event for event in still_waiting.events if event.get("resumed_after_delegated_child")]
+    assert resumed_tools and all(event["active_context_tokens"] > 0 for event in resumed_tools)
 
     child_a_completed = True
     resumed = await runtime.resume_after_delegated_child(still_waiting)
@@ -1169,6 +1171,8 @@ async def test_approval_resume_completes_entire_multi_tool_batch(tmp_path) -> No
     assert resumed.status == "completed"
     assert resumed.output == "batch complete"
     assert resumed.tool_calls == 3
+    finished = [event for event in resumed.events if event["type"] == "tool_finished"]
+    assert finished and all(event["active_context_tokens"] > 0 for event in finished)
     assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "created\n"
 
 
@@ -1194,6 +1198,8 @@ async def test_multi_side_effect_batch_pauses_for_each_approval(tmp_path) -> Non
     assert second.status == "awaiting_approval"
     assert second.output_ledger is first.output_ledger
     assert second.pending_approval["id"] == "write-2"
+    finished = [event for event in second.events if event["type"] == "tool_finished"]
+    assert finished and all(event["active_context_tokens"] > 0 for event in finished)
     assert (tmp_path / "one.txt").exists()
     assert not (tmp_path / "two.txt").exists()
     final = await runtime.resume_after_approval(second)

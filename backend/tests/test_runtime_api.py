@@ -95,6 +95,71 @@ def _seed() -> tuple[str, str, str]:
         return workspace.id, agent.id, session.id
 
 
+def test_session_context_uses_latest_live_snapshot_and_returns_to_history_at_terminal(client) -> None:
+    test_client, _ = client
+    workspace_id, agent_id, session_id = _seed()
+    with database.SessionLocal() as db:
+        turn = ConversationTurn(session_id=session_id)
+        db.add(turn)
+        db.flush()
+        run = Run(session_id=session_id, workspace_id=workspace_id, agent_id=agent_id,
+                  turn_id=turn.id, status="acting")
+        db.add(run)
+        db.commit()
+        run_id = run.id
+    sink = RunCoordinator._event_sink(run_id)
+    for kind, count in [("context_usage_updated", 1200), ("tool_finished", 2400), ("context_compaction_finished", 800)]:
+        sink({"type": kind, "active_context_tokens": count, "effective": True})
+        body = test_client.get(f"/api/sessions/{session_id}/context").json()
+        assert body["used_tokens"] == count
+        assert body["active_context_tokens"] == count
+        if kind == "context_compaction_finished":
+            assert body["last_compaction_at"] is not None
+            assert body["percent"] == 0.4
+    # 重复读取模拟切回会话，不能回到尚未落盘的聊天历史统计。
+    assert test_client.get(f"/api/sessions/{session_id}/context").json()["used_tokens"] == 800
+    # 同会话的子运行不能污染主运行显示。
+    with database.SessionLocal() as db:
+        child = Run(session_id=session_id, workspace_id=workspace_id, agent_id=agent_id, status="acting")
+        db.add(child)
+        db.commit()
+        child_id = child.id
+    RunCoordinator._event_sink(child_id)({"type": "context_usage_updated", "active_context_tokens": 99000})
+    assert test_client.get(f"/api/sessions/{session_id}/context").json()["used_tokens"] == 800
+    with database.SessionLocal() as db:
+        db.get(Run, run_id).status = "completed"
+        db.commit()
+    assert test_client.get(f"/api/sessions/{session_id}/context").json()["used_tokens"] == 0
+
+
+def test_stream_context_snapshot_keeps_only_public_numbers() -> None:
+    from src.api.runtime import _public_stream_event
+    assert _public_stream_event({"type": "context_usage_updated", "active_context_tokens": 123,
+                                 "messages": [{"content": "private"}]}) == {
+        "type": "context_usage_updated", "active_context_tokens": 123,
+    }
+
+
+def test_compaction_stream_reuses_persisted_event_identity(client) -> None:
+    test_client, _ = client
+    workspace_id, agent_id, session_id = _seed()
+    with database.SessionLocal() as db:
+        run = Run(session_id=session_id, workspace_id=workspace_id, agent_id=agent_id, status="completed")
+        db.add(run)
+        db.commit()
+        run_id = run.id
+    sink = RunCoordinator._event_sink(run_id)
+    sink({"type": "context_compaction_started"})
+    sink({"type": "context_compaction_finished", "active_context_tokens": 800, "effective": True})
+    response = test_client.get(f"/api/runs/{run_id}/stream")
+    streamed = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    streamed = [event for event in streamed if event["type"].startswith("context_compaction_")]
+    with database.SessionLocal() as db:
+        persisted = list(db.scalars(select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.sequence)))
+        assert [(event["id"], event["sequence"]) for event in streamed] == [(event.id, event.sequence) for event in persisted]
+    assert len(streamed) == 2
+
+
 def test_run_coordinator_binds_root_and_delegated_observability_context(
     client: tuple[TestClient, dict[str, list]],
 ) -> None:

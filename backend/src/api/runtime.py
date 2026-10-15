@@ -73,6 +73,8 @@ from src.attachments.storage import (
 )
 from src.context.assembly import FilesystemArtifactStore
 from src.api.routes.shared import _public_run_event_payload
+from src.persistence.models import Artifact, SessionInput
+from src.sessions.inputs import active_root_run, input_view, lock_session, reconcile_inputs, require_steer_target
 
 
 # 变量说明：router 表示当前步骤使用的 router 值。
@@ -101,6 +103,9 @@ def _public_stream_event(event: dict) -> dict:
 
     event_type = str(event.get("type") or "message")
     public: dict = {"type": event_type}
+    for key in ("id", "sequence"):
+        if key in event:
+            public[key] = event[key]
     if event.get("event_id") is not None:
         public["event_id"] = event["event_id"]
     # 重连重放必须保留发布时刻，前端才能延续当前等待计时；其余私有字段仍由下方投影过滤。
@@ -131,6 +136,115 @@ class SessionRunRequest(BaseModel):
     content: str = Field(default="", max_length=100_000)
     # 变量说明：idempotency_key 表示当前步骤使用的 idempotency_key 值。
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class SessionInputRequest(SessionRunRequest):
+    idempotency_key: str = Field(min_length=1, max_length=255)
+    mode: Literal["steer", "follow_up"]
+    expected_run_id: str | None = None
+
+
+class SteerTargetRequest(BaseModel):
+    expected_run_id: str
+
+
+@router.get("/sessions/{session_id}/inputs")
+async def list_session_inputs(session_id: str, db: OrmSession = Depends(get_db)) -> list[dict]:
+    lock_session(db, session_id)
+    reconcile_inputs(db, session_id)
+    db.commit()
+    return [input_view(item) for item in db.scalars(select(SessionInput).where(
+        SessionInput.session_id == session_id,
+    ).order_by(SessionInput.created_at, SessionInput.id))]
+
+
+@router.post("/sessions/{session_id}/inputs", status_code=202)
+async def submit_session_input(session_id: str, request: Request, db: OrmSession = Depends(get_db)) -> dict:
+    if request.headers.get("content-type", "").startswith("multipart/form-data"):
+        payload, uploads = await _multipart_payload(request, SessionInputRequest)
+    else:
+        try:
+            payload = SessionInputRequest.model_validate(await request.json())
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(422, "消息格式不正确") from exc
+        uploads = []
+    content = payload.content.strip()
+    if not content and not uploads:
+        raise HTTPException(422, "消息内容和附件不能同时为空")
+    if not payload.idempotency_key.strip():
+        raise HTTPException(422, "消息标识不能为空")
+    lock_session(db, session_id)
+    item = db.scalar(select(SessionInput).where(
+        SessionInput.session_id == session_id, SessionInput.client_message_id == payload.idempotency_key,
+    ))
+    if item is not None:
+        # 复用消息标识重试时逐项比对原始附件，无需再维护一套请求哈希。
+        same = item.content == content and len(item.attachments) == len(uploads)
+        for ref, upload in zip(item.attachments, uploads):
+            row = db.get(Artifact, ref["id"])
+            same = same and row is not None and row.name == upload.name and row.mime_type == upload.mime_type
+            if same:
+                same = Path(row.storage_path).read_bytes() == upload.data
+        if not same:
+            raise HTTPException(409, "该消息标识已用于不同内容")
+        return input_view(item)
+    if find_turn_by_client_message(db, session_id=session_id, client_message_id=payload.idempotency_key):
+        raise HTTPException(409, "该消息标识已用于普通消息")
+    target = require_steer_target(db, session_id, payload.expected_run_id) if payload.mode == "steer" else None
+    attachments = persist_uploaded_attachments(db, session_id=session_id,
+        artifact_store=FilesystemArtifactStore(settings.data_dir / "artifacts" / session_id), uploads=uploads)
+    for ref in attachments:
+        db.get(Artifact, ref["id"]).status = "queued"
+    item = SessionInput(session_id=session_id, client_message_id=payload.idempotency_key, content=content,
+                        attachments=attachments, mode=payload.mode,
+                        status="pending" if target else "queued", run_id=target.id if target else None)
+    db.add(item)
+    db.commit()
+    if payload.mode == "follow_up":
+        coordinator.schedule_session_inputs(session_id)
+    return input_view(item)
+
+
+def _session_input(db: OrmSession, session_id: str, input_id: str) -> SessionInput:
+    item = db.get(SessionInput, input_id)
+    if item is None or item.session_id != session_id:
+        raise HTTPException(404, "消息不存在")
+    return item
+
+
+@router.delete("/sessions/{session_id}/inputs/{input_id}")
+async def cancel_session_input(session_id: str, input_id: str, db: OrmSession = Depends(get_db)) -> dict:
+    lock_session(db, session_id)
+    item = _session_input(db, session_id, input_id)
+    if item.status == "delivered":
+        raise HTTPException(409, "消息已经送出，无法撤回")
+    item.status = "cancelled"
+    item.error = None
+    db.commit()
+    return input_view(item)
+
+
+@router.post("/sessions/{session_id}/inputs/{input_id}/steer")
+async def steer_session_input(session_id: str, input_id: str, payload: SteerTargetRequest,
+                              db: OrmSession = Depends(get_db)) -> dict:
+    lock_session(db, session_id)
+    item = _session_input(db, session_id, input_id)
+    if item.status == "pending" and item.run_id == payload.expected_run_id:
+        return input_view(item)
+    if item.status not in {"queued", "failed"}:
+        raise HTTPException(409, "这条消息已发送或已撤回")
+    target = require_steer_target(db, session_id, payload.expected_run_id)
+    item.mode, item.status, item.run_id = "steer", "pending", target.id
+    item.error = None
+    db.commit()
+    return input_view(item)
+
+
+@router.post("/sessions/{session_id}/inputs/{input_id}/start")
+async def start_session_input(session_id: str, input_id: str, db: OrmSession = Depends(get_db)) -> dict:
+    from src.sessions.inputs import dispatch_follow_up
+    await dispatch_follow_up(coordinator, session_id, input_id)
+    return input_view(_session_input(db, session_id, input_id))
 
 
 # 类职责：定义 SessionContextRead 在本领域中的数据与行为。
@@ -361,6 +475,10 @@ def _mark_unscheduled_run(
     run.error_code = "launch_unavailable"
     # 变量说明：error_message 表示当前步骤使用的 error_message 值。
     run.error_message = "任务已经保存，但本地执行器未能启动。"
+    queued_input = db.scalar(select(SessionInput).where(SessionInput.run_id == run.id))
+    if queued_input is not None:
+        queued_input.status = "failed"
+        queued_input.error = run.error_message
     # 变量说明：finished_at 表示finished_at 对应的时间信息。
     run.finished_at = datetime.now(timezone.utc)
     # 变量说明：event_payload 表示当前步骤使用的 event_payload 值。
@@ -607,17 +725,22 @@ async def _launch_session_run_core(
     response: Response,
     db: OrmSession = Depends(get_db),
     uploads: Sequence[UploadedAttachment] = (),
+    queued_input: SessionInput | None = None,
 ) -> Run:
     # 变量说明：chat_session 表示当前步骤使用的 chat_session 值。
-    chat_session = db.get(Session, session_id)
+    chat_session = lock_session(db, session_id)
     if chat_session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     # 变量说明：content 表示待处理或返回的正文内容。
     content = payload.content.strip()
-    if not content and not uploads:
+    if not content and not uploads and not (queued_input and queued_input.attachments):
         raise HTTPException(status_code=422, detail="消息内容和附件不能同时为空")
     # 变量说明：client_message_id 表示client_message 对象的唯一标识。
     client_message_id = payload.idempotency_key.strip() if payload.idempotency_key else None
+    if queued_input is None and client_message_id and db.scalar(select(SessionInput.id).where(
+        SessionInput.session_id == session_id, SessionInput.client_message_id == client_message_id,
+    )):
+        raise HTTPException(409, "该消息标识已用于运行中输入，请通过原输入重试")
     # 变量说明：fingerprint 表示当前步骤使用的 fingerprint 值。
     fingerprint = _turn_request_fingerprint(content, uploads)
     # 变量说明：existing_turn 表示当前步骤使用的 existing_turn 值。
@@ -665,13 +788,13 @@ async def _launch_session_run_core(
 
     # 变量说明：active 表示当前步骤使用的 active 值。
     active = db.scalar(select(Run).where(Run.session_id == session_id, Run.status.in_(ACTIVE_STATUSES | {"awaiting_approval"})))
-    if active is not None:
+    if active is not None or active_root_run(db, session_id) is not None:
         raise HTTPException(status_code=409, detail="当前会话已有运行或待审批工具，请先处理后再发送")
 
     # 变量说明：mode 表示当前步骤使用的 mode 值。
     mode = "auto"
     # 变量说明：attachments 表示当前流程使用的 attachments 集合。
-    attachments = persist_uploaded_attachments(
+    attachments = queued_input.attachments if queued_input is not None else persist_uploaded_attachments(
         db,
         session_id=session_id,
         artifact_store=FilesystemArtifactStore(
@@ -693,6 +816,12 @@ async def _launch_session_run_core(
     )
     # 变量说明：provider_payload 表示当前步骤使用的 provider_payload 值。
     message.provider_payload = {"attachment_refs": attachments} if attachments else {}
+    if queued_input is not None:
+        queued_input.status = "delivered"
+        queued_input.run_id = run.id
+        message.extra = {**message.extra, "input_id": queued_input.id, "input_mode": "follow_up"}
+        for ref in attachments:
+            db.get(Artifact, ref["id"]).status = "available"
     if not cancellation_request:
         # 变量说明：task_prompt 表示当前步骤使用的 task_prompt 值。
         task_prompt = content or f"分析附件：{', '.join(item['name'] for item in attachments)}"
@@ -852,6 +981,35 @@ def session_context(session_id: str, db: OrmSession = Depends(get_db)) -> Sessio
     db.commit()
     # 变量说明：used_tokens 表示当前流程使用的 used_tokens 集合。
     used_tokens = max(0, min(int(chat_session.context_tokens or 0), settings.context_limit_tokens))
+    # 运行尚未结束时，持久事件中的快照比会话历史更接近模型当前看到的窗口。
+    active_run = db.scalar(
+        select(Run)
+        .where(
+            Run.session_id == session_id,
+            Run.turn_id.is_not(None),
+            Run.status.in_(ACTIVE_STATUSES | {"awaiting_approval"}),
+        )
+        .order_by(Run.started_at.desc(), Run.id.desc())
+    )
+    latest_live_compaction = None
+    if active_run is not None:
+        live_event = db.scalar(
+            select(RunEvent)
+            .where(RunEvent.run_id == active_run.id, RunEvent.payload["active_context_tokens"].as_integer().is_not(None))
+            .order_by(RunEvent.sequence.desc())
+        )
+        live_payload = live_event.payload if live_event is not None else {}
+        if isinstance(live_payload, dict) and isinstance(live_payload.get("active_context_tokens"), (int, float)):
+            used_tokens = max(0, min(int(live_payload["active_context_tokens"]), settings.context_limit_tokens))
+        latest_live_compaction = db.scalar(
+            select(RunEvent)
+            .where(
+                RunEvent.run_id == active_run.id,
+                RunEvent.event_type == "context_compaction_finished",
+                RunEvent.payload["effective"].as_boolean() == True,
+            )
+            .order_by(RunEvent.sequence.desc())
+        )
     # 变量说明：latest_compaction 表示当前步骤使用的 latest_compaction 值。
     latest_compaction = db.scalar(
         select(ConversationCompaction)
@@ -871,7 +1029,10 @@ def session_context(session_id: str, db: OrmSession = Depends(get_db)) -> Sessio
         limit_tokens=settings.context_limit_tokens,
         compact_threshold_tokens=settings.compact_threshold_tokens,
         percent=round((used_tokens / settings.context_limit_tokens) * 100, 2),
-        last_compaction_at=latest_compaction.created_at if latest_compaction is not None else None,
+        last_compaction_at=(
+            latest_live_compaction.created_at if latest_live_compaction is not None
+            else latest_compaction.created_at if latest_compaction is not None else None
+        ),
     )
 
 

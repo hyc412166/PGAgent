@@ -75,6 +75,7 @@ async def lifespan(_app: FastAPI):
     memory_job_ids = coordinator.pending_memory_job_ids()
     coordinator.reconcile_terminal_deliveries()
     coordinator.start()
+    coordinator.recover_session_inputs()
     background_job_manager.set_terminal_listener(coordinator.notify_background_terminal)
     background_job_manager.recover()
     coordinator.reconcile_waiting_background_runs()
