@@ -828,15 +828,46 @@ class BackgroundJobToolStore:
             if job is None:
                 return ToolResult("write_stdin", False, "background job not found", error_code="task_not_found")
             if job.status != "running":
+                # 终态任务不再接收 stdin，但必须把退出原因和已产生的输出交给模型，避免只看到一句笼统的未运行错误。
+                payload = background_job_payload(job, output_offset=output_offset)
                 return ToolResult(
                     "write_stdin",
                     False,
-                    f"background job is {job.status}",
-                    error_code="task_not_running",
+                    json.dumps(payload, ensure_ascii=False),
+                    error_code="background_job_failed" if job.status == "failed" else "task_not_running",
+                    metadata={
+                        "background_job_active": False,
+                        "background_job_status": job.status,
+                        "session_id": job.id,
+                        "next_output_offset": payload.get("next_output_offset", 0),
+                    },
                 )
         # 变量说明：error 表示当前捕获或准备上报的错误。
         error = background_job_manager.send_input(normalized_id, input, close=bool(close))
         if error:
+            # 发送 stdin 与子进程退出之间存在竞态；若此时任务已落入终态，重新读取持久化状态以保留真实根因。
+            with database_module.SessionLocal() as db:
+                ownership = self._ownership_clause()
+                if self.session_id is not None:
+                    ownership = BackgroundJob.session_id == self.session_id
+                job = db.scalar(select(BackgroundJob).where(
+                    ownership,
+                    BackgroundJob.id == normalized_id,
+                ))
+                if job is not None and job.status in TERMINAL_BACKGROUND_STATUSES:
+                    payload = background_job_payload(job, output_offset=output_offset)
+                    return ToolResult(
+                        "write_stdin",
+                        False,
+                        json.dumps(payload, ensure_ascii=False),
+                        error_code="background_job_failed" if job.status == "failed" else "task_not_running",
+                        metadata={
+                            "background_job_active": False,
+                            "background_job_status": job.status,
+                            "session_id": job.id,
+                            "next_output_offset": payload.get("next_output_offset", 0),
+                        },
+                    )
             return ToolResult("write_stdin", False, error, error_code="stdin_unavailable")
         # 变量说明：result 表示本步骤产生的结果。
         result = self.check(

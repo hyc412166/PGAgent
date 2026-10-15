@@ -135,6 +135,118 @@ def test_write_stdin_sends_input_to_running_background_job(background_store) -> 
     assert "stdin:hello" in sent.content
 
 
+# 测试场景：后台命令失败后再次写入 stdin 时，必须返回可诊断的终态、退出码、错误和已有输出，避免模型重复盲目写入。
+def test_write_stdin_reports_failed_background_job_details(background_store) -> None:
+    store, _manager = background_store
+    started = store.start(
+        command="Write-Output failed-output; exit 7",
+        shell="powershell",
+        timeout=30,
+    )
+    job_id = started.metadata["background_job_id"]
+    failed = store.check(task_id=job_id, wait=True, wait_timeout=10, output_offset=0)
+
+    assert failed.ok is False
+    retried = store.write_stdin(task_id=job_id, input="ignored\n", wait_ms=10, output_offset=0)
+
+    assert retried.ok is False
+    assert retried.error_code == "background_job_failed"
+    payload = json.loads(retried.content)
+    assert payload["status"] == "failed"
+    assert payload["exit_code"] == 7
+    assert payload["error"] == "command exited with code 7"
+    assert "failed-output" in payload["output"]
+
+
+# 测试场景：已经完成或取消的后台命令不能发送 stdin，但仍需返回终态上下文而不是只有 task_not_running 文本。
+@pytest.mark.parametrize(
+    ("status", "exit_code", "error", "output"),
+    [
+        ("completed", 0, None, "completed-output"),
+        ("cancelled", None, "background job cancelled", "cancelled-output"),
+    ],
+)
+def test_write_stdin_reports_non_running_background_job_details(
+    background_store,
+    status: str,
+    exit_code: int | None,
+    error: str | None,
+    output: str,
+) -> None:
+    store, _manager = background_store
+    with database.SessionLocal() as db:
+        job = BackgroundJob(
+            run_id=store.run_id,
+            session_id=store.session_id,
+            workspace_id=store.workspace_id,
+            workspace_root=store.workspace_root,
+            command="Write-Output terminal",
+            shell="powershell",
+            status=status,
+            timeout_seconds=30,
+            output_preview=output,
+            exit_code=exit_code,
+            error=error,
+            log_path="",
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    result = store.write_stdin(task_id=job_id, input="ignored\n", wait_ms=10)
+
+    assert result.ok is False
+    assert result.error_code == "task_not_running"
+    payload = json.loads(result.content)
+    assert payload["status"] == status
+    assert payload["exit_code"] == exit_code
+    assert payload["error"] == error
+    assert payload["output"] == output
+
+
+# 测试场景：查询到 running 后子进程恰好退出时，write_stdin 仍需重新读取终态，不能把真实失败原因降级成 stdin_unavailable。
+def test_write_stdin_reports_terminal_state_after_input_race(background_store, monkeypatch) -> None:
+    store, manager = background_store
+    with database.SessionLocal() as db:
+        job = BackgroundJob(
+            run_id=store.run_id,
+            session_id=store.session_id,
+            workspace_id=store.workspace_id,
+            workspace_root=store.workspace_root,
+            command="Write-Output race",
+            shell="powershell",
+            status="running",
+            timeout_seconds=30,
+            output_preview="race-output",
+            log_path="",
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    def fail_before_input(_job_id: str, _input_text: str, *, close: bool = False) -> str:
+        with database.SessionLocal() as db:
+            current = db.get(BackgroundJob, job_id)
+            assert current is not None
+            current.status = "failed"
+            current.exit_code = 9
+            current.error = "command exited with code 9"
+            db.commit()
+        return "background job is not accepting input"
+
+    monkeypatch.setattr(manager, "send_input", fail_before_input)
+
+    result = store.write_stdin(task_id=job_id, input="ignored\n", wait_ms=10)
+
+    assert result.ok is False
+    assert result.error_code == "background_job_failed"
+    payload = json.loads(result.content)
+    assert payload["status"] == "failed"
+    assert payload["exit_code"] == 9
+    assert payload["error"] == "command exited with code 9"
+    assert payload["output"] == "race-output"
+
+
 # 测试场景：验证取消或终止请求会收敛相关运行状态，并正确清理或保留应有资源；函数名 test_background_wait_timeout_yields_without_stopping_process 精确标识本用例的具体条件。
 def test_background_wait_timeout_yields_without_stopping_process(background_store) -> None:
     store, _manager = background_store
