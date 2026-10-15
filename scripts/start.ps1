@@ -50,6 +50,8 @@ if (Test-Path -LiteralPath $LocalEnvironmentFile) {
         'VERCEL_OIDC_TOKEN',
         'PGAGENT_SKILL_MARKET_URL',
         'PGAGENT_SKILL_MARKET_CLIENT_TOKEN',
+        # LiteLLM 启动时强制使用随包提供的本地模型价格映射，避免访问 GitHub raw 文件。
+        'LITELLM_LOCAL_MODEL_COST_MAP',
         # 标准代理变量由 httpx trust_env=True 读取，写入 .env.local 后不再依赖
         # Windows Terminal/Codex 启动时是否恰好继承了当前 PowerShell 环境。
         'HTTP_PROXY',
