@@ -59,11 +59,11 @@ export function ChildConversation({ task }: { task: DelegatedTask }) {
     {data.error && <ErrorState message={data.error} onRetry={reload} />}
     <article className="message assistant"><div className="message-body"><div className="message-meta"><strong>{name}</strong><StatusBadge status={data.data.run?.status || task.status} /></div>
       {!!data.data.events.length && <CompletedThoughtTimeline runId={runId} sessionId={task.parent_session_id} timeline={timelineFromRunEvents(data.data.events.filter(event => !(event.event_type || event.type || '').startsWith('assistant_message_')).map(event => ({ ...event, type: event.event_type || event.type || '' })))} />}
-      {replies.map(reply => <MarkdownContent key={reply.id} content={reply.content} />)}
+      {replies.map(reply => <MarkdownContent key={reply.id} content={reply.content} runId={runId} />)}
       {!data.loading && !data.error && !replies.length && <p className="inline-notice">{terminal ? '此运行没有已记录的回复正文。' : '子 Agent 正在执行任务…'}</p>}
     </div></article>
     {data.data.limited && <p role="status">协作消息仅包含会话最近 500 条中的相关记录，较早消息可能未显示。</p>}
     {!!data.data.messages.length && <h3>协作通信记录</h3>}
-    {data.data.messages.map(message => <article key={message.id} className={`message ${message.sender_worker_id === task.teammate_id ? 'assistant' : 'user'}`}><div className="message-body"><div className="message-meta"><strong>{message.sender_worker_id === task.teammate_id ? name : '主 Agent'}</strong><time>{message.created_at}</time></div><MarkdownContent content={message.content} /></div></article>)}
+    {data.data.messages.map(message => <article key={message.id} className={`message ${message.sender_worker_id === task.teammate_id ? 'assistant' : 'user'}`}><div className="message-body"><div className="message-meta"><strong>{message.sender_worker_id === task.teammate_id ? name : '主 Agent'}</strong><time>{message.created_at}</time></div><MarkdownContent content={message.content} runId={message.sender_worker_id === task.teammate_id ? runId : undefined} /></div></article>)}
   </section>
 }

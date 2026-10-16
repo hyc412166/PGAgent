@@ -877,6 +877,55 @@ def test_run_file_content_reads_workspace_file_and_rejects_traversal(client: Tes
     assert nul_rejected.status_code == 400
 
 
+def test_run_markdown_file_opens_original_text_from_run_checkout(client: TestClient, tmp_path: Path) -> None:
+    root = tmp_path / "markdown-project"
+    checkout = root / "checkout"
+    checkout.mkdir(parents=True)
+    filename = "论文完成计划.md"
+    content = "# 论文完成计划\r\n\r\n<script>alert('仅作为原文')</script>\r\n"
+    (root / filename).write_text("不是本次运行的文件", encoding="utf-8")
+    (checkout / filename).write_bytes(content.encode("utf-8"))
+    workspace = client.post("/api/workspaces", json={"root_path": str(root)}).json()
+    session = client.post("/api/sessions", json={"workspace_id": workspace["id"]}).json()
+    with database.SessionLocal() as db:
+        run = Run(session_id=session["id"], workspace_id=workspace["id"], cwd=str(checkout), status="completed")
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    response = client.get(f"/api/runs/{run_id}/file", params={"path": filename})
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "text/plain; charset=utf-8"
+    assert response.headers["content-disposition"] == "inline"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.content == content.encode("utf-8")
+
+
+def test_run_markdown_file_preserves_read_boundaries(client: TestClient, tmp_path: Path) -> None:
+    root = tmp_path / "markdown-project"
+    root.mkdir()
+    (tmp_path / "outside.md").write_text("outside", encoding="utf-8")
+    (root / "binary.md").write_bytes(b"\x00binary")
+    (root / "large.md").write_bytes(b"x" * 1_000_001)
+    (root / "page.html").write_text("<script>alert(1)</script>", encoding="utf-8")
+    workspace = client.post("/api/workspaces", json={"root_path": str(root)}).json()
+    session = client.post("/api/sessions", json={"workspace_id": workspace["id"]}).json()
+    run = client.post("/api/runs", json={"session_id": session["id"], "workspace_id": workspace["id"]}).json()
+    for path, status in [
+        ("../outside.md", 400),
+        ("..\\outside.md", 400),
+        (str(tmp_path / "outside.md"), 400),
+        ("file\x00.md", 400),
+        ("missing.md", 404),
+        ("binary.md", 415),
+        ("large.md", 413),
+        ("page.html", 415),
+    ]:
+        response = client.get(f"/api/runs/{run['id']}/file", params={"path": path})
+        assert response.status_code == status, (path, response.text)
+        assert response.json()["detail"]
+
+
 # 测试场景：验证该正常业务场景从输入准备到结果断言的完整链路；函数名 test_run_listing_supports_stable_pagination 精确标识本用例的具体条件。
 def test_run_listing_supports_stable_pagination(client: TestClient) -> None:
     session_id = client.post("/api/sessions", json={}).json()["id"]

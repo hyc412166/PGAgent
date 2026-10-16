@@ -244,7 +244,7 @@ export const MessageBubble = memo(function MessageBubble({ message, thoughtRunId
           })}
         </div>}
         {!!message.content && (message.role === 'assistant' || (isTool && message.role !== 'user')
-          ? <MarkdownContent content={message.content} />
+          ? <MarkdownContent content={message.content} runId={messageRunId} />
           : <div className="message-content">{message.content}</div>)}
         {finalChangeSet && <FileChangeActivity
           runId={messageRunId}
@@ -480,7 +480,7 @@ function OrderedRunContent({
       if (entry.kind === 'assistant') {
         // 折叠执行详情时保留最终回复；commentary 属于执行过程，随详情一起隐藏。
         if (!activitiesVisible && entry.item.phase !== 'final_answer') return null
-        return <div className="ordered-assistant-content" key={entry.item.id}><MarkdownContent content={entry.item.detail} streaming={Boolean(live && entry.item.status === 'running')} /></div>
+        return <div className="ordered-assistant-content" key={entry.item.id}><MarkdownContent content={entry.item.detail} runId={runId} streaming={Boolean(live && entry.item.status === 'running')} /></div>
       }
       return activitiesVisible
         ? <ThoughtActivityList key={`activities-${entry.items[0]?.id || index}`} items={entry.items} runId={runId} sessionId={sessionId} live={live} activeItemId={activeItemId} onOpenFileChange={onOpenFileChange} />
@@ -608,7 +608,7 @@ export function ThoughtActivityList({ items, runId, sessionId, live = false, act
         const task = navigation.tasks.find(task => task.id === item.delegationId || Boolean(item.childRunId && task.child_run_id === item.childRunId))
         return <div key={item.id} className="thought-activity kind-tool"><Bot size={14} /><div className="thought-activity-copy"><div className="thought-activity-static">{task ? <button type="button" className="thought-activity-title child-delegation-link" onClick={() => navigation.open(task.id)}>{navigation.names[task.id]}</button> : <span className="thought-activity-title">子 Agent</span>}<span className="thought-activity-summary">{item.delegationState || item.title}</span></div></div></div>
       }
-      if (item.kind === 'assistant') return <div key={item.id} className="ordered-assistant-content"><MarkdownContent content={item.detail} streaming={Boolean(live && item.status === 'running')} /></div>
+      if (item.kind === 'assistant') return <div key={item.id} className="ordered-assistant-content"><MarkdownContent content={item.detail} runId={runId} streaming={Boolean(live && item.status === 'running')} /></div>
       if (item.kind === 'file-change') return <FileChangeActivity key={item.id} runId={runId} title={item.title} status={item.status} changeSet={item.changeSet} onOpenFileChange={onOpenFileChange} />
       if (item.kind === 'thought') return <p key={item.id} className={`thought-activity-thought ${item.status}`}>{item.detail}</p>
       const detailRequest = toolResultRequest(runId, live, item.kind, item.id)

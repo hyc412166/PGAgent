@@ -1,7 +1,7 @@
 // 本组件负责把 Agent 的 Markdown 与 LaTeX 正文转换为富文本，并统一公式、代码块和表格的展示。
 import { Children, isValidElement, memo, useEffect, useState, type ComponentProps, type ReactNode } from 'react'
 import { CheckCheck, Code2, Copy, XCircle } from 'lucide-react'
-import ReactMarkdown, { type Components } from 'react-markdown'
+import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown'
 import rehypeHighlight from 'rehype-highlight'
 import rehypeKatex from 'rehype-katex'
 import remarkBreaks from 'remark-breaks'
@@ -9,6 +9,7 @@ import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math-extended'
 import 'katex/dist/katex.min.css'
 
+import { apiUrl } from '../../api'
 import { createLiveMarkdownCoalescer } from './liveMarkdownCoalescer'
 
 const languageLabels: Record<string, string> = {
@@ -121,6 +122,20 @@ function MarkdownCodeBlock({ children }: { children?: ReactNode }) {
   </div>
 }
 
+function localMarkdownFileHref(href: string | undefined, runId: string | undefined) {
+  if (!href || !runId || href.startsWith('/') || /^[a-z][a-z\d+.-]*:/i.test(href)) return undefined
+  // 先拆 URL 再解码，避免把文件名里的 %23 当成片段；工作区边界仍由后端统一检查。
+  let path = href.split(/[?#]/, 1)[0]
+  try {
+    path = decodeURIComponent(path)
+  } catch {
+    // 非法百分号保留为文件名原文，文件不存在时由读取接口明确返回错误。
+  }
+  if (!path.toLowerCase().endsWith('.md')) return undefined
+  path = path.replace(/^\.\//, '')
+  return apiUrl(`/api/runs/${encodeURIComponent(runId)}/file?path=${encodeURIComponent(path)}`)
+}
+
 const markdownComponents: Components = {
   a({ children, href, title }) {
     return <a href={href} title={title} target="_blank" rel="noreferrer">{children}</a>
@@ -136,9 +151,10 @@ const markdownComponents: Components = {
 const remarkPlugins: NonNullable<ComponentProps<typeof ReactMarkdown>['remarkPlugins']> = [[remarkMath, { backslashDelimiters: true, singleDollarTextMath: false }], remarkGfm, remarkBreaks]
 const rehypePlugins: NonNullable<ComponentProps<typeof ReactMarkdown>['rehypePlugins']> = [preserveLatexCodeFences, [rehypeHighlight, { detect: false, plainText: ['text', 'plaintext', 'txt', 'math'] }], rehypeKatex]
 
-const MarkdownDocument = memo(function MarkdownDocument({ content }: { content: string }) {
+const MarkdownDocument = memo(function MarkdownDocument({ content, runId }: { content: string; runId?: string }) {
   return <ReactMarkdown
     components={markdownComponents}
+    urlTransform={(url, key) => defaultUrlTransform(key === 'href' ? localMarkdownFileHref(url, runId) || url : url)}
     remarkPlugins={remarkPlugins}
     rehypePlugins={rehypePlugins}
   >
@@ -146,7 +162,7 @@ const MarkdownDocument = memo(function MarkdownDocument({ content }: { content: 
   </ReactMarkdown>
 })
 
-function MarkdownContentView({ content, streaming = false }: { content: string; streaming?: boolean }) {
+function MarkdownContentView({ content, runId, streaming = false }: { content: string; runId?: string; streaming?: boolean }) {
   const [renderedContent, setRenderedContent] = useState(content)
   const [coalescer] = useState(() => createLiveMarkdownCoalescer(content, setRenderedContent))
 
@@ -160,7 +176,7 @@ function MarkdownContentView({ content, streaming = false }: { content: string; 
   // 流式正文最多每 100ms 触发一次完整 Markdown/KaTeX 解析；结束态直接使用最终内容。
   const visibleContent = streaming ? renderedContent : content
   return <div className="message-content markdown-content">
-    <MarkdownDocument content={visibleContent} />
+    <MarkdownDocument content={visibleContent} runId={runId} />
   </div>
 }
 

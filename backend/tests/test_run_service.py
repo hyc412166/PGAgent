@@ -1805,6 +1805,50 @@ def test_runtime_uses_session_thinking_and_ignores_child_agent_settings(
         RunCoordinator._resolve_runtime(run_id, runtime_binding=binding)
 
 
+def test_runtime_probes_the_selected_session_model_when_default_model_was_detected(
+    seeded_run: tuple[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """会话切换模型后，服务端搜索能力必须按实际模型重新检测。"""
+    run_id, session_id = seeded_run
+    probe_calls: list[str] = []
+
+    def probe(_base_url: str, _api_key: str, model_id: str, _headers: dict[str, str]) -> dict[str, object]:
+        probe_calls.append(model_id)
+        return {"supported": True, "category": "ok", "message": "已验证服务端搜索"}
+
+    monkeypatch.setattr(lifecycle_service, "probe_hosted_web_search", probe, raising=False)
+    monkeypatch.setattr(lifecycle_service, "get_api_key", lambda _secret_ref: "test-key", raising=False)
+    with database.SessionLocal() as db:
+        connection = ModelConnection(
+            name="Per-model search capability",
+            provider="openai_compatible",
+            api_protocol="responses",
+            base_url="https://search.test/v1",
+            secret_ref="selected-model-secret",
+            default_model="default-model",
+            status="connected",
+            capabilities={"hosted_web_search": {"base_url": "https://search.test/v1", "models": {
+                "default-model": {"supported": False, "category": "unsupported"},
+            }}},
+        )
+        db.add(connection)
+        session = db.get(Session, session_id)
+        assert session is not None
+        session.model_connection_id = connection.id
+        session.model_id = "selected-model"
+        db.commit()
+
+    runtime, context = RunCoordinator._resolve_runtime(run_id)
+
+    assert probe_calls == ["selected-model"]
+    assert runtime.tool_registry.runtime_state()["web_search_backend"] == "provider"
+    assert context["provider"].model_id == "selected-model"
+    with database.SessionLocal() as db:
+        connection = db.get(ModelConnection, context["model_connection_id"])
+        assert connection is not None
+        assert connection.capabilities["hosted_web_search"]["models"]["selected-model"]["supported"] is True
+
+
 @pytest.mark.parametrize("initial_supported", [False, True])
 def test_resume_preserves_search_capability_when_live_connection_is_retested(
     seeded_run: tuple[str, str], initial_supported: bool,

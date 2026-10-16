@@ -328,14 +328,9 @@ def get_run(run_id: str, db: Session = Depends(get_db)) -> RunRead:
     return _run_read(_require(db, Run, run_id, "Run"), db=db)
 
 
-@router.get("/runs/{run_id}/file-content", response_model=FileContentRead)
-def get_run_file_content(
-    run_id: str,
-    path: str = Query(..., min_length=1, max_length=1_000),
-    db: Session = Depends(get_db),
-) -> FileContentRead:
-    """Read one current workspace file for the change inspector."""
-
+def _resolve_run_file(run_id: str, path: str, db: Session) -> tuple[str, Path]:
+    """Resolve one run-scoped relative file path for both JSON and raw readers."""
+    # 两种读取方式共用运行目录和路径校验，不允许新标签读取绕过文件侧栏的工作区边界。
     run = _require(db, Run, run_id, "Run")
     workspace = db.get(Workspace, run.workspace_id) if run.workspace_id else None
     if workspace is None or not workspace.root_path:
@@ -362,6 +357,18 @@ def get_run_file_content(
         raise HTTPException(status_code=400, detail="文件路径越过工作区边界") from exc
     if not target.is_file():
         raise HTTPException(status_code=404, detail="文件不存在或已被删除")
+    return relative, target
+
+
+@router.get("/runs/{run_id}/file-content", response_model=FileContentRead)
+def get_run_file_content(
+    run_id: str,
+    path: str = Query(..., min_length=1, max_length=1_000),
+    db: Session = Depends(get_db),
+) -> FileContentRead:
+    """Read one current workspace file for the change inspector."""
+
+    relative, target = _resolve_run_file(run_id, path, db)
     try:
         max_bytes = 1_000_000
         with target.open("rb") as handle:
@@ -389,6 +396,34 @@ def get_run_file_content(
         line_count=len(lines),
         truncated=truncated,
     )
+
+
+@router.get("/runs/{run_id}/file")
+def get_run_file(
+    run_id: str,
+    path: str = Query(..., min_length=1, max_length=1_000),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Serve a bounded workspace Markdown file without falling back to the SPA."""
+
+    _relative, target = _resolve_run_file(run_id, path, db)
+    if target.suffix.lower() != ".md":
+        raise HTTPException(status_code=415, detail="此接口仅支持打开 Markdown 文件")
+    max_bytes = 1_000_000
+    try:
+        with target.open("rb") as handle:
+            raw = handle.read(max_bytes + 1)
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail="读取文件失败") from exc
+    if len(raw) > max_bytes:
+        raise HTTPException(status_code=413, detail="文件过大，无法直接打开")
+    if b"\x00" in raw[:8192]:
+        raise HTTPException(status_code=415, detail="二进制文件不能作为 Markdown 打开")
+    # 以纯文本在浏览器内打开原文；Markdown 内嵌的 HTML 不得作为同源页面执行。
+    return Response(content=raw, media_type="text/plain; charset=utf-8", headers={
+        "Content-Disposition": "inline",
+        "X-Content-Type-Options": "nosniff",
+    })
 
 
 # 函数职责：按需分页读取某次运行持久化的完整工具结果，同时严格限制消息归属。

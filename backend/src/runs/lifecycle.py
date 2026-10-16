@@ -63,6 +63,8 @@ from src.mcp import mcp_runtime_pool
 
 from src.tasks import background as background_job_service
 from src.model.gateway import ModelConfigurationError, ProviderConfig
+from src.model.credentials import get_api_key
+from src.model.web_search import probe_hosted_web_search
 from src.memory.repository import load_memory_index, record_memory_citations
 from src.memory.preferences import memories_enabled
 from src.observability import bind_observability_context
@@ -118,6 +120,32 @@ from .runtime_preparer import RunRuntimePreparer
 
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_selected_model_search_capability(connection: ModelConnection, model_id: str) -> None:
+    """为会话实际选中的 Responses 模型补齐一次服务端搜索能力检测。"""
+    if connection.api_protocol != "responses" or not model_id:
+        return
+    base_url = connection.base_url.strip().rstrip("/")
+    current = dict(connection.capabilities or {})
+    evidence = current.get("hosted_web_search")
+    models = (
+        dict(evidence.get("models", {}))
+        if isinstance(evidence, dict) and evidence.get("base_url") == base_url
+        else {}
+    )
+    # 连接创建时只检测默认模型；会话可以独立选择同一连接中的其他模型。
+    if model_id in models:
+        return
+    api_key = get_api_key(connection.secret_ref)
+    if not api_key:
+        return
+    result = probe_hosted_web_search(base_url, api_key, model_id, connection.custom_headers)
+    models[model_id] = result
+    connection.capabilities = {
+        **current,
+        "hosted_web_search": {"base_url": base_url, "models": models},
+    }
 
 
 # 变量说明：ACTIVE_STATUSES 表示当前流程使用的 ACTIVE_STATUSES 集合。
@@ -1832,6 +1860,7 @@ class RunCoordinator:
                 model_id = session_model or agent_model or default_model or (enabled_models[0] if enabled_models else None)
                 if not model_id:
                     raise ModelConfigurationError("模型连接中没有可用模型，请发现模型或填写手动模型 ID")
+                _ensure_selected_model_search_capability(connection, model_id)
                 # 变量说明：thinking_level 表示当前步骤使用的 thinking_level 值。
                 # 普通会话 Run 直接采用会话保存值，确保每一轮都与前端当前选择一致。
                 thinking_level = (
