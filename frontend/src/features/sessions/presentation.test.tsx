@@ -11,7 +11,7 @@ import { createLiveMarkdownCoalescer } from './liveMarkdownCoalescer'
 import { formatApprovalArguments } from './approvalPresentation'
 import { groupThoughtActivities } from './thoughtActivityGrouping'
 import type { DurableTask } from '../../types'
-import { emptyThoughtTimeline, updateThoughtTimeline } from '../../thoughtTimeline'
+import { emptyThoughtTimeline, mergeThoughtTimelineHistory, updateThoughtTimeline } from '../../thoughtTimeline'
 import type { ThoughtTimelineState } from '../../thoughtTimeline'
 
 const sessionsCss = readFileSync(new URL('../../styles/sessions.css', import.meta.url), 'utf8')
@@ -155,7 +155,7 @@ describe('助手消息中的思考过程展示', () => {
     const failed = updateThoughtTimeline(thought, { type: 'image_read_failed', attachment_id: 'image-1' }, 1_100)
     expect(renderToStaticMarkup(createElement(ThoughtActivityList, { items: failed.items, sessionId: 'session-images' }))).not.toContain('aria-label="预览')
   })
-  it('最终回复开始后不再显示停顿思考提示，真正进入新步骤后恢复', () => {
+  it('最终回复续写、重试和压缩收尾不恢复思考提示，真正执行工具后恢复', () => {
     vi.useFakeTimers()
     vi.setSystemTime(10_000)
     const render = (thought: ThoughtTimelineState) => renderToStaticMarkup(createElement(LiveAssistantMessage, {
@@ -170,9 +170,64 @@ describe('助手消息中的思考过程展示', () => {
       thought = updateThoughtTimeline(thought, { type: 'assistant_message_completed', item_id: 'final', phase: 'final_answer', content: '最终结果。' }, 1_300)
       expect(render(thought)).not.toContain('class="thought-waiting"')
       expect(thought.finished).toBe(false)
-      const next = updateThoughtTimeline(thought, { type: 'model_step_started', step: 2 }, 9_000)
+      let next = updateThoughtTimeline(thought, { type: 'model_step_started', step: 2 }, 7_000)
+      expect(render(next)).not.toContain('class="thought-waiting"')
+      expect(render(next)).toContain('最终结果。')
+      next = updateThoughtTimeline(next, { type: 'model_retry', attempt: 1, event_id: 'retry-final' }, 7_200)
+      expect(render(next)).toContain('重试模型')
+      expect(render(next)).not.toContain('class="thought-waiting"')
+      next = updateThoughtTimeline(next, { type: 'context_compaction_started' }, 7_300)
+      next = updateThoughtTimeline(next, { type: 'context_compaction_finished' }, 7_400)
+      expect(render(next)).not.toContain('class="thought-waiting"')
+      next = updateThoughtTimeline(next, { type: 'assistant_message_delta', item_id: 'final-2', phase: 'final_answer', delta: '补充最终说明。' }, 7_500)
+      expect(render(next)).not.toContain('class="thought-waiting"')
+      next = updateThoughtTimeline(next, { type: 'tool_started', tool_name: 'shell', tool_call_id: 'shell-after-final' }, 8_000)
+      expect(render(next)).not.toContain('class="thought-waiting"')
+      next = updateThoughtTimeline(next, { type: 'tool_finished', tool_call_id: 'shell-after-final' }, 9_000)
       expect(render(next)).toContain('已等待 1 秒')
       expect(next.startedAt).toBe(1_000)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('最终回复后重新输出中间过程时恢复正常停顿提示', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    try {
+      let thought = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 17 }, 1_000)
+      thought = updateThoughtTimeline(thought, { type: 'assistant_message_completed', item_id: 'final-17', phase: 'final_answer', content: '报告已完成。' }, 2_000)
+      thought = updateThoughtTimeline(thought, { type: 'model_step_started', step: 18 }, 3_000)
+      thought = updateThoughtTimeline(thought, { type: 'assistant_message_delta', item_id: 'commentary-18', phase: 'commentary', delta: '发现遗漏，继续核对。' }, 7_000)
+      const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+        liveRun: { runId: 'run-resumed-commentary', phase: '正在回复…', draft: '', status: 'live', error: '', thinkingStatus: '思考中…', thought },
+      }))
+      expect(markup).toContain('报告已完成。')
+      expect(markup).toContain('发现遗漏，继续核对。')
+      expect(markup).toContain('已等待 3 秒')
+      expect(thought.finished).toBe(false)
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each(['continuation', 'commentary', 'tool'] as const)('历史最终回复晚于实时 %s 到达时，合并保留正确的等待阶段', (stage) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    try {
+      let history = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 17 }, 1_000)
+      history = updateThoughtTimeline(history, { type: 'assistant_message_completed', item_id: 'final-history', phase: 'final_answer', content: '历史最终结果。' }, 2_000)
+      let live = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_step_started', step: 18 }, 3_000)
+      if (stage === 'commentary') {
+        live = updateThoughtTimeline(live, { type: 'assistant_message_completed', item_id: 'next-commentary', phase: 'commentary', content: '继续检查。' }, 7_000)
+      } else if (stage === 'tool') {
+        live = updateThoughtTimeline(live, { type: 'tool_started', tool_name: 'shell', tool_call_id: 'next-tool' }, 6_000)
+        live = updateThoughtTimeline(live, { type: 'tool_finished', tool_call_id: 'next-tool' }, 7_000)
+      }
+      const thought = mergeThoughtTimelineHistory(live, history)
+      const markup = renderToStaticMarkup(createElement(LiveAssistantMessage, {
+        liveRun: { runId: 'run-merged-final', phase: '正在回复…', draft: '', status: 'live', error: '', thinkingStatus: '思考中…', thought },
+      }))
+      expect(markup).toContain('历史最终结果。')
+      expect(markup.includes('class="thought-waiting"')).toBe(stage !== 'continuation')
+      if (stage !== 'continuation') expect(markup).toContain('已等待 3 秒')
+      expect(thought.finished).toBe(false)
     } finally { vi.useRealTimers() }
   })
 

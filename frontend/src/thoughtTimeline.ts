@@ -52,7 +52,7 @@ export interface ThoughtTimelineState {
   activeStepHasVisibleContent?: boolean
   // 文字已停止增量输出时，完成事件可能还未到达；用实际文字更新时间识别这段等待。
   lastVisibleOutputAt?: number
-  // 最终回复期间的停顿是输出/收尾，不是等待下一段中间思考；只有新执行阶段才重置。
+  // 最终回复可跨模型步骤继续收尾；只有实际工具执行或新的 commentary 才恢复过程等待。
   activeStepHasFinalAnswer?: boolean
   conclusion?: string
 }
@@ -427,7 +427,9 @@ function updateAssistantTimelineItem(
     startedAt: state.startedAt,
     items,
     activeItemId: undefined,
-    activeStepHasFinalAnswer: state.activeStepHasFinalAnswer || phase === 'final_answer',
+    activeStepHasFinalAnswer: phase === 'commentary' && !wasCompleted
+      ? false
+      : state.activeStepHasFinalAnswer || phase === 'final_answer',
     lastVisibleOutputAt: items[index >= 0 ? index : items.length - 1].detail !== previousContent
       ? now
       : state.lastVisibleOutputAt,
@@ -605,7 +607,9 @@ function activityFromNonToolEvent(event: RunStreamEvent, itemIndex: number): Tho
   }
   if (type === 'model_retry') {
     const attempt = typeof event.attempt === 'number' ? `第 ${event.attempt} 次重试` : '正在重试模型'
-    return { id: 'model-retry', kind: 'event', icon: 'think', title: '重试模型', detail: progress || attempt, status: 'running' }
+    // 每次重试是独立的时间线事件；复用持久事件身份，让实时与历史回放保持相同位置。
+    const id = firstString(event.event_id, event.id) || `model-retry-${itemIndex}`
+    return { id, kind: 'event', icon: 'think', title: '重试模型', detail: progress || attempt, status: 'running' }
   }
   if (type === 'completion_verification_started' || type === 'completion_verification_passed' || type === 'completion_verification_rejected') {
     const passed = type.endsWith('passed')
@@ -764,6 +768,7 @@ export function updateThoughtTimeline(
         status: 'running',
       }],
       activeItemId: id,
+      activeStepHasFinalAnswer: false,
       activeStepHasVisibleContent: true,
     }
   }
@@ -899,7 +904,10 @@ export function updateThoughtTimeline(
       items,
       activeItemId: currentActivity.status === 'running' ? currentActivity.id : (state.activeItemId === currentActivity.id ? undefined : state.activeItemId),
       activeStepStartedAt: type === 'model_step_started' || resetWaiting ? now : state.activeStepStartedAt,
-      activeStepHasFinalAnswer: type === 'model_step_started' || resetWaiting ? false : state.activeStepHasFinalAnswer,
+      // 新模型步骤、重试和上下文压缩也可能只是续写最终结果，不能据此回到“思考中”。
+      activeStepHasFinalAnswer: type === 'image_read_completed' || type === 'image_read_failed'
+        ? false
+        : state.activeStepHasFinalAnswer,
       lastVisibleOutputAt: type === 'model_step_started' || resetWaiting ? undefined : state.lastVisibleOutputAt,
       activeStepHasVisibleContent: resetWaiting
         ? false
@@ -992,6 +1000,8 @@ export function mergeThoughtTimelineHistory(
   const historyToolIds = new Set(history.tools.map((tool) => tool.id))
   return {
     ...live,
+    // 切回会话可能先收到续写步骤，再补到最终回复；明确的新执行状态 false 仍以实时流为准。
+    activeStepHasFinalAnswer: live.activeStepHasFinalAnswer ?? history.activeStepHasFinalAnswer,
     startedAt: history.startedAt === null ? live.startedAt : live.startedAt === null ? history.startedAt : Math.min(live.startedAt, history.startedAt),
     elapsedMs: Math.max(live.elapsedMs, history.elapsedMs),
     items: [...items, ...live.items.filter(item => !mergedLiveIds.has(item.id))],

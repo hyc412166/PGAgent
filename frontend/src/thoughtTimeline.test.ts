@@ -1,7 +1,7 @@
 // 本测试文件验证 thoughtTimeline 模块的公开行为与关键边界，确保相关组件或纯函数在重构后保持既定契约。
 import { describe, expect, it, vi } from 'vitest'
 import { parseRunStreamEvent } from './sessionStream'
-import { displayToolName, emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, pickThinkingStatus, safeToolTarget, summarizeThoughtConclusion, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from './thoughtTimeline'
+import { displayToolName, emptyThoughtTimeline, formatLiveThinkingDuration, formatThoughtDuration, hasVisibleCompletedThought, mergeThoughtTimelineHistory, pickThinkingStatus, safeToolTarget, summarizeThoughtConclusion, thinkingStatusForRun, timelineFromRunEvents, updateThoughtTimeline } from './thoughtTimeline'
 
 // 测试分组：实时 Thought 时间线。
 describe('实时 Thought 时间线', () => {
@@ -67,8 +67,9 @@ describe('实时 Thought 时间线', () => {
     const completed = updateThoughtTimeline(timeline, { type: 'model_response_completed', has_tool_calls: false }, 1_200)
     expect(completed.activeStepHasFinalAnswer).toBe(true)
     expect(completed.finished).toBe(false)
-    expect(updateThoughtTimeline(completed, { type: 'model_step_started', step: 2 }, 1_300).activeStepHasFinalAnswer).toBe(false)
-    expect(updateThoughtTimeline(completed, { type: 'model_retry' }, 1_300).activeStepHasFinalAnswer).toBe(false)
+    expect(updateThoughtTimeline(completed, { type: 'model_step_started', step: 2 }, 1_300).activeStepHasFinalAnswer).toBe(true)
+    expect(updateThoughtTimeline(completed, { type: 'model_retry' }, 1_300).activeStepHasFinalAnswer).toBe(true)
+    expect(updateThoughtTimeline(completed, { type: 'tool_started', tool_name: 'shell', tool_call_id: 'next-tool' }, 1_400).activeStepHasFinalAnswer).toBe(false)
   })
 
   it('可恢复等待不会永久结束时间线，恢复后的模型步骤重新显示进行中状态', () => {
@@ -233,7 +234,7 @@ describe('实时 Thought 时间线', () => {
     const visible = updateThoughtTimeline(started, { type: 'thought_summary', step: 1, summary: '正在检查文件。' }, 1_200)
     const retried = updateThoughtTimeline(visible, { type: 'model_retry', attempt: 2 }, 1_500)
 
-    expect(retried.items.at(-1)).toMatchObject({ id: 'model-retry', title: '重试模型', status: 'running' })
+    expect(retried.items.at(-1)).toMatchObject({ title: '重试模型', status: 'running' })
     expect(retried).toMatchObject({ activeStepStartedAt: 1_500, activeStepHasVisibleContent: false })
   })
 
@@ -600,14 +601,44 @@ describe('实时 Thought 时间线', () => {
     expect(JSON.stringify(timeline)).not.toContain('secret')
   })
 
-  // 测试场景：后续模型重试覆盖当前重试行。
-  it('后续模型重试覆盖当前重试行', () => {
+  it('不同重试按事件顺序保留，同一事件回放不重复追加', () => {
     const first = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_retry', attempt: 1, event_id: 'retry-1' }, 1_000)
     const second = updateThoughtTimeline(first, { type: 'model_retry', attempt: 2, event_id: 'retry-2' }, 1_100)
+    const replayed = updateThoughtTimeline(second, { type: 'model_retry', attempt: 1, event_id: 'retry-1' }, 1_000)
 
-    expect(second.items).toEqual([
-      expect.objectContaining({ id: 'model-retry', title: '重试模型', detail: '第 2 次重试' }),
+    expect(replayed.items).toEqual([
+      expect.objectContaining({ title: '重试模型', detail: '第 1 次重试' }),
+      expect.objectContaining({ title: '重试模型', detail: '第 2 次重试' }),
     ])
+  })
+
+  it('跨模型步骤的重试追加在当前末尾，历史补齐不会搬回旧步骤', () => {
+    const events = [
+      { type: 'model_step_started', step: 10, sequence: 78 },
+      { type: 'model_retry', attempt: 1, event_id: 'retry-80', sequence: 80 },
+      { type: 'assistant_message_completed', item_id: 'commentary-10', phase: 'commentary', content: '开始写入报告。', sequence: 81 },
+      { type: 'tool_started', tool_name: 'shell', tool_call_id: 'shell-10', sequence: 84 },
+      { type: 'tool_finished', tool_call_id: 'shell-10', sequence: 85 },
+      { type: 'model_step_started', step: 15, sequence: 120 },
+      { type: 'model_retry', attempt: 1, event_id: 'retry-122', sequence: 122 },
+      { type: 'model_retry', attempt: 2, event_id: 'retry-123', sequence: 123 },
+    ]
+    const history = timelineFromRunEvents(events.slice(0, 5))
+    const live = timelineFromRunEvents(events.slice(5))
+    const replayed = timelineFromRunEvents([...events].reverse())
+    const merged = mergeThoughtTimelineHistory(live, history)
+    for (const timeline of [replayed, merged]) {
+      expect(timeline.items.map(item => item.kind === 'tool' ? item.id : item.detail)).toEqual([
+        '', '第 1 次重试', '开始写入报告。', 'shell-10', '', '第 1 次重试', '第 2 次重试',
+      ])
+    }
+  })
+
+  it('无事件 ID 的旧重试仍保留不同条目', () => {
+    const first = updateThoughtTimeline(emptyThoughtTimeline, { type: 'model_retry', attempt: 1 }, 1_000)
+    const second = updateThoughtTimeline(first, { type: 'model_retry', attempt: 2 }, 1_100)
+    expect(second.items.map(item => item.detail)).toEqual(['第 1 次重试', '第 2 次重试'])
+    expect(second.items[0].id).not.toBe(second.items[1].id)
   })
 
   // 测试场景：为默认收起的处理摘要提取安全、简短的结论首行。
